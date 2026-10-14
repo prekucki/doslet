@@ -91,7 +91,12 @@ impl Gpr16 {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+use core::sync::atomic::{AtomicU32, Ordering};
+
+// Setup-only lineage identities for `Registers` values; they contain no guest
+// state and never wrap. Exhaustion leaves new values without a lineage.
+static NEXT_LINEAGE: AtomicU32 = AtomicU32::new(1);
+
 pub struct Registers {
     general: [u32; 8],
     pub cs: u16,
@@ -104,6 +109,69 @@ pub struct Registers {
     pub(crate) protected: bool,
     pub(crate) caches: [SegmentCache; 6],
     pub(crate) cpl: u8,
+    /// Decode-cache hint, not guest state: a lineage unique to this value
+    /// (0 when exhausted) and a version advanced on every hidden CS cache
+    /// reload. `Registers` is not `Clone`, so no other value can reproduce a
+    /// (lineage, version) pair with different CS state.
+    pub(crate) cs_lineage: u32,
+    pub(crate) cs_version: u64,
+}
+impl Default for Registers {
+    fn default() -> Self {
+        Self {
+            general: [0; 8],
+            cs: 0,
+            ds: 0,
+            es: 0,
+            ss: 0,
+            fs: 0,
+            gs: 0,
+            ip: 0,
+            protected: false,
+            caches: [SegmentCache::default(); 6],
+            cpl: 0,
+            cs_lineage: NEXT_LINEAGE
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .unwrap_or(0),
+            cs_version: 0,
+        }
+    }
+}
+// Equality and Debug cover guest state only, excluding the decode-cache hint.
+impl PartialEq for Registers {
+    fn eq(&self, other: &Self) -> bool {
+        self.general == other.general
+            && self.cs == other.cs
+            && self.ds == other.ds
+            && self.es == other.es
+            && self.ss == other.ss
+            && self.fs == other.fs
+            && self.gs == other.gs
+            && self.ip == other.ip
+            && self.protected == other.protected
+            && self.caches == other.caches
+            && self.cpl == other.cpl
+    }
+}
+impl Eq for Registers {}
+impl core::fmt::Debug for Registers {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Registers")
+            .field("general", &self.general)
+            .field("cs", &self.cs)
+            .field("ds", &self.ds)
+            .field("es", &self.es)
+            .field("ss", &self.ss)
+            .field("fs", &self.fs)
+            .field("gs", &self.gs)
+            .field("ip", &self.ip)
+            .field("protected", &self.protected)
+            .field("caches", &self.caches)
+            .field("cpl", &self.cpl)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +276,9 @@ impl Registers {
             SegmentRegister::Gs => self.gs = cache.selector,
         }
         self.caches[segment as usize] = cache;
+        if segment == SegmentRegister::Cs {
+            self.cs_version = self.cs_version.saturating_add(1);
+        }
     }
     pub(crate) fn sync_mode(&mut self, protected: bool) {
         if protected && !self.protected {
@@ -215,6 +286,8 @@ impl Registers {
                 self.caches[segment as usize] = self.segment_cache(segment);
             }
         }
+        // Materialized caches always accompany a PE change, which decode-cache
+        // keys record directly; the CS version tracks only CS reloads.
         self.protected = protected;
     }
     pub fn code32(&self) -> bool {
@@ -357,6 +430,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cs_versions_track_cs_reloads_without_affecting_equality() {
+        let mut r = Registers::default();
+        let other = Registers::default();
+        assert!(r.cs_lineage != 0 && r.cs_lineage != other.cs_lineage);
+        assert_eq!(r, other);
+        r.set_segment(SegmentRegister::Ds, SegmentCache::real(1, false));
+        assert_eq!(r.cs_version, 0);
+        r.set_segment(SegmentRegister::Cs, SegmentCache::real(2, true));
+        assert_eq!(r.cs_version, 1);
+        // PE changes are keyed directly by the decode cache.
+        r.sync_mode(true);
+        r.sync_mode(false);
+        assert_eq!(r.cs_version, 1);
+        r.cs_version = u64::MAX;
+        r.set_segment(SegmentRegister::Cs, SegmentCache::real(3, true));
+        assert_eq!(r.cs_version, u64::MAX);
     }
 
     #[test]

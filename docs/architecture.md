@@ -167,7 +167,10 @@ Cache entries contain operations, immediates and addressing expressions rather
 than resolved data addresses. Register-dependent addresses and segment checks
 remain execution work. CS context changes clear entries and resolve the selector,
 hidden-cache, PE-mode and execute checks once; hits validate the entire code span's
-offset range and its generation token. Short/noncontiguous code views and unsupported
+offset range and its generation token. Each `Registers` value carries a setup-time
+lineage and a CS reload version that are not guest state; a step whose lineage,
+version, selector and PE mode match the last resolution skips the full context
+comparison, and exhausted counters restore it. Short/noncontiguous code views and unsupported
 forms use the original byte-fetching interpreter, preserving partial fault IP
 progress. One cached instruction still consumes exactly one bounded step; REP
 and IRQ delivery retain their existing paths. No decoded blocks or JIT exist.

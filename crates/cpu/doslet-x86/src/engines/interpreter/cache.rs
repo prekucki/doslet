@@ -49,6 +49,10 @@ struct Entry {
 pub(super) struct Cache {
     entries: [Option<Entry>; CAPACITY],
     context: Option<Context>,
+    /// Registers lineage, CS version, selector and PE mode under which
+    /// `code32` and `context` were last resolved.
+    key: Option<(u32, u64, u16, bool)>,
+    code32: bool,
     /// Execute window of `context`; None leaves its faults to the interpreter.
     window: Option<SegmentWindow>,
     pub enabled: bool,
@@ -60,6 +64,8 @@ impl Default for Cache {
         Self {
             entries: [None; CAPACITY],
             context: None,
+            key: None,
+            code32: false,
             window: None,
             enabled: true,
             #[cfg(feature = "profiling")]
@@ -79,21 +85,20 @@ impl Cache {
     pub fn clear(&mut self) {
         self.entries.fill(None);
         self.context = None;
+        self.key = None;
+        self.code32 = false;
         self.window = None;
     }
-    fn instruction<B: CpuBus>(&mut self, r: &Registers, bus: &B) -> Option<Instruction> {
-        if !self.enabled {
-            return None;
-        }
+    /// Full context check; entries survive only an unchanged 32-bit context.
+    #[inline(always)]
+    fn resolve_context(&mut self, r: &Registers) {
         let context = Context {
             cs: r.segment_cache(SegmentRegister::Cs),
             selector: r.cs,
             protected: r.protected,
         };
-        if !context.cs.default32 {
-            return None;
-        }
-        if self.context != Some(context) {
+        self.code32 = context.cs.default32;
+        if self.code32 && self.context != Some(context) {
             #[cfg(feature = "profiling")]
             {
                 self.stats.context_switches += u64::from(self.context.is_some());
@@ -102,9 +107,42 @@ impl Cache {
                 self.stats.invalidations += removed;
             }
             self.clear();
+            self.code32 = true;
             self.context = Some(context);
             // The context fixes every CS check except the instruction's offset range.
             self.window = r.window(SegmentRegister::Cs, Access::Execute);
+        }
+    }
+    fn instruction<B: CpuBus>(&mut self, r: &Registers, bus: &B) -> Option<Instruction> {
+        if !self.enabled {
+            return None;
+        }
+        // The hidden CS cache changes only with a new version in the same
+        // lineage or with PE mode; the selector is public, so it is keyed too.
+        // Keep the tuple: a packed [u64; 2] key measured ~5 ns/step slower in
+        // Chrome WASM, although native code was unaffected.
+        let key = (r.cs_lineage, r.cs_version, r.cs, r.protected);
+        let known = r.cs_lineage != 0 && r.cs_version != u64::MAX && self.key == Some(key);
+        #[cfg(debug_assertions)]
+        if known {
+            let cs = r.segment_cache(SegmentRegister::Cs);
+            debug_assert_eq!(self.code32, cs.default32);
+            debug_assert!(
+                !self.code32
+                    || self.context
+                        == Some(Context {
+                            cs,
+                            selector: r.cs,
+                            protected: r.protected,
+                        })
+            );
+        }
+        if !known {
+            self.resolve_context(r);
+            self.key = Some(key);
+        }
+        if !self.code32 {
+            return None;
         }
         let window = self.window?;
         let address = window.address(r.ip, 1)?;
@@ -726,5 +764,91 @@ impl Cpu {
             )?,
         }
         Ok(StepOutcome::Continue)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Gpr32;
+    use doslet_bus::{BusError, MemoryBus, PortBus};
+
+    /// Flat RAM whose single write generation validates every code span.
+    struct Flat {
+        ram: [u8; 0x200],
+        generation: u64,
+    }
+    impl MemoryBus for Flat {
+        fn read_u8(&mut self, address: u32) -> Result<u8, BusError> {
+            let byte = self.ram.get(address as usize);
+            byte.copied().ok_or(BusError::UnmappedMemory(address))
+        }
+        fn write_u8(&mut self, address: u32, value: u8) -> Result<(), BusError> {
+            let byte = self.ram.get_mut(address as usize);
+            *byte.ok_or(BusError::UnmappedMemory(address))? = value;
+            self.generation += 1;
+            Ok(())
+        }
+        fn code_check(&self, address: u32, length: u8) -> Option<CodeCheck> {
+            (address as usize + usize::from(length) <= self.ram.len()).then_some(CodeCheck {
+                space: 1 << 32,
+                pages: [0; 2],
+                generations: [self.generation; 2],
+            })
+        }
+        fn code_valid(&self, check: &CodeCheck) -> bool {
+            check.generations[0] == self.generation
+        }
+        fn code_bytes(&self, address: u32, length: u8) -> Option<&[u8]> {
+            let start = address as usize;
+            self.ram
+                .get(start..(start + usize::from(length)).min(self.ram.len()))
+        }
+    }
+    impl PortBus for Flat {
+        fn read_port_u8(&mut self, port: u16) -> Result<u8, BusError> {
+            Err(BusError::UnmappedPort(port))
+        }
+        fn write_port_u8(&mut self, port: u16, _: u8) -> Result<(), BusError> {
+            Err(BusError::UnmappedPort(port))
+        }
+    }
+
+    #[test]
+    fn exhausted_cs_lineage_or_version_resolves_the_context_every_step() {
+        for exhausted in [
+            |r: &mut Registers| r.cs_lineage = 0,
+            |r: &mut Registers| r.cs_version = u64::MAX,
+        ] {
+            let mut bus = Flat {
+                ram: [0; 0x200],
+                generation: 0,
+            };
+            bus.ram[..5].copy_from_slice(&[0xB8, 1, 0, 0, 0]);
+            bus.ram[0x100..0x105].copy_from_slice(&[0xB8, 2, 0, 0, 0]);
+            let mut cpu = Cpu::default();
+            cpu.control.cr0 |= 1;
+            let r = &mut cpu.registers;
+            r.sync_mode(true);
+            r.cs = 8;
+            r.caches[SegmentRegister::Cs as usize] = SegmentCache {
+                selector: 8,
+                base: 0,
+                limit: 0x1FF,
+                access: 0x9B,
+                flags: 0x40,
+                default32: true,
+                usable: true,
+            };
+            exhausted(r);
+            cpu.step(&mut bus).unwrap();
+            assert_eq!(cpu.registers.get32(Gpr32::Eax), 1);
+            // Rebase CS without a version change; only a full check notices.
+            cpu.registers.caches[SegmentRegister::Cs as usize].base = 0x100;
+            cpu.registers.caches[SegmentRegister::Cs as usize].limit = 0xFF;
+            cpu.registers.ip = 0;
+            cpu.step(&mut bus).unwrap();
+            assert_eq!(cpu.registers.get32(Gpr32::Eax), 2);
+        }
     }
 }

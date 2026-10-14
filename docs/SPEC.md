@@ -155,7 +155,8 @@ through wide write views. A code span checks both page generations, its RAM
 owner identity and A20 mapping generation; its physical pages are resolved at
 decode time and hits do not translate the address again. CS-cache/context
 changes clear the instruction cache. Offset-independent CS checks are resolved
-once per context; hits still check the instruction's complete offset range.
+once per context, detected through a registers lineage and CS reload version;
+hits still check the instruction's complete offset range.
 Counter exhaustion disables caching rather than wrapping.
 MMIO, noncontiguous A20 spans, code-address wrap and failed whole-instruction
 segment validation retain byte fetching and its partial fault progress. Storage

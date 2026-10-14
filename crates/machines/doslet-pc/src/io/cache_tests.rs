@@ -544,3 +544,27 @@ fn buses_with_identical_histories_reject_each_others_checks() {
     assert!(a.code_valid(&check) && b.code_valid(&other));
     assert!(!b.code_valid(&check) && !a.code_valid(&other));
 }
+
+#[test]
+fn registers_moved_from_another_machine_resolve_their_own_cs_context() {
+    let mut a = machine(true);
+    let mut b = machine(true);
+    for m in [&mut a, &mut b] {
+        code(m, 0x10000, &[0xB8, 1, 0, 0, 0]);
+        code(m, 0x11000, &[0xB8, 2, 0, 0, 0]);
+    }
+    // Same selector, PE mode and CS version count; only B's descriptor base differs.
+    descriptor(&mut b.bus, 8, 0x1000, 0xFFFFF, true, true);
+    for m in [&mut a, &mut b] {
+        m.cpu
+            .load_segment(&mut m.bus, SegmentRegister::Cs, 8)
+            .unwrap();
+        m.cpu.registers.ip = 0x10000;
+    }
+    a.step().unwrap();
+    assert_eq!(a.cpu.registers.get32(Gpr32::Eax), 1);
+    core::mem::swap(&mut a.cpu.registers, &mut b.cpu.registers);
+    a.cpu.registers.ip = 0x10000;
+    a.step().unwrap();
+    assert_eq!(a.cpu.registers.get32(Gpr32::Eax), 2);
+}
