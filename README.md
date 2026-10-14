@@ -237,7 +237,8 @@ To measure execution separately from indexed-to-RGBA conversion:
 cargo run -p doslet-headless --release --features profiling --locked -- run-stub PRINCE/PRINCE.EXE --steps 300000000 --profile-cpu
 ```
 
-The optional feature counts CPU/IRQ/HLT scheduling units, skipped VGA-wait units
+The optional feature counts decoded-instruction cache hits, misses, invalidations
+and fallbacks, CPU/IRQ/HLT scheduling units, skipped VGA-wait units
 and batches, and actual dispatched bus reads,
 samples guest PCs at varying intervals, and drains MIDI without synthesizing it.
 The timed CPU boundary excludes sampling, UI rendering and host audio. A game
@@ -250,6 +251,25 @@ whole iterations strictly before the next raster/PIT/DSP event; other polling
 loops execute normally. Append `--no-vga-waits` to disable recognition and
 batching for reference measurements. [The driver report](docs/compatibility/prince-svga.md)
 records the supported scope and differential checks.
+
+Selected instructions in default-32-bit code use a fixed single-instruction
+decode cache shared by native and WASM builds. Page write generations, A20 mapping
+and CS context validate entries. Other forms retain the interpreter; REP and IRQ
+boundaries stay unchanged. Append `--no-decode-cache` for a reference run using
+the same bus and generation tracking. This comparison measures the cache's
+execution benefit; generation tracking also has a cost relative to older builds.
+
+Run the opt-in local comparison through 300 million PRINCE steps:
+
+```sh
+cargo test -p doslet-headless --release --features profiling --locked local_prince_decode_cache_matches_reference_during_execution -- --ignored --nocapture
+```
+
+It compares registers, flags, control state and guest time after varied bounded
+batches, all emitted MIDI/PCM, periodic RAM/scanout/palette snapshots and full
+final ordinary RAM and all physical VRAM. This headless check does not measure UI, host synthesis or
+browser throughput. Guest-PC sampling counts guest activity; it does not locate
+host CPU time by emulator function.
 
 ## A local game target
 
@@ -334,7 +354,8 @@ cargo run -p doslet-headless --locked -- demo --frame /tmp/doslet-demo.ppm
 
 [`mise.toml`](mise.toml) provides the same workflows as `mise run test`,
 `mise run check`, `mise run demo`, `mise run run`, `mise run web` and
-`mise run inspect-prince`.
+`mise run inspect-prince`. `mise run run` uses the optimized release profile;
+`mise run run-debug` retains the debug profile for development.
 
 ## Development direction
 
@@ -350,3 +371,10 @@ Doslet is licensed under [GPL-2.0-or-later](LICENSE). Files that include
 third-party code keep their original copyright notices, and third-party
 libraries keep their own licenses. The
 original demo is part of Doslet. The commercial game is an external test input.
+
+Decode-cache profiling distinguishes CS context transitions and discarded entries
+from page-write, mapping, bus-owner and access invalidations. These counters count
+rejected entries, not writes to guest code. Collisions count lookups at occupied
+slots with another key; evictions count successful replacements. Decode attempts
+and failed decodes expose repeated unsupported-form probing. `fallback_hits` is
+reserved for experiments and remains zero in the current implementation.

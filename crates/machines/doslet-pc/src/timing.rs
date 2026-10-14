@@ -1,9 +1,35 @@
 use crate::{MachineError, PcMachine};
-use core::num::NonZeroU32;
-use doslet_time::{ClockRate, EmuTime};
+use doslet_time::EmuTime;
+
+// Four 33-MHz clocks are 121 ns plus 7/33 ns. Keeping that fraction
+// directly removes variable-frequency division from ordinary CPU steps.
+#[derive(Default)]
+struct StepClock {
+    fraction: u64,
+}
+impl StepClock {
+    fn advance(&mut self, steps: u32) -> u64 {
+        if steps == 1 {
+            let fraction = self.fraction + 7;
+            let carry = u64::from(fraction >= 33);
+            self.fraction = fraction - carry * 33;
+            121 + carry
+        } else {
+            let fraction = self.fraction + u64::from(steps) * 7;
+            self.fraction = fraction % 33;
+            u64::from(steps) * 121 + fraction / 33
+        }
+    }
+    fn steps_until_nanos(&self, nanos: u64) -> u64 {
+        (u128::from(nanos) * 33)
+            .saturating_sub(u128::from(self.fraction))
+            .div_ceil(4000)
+            .min(u128::from(u64::MAX)) as u64
+    }
+}
 
 pub(crate) struct Timing {
-    cpu: ClockRate,
+    cpu: StepClock,
     pub time: EmuTime,
     pit_fraction: u64,
     pcm_fraction: u64,
@@ -11,7 +37,7 @@ pub(crate) struct Timing {
 impl Default for Timing {
     fn default() -> Self {
         Self {
-            cpu: ClockRate::new(NonZeroU32::new(33_000_000).unwrap()),
+            cpu: StepClock::default(),
             time: EmuTime::ZERO,
             pit_fraction: 0,
             pcm_fraction: 0,
@@ -46,11 +72,12 @@ impl PcMachine {
                 .div_ceil(u64::from(self.bus.dsp.sample_rate()));
             nanos = nanos.min(deadline);
         }
-        let steps = self.timing.cpu.ticks_until_nanos(nanos).div_ceil(4);
+        let steps = self.timing.cpu.steps_until_nanos(nanos);
         budget.min(steps.max(1) as u32)
     }
+    #[inline]
     pub(crate) fn advance_hardware_steps(&mut self, steps: u32) -> Result<(), MachineError> {
-        let nanos = self.timing.cpu.advance(steps * 4);
+        let nanos = self.timing.cpu.advance(steps);
         self.timing.time = self
             .timing
             .time
@@ -115,6 +142,24 @@ impl PcMachine {
 pub(crate) mod tests {
     use super::*;
     use doslet_bus::{MemoryBus, PortBus};
+    #[test]
+    fn step_clock_matches_reference_and_deadlines_at_every_fraction() {
+        for prefix in 0..33 {
+            let mut clock = StepClock::default();
+            let mut reference =
+                doslet_time::ClockRate::new(core::num::NonZeroU32::new(33_000_000).unwrap());
+            assert_eq!(clock.advance(prefix), reference.advance(prefix * 4));
+            for nanos in [0, 1, 120, 121, 122, 1000, 1_000_000, u64::MAX] {
+                assert_eq!(
+                    clock.steps_until_nanos(nanos),
+                    reference.ticks_until_nanos(nanos).div_ceil(4)
+                );
+            }
+            for steps in [0, 1, 1, 7, 33, 8250, 1000000] {
+                assert_eq!(clock.advance(steps), reference.advance(steps * 4));
+            }
+        }
+    }
     #[test]
     fn single_and_batched_hardware_advances_preserve_clock_fraction() {
         let mut machine = PcMachine::default();

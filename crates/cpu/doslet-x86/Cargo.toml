@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+profiling = []
+
 [dependencies]
 doslet-bus.workspace = true
 doslet-x87.workspace = true

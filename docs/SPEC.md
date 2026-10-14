@@ -140,6 +140,29 @@ selected VGA pixel clocks and DSP sample rates. This is deterministic across
 host batches; it is not cycle-accurate CPU/bus arbitration or complete peripheral
 timing. Timing-sensitive compatibility still needs real-run evidence.
 
+`Cpu::step` has a bounded 512-entry single-instruction cache for selected
+default-32-bit code. It caches prefix decisions, operations, immediates and
+16/32-bit address expressions; effective addresses and segment permissions are
+resolved against current registers. Implemented cached forms include byte/dword
+MOV and ALU/CMP/TEST, dword INC/DEC, LEA, XCHG, NEG/NOT, selected dword stack
+operations, short/near relative jumps and conditional jumps, near CALL/RET and
+byte IN/OUT through DX. Word operand overrides, REP strings, other instructions
+and buses without the optional code contract use the original interpreter.
+Both paths consume one scheduling step and preserve the existing IRQ boundaries.
+
+PC RAM tracks checked write generations for 4-KiB pages, including mutations
+through wide write views. A code span checks both page generations, its RAM
+owner identity and A20 mapping generation. CS-cache/context changes clear the
+instruction cache. Counter exhaustion disables caching rather than wrapping.
+MMIO, noncontiguous A20 spans, code-address wrap and failed whole-instruction
+segment validation retain byte fetching and its partial fault progress. Storage
+is fixed/reserved during setup; execution does not allocate cache entries.
+`Session::set_decode_cache(false)` and headless `--no-decode-cache` select the
+reference path. The profiling feature exposes hits, misses, invalidations and
+fallbacks. Differential tests cover dynamic operands, faults and invalidation;
+the opt-in local PRINCE test compares bounded execution through 300 million
+steps, including full final RAM/VRAM, scanout/palette, MIDI, PCM and guest time.
+
 A decoded-block backend may share architectural state and instruction semantics
 with the interpreter. It must invalidate cached code when relevant guest memory
 changes. Native JIT backends are optional future components. The initial WASM

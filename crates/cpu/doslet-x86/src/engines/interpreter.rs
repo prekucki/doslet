@@ -3,9 +3,12 @@ use crate::{Access, SegmentRegister};
 use crate::{Gpr16, Gpr32, Registers, decode, flags};
 use core::fmt;
 use doslet_bus::{BusError, CpuBus, MemoryBus};
+mod cache;
 mod operand32;
 mod segments;
 mod x87;
+#[cfg(feature = "profiling")]
+pub use cache::DecodeCacheStats;
 pub use segments::DescriptorError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +170,7 @@ pub struct Cpu {
     pub fpu: Option<doslet_x87::X87>,
     halted: bool,
     interrupt_shadow: u8,
+    decode_cache: cache::Cache,
 }
 
 impl Default for Cpu {
@@ -178,11 +182,21 @@ impl Default for Cpu {
             fpu: None,
             halted: false,
             interrupt_shadow: 0,
+            decode_cache: cache::Cache::default(),
         }
     }
 }
 
 impl Cpu {
+    /// Keep the original byte-fetching interpreter available as a reference.
+    pub fn set_decode_cache(&mut self, enabled: bool) {
+        self.decode_cache.clear();
+        self.decode_cache.enabled = enabled;
+    }
+    #[cfg(feature = "profiling")]
+    pub fn decode_cache_stats(&self) -> DecodeCacheStats {
+        self.decode_cache.stats
+    }
     pub fn with_x87(mut self) -> Self {
         self.fpu = Some(doslet_x87::X87::new());
         self.control.cr0 &= !4;
@@ -212,6 +226,13 @@ impl Cpu {
             return Err(CpuError::PagingUnavailable { cs, ip });
         }
         self.registers.sync_mode(self.protected_mode());
+        if let Some(result) = self.cached_step(bus) {
+            return result;
+        }
+        #[cfg(feature = "profiling")]
+        {
+            self.decode_cache.stats.fallbacks += 1;
+        }
         let mut repeat = false;
         let mut repeat_zero = true;
         let default32 = self.registers.code32();

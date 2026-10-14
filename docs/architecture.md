@@ -47,8 +47,10 @@ devices. VGA owns its aperture and palette. `IndexedFrame<'a>` borrows those
 arrays; Rust prevents mutating VGA while that frame remains borrowed.
 
 `PcBus::ram_view` returns a slice only for ranges wholly in ordinary RAM. A range
-crossing the VGA aperture is rejected. Byte/word bus operations route each access
-to the appropriate backing store or device. Loading copies file bytes into guest
+crossing the VGA aperture is rejected. Word/dword bus operations borrow one RAM
+range when its A20 mapping is contiguous and excludes MMIO. Crossings, address
+wrap and out-of-range accesses retain ordered byte operations, including partial
+writes before a bus error. Loading copies file bytes into guest
 memory once; ordinary execution does not make intermediate memory buffers.
 
 The executable inspector borrows the input file. Its load-module and relocation
@@ -148,6 +150,24 @@ the resulting line value through an explicit setter. The default machine owns
 that storage. Device queues and core execution remain fixed/preallocated;
 CMOS clock ticking and complete device-event scheduling are still pending.
 
+The CPU also owns a fixed 512-entry decoded-instruction cache for selected
+default-32-bit forms. `MemoryBus` optionally supplies side-effect-free code views
+and `CodeStamp` tokens. A token identifies the RAM owner, mapping generation and
+both 4-KiB page generations touched by an instruction. Every RAM write and
+borrowed mutable view advances the relevant generations, so DOS services and
+wide CPU writes share the same invalidation path. The PC retains 32 KiB of page
+generations beside its 16-MiB RAM. Setup-only atomic owner identities distinguish
+replacement buses; they contain no guest state. Checked counters never wrap;
+exhaustion falls back to interpretation. A20 changes advance the mapping token.
+
+Cache entries contain operations, immediates and addressing expressions rather
+than resolved data addresses. Register-dependent addresses and segment checks
+remain execution work. CS context changes clear entries; hits validate the entire
+code span and its generation token. Short/noncontiguous code views and unsupported
+forms use the original byte-fetching interpreter, preserving partial fault IP
+progress. One cached instruction still consumes exactly one bounded step; REP
+and IRQ delivery retain their existing paths. No decoded blocks or JIT exist.
+
 The CPU owns hidden segment caches, descriptor-table state and optional x87
 state. Its decoder selects 16/32-bit addressing and validates cache permissions
 before emitting linear bus addresses. The independent `doslet-x87` crate owns
@@ -167,8 +187,10 @@ The PIC and PIT have no bus or CPU dependency. Their methods operate on explicit
 port values and clock ticks. The PC adapter chooses their I/O addresses and
 connects PIT output periods to the PIC request latch. The machine delivers
 eligible interrupts at CPU boundaries with the CPU's STI/SS inhibition state.
-Its functional timeline advances four nominal 33-MHz clocks per bounded step;
-PIT, selected raster status and DSP rates retain fractional clock conversion.
+Its functional timeline advances four nominal 33-MHz clocks per bounded step,
+using 121 ns plus a retained 7/33-ns fraction. Single steps use addition and
+carry; batches preserve the same fraction. PIT, selected raster status and DSP
+rates retain fractional clock conversion.
 Interrupt-enabled HLT can combine those same logical steps until the first
 PIT/DSP deadline, the remaining budget, or 1 ms of guest time. IRQ eligibility
 still takes precedence. VGA accumulates bounded guest nanoseconds and resolves

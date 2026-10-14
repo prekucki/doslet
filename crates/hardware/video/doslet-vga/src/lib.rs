@@ -51,6 +51,11 @@ impl Default for Vga {
     }
 }
 impl Vga {
+    /// Borrow physical VRAM for diagnostics, including banks outside scanout.
+    /// CPU memory transactions still use the mapped aperture operations.
+    pub fn vram_view(&self) -> &[u8] {
+        &self.memory
+    }
     pub fn set_mode_13h(&mut self) {
         self.flush_raster_time();
         self.memory.fill(0);

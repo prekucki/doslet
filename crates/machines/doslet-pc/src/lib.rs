@@ -12,7 +12,7 @@ use doslet_bus::BusError;
 use doslet_x86::{Cpu, CpuError, StepOutcome};
 pub use io::PcBus;
 #[cfg(feature = "profiling")]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionStats {
     /// CPU scheduling steps, including individual REP iterations.
     pub cpu_steps: u64,

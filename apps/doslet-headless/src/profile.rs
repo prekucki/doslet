@@ -86,6 +86,7 @@ impl Profile {
             elapsed.as_secs_f64()
         );
         println!("Exact execution counters: {stats:?}");
+        println!("Decode cache counters: {:?}", session.decode_cache_stats());
         let mut entries: Vec<_> = self.hot.iter().collect();
         entries.sort_unstable_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
         println!(

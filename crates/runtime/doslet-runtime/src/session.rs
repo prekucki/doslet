@@ -201,6 +201,13 @@ impl Session {
     pub fn set_vga_wait_acceleration(&mut self, enabled: bool) {
         self.machine.set_vga_wait_acceleration(enabled);
     }
+    pub fn set_decode_cache(&mut self, enabled: bool) {
+        self.machine.cpu.set_decode_cache(enabled);
+    }
+    #[cfg(feature = "profiling")]
+    pub fn decode_cache_stats(&self) -> doslet_x86::DecodeCacheStats {
+        self.machine.cpu.decode_cache_stats()
+    }
     #[cfg(feature = "profiling")]
     pub fn execution_stats(&self) -> doslet_pc::ExecutionStats {
         self.machine.execution_stats()
@@ -249,6 +256,10 @@ impl Session {
     }
     pub fn frame(&self) -> Option<IndexedFrame<'_>> {
         self.machine.bus.vga.frame()
+    }
+    /// Read-only physical video memory for differential diagnostics.
+    pub fn vram_view(&self) -> &[u8] {
+        self.machine.bus.vga.vram_view()
     }
     pub fn start(&mut self) {
         if matches!(self.status, SessionStatus::Ready | SessionStatus::Paused) {

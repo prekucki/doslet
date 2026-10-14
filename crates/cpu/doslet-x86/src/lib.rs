@@ -7,6 +7,8 @@ pub mod engines;
 pub mod flags;
 pub mod state;
 
+#[cfg(feature = "profiling")]
+pub use engines::interpreter::DecodeCacheStats;
 pub use engines::interpreter::{Cpu, CpuError, StepOutcome};
 pub use state::{
     Access, ControlRegisters, DescriptorTable, Gpr16, Gpr32, Registers, SegmentCache,

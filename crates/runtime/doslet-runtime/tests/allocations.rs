@@ -4,6 +4,37 @@ use doslet_runtime::{Session, SessionStatus};
 include!("../../../../tests/fixtures/relocated_mz.rs");
 include!("../../../../tests/fixtures/protected_graphics.rs");
 #[test]
+fn decoded_instruction_cache_misses_hits_and_ram_writes_allocate_nothing() {
+    let mut program = protected_graphics_com();
+    let code = [
+        0xB8, 0x10, 0, 0, 0, 0x8E, 0xD8, // Load flat DS.
+        0xB8, 1, 0, 0, 0, // MOV EAX,1.
+        0xA3, 0, 0, 2, 0,    // MOV [20000h],EAX.
+        0x40, // INC EAX.
+        0xEB, 0xF8, // Repeat store and increment.
+    ];
+    program[0x300..0x300 + code.len()].copy_from_slice(&code);
+    let mut cached = Session::new(&program).unwrap();
+    let mut reference = Session::new(&program).unwrap();
+    reference.set_decode_cache(false);
+    cached.start();
+    reference.start();
+    let measured = allocation_counter::measure(|| {
+        assert_eq!(cached.advance(100_000), 100_000);
+    });
+    assert_eq!(reference.advance(100_000), 100_000);
+    assert_eq!(cached.registers(), reference.registers());
+    assert_eq!(cached.eflags(), reference.eflags());
+    assert_eq!(
+        cached.ram_view(0x20000..0x20004),
+        reference.ram_view(0x20000..0x20004)
+    );
+    assert_eq!(measured.count_total, 0);
+    assert_eq!(measured.bytes_total, 0);
+    #[cfg(feature = "profiling")]
+    assert!(cached.decode_cache_stats().hits > 90_000);
+}
+#[test]
 fn confirmed_vga_waits_allocate_nothing_and_keep_logical_time_and_budget() {
     // Set mode 13h and repeatedly finish/start vertical retrace.
     let program = [

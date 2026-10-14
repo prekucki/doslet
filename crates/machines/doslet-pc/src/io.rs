@@ -124,11 +124,104 @@ impl PcBus {
         self.a20.enabled
     }
     pub fn set_a20(&mut self, enabled: bool) {
+        if self.a20.enabled != enabled {
+            self.a20.generation = self.a20.generation.saturating_add(1);
+        }
         self.a20.enabled = enabled;
         self.keyboard.set_a20_line(enabled);
     }
+    /// Wide accesses may use RAM only if every byte maps contiguously and
+    /// the complete range excludes MMIO. All other accesses retain byte order.
+    #[inline]
+    fn wide_ram_range(&self, address: u32, length: u32) -> Option<Range<usize>> {
+        let start = self.a20.address(address);
+        if start > crate::memory::RAM_SIZE as u32 - length
+            || (!self.a20.enabled && (address & 0xFFFFF) > 0x100000 - length)
+            || (start < APERTURE_START + APERTURE_LEN as u32 && start + length > APERTURE_START)
+        {
+            return None;
+        }
+        Some(start as usize..start as usize + length as usize)
+    }
+    #[inline]
+    fn read_wide<const N: usize>(&mut self, address: u32) -> Result<[u8; N], BusError> {
+        if let Some(range) = self.wide_ram_range(address, N as u32)
+            && let Some(bytes) = self.ram.view(range.clone())
+        {
+            #[cfg(feature = "profiling")]
+            {
+                // Count the same BDA bytes as the reference byte path.
+                self.stats.bda_tick_reads +=
+                    range.end.min(0x470).saturating_sub(range.start.max(0x46C)) as u64;
+            }
+            return Ok(bytes.try_into().expect("wide RAM range length"));
+        }
+        let mut bytes = [0; N];
+        for (offset, byte) in bytes.iter_mut().enumerate() {
+            *byte = self.read_u8(address.wrapping_add(offset as u32))?;
+        }
+        Ok(bytes)
+    }
+    #[inline]
+    fn write_wide<const N: usize>(&mut self, address: u32, bytes: [u8; N]) -> Result<(), BusError> {
+        if let Some(range) = self.wide_ram_range(address, N as u32)
+            && let Some(ram) = self.ram.view_mut(range)
+        {
+            ram.copy_from_slice(&bytes);
+            return Ok(());
+        }
+        for (offset, byte) in bytes.into_iter().enumerate() {
+            self.write_u8(address.wrapping_add(offset as u32), byte)?;
+        }
+        Ok(())
+    }
 }
 impl MemoryBus for PcBus {
+    #[inline]
+    fn code_stamp(&self, address: u32, length: u8) -> Option<doslet_bus::CodeStamp> {
+        if length == 0 {
+            return None;
+        }
+        self.ram.code_stamp(
+            self.wide_ram_range(address, u32::from(length))?,
+            self.a20.generation,
+        )
+    }
+    fn code_bytes(&self, address: u32, length: u8) -> Option<&[u8]> {
+        // Decoding may inspect a short view at RAM/MMIO/A20 boundaries, but
+        // never touches a device or changes guest state on a failed attempt.
+        let start = self.a20.address(address);
+        if start >= crate::memory::RAM_SIZE as u32
+            || (APERTURE_START..APERTURE_START + APERTURE_LEN as u32).contains(&start)
+        {
+            return None;
+        }
+        let mut length = u32::from(length).min(crate::memory::RAM_SIZE as u32 - start);
+        if start < APERTURE_START {
+            length = length.min(APERTURE_START - start);
+        }
+        if !self.a20.enabled {
+            length = length.min(0x100000 - (address & 0xFFFFF));
+        }
+        self.ram
+            .view(start as usize..start as usize + length as usize)
+    }
+    #[inline]
+    fn read_u16(&mut self, address: u32) -> Result<u16, BusError> {
+        self.read_wide(address).map(u16::from_le_bytes)
+    }
+    #[inline]
+    fn read_u32(&mut self, address: u32) -> Result<u32, BusError> {
+        self.read_wide(address).map(u32::from_le_bytes)
+    }
+    #[inline]
+    fn write_u16(&mut self, address: u32, value: u16) -> Result<(), BusError> {
+        self.write_wide(address, value.to_le_bytes())
+    }
+    #[inline]
+    fn write_u32(&mut self, address: u32, value: u32) -> Result<(), BusError> {
+        self.write_wide(address, value.to_le_bytes())
+    }
     fn read_u8(&mut self, address: u32) -> Result<u8, BusError> {
         let address = self.a20.address(address);
         #[cfg(feature = "profiling")]
@@ -304,8 +397,82 @@ impl PortBus for PcBus {
 }
 
 #[cfg(test)]
+mod cache_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wide_memory_matches_byte_accesses_at_mapping_boundaries() {
+        let mut wide = PcBus::default();
+        let mut bytes = PcBus::default();
+        wide.vga.set_mode_13h();
+        bytes.vga.set_mode_13h();
+        for a20 in [false, true] {
+            wide.set_a20(a20);
+            bytes.set_a20(a20);
+            for boundary in [
+                0x100,
+                0x46C,
+                0x470,
+                APERTURE_START,
+                APERTURE_START + APERTURE_LEN as u32,
+                APERTURE_START | (1 << 20),
+                (APERTURE_START + APERTURE_LEN as u32) | (1 << 20),
+                0x100000,
+                0x200000,
+                0x300000,
+                crate::memory::RAM_SIZE as u32,
+                u32::MAX,
+            ] {
+                for delta in -4_i32..=4 {
+                    let address = boundary.wrapping_add_signed(delta);
+                    for length in [2, 4] {
+                        let value = 0xB1C2D3E4_u32;
+                        let fast = if length == 2 {
+                            wide.write_u16(address, value as u16)
+                        } else {
+                            wide.write_u32(address, value)
+                        };
+                        let slow = (0..length).try_for_each(|offset| {
+                            bytes.write_u8(
+                                address.wrapping_add(offset),
+                                (value >> (offset * 8)) as u8,
+                            )
+                        });
+                        assert_eq!(fast, slow, "write {address:#x}, {length}, A20={a20}");
+                        let fast = if length == 2 {
+                            wide.read_u16(address).map(u32::from)
+                        } else {
+                            wide.read_u32(address)
+                        };
+                        let slow = (0..length).try_fold(0_u32, |value, offset| {
+                            bytes
+                                .read_u8(address.wrapping_add(offset))
+                                .map(|byte| value | (u32::from(byte) << (offset * 8)))
+                        });
+                        assert_eq!(fast, slow, "read {address:#x}, {length}, A20={a20}");
+                        // Also verify successful bytes preceding a failing access.
+                        for offset in 0..length {
+                            assert_eq!(
+                                wide.read_u8(address.wrapping_add(offset)),
+                                bytes.read_u8(address.wrapping_add(offset))
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                wide.ram.view(0..crate::memory::RAM_SIZE),
+                bytes.ram.view(0..crate::memory::RAM_SIZE)
+            );
+            assert_eq!(
+                wide.vga.frame().unwrap().revision,
+                bytes.vga.frame().unwrap().revision
+            );
+            #[cfg(feature = "profiling")]
+            assert_eq!(wide.stats.bda_tick_reads, bytes.stats.bda_tick_reads);
+        }
+    }
     #[test]
     fn word_dma_wraps_at_128k_and_ignores_the_cpu_a20_gate() {
         let mut bus = PcBus::default();

@@ -14,7 +14,11 @@ description = "Format and lint all native targets"
 run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets --locked -- -D warnings"]
 
 [tasks.run]
-description = "Launch the iced desktop application"
+description = "Launch the optimized iced desktop application"
+run = "cargo run -p doslet --release --locked"
+
+[tasks.run-debug]
+description = "Launch the iced desktop application with the debug profile"
 run = "cargo run -p doslet --locked"
 
 [tasks.demo]

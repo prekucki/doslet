@@ -68,13 +68,11 @@ impl Operand {
             }),
             _ => {
                 let address = self.address(r, if word { 2 } else { 1 }, Access::Read)?;
-                let low = bus.read_u8(address)?;
-                let high = if word {
-                    bus.read_u8(address.wrapping_add(1))?
+                Ok(if word {
+                    bus.read_u16(address)?
                 } else {
-                    0
-                };
-                Ok(u16::from_le_bytes([low, high]))
+                    u16::from(bus.read_u8(address)?)
+                })
             }
         }
     }
@@ -95,9 +93,10 @@ impl Operand {
             }
             _ => {
                 let address = self.address(r, if word { 2 } else { 1 }, Access::Write)?;
-                bus.write_u8(address, value as u8)?;
                 if word {
-                    bus.write_u8(address.wrapping_add(1), (value >> 8) as u8)?;
+                    bus.write_u16(address, value)?;
+                } else {
+                    bus.write_u8(address, value as u8)?;
                 }
             }
         }
@@ -105,21 +104,14 @@ impl Operand {
     }
 }
 pub(crate) fn read_dword<B: MemoryBus>(bus: &mut B, address: u32) -> Result<u32, BusError> {
-    let mut bytes = [0; 4];
-    for (offset, byte) in bytes.iter_mut().enumerate() {
-        *byte = bus.read_u8(address.wrapping_add(offset as u32))?;
-    }
-    Ok(u32::from_le_bytes(bytes))
+    bus.read_u32(address)
 }
 pub(crate) fn write_dword<B: MemoryBus>(
     bus: &mut B,
     address: u32,
     value: u32,
 ) -> Result<(), BusError> {
-    for (offset, byte) in value.to_le_bytes().iter().enumerate() {
-        bus.write_u8(address.wrapping_add(offset as u32), *byte)?;
-    }
-    Ok(())
+    bus.write_u32(address, value)
 }
 /// Decode all 16-bit addresses and 32-bit ModR/M/SIB addresses without allocating.
 pub(crate) fn operand<B: MemoryBus>(
