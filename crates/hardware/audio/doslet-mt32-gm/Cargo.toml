@@ -1,0 +1,10 @@
+[package]
+name = "doslet-mt32-gm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dev-dependencies]
+allocation-counter = "0.8"
+[lints]
+workspace = true

@@ -21,7 +21,8 @@ class DosletProcessor extends AudioWorkletProcessor {
             }
             if (data.kind === 'connect') {
                 this.portToWorker = data.port;
-                this.portToWorker.onmessage = event => this.receive(event.data);
+                const source = data.port;
+                source.onmessage = event => this.receive(event.data, source);
             }
         };
         this.port.postMessage({kind: 'ready'});
@@ -31,8 +32,9 @@ class DosletProcessor extends AudioWorkletProcessor {
         this.port.postMessage({kind: 'error', error: String(error)});
         if (this.portToWorker) this.portToWorker.postMessage({kind: 'error', error: String(error)});
     }
-    receive(data) {
+    receive(data, source = this.portToWorker) {
         try {
+            if (source !== this.portToWorker) return;
             if (data.kind === 'reset') {
                 this.epoch = data.epoch; this.engine.reset(data.nanos);
                 this.active = data.active; this.failed = false; this.warming = true; this.baseGuest = data.nanos;
@@ -46,9 +48,12 @@ class DosletProcessor extends AudioWorkletProcessor {
                     this.port.postMessage(message); this.portToWorker.postMessage(message);
                 }
                 if (data.kind === 'midi') {
-                    this.midi.set(new Uint8Array(data.buffer, 0, data.count));
-                    const result = this.engine.receive(data.nanos, data.count);
-                    if (result) this.fail(`WASM MIDI queue error ${result}`);
+                    for (let offset = 0; offset < data.count; offset += 1024) {
+                        const count = Math.min(1024, data.count - offset);
+                        this.midi.set(new Uint8Array(data.buffer, offset, count));
+                        const result = this.engine.receive(data.nanos, count);
+                        if (result) { this.fail(`WASM MIDI queue error ${result}`); break; }
+                    }
                 }
                 if (data.kind === 'commit') {
                     const result = this.engine.receive(data.nanos, 0);
@@ -58,7 +63,7 @@ class DosletProcessor extends AudioWorkletProcessor {
             }
         } catch (error) { this.fail(error); }
         finally {
-            if (data.buffer) this.portToWorker.postMessage({kind: 'return', buffer: data.buffer}, [data.buffer]);
+            if (data.buffer && source) source.postMessage({kind: 'return', buffer: data.buffer}, [data.buffer]);
         }
     }
     process(_inputs, outputs) {

@@ -1,7 +1,7 @@
 //! Single owner of the browser machine, imported storage and scanout conversion.
 #[path = "../../doslet/src/archive.rs"]
 mod archive;
-use doslet_midi_synth::wire::{Decoder, REPLAY_CAPACITY, State};
+use doslet_midi_routing::{Mode, Routing, SNAPSHOT_CAPACITY};
 use doslet_runtime::{Session, SessionStatus};
 use doslet_x86::Gpr16;
 use std::sync::Arc;
@@ -14,12 +14,13 @@ pub struct WorkerEngine {
     archive: Option<archive::GameArchive>,
     active: Option<(archive::GameArchive, String)>,
     pixels: Vec<u8>,
-    revision: Option<u64>,
-    midi: [u8; 1024],
+    revision: Option<(usize, usize, u64)>,
+    midi: [u8; 16384],
+    source_midi: [u8; 64],
+    output_mode: Mode,
     pcm: [[i16; 2]; 128],
-    wire: Decoder,
-    wire_state: State,
-    replay: [u8; REPLAY_CAPACITY],
+    routing: Routing,
+    replay: Box<[u8]>,
 }
 impl Default for WorkerEngine {
     fn default() -> Self {
@@ -28,6 +29,15 @@ impl Default for WorkerEngine {
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl WorkerEngine {
+    pub fn pointer_event(&mut self, x: u16, y: u16, button: i8, pressed: bool) {
+        if button == -2 {
+            self.session.release_pointer_buttons();
+        } else if button >= 0 {
+            self.session.pointer_button(button as u8, pressed);
+        } else {
+            self.session.pointer_move(x, y);
+        }
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(constructor))]
     pub fn new() -> Self {
         #[cfg(target_arch = "wasm32")]
@@ -38,11 +48,12 @@ impl WorkerEngine {
             active: None,
             pixels: Vec::new(),
             revision: None,
-            midi: [0; 1024],
+            midi: [0; 16384],
+            source_midi: [0; 64],
+            output_mode: Mode::Gm,
             pcm: [[0; 2]; 128],
-            wire: Decoder::new(),
-            wire_state: State::new(),
-            replay: [0; REPLAY_CAPACITY],
+            routing: Routing::new(Mode::Gm),
+            replay: vec![0; SNAPSHOT_CAPACITY].into_boxed_slice(),
         }
     }
     pub fn import_zip(&mut self, bytes: Vec<u8>) -> Result<String, String> {
@@ -57,8 +68,7 @@ impl WorkerEngine {
         session.start();
         self.active = Some((archive.clone(), program.into()));
         self.session = session;
-        self.wire = Decoder::new();
-        self.wire_state = State::new();
+        self.routing = Routing::new(self.routing.mode());
         self.revision = None;
         Ok(())
     }
@@ -70,8 +80,7 @@ impl WorkerEngine {
         } else {
             Session::demo()
         };
-        self.wire = Decoder::new();
-        self.wire_state = State::new();
+        self.routing = Routing::new(self.routing.mode());
         self.revision = None;
         Ok(())
     }
@@ -86,6 +95,24 @@ impl WorkerEngine {
     }
     pub fn advance(&mut self, budget: u32) -> u32 {
         self.session.advance(budget.min(10000))
+    }
+    pub fn key_event(
+        &mut self,
+        scan: u8,
+        ascii: u8,
+        modifiers: u8,
+        pressed: bool,
+    ) -> Result<bool, String> {
+        self.session
+            .set_key_modifiers(modifiers)
+            .map_err(|e| e.to_string())?;
+        if pressed {
+            self.session
+                .push_key(scan, ascii)
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(true)
+        }
     }
     pub fn status(&self) -> u32 {
         match self.session.status() {
@@ -125,56 +152,155 @@ impl WorkerEngine {
         self.midi.as_ptr() as usize
     }
     pub fn drain_midi(&mut self) -> Result<usize, String> {
-        let count = self.session.drain_midi(&mut self.midi);
-        for &byte in &self.midi[..count] {
-            if let Some(message) = self
-                .wire
-                .push(byte)
-                .map_err(|e| format!("MIDI wire error: {e:?}"))?
-            {
-                self.wire_state.receive(message);
-            }
+        let count = self.session.drain_midi(&mut self.source_midi);
+        let mut used = 0;
+        let mut overflow = false;
+        for &byte in &self.source_midi[..count] {
+            self.routing
+                .push(byte, self.output_mode, &mut |message| {
+                    if used + message.len() > self.midi.len() {
+                        overflow = true;
+                        return;
+                    }
+                    self.midi[used..used + message.len()].copy_from_slice(message);
+                    used += message.len();
+                })
+                .map_err(|e| format!("MIDI wire error: {e:?}"))?;
         }
-        Ok(count)
+        if overflow {
+            return Err("Translated MIDI batch capacity exceeded".into());
+        }
+        Ok(used)
     }
     pub fn replay_ptr(&self) -> usize {
         self.replay.as_ptr() as usize
     }
     pub fn snapshot_midi(&mut self) -> usize {
-        self.wire_state
-            .write_with_decoder(&mut self.replay, &self.wire)
+        let mut count = 0;
+        self.routing.replay(self.output_mode, &mut |message| {
+            self.replay[count..count + message.len()].copy_from_slice(message);
+            count += message.len();
+        });
+        count
+    }
+    pub fn set_midi_mode(&mut self, mode: &str) -> Result<(), String> {
+        let mode = parse_mode(mode)?;
+        if mode == Mode::Gm && self.output_mode == Mode::Mt32 {
+            return Err("Select a GM output before GM game mode".into());
+        }
+        self.routing.set_mode(mode);
+        Ok(())
+    }
+    pub fn set_output_mode(&mut self, mode: &str) -> Result<(), String> {
+        let mode = parse_mode(mode)?;
+        if mode == Mode::Mt32 && self.routing.mode() == Mode::Gm {
+            return Err("Select MT-32 game mode before an MT-32 host port".into());
+        }
+        self.output_mode = mode;
+        Ok(())
+    }
+    pub fn midi_mode(&self) -> String {
+        self.routing.mode().as_str().into()
+    }
+    pub fn midi_upgraded(&self) -> bool {
+        self.routing.upgraded()
+    }
+    pub fn midi_sysex(&self) -> f64 {
+        self.routing.translator().stats().sysex as f64
+    }
+    pub fn midi_unmapped(&self) -> f64 {
+        self.routing.translator().stats().unmapped_notes as f64
+    }
+    pub fn midi_display(&self) -> String {
+        String::from_utf8_lossy(self.routing.translator().display()).into_owned()
     }
     pub fn drain_pcm(&mut self) {
         while self.session.drain_pcm(&mut self.pcm) != 0 {}
     }
     pub fn width(&self) -> usize {
-        self.session.frame().map_or(0, |f| f.width)
+        self.session.presentation_frame().width()
     }
     pub fn height(&self) -> usize {
-        self.session.frame().map_or(0, |f| f.height)
+        self.session.presentation_frame().height()
     }
     pub fn frame_ptr(&self) -> usize {
         self.pixels.as_ptr() as usize
     }
     pub fn convert_frame(&mut self) -> usize {
-        let Some(frame) = self.session.frame() else {
-            return 0;
-        };
-        if self.revision == Some(frame.revision) {
+        let frame = self.session.presentation_frame();
+        let revision = (frame.width(), frame.height(), frame.revision());
+        if self.revision == Some(revision) {
             return 0;
         }
-        self.pixels.resize(frame.width * frame.height * 4, 0);
+        self.pixels.resize(frame.width() * frame.height() * 4, 0);
         frame
             .write_rgba(&mut self.pixels)
             .expect("matching presentation buffer");
-        self.revision = Some(frame.revision);
+        self.revision = Some(revision);
         self.pixels.len()
+    }
+}
+
+fn parse_mode(mode: &str) -> Result<Mode, String> {
+    match mode {
+        "gm" => Ok(Mode::Gm),
+        "mt32" => Ok(Mode::Mt32),
+        _ => Err("MIDI mode must be gm or mt32".into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gm_to_raw_mt32_port_is_rejected_without_changing_dialects() {
+        let mut engine = WorkerEngine::new();
+        assert!(engine.set_output_mode("mt32").is_err());
+        assert_eq!(engine.output_mode, Mode::Gm);
+        engine.set_midi_mode("mt32").unwrap();
+        engine.set_output_mode("mt32").unwrap();
+        assert!(engine.set_midi_mode("gm").is_err());
+        assert_eq!(engine.midi_mode(), "mt32");
+        engine.set_output_mode("gm").unwrap();
+        engine.set_midi_mode("gm").unwrap();
+    }
+    #[test]
+    fn worker_upgrades_roland_before_worklet_and_replays_raw_sysex_to_mt32_port() {
+        let mut engine = WorkerEngine::new();
+        let message = [
+            0xF0, 0x41, 0x10, 0x16, 0x12, 0x20, 0, 0, b'A', 0x1F, 0xF7, 0x91, 60, 100,
+        ];
+        let mut program = vec![0xBA, 0x31, 3, 0xB0, 0x3F, 0xEE, 0xBA, 0x30, 3];
+        for byte in message {
+            program.extend_from_slice(&[0xB0, byte, 0xEE]);
+        }
+        program.extend_from_slice(&[0xEB, 0xFE]);
+        engine.session = Session::new(&program).unwrap();
+        engine.start();
+        engine.advance(1000);
+        let count = engine.drain_midi().unwrap();
+        assert_eq!(engine.midi_mode(), "mt32");
+        assert!(engine.midi_upgraded());
+        assert_eq!(engine.midi_sysex(), 1.0);
+        assert!(!engine.midi[..count].contains(&0xF0));
+        assert!(
+            engine.midi[..count]
+                .windows(3)
+                .any(|m| m == [0x90, 60, 100])
+        );
+        engine.set_output_mode("mt32").unwrap();
+        let count = engine.snapshot_midi();
+        assert!(
+            engine.replay[..count]
+                .windows(11)
+                .any(|m| m == &message[..11])
+        );
+        assert!(
+            engine.replay[..count]
+                .windows(3)
+                .any(|m| m == [0x91, 60, 100])
+        );
+    }
     #[test]
     fn worker_owns_demo_and_bounds_each_execution_chunk() {
         let mut engine = WorkerEngine::new();

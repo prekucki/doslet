@@ -1,13 +1,31 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use doslet_midi_routing::Mode;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum MidiMode {
+    #[default]
+    Gm,
+    Mt32,
+}
+impl From<MidiMode> for Mode {
+    fn from(mode: MidiMode) -> Self {
+        match mode {
+            MidiMode::Gm => Self::Gm,
+            MidiMode::Mt32 => Self::Mt32,
+        }
+    }
+}
 use std::path::PathBuf;
 
 /// Run a DOS game in the Doslet desktop window.
-#[derive(Debug, Parser)]
+#[derive(Debug, Default, Parser)]
 #[command(
     version,
-    after_help = "Without --game, opens the built-in color-bar demo.\nGame support is experimental; keyboard/mouse input and saves are pending."
+    after_help = "Without --game, opens the built-in color-bar demo.\nGame support is experimental. Keyboard/mouse input and in-memory saves are available; persistent saves are pending."
 )]
 pub struct Cli {
+    /// Load a TOML launch profile; explicit CLI options override profile values
+    #[arg(long, value_name = "TOML")]
+    pub config: Option<PathBuf>,
     /// DOS executable; its containing directory is mounted as C:
     #[arg(long, value_name = "EXE")]
     pub game: Option<PathBuf>,
@@ -16,13 +34,30 @@ pub struct Cli {
     #[arg(long, conflicts_with = "midi_output")]
     pub no_audio: bool,
 
-    /// MIDI output index or exact port name; use the host's synthesizer
+    /// MIDI port index/name, rust, or moont
     #[arg(long, value_name = "PORT")]
     pub midi_output: Option<String>,
+
+    /// MIDI dialect produced by the game (default gm); Roland SysEx upgrades GM
+    #[arg(long, value_enum)]
+    pub midi_mode: Option<MidiMode>,
+
+    /// Dialect of a host MIDI port (default gm; MT-32 hardware/Munt may use mt32)
+    #[arg(long, value_enum)]
+    pub midi_output_mode: Option<MidiMode>,
+
+    /// Load CM32L_CONTROL.ROM and CM32L_PCM.ROM for MT-32-family audio
+    #[arg(long, value_name = "DIR", conflicts_with = "no_audio")]
+    pub mt32_rom_dir: Option<PathBuf>,
 
     /// List host MIDI output ports and exit before opening a window
     #[arg(long)]
     pub list_midi_outputs: bool,
+
+    #[arg(skip)]
+    pub launch: crate::native_input::LaunchSettings,
+    #[arg(skip)]
+    pub profile_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -30,6 +65,28 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
 
+    #[test]
+    fn midi_modes_and_moont_port_selection_parse_explicitly() {
+        let cli = Cli::try_parse_from(["doslet"]).unwrap();
+        assert_eq!(cli.midi_mode, None);
+        assert_eq!(cli.midi_output_mode, None);
+        let cli = Cli::try_parse_from([
+            "doslet",
+            "--midi-mode",
+            "mt32",
+            "--midi-output-mode",
+            "mt32",
+            "--midi-output",
+            "moont",
+            "--mt32-rom-dir",
+            "/local/roms",
+        ])
+        .unwrap();
+        assert_eq!(cli.midi_mode, Some(MidiMode::Mt32));
+        assert_eq!(cli.midi_output_mode, Some(MidiMode::Mt32));
+        assert_eq!(cli.midi_output.as_deref(), Some("moont"));
+        assert!(Cli::try_parse_from(["doslet", "--midi-mode", "auto"]).is_err());
+    }
     #[test]
     fn game_options_and_demo_default() {
         let cli =

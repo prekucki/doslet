@@ -13,12 +13,15 @@ mod browser_diagnostics;
 mod browser_input;
 #[cfg(not(target_arch = "wasm32"))]
 mod cli;
+mod keyboard;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "../../common/native_input.rs"]
 mod native_input;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_midi;
 mod presentation;
+#[cfg(not(target_arch = "wasm32"))]
+mod profile;
 mod ui;
 
 #[cfg(not(target_arch = "wasm32"))]

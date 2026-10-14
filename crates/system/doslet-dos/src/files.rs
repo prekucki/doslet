@@ -1,6 +1,7 @@
 //! Preloaded read-only DOS drive. Host acquisition stays outside the DOS core.
 use alloc::vec::Vec;
 mod overlay;
+pub mod search;
 
 const NAME_BYTES: usize = 128;
 const HANDLE_COUNT: usize = 64;
@@ -95,6 +96,7 @@ pub struct ReadOnlyDrive {
     last_midi: Option<usize>,
     last_midi_request: Option<(Name, u8, u16)>,
     overlay: Option<overlay::Overlay>,
+    new_file_limit: usize,
 }
 impl Default for ReadOnlyDrive {
     fn default() -> Self {
@@ -112,13 +114,62 @@ impl ReadOnlyDrive {
             last_midi: None,
             last_midi_request: None,
             overlay: None,
+            new_file_limit: 0,
         }
     }
     /// Enable an isolated sparse write overlay during setup. Input buffers and
     /// host files stay immutable; writes use reserved space and 64 fixed extents.
     pub fn with_write_overlay(mut self, capacity: usize) -> Self {
+        self.files.reserve(64);
+        self.new_file_limit = self.files.len() + 64;
         self.overlay = Some(overlay::Overlay::new(capacity));
         self
+    }
+    /// Create/truncate an ordinary overlay file using setup-reserved metadata.
+    pub fn create(&mut self, path: &[u8], attributes: u16) -> Result<u16, u16> {
+        if self.overlay.is_none() || attributes & !0x20 != 0 {
+            return Err(5);
+        }
+        let name = Name::relative(path, self.current)?;
+        if name.len == 0 || self.name_attributes(name) == Ok(0x10) {
+            return Err(5);
+        }
+        if let Some(separator) = name.as_bytes().iter().rposition(|byte| *byte == b'\\') {
+            let mut parent = name;
+            parent.len = separator;
+            if self.name_attributes(parent) != Ok(0x10) {
+                return Err(3);
+            }
+        }
+        let slot = self.handles.iter().position(Option::is_none).ok_or(4u16)?;
+        let index = if let Some(index) = self.files.iter().position(|file| file.name == name) {
+            index
+        } else {
+            if self.files.len() >= self.new_file_limit {
+                return Err(8);
+            }
+            let index = self.files.len();
+            // Verify overlay metadata before publishing the new name.
+            self.overlay.as_mut().unwrap().reserve(index, 0, 0, 0)?;
+            self.files.push(File {
+                name,
+                bytes: Vec::new(),
+            });
+            index
+        };
+        self.overlay.as_mut().unwrap().reserve(
+            index,
+            0,
+            0,
+            self.files[index].bytes.len() as u32,
+        )?;
+        self.handles[slot] = Some(Handle {
+            file: index,
+            position: 0,
+            mode: 2,
+        });
+        self.opens += 1;
+        Ok(slot as u16 + 5)
     }
     /// Transfer ownership once during setup; mounting is not a guest execution operation.
     pub fn mount(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<(), u16> {
@@ -145,6 +196,43 @@ impl ReadOnlyDrive {
     }
     pub fn file(&self, path: &[u8]) -> Result<&[u8], u16> {
         Ok(&self.files[self.find(path)?].bytes)
+    }
+    /// Search ordinary 8.3 files in the current directory without allocating.
+    pub fn find_fcb(&self, pattern: &[u8; 11], start: usize) -> Option<(usize, [u8; 11], u32)> {
+        for (index, file) in self.files.iter().enumerate().skip(start) {
+            let path = file.name.as_bytes();
+            let split = path.iter().rposition(|byte| *byte == b'\\');
+            let (directory, name) =
+                split.map_or((&b""[..], path), |i| (&path[..i], &path[i + 1..]));
+            if directory != self.current.as_bytes() {
+                continue;
+            }
+            let dot = name
+                .iter()
+                .position(|byte| *byte == b'.')
+                .unwrap_or(name.len());
+            let (base, ext) = (&name[..dot], name.get(dot + 1..).unwrap_or_default());
+            if base.len() > 8 || ext.len() > 3 {
+                continue;
+            }
+            let mut short = [b' '; 11];
+            short[..base.len()].copy_from_slice(base);
+            short[8..8 + ext.len()].copy_from_slice(ext);
+            if pattern
+                .iter()
+                .zip(short)
+                .all(|(p, b)| *p == b'?' || p.to_ascii_uppercase() == b)
+            {
+                let length = self
+                    .overlay
+                    .as_ref()
+                    .map_or(file.bytes.len() as u32, |overlay| {
+                        overlay.length(index, file.bytes.len() as u32)
+                    });
+                return Some((index + 1, short, length));
+            }
+        }
+        None
     }
     pub fn attributes(&self, path: &[u8]) -> Result<u16, u16> {
         self.name_attributes(Name::relative(path, self.current)?)
@@ -346,6 +434,32 @@ impl ReadView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn created_overlay_files_can_be_reopened_truncated_and_searched() {
+        let mut drive = ReadOnlyDrive::new().with_write_overlay(256);
+        assert_eq!(drive.create(b"MISSING/SAVE.SAV", 0), Err(3));
+        let handle = drive.create(b"SAVE.SAV", 0).unwrap();
+        drive
+            .write_buffer(handle, 4)
+            .unwrap()
+            .copy_from_slice(b"save");
+        drive.close(handle).unwrap();
+        let handle = drive.open(b"save.sav", 0).unwrap();
+        let view = drive.read_view(handle, 100).unwrap();
+        assert_eq!(
+            (0..view.len())
+                .map(|i| view.byte(i).unwrap())
+                .collect::<Vec<_>>(),
+            b"save"
+        );
+        drive.close(handle).unwrap();
+        assert_eq!(drive.find_fcb(b"SAVE    SAV", 0).unwrap().2, 4);
+        let handle = drive.create(b"SAVE.SAV", 0).unwrap();
+        assert_eq!(drive.read_view(handle, 100).unwrap().len(), 0);
+        drive.close(handle).unwrap();
+        assert_eq!(drive.find_fcb(b"???????????", 0).unwrap().2, 0);
+        assert!(ReadOnlyDrive::new().create(b"SAVE.SAV", 0).is_err());
+    }
     #[test]
     fn sparse_overlay_merges_overwrites_truncation_and_extensions_without_changing_inputs() {
         let mut drive = ReadOnlyDrive::new().with_write_overlay(8);

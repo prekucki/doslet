@@ -4,6 +4,46 @@ use doslet_runtime::{Session, SessionStatus};
 include!("../../../../tests/fixtures/relocated_mz.rs");
 include!("../../../../tests/fixtures/protected_graphics.rs");
 #[test]
+fn creating_a_save_reading_it_and_converting_text_allocate_nothing_after_setup() {
+    let mut program = vec![0; 0xB0];
+    let code = [
+        0xBA, 0x80, 1, 0x31, 0xC9, 0xB4, 0x3C, 0xCD, 0x21, 0x89, 0xC3, 0xBA, 0x90, 1, 0xB9, 5, 0,
+        0xB4, 0x40, 0xCD, 0x21, 0xB4, 0x3E, 0xCD, 0x21, 0xBA, 0x80, 1, 0xB8, 0, 0x3D, 0xCD, 0x21,
+        0x89, 0xC3, 0xBA, 0xA0, 1, 0xB9, 5, 0, 0xB4, 0x3F, 0xCD, 0x21, 0xB8, 0, 0x4C, 0xCD, 0x21,
+    ];
+    program[..code.len()].copy_from_slice(&code);
+    program[0x80..0x89].copy_from_slice(b"SAVE.SAV\0");
+    program[0x90..0x95].copy_from_slice(b"hello");
+    let drive = doslet_dos::files::ReadOnlyDrive::new().with_write_overlay(128);
+    let mut session = Session::new(&program).unwrap().with_drive(drive);
+    let mut rgba = vec![0; 720 * 400 * 4];
+    session.start();
+    let measured = allocation_counter::measure(|| {
+        session.advance(200);
+        session.presentation_frame().write_rgba(&mut rgba).unwrap();
+    });
+    assert_eq!(session.status(), SessionStatus::Exited(0));
+    assert_eq!(session.ram_view(0x101A0..0x101A5).unwrap(), b"hello");
+    assert_eq!(measured.count_total, 0);
+}
+
+#[test]
+fn console_diagnostic_capacity_does_not_stop_guest_output_or_allocate() {
+    let program = [
+        0xB9, 0x88, 0x13, 0xB2, b'x', 0xB4, 2, 0xCD, 0x21, 0xE2, 0xFA, 0xB8, 0, 0x4C, 0xCD, 0x21,
+    ];
+    let mut session = Session::new(&program).unwrap();
+    session.start();
+    let measured = allocation_counter::measure(|| {
+        session.advance(40000);
+    });
+    assert_eq!(session.status(), SessionStatus::Exited(0));
+    assert!(session.console_truncated());
+    assert!(session.console().len() <= 4096);
+    assert_eq!(measured.count_total, 0);
+}
+
+#[test]
 fn decoded_instruction_cache_misses_hits_and_ram_writes_allocate_nothing() {
     let mut program = protected_graphics_com();
     let code = [
@@ -264,4 +304,24 @@ fn dos_read_write_overlay_and_merged_read_allocate_nothing_after_setup() {
     assert_eq!(session.console(), b"abXYef");
     assert_eq!(measured.count_total, 0);
     assert_eq!(measured.bytes_total, 0);
+}
+
+#[test]
+fn find_first_next_and_dta_results_allocate_nothing_after_setup() {
+    let mut program = vec![
+        0xBA, 0, 3, 0x31, 0xC9, 0xB8, 0xFC, 0x4E, 0xCD, 0x21, 0xB8, 0xFC, 0x4F, 0xCD, 0x21, 0xB8,
+        0, 0x4C, 0xCD, 0x21,
+    ];
+    program.resize(0x200, 0);
+    program.extend_from_slice(b"*.SAV\0");
+    let mut drive = doslet_dos::files::ReadOnlyDrive::new();
+    drive.mount(b"ONE.SAV", vec![0; 3]).unwrap();
+    drive.mount(b"TWO.SAV", vec![0; 4]).unwrap();
+    let mut session = Session::new(&program).unwrap().with_drive(drive);
+    session.start();
+    let measured = allocation_counter::measure(|| {
+        session.advance(100);
+    });
+    assert_eq!(session.status(), doslet_runtime::SessionStatus::Exited(0));
+    assert_eq!(measured.count_total, 0);
 }

@@ -20,11 +20,26 @@ enum Pending {
     OutputPort,
 }
 
+#[derive(Clone, Copy, Default)]
+enum KeyboardPending {
+    #[default]
+    None,
+    Leds,
+    Typematic,
+    ScanSet,
+}
+
 pub struct Controller {
     command_byte: u8,
     output_port: u8,
     pending: Pending,
     last_command: bool,
+    keyboard_pending: KeyboardPending,
+    leds: u8,
+    typematic: u8,
+    scan_set: u8,
+    scanning: bool,
+    last_reply: u8,
     output: [u8; 16],
     head: usize,
     len: usize,
@@ -41,6 +56,12 @@ impl Controller {
             output_port: 1,
             pending: Pending::None,
             last_command: false,
+            keyboard_pending: KeyboardPending::None,
+            leds: 0,
+            typematic: 0x2B,
+            scan_set: 2,
+            scanning: true,
+            last_reply: 0xFA,
             output: [0; 16],
             head: 0,
             len: 0,
@@ -56,6 +77,7 @@ impl Controller {
         let byte = self.output[self.head];
         self.head = (self.head + 1) % self.output.len();
         self.len -= 1;
+        self.last_reply = byte;
         byte
     }
     fn reply(&mut self, byte: u8) -> Result<(), ControllerError> {
@@ -64,6 +86,81 @@ impl Controller {
         }
         self.output[(self.head + self.len) % self.output.len()] = byte;
         self.len += 1;
+        Ok(())
+    }
+    fn replies(&mut self, bytes: &[u8]) -> Result<(), ControllerError> {
+        if bytes.len() > self.output.len() - self.len {
+            return Err(ControllerError::OutputFull);
+        }
+        for &byte in bytes {
+            self.reply(byte)?;
+        }
+        Ok(())
+    }
+    pub fn led_state(&self) -> u8 {
+        self.leds
+    }
+    fn keyboard_defaults(&mut self) {
+        self.leds = 0;
+        self.typematic = 0x2B;
+        self.scan_set = 2;
+        self.keyboard_pending = KeyboardPending::None;
+    }
+    fn keyboard_data(&mut self, value: u8) -> Result<(), ControllerError> {
+        match self.keyboard_pending {
+            KeyboardPending::Leds => {
+                self.reply(0xFA)?;
+                self.leds = value & 7;
+                self.keyboard_pending = KeyboardPending::None;
+            }
+            KeyboardPending::Typematic => {
+                self.reply(0xFA)?;
+                self.typematic = value & 0x7F;
+                self.keyboard_pending = KeyboardPending::None;
+            }
+            KeyboardPending::ScanSet => {
+                match value {
+                    0 => self.replies(&[0xFA, self.scan_set])?,
+                    1..=3 => {
+                        self.reply(0xFA)?;
+                        self.scan_set = value;
+                    }
+                    _ => {
+                        self.reply(0xFE)?;
+                        return Ok(());
+                    }
+                }
+                self.keyboard_pending = KeyboardPending::None;
+            }
+            KeyboardPending::None => match value {
+                0xED | 0xF0 | 0xF3 => {
+                    self.reply(0xFA)?;
+                    self.keyboard_pending = match value {
+                        0xED => KeyboardPending::Leds,
+                        0xF0 => KeyboardPending::ScanSet,
+                        _ => KeyboardPending::Typematic,
+                    };
+                }
+                0xEE => self.reply(0xEE)?,
+                0xF2 => self.replies(&[0xFA, 0xAB, 0x83])?,
+                0xF4 => {
+                    self.reply(0xFA)?;
+                    self.scanning = true;
+                }
+                0xF5 | 0xF6 => {
+                    self.reply(0xFA)?;
+                    self.keyboard_defaults();
+                    self.scanning = value == 0xF6;
+                }
+                0xFE => self.reply(self.last_reply)?,
+                0xFF => {
+                    self.replies(&[0xFA, 0xAA])?;
+                    self.keyboard_defaults();
+                    self.scanning = true;
+                }
+                _ => return Err(ControllerError::UnsupportedData(value)),
+            },
+        }
         Ok(())
     }
     /// Machine wiring can reflect the A20 signal without introducing a device dependency.
@@ -102,7 +199,10 @@ impl Controller {
                     reset_requested: value & 1 == 0,
                 }))
             }
-            Pending::None => Err(ControllerError::UnsupportedData(value)),
+            Pending::None => {
+                self.keyboard_data(value)?;
+                Ok(None)
+            }
         }
     }
 }
@@ -110,6 +210,54 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keyboard_commands_acknowledge_parameters_without_changing_a20() {
+        let mut c = Controller::new();
+        for byte in [0xED, 7, 0xF3, 0x20] {
+            assert_eq!(c.write_data(byte), Ok(None));
+            assert_eq!(c.read_data(), 0xFA);
+        }
+        assert_eq!(c.led_state(), 7);
+        assert_eq!(c.typematic, 0x20);
+        c.write_command(0xD0).unwrap();
+        assert_eq!(c.read_data(), 1);
+        c.write_data(0xF2).unwrap();
+        assert_eq!(
+            [c.read_data(), c.read_data(), c.read_data()],
+            [0xFA, 0xAB, 0x83]
+        );
+        c.write_data(0xFF).unwrap();
+        assert_eq!([c.read_data(), c.read_data()], [0xFA, 0xAA]);
+        assert_eq!(c.led_state(), 0);
+        assert!(c.scanning);
+        assert_eq!(
+            c.write_data(0x12),
+            Err(ControllerError::UnsupportedData(0x12))
+        );
+    }
+    #[test]
+    fn multibyte_keyboard_replies_do_not_publish_partial_responses_when_full() {
+        let mut c = Controller::new();
+        for _ in 0..15 {
+            c.write_command(0xAB).unwrap();
+        }
+        assert_eq!(c.write_data(0xF2), Err(ControllerError::OutputFull));
+        for _ in 0..15 {
+            assert_eq!(c.read_data(), 0);
+        }
+        assert_eq!(c.status() & 1, 0);
+        c.write_data(0xF0).unwrap();
+        assert_eq!(c.read_data(), 0xFA);
+        c.write_data(0).unwrap();
+        assert_eq!([c.read_data(), c.read_data()], [0xFA, 2]);
+        c.write_data(0xF0).unwrap();
+        assert_eq!(c.read_data(), 0xFA);
+        c.write_data(9).unwrap();
+        assert_eq!(c.read_data(), 0xFE);
+        c.write_data(1).unwrap();
+        assert_eq!(c.read_data(), 0xFA);
+        assert_eq!(c.scan_set, 1);
+    }
     #[test]
     fn controller_output_port_reports_a20_and_reset_lines() {
         let mut c = Controller::new();

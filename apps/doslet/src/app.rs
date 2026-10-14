@@ -1,7 +1,7 @@
 use crate::presentation::DisplayFrame;
+use doslet_midi_routing::{Mode, Routing, SNAPSHOT_CAPACITY};
 use doslet_midi_synth::Timeline;
-use doslet_midi_synth::wire::{Decoder, REPLAY_CAPACITY, State};
-use doslet_runtime::{Session, SessionStatus};
+use doslet_runtime::{RuntimeError, Session, SessionStatus};
 use iced::{Element, Subscription, Task, Theme};
 use std::time::{Duration, Instant};
 
@@ -12,11 +12,14 @@ pub struct Doslet {
     pub display: DisplayFrame,
     pub name: String,
     pub notice: Option<String>,
+    logged_fault: Option<RuntimeError>,
+    logged_notice: Option<String>,
     pub midi_choices: Vec<String>,
     pub midi_choice: String,
     host_midi: Option<crate::native_midi::Output>,
-    wire: Decoder,
-    wire_state: State,
+    routing: Routing,
+    pub midi_mode: Mode,
+    pub midi_output_mode: Mode,
     #[cfg(test)]
     pub archive: Option<crate::archive::GameArchive>,
     #[cfg(test)]
@@ -26,22 +29,32 @@ pub struct Doslet {
     theme: Theme,
     anchor: Option<(Instant, u64)>,
     midi: Timeline,
+    mt32: Option<doslet_mt32::Timeline>,
+    mt32_rom_dir: Option<std::path::PathBuf>,
     samples: [[f32; 2]; 512],
     midi_bytes: [u8; 1024],
     pcm: [[i16; 2]; 128],
     #[cfg(not(target_arch = "wasm32"))]
     source: Option<std::path::PathBuf>,
     #[cfg(not(target_arch = "wasm32"))]
+    launch: crate::native_input::LaunchSettings,
+    #[cfg(not(target_arch = "wasm32"))]
     audio: Option<crate::audio::Output>,
 }
 #[derive(Clone, Debug)]
 pub enum Message {
+    PointerMoved(u16, u16),
+    PointerButton(u8, bool),
+    PointerLeft,
+    Keyboard(iced::keyboard::Event),
     RunPause,
     Step,
     Reset,
     Tick,
     RefreshMidi,
     MidiSelected(String),
+    MidiModeSelected(Mode),
+    MidiOutputModeSelected(Mode),
     #[cfg(test)]
     ArchiveLoaded(Result<Option<std::sync::Arc<Vec<u8>>>, String>),
     #[cfg(test)]
@@ -56,11 +69,14 @@ impl Doslet {
             display: DisplayFrame::default(),
             name: "Color bars".into(),
             notice: None,
+            logged_fault: None,
+            logged_notice: None,
             midi_choices: vec!["Rust synth".into()],
             midi_choice: "Rust synth".into(),
             host_midi: None,
-            wire: Decoder::new(),
-            wire_state: State::new(),
+            routing: Routing::new(Mode::Gm),
+            midi_mode: Mode::Gm,
+            midi_output_mode: Mode::Gm,
             #[cfg(test)]
             archive: None,
             #[cfg(test)]
@@ -70,24 +86,35 @@ impl Doslet {
             theme: crate::ui::theme(),
             anchor: None,
             midi: Timeline::new(48000).unwrap(),
+            mt32: None,
+            mt32_rom_dir: None,
             samples: [[0.0; 2]; 512],
             midi_bytes: [0; 1024],
             pcm: [[0; 2]; 128],
             #[cfg(not(target_arch = "wasm32"))]
             source: None,
             #[cfg(not(target_arch = "wasm32"))]
+            launch: crate::native_input::LaunchSettings::default(),
+            #[cfg(not(target_arch = "wasm32"))]
             audio: None,
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_cli(cli: crate::cli::Cli) -> Result<Self, Box<dyn std::error::Error>> {
+        let cli = cli.resolve()?;
         let mut app = Self::new();
+        app.midi_mode = cli.midi_mode.unwrap_or_default().into();
+        app.midi_output_mode = cli.midi_output_mode.unwrap_or_default().into();
+        app.launch = cli.launch;
+        app.routing.set_mode(app.midi_mode);
         if let Some(path) = cli.game {
-            let mut session = crate::native_input::load_game(&path)
+            let mut session = crate::native_input::load_game_with_settings(&path, &app.launch)
                 .map_err(|error| format!("Cannot load {}: {error}", path.display()))?;
             session.start();
             app.session = session;
-            app.name = path.file_name().unwrap().to_string_lossy().into_owned();
+            app.name = cli
+                .profile_name
+                .unwrap_or_else(|| path.file_name().unwrap().to_string_lossy().into_owned());
             app.source = Some(path);
             if !cli.no_audio && cli.midi_output.is_none() {
                 match crate::audio::Output::new() {
@@ -99,25 +126,96 @@ impl Doslet {
                 }
             }
         }
-        if let Some(selection) = cli.midi_output {
-            let ports = crate::native_midi::ports()?;
-            app.midi_choices.extend(ports.names.iter().cloned());
-            let mut output = ports.connect(&selection)?;
-            output.set_active(app.session.status() == SessionStatus::Running)?;
-            app.midi_choice = output.name.clone();
-            app.host_midi = Some(output);
+        if let Some(directory) = cli.mt32_rom_dir {
+            app.mt32_rom_dir = Some(directory);
+            app.midi_choices.push("CM-32L / MT-32".into());
         }
+        if let Some(selection) = cli.midi_output {
+            let selection = match selection.as_str() {
+                "rust" => "Rust synth",
+                "moont" => "CM-32L / MT-32",
+                other => other,
+            };
+            app.select_midi(selection)?;
+        } else if app.mt32_rom_dir.is_some() {
+            app.select_midi("CM-32L / MT-32")?;
+        }
+        app.log_errors();
         Ok(app)
+    }
+    fn load_mt32(
+        directory: &std::path::Path,
+        rate: u32,
+        mode: Mode,
+    ) -> Result<doslet_mt32::Timeline, Box<dyn std::error::Error>> {
+        let control = std::fs::read(directory.join("CM32L_CONTROL.ROM"))?;
+        let pcm = std::fs::read(directory.join("CM32L_PCM.ROM"))?;
+        Ok(doslet_mt32::Timeline::with_gm(
+            &control,
+            &pcm,
+            rate,
+            mode == Mode::Gm,
+        )?)
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::PointerMoved(x, y) => {
+                if self.session.status() == SessionStatus::Running {
+                    self.session.pointer_move(x, y);
+                }
+            }
+            Message::PointerButton(button, pressed) => {
+                if self.session.status() == SessionStatus::Running || !pressed {
+                    self.session.pointer_button(button, pressed);
+                }
+            }
+            Message::PointerLeft => self.session.release_pointer_buttons(),
+            Message::Keyboard(event) => {
+                if self.session.status() == SessionStatus::Running {
+                    let (modifiers, key) = crate::keyboard::translate(&event);
+                    if let Err(error) = self.session.set_key_modifiers(modifiers).and_then(|()| {
+                        if let Some((scan, ascii)) = key {
+                            self.session.push_key(scan, ascii).map(|_| ())
+                        } else {
+                            Ok(())
+                        }
+                    }) {
+                        self.notice = Some(error.to_string());
+                    }
+                }
+            }
             Message::RefreshMidi => match crate::native_midi::ports() {
                 Ok(ports) => {
                     self.midi_choices = vec!["Rust synth".into()];
+                    if self.mt32_rom_dir.is_some() {
+                        self.midi_choices.push("CM-32L / MT-32".into());
+                    }
                     self.midi_choices.extend(ports.names);
                 }
                 Err(error) => self.notice = Some(error),
             },
+            Message::MidiModeSelected(mode) => {
+                let previous = self.midi_mode;
+                self.midi_mode = mode;
+                self.routing.set_mode(mode);
+                let selection = self.midi_choice.clone();
+                if let Err(error) = self.reselect_midi(&selection) {
+                    self.midi_mode = previous;
+                    self.routing.set_mode(previous);
+                    self.notice = Some(error);
+                }
+            }
+            Message::MidiOutputModeSelected(mode) => {
+                let previous = self.midi_output_mode;
+                self.midi_output_mode = mode;
+                if self.host_midi.is_some() {
+                    let selection = self.midi_choice.clone();
+                    if let Err(error) = self.reselect_midi(&selection) {
+                        self.midi_output_mode = previous;
+                        self.notice = Some(error);
+                    }
+                }
+            }
             Message::MidiSelected(selection) => {
                 if let Err(error) = self.select_midi(&selection) {
                     self.notice = Some(error);
@@ -182,8 +280,11 @@ impl Doslet {
         if let Some(output) = &mut self.host_midi {
             match output.set_active(self.session.status() == SessionStatus::Running) {
                 Ok(true) => {
-                    let mut replay = [0; REPLAY_CAPACITY];
-                    let count = self.wire_state.write_with_decoder(&mut replay, &self.wire);
+                    let mut replay = Vec::with_capacity(SNAPSHOT_CAPACITY);
+                    self.routing.replay(self.midi_output_mode, &mut |message| {
+                        replay.extend_from_slice(message)
+                    });
+                    let count = replay.len();
                     if let Err(error) = output.push(self.session.emulated_nanos(), &replay[..count])
                     {
                         self.notice = Some(error);
@@ -198,10 +299,26 @@ impl Doslet {
                 }
             }
         }
+        self.log_errors();
         self.display.refresh(&self.session);
         #[cfg(not(target_arch = "wasm32"))]
         {
             Task::none()
+        }
+    }
+    fn log_errors(&mut self) {
+        let fault = self.session.fault();
+        if fault != self.logged_fault {
+            if let Some(error) = fault {
+                eprintln!("[ERROR doslet] {}: {error}", self.name);
+            }
+            self.logged_fault = fault;
+        }
+        if self.notice != self.logged_notice {
+            if let Some(error) = &self.notice {
+                eprintln!("[ERROR doslet] {}: {error}", self.name);
+            }
+            self.logged_notice.clone_from(&self.notice);
         }
     }
     fn reset(&mut self) {
@@ -222,7 +339,7 @@ impl Doslet {
         #[cfg(not(target_arch = "wasm32"))]
         {
             if let Some(path) = &self.source {
-                match crate::native_input::load_game(path) {
+                match crate::native_input::load_game_with_settings(path, &self.launch) {
                     Ok(mut session) => {
                         session.start();
                         self.session = session;
@@ -246,8 +363,22 @@ impl Doslet {
             audio.set_active(self.session.status() == SessionStatus::Running);
         }
         self.midi = Timeline::new(self.midi.sample_rate()).unwrap();
-        self.wire = Decoder::new();
-        self.wire_state = State::new();
+        if self.midi_choice == "CM-32L / MT-32"
+            && let Some(directory) = &self.mt32_rom_dir
+        {
+            let rate = self
+                .audio
+                .as_ref()
+                .map_or(self.midi.sample_rate(), |audio| audio.rate);
+            match Self::load_mt32(directory, rate, self.midi_mode) {
+                Ok(engine) => self.mt32 = Some(engine),
+                Err(error) => {
+                    self.notice = Some(format!("CM-32L reset: {error}"));
+                    self.session.pause();
+                }
+            }
+        }
+        self.routing = Routing::new(self.midi_mode);
         if let Some(output) = &mut self.host_midi
             && let Err(error) = output.clear()
         {
@@ -305,7 +436,19 @@ impl Doslet {
         }
     }
     fn process_audio(&mut self) -> Result<(), String> {
-        if self.host_midi.is_some() {
+        if let Some(mt32) = &mut self.mt32 {
+            loop {
+                let count = mt32
+                    .render_until(self.session.emulated_nanos(), &mut self.samples)
+                    .map_err(|e| e.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                if let Some(audio) = &self.audio {
+                    audio.push(&self.samples[..count])?;
+                }
+            }
+        } else if self.host_midi.is_some() {
             self.midi
                 .skip_until(self.session.emulated_nanos())
                 .map_err(|e| e.to_string())?;
@@ -325,20 +468,43 @@ impl Doslet {
             }
         }
         let count = self.session.drain_midi(&mut self.midi_bytes);
-        for byte in &self.midi_bytes[..count] {
-            if let Some(message) = self
-                .wire
-                .push(*byte)
-                .map_err(|e| format!("MIDI wire error: {e:?}"))?
-            {
-                self.wire_state.receive(message);
-            }
-            if self.host_midi.is_none() {
-                self.midi.push_byte(*byte).map_err(|e| e.to_string())?;
+        let dialect = self.output_dialect();
+        let mut bytes = [0u8; 16384];
+        let mut used = 0;
+        let mut overflow = false;
+        for &byte in &self.midi_bytes[..count] {
+            self.routing
+                .push(byte, dialect, &mut |message| {
+                    if used + message.len() > bytes.len() {
+                        overflow = true;
+                        return;
+                    }
+                    bytes[used..used + message.len()].copy_from_slice(message);
+                    used += message.len();
+                })
+                .map_err(|error| format!("MIDI wire error: {error:?}"))?;
+        }
+        if overflow {
+            return Err("Translated MIDI batch capacity exceeded".into());
+        }
+        if self.routing.mode() != self.midi_mode {
+            self.midi_mode = self.routing.mode();
+            if self.mt32.is_some() {
+                let selection = self.midi_choice.clone();
+                self.reselect_midi(&selection)?;
+                used = 0; // Replay already includes this batch's device state and notes.
             }
         }
         if let Some(output) = &mut self.host_midi {
-            output.push(self.session.emulated_nanos(), &self.midi_bytes[..count])?;
+            output.push(self.session.emulated_nanos(), &bytes[..used])?;
+        } else if let Some(mt32) = &mut self.mt32 {
+            for &byte in &bytes[..used] {
+                mt32.push_byte(byte).map_err(|e| e.to_string())?;
+            }
+        } else {
+            for &byte in &bytes[..used] {
+                self.midi.push_byte(byte).map_err(|e| e.to_string())?;
+            }
         }
         while self.session.drain_pcm(&mut self.pcm) != 0 {}
         Ok(())
@@ -350,6 +516,15 @@ impl Doslet {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(audio) = &self.audio {
             let (frames, _, peak) = audio.stats();
+            if let Some(mt32) = &self.mt32 {
+                return format!(
+                    "CM-32L · {} notes · {} SysEx · peak {:.2} · {} frames",
+                    mt32.note_events(),
+                    mt32.sysex_messages(),
+                    peak,
+                    frames
+                );
+            }
             return format!(
                 "MIDI · {} Hz · {} notes · peak {:.2} · {} played frames",
                 audio.rate,
@@ -360,44 +535,125 @@ impl Doslet {
         }
         "Audio output inactive".into()
     }
-    fn select_midi(&mut self, selection: &str) -> Result<(), String> {
-        if selection == self.midi_choice
-            && self
-                .host_midi
-                .as_ref()
-                .is_none_or(|output| output.check().is_ok())
-        {
-            return Ok(());
+    fn output_dialect(&self) -> Mode {
+        if self.host_midi.is_some() {
+            self.midi_output_mode
+        } else if self.mt32.is_some() {
+            self.midi_mode
+        } else {
+            Mode::Gm
         }
-        let mut replay = [0; REPLAY_CAPACITY];
-        let count = self.wire_state.write_with_decoder(&mut replay, &self.wire);
-        if selection == "Rust synth" {
+    }
+    fn reselect_midi(&mut self, selection: &str) -> Result<(), String> {
+        if selection == "CM-32L / MT-32" || selection == "Rust synth" {
             let audio = crate::audio::Output::new()?;
-            let mut midi = Timeline::new(audio.rate).map_err(|e| e.to_string())?;
-            midi.skip_until(self.session.emulated_nanos())
-                .map_err(|e| e.to_string())?;
-            for &byte in &replay[..count] {
-                midi.push_byte(byte).map_err(|e| e.to_string())?;
+            let mut replay_error = None;
+            if selection == "CM-32L / MT-32" {
+                let directory = self
+                    .mt32_rom_dir
+                    .as_ref()
+                    .ok_or("Use --mt32-rom-dir to load CM-32L ROMs")?;
+                let mut engine = Self::load_mt32(directory, audio.rate, self.midi_mode)
+                    .map_err(|e| e.to_string())?;
+                engine.rebase(self.session.emulated_nanos());
+                self.routing.replay(self.midi_mode, &mut |message| {
+                    for &byte in message {
+                        if let Err(error) = engine.push_byte(byte) {
+                            replay_error = Some(error.to_string());
+                        }
+                    }
+                });
+                if let Some(error) = replay_error {
+                    return Err(error);
+                }
+                self.mt32 = Some(engine);
+            } else {
+                let mut engine = Timeline::new(audio.rate).map_err(|e| e.to_string())?;
+                engine
+                    .skip_until(self.session.emulated_nanos())
+                    .map_err(|e| e.to_string())?;
+                self.routing.replay(Mode::Gm, &mut |message| {
+                    for &byte in message {
+                        if let Err(error) = engine.push_byte(byte) {
+                            replay_error = Some(error.to_string());
+                        }
+                    }
+                });
+                if let Some(error) = replay_error {
+                    return Err(error);
+                }
+                self.midi = engine;
+                self.mt32 = None;
             }
             audio.set_active(self.session.status() == SessionStatus::Running);
+            if let Some(output) = &mut self.host_midi {
+                output.clear()?;
+            }
             self.host_midi = None;
             self.audio = Some(audio);
-            self.midi = midi;
         } else {
-            let mut output = crate::native_midi::ports()?.connect(selection)?;
+            if self.midi_mode == Mode::Gm && self.midi_output_mode == Mode::Mt32 {
+                return Err("GM to an MT-32 host port is unsupported; select MT-32 game mode. GM on moont uses GmDevice.".into());
+            }
+            let ports = crate::native_midi::ports()?;
+            self.midi_choices = vec!["Rust synth".into()];
+            if self.mt32_rom_dir.is_some() {
+                self.midi_choices.push("CM-32L / MT-32".into());
+            }
+            self.midi_choices.extend(ports.names.iter().cloned());
+            let mut output = ports.connect(selection)?;
+            // Finish the old sender's final silence before replay on the new port.
+            drop(self.host_midi.take());
             output.clear()?;
             output.set_active(self.session.status() == SessionStatus::Running)?;
-            output.push(self.session.emulated_nanos(), &replay[..count])?;
+            let mut replay = Vec::with_capacity(SNAPSHOT_CAPACITY);
+            self.routing.replay(self.midi_output_mode, &mut |message| {
+                replay.extend_from_slice(message)
+            });
+            output.push(self.session.emulated_nanos(), &replay)?;
             if let Some(audio) = &self.audio {
                 audio.set_active(false);
             }
             self.audio = None;
+            self.mt32 = None;
             self.host_midi = Some(output);
         }
-        self.midi_choice = selection.into();
+        self.midi_choice = self
+            .host_midi
+            .as_ref()
+            .map_or_else(|| selection.into(), |output| output.name.clone());
         self.anchor = None;
         self.notice = None;
         Ok(())
+    }
+    fn select_midi(&mut self, selection: &str) -> Result<(), String> {
+        if selection == self.midi_choice
+            && self.host_midi.as_ref().is_none_or(|o| o.check().is_ok())
+        {
+            return Ok(());
+        }
+        self.reselect_midi(selection)
+    }
+    pub fn midi_mode_label(&self) -> String {
+        let route = if self.midi_mode == Mode::Mt32 && self.output_dialect() == Mode::Gm {
+            "MT-32 → GM (przybliżenie)"
+        } else if self.mt32.is_some() && self.midi_mode == Mode::Gm {
+            "GM → CM-32L (approximation, 8 melodic parts)"
+        } else {
+            ""
+        };
+        let stats = self.routing.translator().stats();
+        let lcd = String::from_utf8_lossy(self.routing.translator().display());
+        format!(
+            "{route}{} · {} SysEx · {} unmapped notes · {lcd}",
+            if self.routing.upgraded() {
+                " · Roland detected: upgraded to MT-32"
+            } else {
+                ""
+            },
+            stats.sysex,
+            stats.unmapped_notes
+        )
     }
     pub fn view(&self) -> Element<'_, Message> {
         crate::ui::view(self)
@@ -405,12 +661,27 @@ impl Doslet {
     pub fn theme(&self) -> Theme {
         self.theme.clone()
     }
+    pub fn pointer_dimensions(&self) -> (u16, u16) {
+        self.session.pointer_dimensions()
+    }
     pub fn subscription(&self) -> Subscription<Message> {
-        if self.session.status() == SessionStatus::Running {
+        let tick = if self.session.status() == SessionStatus::Running {
             iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
         } else {
             Subscription::none()
-        }
+        };
+        Subscription::batch([
+            tick,
+            iced::event::listen_with(|event, status, _| {
+                if status == iced::event::Status::Ignored
+                    && let iced::Event::Keyboard(event) = event
+                {
+                    Some(Message::Keyboard(event))
+                } else {
+                    None
+                }
+            }),
+        ])
     }
 }
 
@@ -418,6 +689,115 @@ impl Doslet {
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "requires the user's local games and TOML profiles; runs without a window or audio device"]
+    fn local_toml_profiles_load_real_games_without_audio() {
+        use clap::Parser;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for name in ["CIV", "PRINCE", "HoMnM"] {
+            let profile = root.join(format!("games/{name}.toml"));
+            let cli = crate::cli::Cli::parse_from([
+                std::ffi::OsString::from("doslet"),
+                "--config".into(),
+                profile.into_os_string(),
+                "--no-audio".into(),
+            ]);
+            let mut app = Doslet::from_cli(cli).unwrap();
+            assert!(app.audio.is_none());
+            assert!(app.mt32.is_none());
+            app.session.advance(1_000_000);
+            assert_ne!(
+                app.session.status(),
+                SessionStatus::Faulted,
+                "{name}: {:?}",
+                app.session.fault()
+            );
+            println!(
+                "{name}: {:?}, steps={}",
+                app.session.status(),
+                app.session.steps()
+            );
+        }
+    }
+
+    #[test]
+    fn profile_arguments_working_directory_and_mode_survive_game_reset() {
+        let fixture = crate::profile::tests::Fixture::new(
+            r#"
+version = 1
+name = "Configured game"
+[game]
+executable = "../TINY.EXE"
+arguments = ["/test", "two words"]
+working_directory = 'C:\SUB'
+[midi]
+game_mode = "mt32"
+[audio]
+enabled = false
+"#,
+        );
+        std::fs::create_dir(fixture.root.join("SUB")).unwrap();
+        std::fs::write(fixture.root.join("SUB/DATA.DAT"), b"data").unwrap();
+        let mut app = Doslet::from_cli(fixture.cli(&[])).unwrap();
+        assert_eq!(app.name, "Configured game");
+        assert_eq!(app.midi_mode, Mode::Mt32);
+        assert!(app.audio.is_none());
+        let tail = b" /test \"two words\"";
+        for _ in 0..2 {
+            assert_eq!(
+                app.session.ram_view(0x10080..0x10081).unwrap(),
+                &[tail.len() as u8]
+            );
+            assert_eq!(
+                app.session.ram_view(0x10081..0x10081 + tail.len()).unwrap(),
+                tail
+            );
+            app.session.advance(100);
+            assert_eq!(app.session.status(), SessionStatus::Exited(7));
+            assert_eq!(app.session.console(), b"Relocated MZ");
+            let _ = app.update(Message::Reset);
+            assert_eq!(app.session.status(), SessionStatus::Running);
+            assert_eq!(app.midi_mode, Mode::Mt32);
+        }
+    }
+
+    #[test]
+    fn incompatible_host_dialect_selection_keeps_the_existing_output_and_mode() {
+        let mut app = Doslet::new();
+        let (output, _receiver) = crate::native_midi::Output::mock();
+        app.midi_choice = output.name.clone();
+        app.host_midi = Some(output);
+        let _ = app.update(Message::MidiOutputModeSelected(Mode::Mt32));
+        assert_eq!(app.midi_output_mode, Mode::Gm);
+        assert!(app.host_midi.is_some());
+        assert!(app.notice.is_some());
+        app.midi_mode = Mode::Mt32;
+        app.routing.set_mode(Mode::Mt32);
+        app.midi_output_mode = Mode::Mt32;
+        let _ = app.update(Message::MidiModeSelected(Mode::Gm));
+        assert_eq!(app.midi_mode, Mode::Mt32);
+        assert_eq!(app.routing.mode(), Mode::Mt32);
+        assert!(app.host_midi.is_some());
+    }
+    #[test]
+    fn native_rust_output_upgrades_roland_and_accepts_translated_notes() {
+        let mut app = Doslet::new();
+        let mut program = vec![0xBA, 0x31, 3, 0xB0, 0x3F, 0xEE, 0xBA, 0x30, 3];
+        for byte in [
+            0xF0, 0x41, 0x10, 0x16, 0x12, 0x20, 0, 0, b'A', 0x1F, 0xF7, 0x91, 60, 100,
+        ] {
+            program.extend_from_slice(&[0xB0, byte, 0xEE]);
+        }
+        program.extend_from_slice(&[0xEB, 0xFE]);
+        app.session = Session::new(&program).unwrap();
+        app.session.start();
+        app.session.advance(1000);
+        app.process_audio().unwrap();
+        assert_eq!(app.midi_mode, Mode::Mt32);
+        assert_eq!(app.routing.translator().stats().sysex, 1);
+        assert_eq!(app.midi.note_events(), 1);
+        assert!(app.midi_mode_label().contains("przybliżenie"));
+    }
     #[test]
     fn host_midi_lookahead_is_bounded_and_rebases_after_pause_and_reset() {
         let mut app = Doslet::new();
@@ -516,6 +896,10 @@ mod tests {
             no_audio: true,
             midi_output: None,
             list_midi_outputs: false,
+            mt32_rom_dir: None,
+            midi_mode: Some(crate::cli::MidiMode::Gm),
+            midi_output_mode: Some(crate::cli::MidiMode::Gm),
+            ..Default::default()
         })
         .unwrap();
         let start = Instant::now();

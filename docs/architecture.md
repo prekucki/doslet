@@ -4,6 +4,12 @@ Doslet separates architectural CPU behavior, chip behavior, machine wiring and
 application policy. Libraries live in nested domains, with independent manifests
 and tests. No emulation library depends on iced or accesses a host filesystem.
 
+Native TOML launch profiles are parsed with `toml_edit` in the desktop frontend.
+The frontend merges explicit CLI options, resolves host paths and transfers
+mounted file ownership during setup. `Session::configure_launch` accepts DOS
+command-tail and working-directory byte slices before execution; the CPU and
+chip graph does not depend on TOML. The desktop retains launch settings for Reset.
+
 ## Dependency graph
 
 Arrows mean "depends on".
@@ -12,6 +18,11 @@ Arrows mean "depends on".
 graph TD
   UI[iced application] --> Runtime[doslet-runtime]
   UI --> Synth[doslet-midi-synth]
+  UI --> Routing[doslet-midi-routing]
+  Worker[browser Worker] --> Routing
+  Routing --> Translator[doslet-mt32-gm]
+  Routing --> Synth
+  UI --> Moont[doslet-mt32]
   CLI[headless application] --> Runtime
   CLI --> Synth
   CLI --> Executable[doslet-executable]
@@ -62,7 +73,7 @@ range; the host CLI owns file acquisition and output.
 
 `ReadOnlyDrive` owns preloaded file buffers transferred by the host during setup.
 DOS handles are fixed-size records referring to those buffers; reads borrow the
-file slice and write through the bus. The DOS memory arena uses 64 fixed block
+file slice and write through the bus. The DOS memory arena uses 1024 fixed block
 records and publishes MCB metadata into guest RAM. A DOS overlay load borrows
 the mounted executable, copies its module once and relocates in place without
 creating another machine or process.
@@ -129,7 +140,43 @@ timer queue. Neither adapter assumes an OS synthesizer exists. Audio errors
 pause/report once and an output replacement can recover the existing Session.
 Host API allocations and presentation copies remain explicit; the machine is
 not shared with either audio API. The procedural synth is not
-sample-based GM or MT-32 emulation; Sound Blaster PCM mixing remains pending.
+sample-based GM or MT-32 emulation. Optional native `doslet-mt32` uses the
+`no_std` moont CM-32L engine with externally supplied, fingerprint-validated
+Control v1.02 and PCM ROMs. Its timeline renders bounded blocks and explicitly
+resamples 32-kHz output to the host rate. ROM loading and SysEx ownership occur
+outside the audio callback. Browser ROM selection remains pending.
+
+The independent `no_std` `doslet-mt32-gm` crate translates the MT-32 MIDI
+dialect to GM channel messages without ROM data. It owns a fixed ~23-KiB model
+of the SysEx-addressed parameter memory (patch/timbre/rhythm temp, patch and
+timbre memory, system area, display) and per-part held-note mappings. Built-in
+presets map by number through Doslet's own table; guest-uploaded timbres are
+classified by name, then by envelope, waveform and register. Parts 1–8 play on
+GM channels 1–8 and rhythm on 10. Translation borrows each framed message,
+emits through a caller closure and allocates nothing. It is an approximation,
+not LA synthesis. Native and browser applications use `doslet-midi-routing` to
+frame messages, maintain original and translated channel state, and select
+translation according to the game/output dialects. Roland model-16h SysEx
+upgrades GM game mode to MT-32 before a GM output receives it. Other unsupported
+SysEx retains the output's explicit error behavior. The procedural synth honors
+RPN 0; replay restores its semitone/cents range and current RPN selector.
+Written-byte masks in the MT-32 model track DT1 and program/controller side
+effects. Raw replay sends a device reset followed by bounded DT1 packets only
+for known written ranges, then pitch, expression, sustain and active notes.
+It does not copy factory timbre bytes from ROM. Snapshots fit a separate 256-KiB
+transport buffer (including fragmented written ranges) and preserve the router's partial wire message across switches.
+Native moont uses its GmDevice wrapper in GM mode and its Device in MT-32 mode.
+GmDevice approximates GM with CM-32L instruments and eight melodic parts; it is
+not a full GM sound bank. Output switches restart voices rather than preserve
+voice envelopes and reverb tails.
+
+The session owns the selected DOS mouse-driver state. Host adapters supply
+logical pointer coordinates and button transitions. Guest callbacks execute as
+far calls through an interrupt wrapper that preserves registers and FLAGS;
+protected-mode mouse callbacks remain unsupported. Pointer events do not mutate
+VRAM: presentation borrows cursor masks and applies AND/XOR while converting
+the indexed frame to RGBA. Text presentation also borrows guest memory and uses
+explicit BIOS glyph tables. No guest RAM or VRAM clone is required.
 
 The SB16 DSP and CT1745 mixer have independent `no_std` crates and fixed state.
 PC ports 220h-based DSP/mixer accesses route to them. The DSP owns command
@@ -178,7 +225,8 @@ and IRQ delivery retain their existing paths. No decoded blocks or JIT exist.
 The CPU owns hidden segment caches, descriptor-table state and optional x87
 state. Its decoder selects 16/32-bit addressing and validates cache permissions
 before emitting linear bus addresses. The independent `doslet-x87` crate owns
-eight fixed values, tags, control/status and selected operations; it depends on
+eight fixed values with retained 64-bit finite significands, tags, control/status
+and selected operations; it depends on
 neither a PC device nor the frontend. The PC chooses whether to install it and
 sets the corresponding CMOS equipment bit.
 

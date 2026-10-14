@@ -1,7 +1,9 @@
 //! A bounded DOS conventional-memory arena with guest-visible MCBs.
 use doslet_bus::{BusError, MemoryBus};
 
-const CAPACITY: usize = 64;
+// PRINCE allocates 233 conventional-memory buffers through its extender.
+// Keep metadata fixed and allocation-free without exhausting a 64-entry table.
+const CAPACITY: usize = 1024;
 #[derive(Clone, Copy, Default, Debug)]
 struct Block {
     segment: u16,
@@ -153,6 +155,15 @@ impl MemoryArena {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hundreds_of_small_dos_buffers_fit_without_false_out_of_memory() {
+        let mut arena = MemoryArena::new(0x1000, 0x2000, 0xA000);
+        for _ in 0..233 {
+            arena.allocate(64, 0x1000).unwrap();
+        }
+        assert_eq!(arena.len, 235);
+        assert!(arena.allocate(0x4000, 0x1000).is_ok());
+    }
     #[test]
     fn resize_allocate_free_and_coalesce_account_for_mcb_paragraphs() {
         let mut arena = MemoryArena::new(0x1000, 0x2000, 0x2000);

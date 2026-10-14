@@ -4,6 +4,7 @@
 #![no_std]
 extern crate alloc;
 
+pub mod font;
 mod palette;
 mod registers;
 pub mod scanout;
@@ -26,6 +27,9 @@ pub struct Vga {
     memory: Box<[u8]>,
     palette: [[u8; 4]; 256],
     dac_cursor: usize,
+    dac_read_cursor: usize,
+    dac_reading: bool,
+    dac_mask: u8,
     registers: registers::Registers,
     mode: VideoMode,
     bank: u16,
@@ -40,6 +44,9 @@ impl Default for Vga {
             memory: vec![0; VRAM_LEN].into_boxed_slice(),
             palette: palette::default_palette(),
             dac_cursor: 0,
+            dac_read_cursor: 0,
+            dac_reading: false,
+            dac_mask: 255,
             registers: registers::Registers::default(),
             mode: VideoMode::Text3,
             bank: 0,
@@ -51,16 +58,40 @@ impl Default for Vga {
     }
 }
 impl Vga {
+    pub fn memory_configuration(&self) -> (u8, u8, u8, u16, u8, u8) {
+        self.registers.memory_config()
+    }
     /// Borrow physical VRAM for diagnostics, including banks outside scanout.
     /// CPU memory transactions still use the mapped aperture operations.
     pub fn vram_view(&self) -> &[u8] {
         &self.memory
+    }
+    pub fn palette(&self) -> &[[u8; 4]; 256] {
+        &self.palette
+    }
+    /// Restore the selected 80x25 text configuration. Text scanout is pending;
+    /// the machine/runtime owns the current B800h text-memory backing.
+    pub fn set_mode_3h(&mut self) {
+        self.flush_raster_time();
+        self.palette = palette::default_palette();
+        self.dac_cursor = 0;
+        self.dac_read_cursor = 0;
+        self.dac_reading = false;
+        self.dac_mask = 255;
+        self.registers = registers::Registers::default();
+        self.mode = VideoMode::Text3;
+        self.bank = 0;
+        self.raster_ticks = 0;
+        self.revision = self.revision.wrapping_add(1);
     }
     pub fn set_mode_13h(&mut self) {
         self.flush_raster_time();
         self.memory.fill(0);
         self.palette = palette::default_palette();
         self.dac_cursor = 0;
+        self.dac_read_cursor = 0;
+        self.dac_reading = false;
+        self.dac_mask = 255;
         self.registers.mode_13h();
         self.mode = VideoMode::Mode13;
         self.bank = 0;
@@ -116,8 +147,24 @@ impl Vga {
     }
     pub fn set_dac_index(&mut self, index: u8) {
         self.dac_cursor = usize::from(index) * 3;
+        self.dac_reading = false;
+    }
+    pub fn set_dac_read_index(&mut self, index: u8) {
+        self.dac_read_cursor = usize::from(index) * 3;
+        self.dac_reading = true;
+    }
+    pub fn read_dac(&mut self) -> u8 {
+        let value = self.palette[self.dac_read_cursor / 3][self.dac_read_cursor % 3];
+        self.dac_read_cursor = (self.dac_read_cursor + 1) % 768;
+        ((u16::from(value) * 63 + 127) / 255) as u8
     }
     pub fn read_port(&self, port: u16) -> Option<u8> {
+        match port {
+            0x3C6 => return Some(self.dac_mask),
+            0x3C7 => return Some(if self.dac_reading { 0 } else { 3 }),
+            0x3C8 => return Some((self.dac_cursor / 3) as u8),
+            _ => {}
+        }
         if port == self.input_status_port() {
             let (total, visible, lines, sync_start, sync_end) = self.raster_geometry();
             let phase = self.raster_phase();
@@ -133,6 +180,13 @@ impl Vga {
             );
         }
         self.registers.read(port)
+    }
+    pub fn read_status(&mut self, port: u16) -> Option<u8> {
+        let value = self.read_port(port)?;
+        if port == self.input_status_port() {
+            self.registers.reset_attribute_latch();
+        }
+        Some(value)
     }
     /// Active input-status decode without resolving raster time.
     #[inline]
@@ -152,8 +206,8 @@ impl Vga {
     }
     /// Selected input-status port and exact guest-nanosecond deadline of the
     /// next vertical-retrace bit transition. This is a query without read side
-    /// effects; a future attribute-controller flip-flop model must revisit wait
-    /// batching equivalence before adding status-read side effects.
+    /// effects. Actual bus status reads reset the attribute index/data latch;
+    /// repeated reads in recognized wait loops have the same idempotent reset.
     pub fn retrace_deadline(&self, port: u16) -> Option<u64> {
         if port != self.input_status_port() {
             return None;
@@ -229,6 +283,11 @@ impl Vga {
             ((u64::from(self.raster_ticks) + u64::from(ticks)) % u64::from(line * rows)) as u32;
     }
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
+        if port == 0x3C6 {
+            self.dac_mask = value;
+            self.revision = self.revision.wrapping_add(1);
+            return true;
+        }
         self.registers.write(port, value)
     }
     pub fn write_dac(&mut self, value: u8) {
@@ -249,12 +308,66 @@ impl Vga {
             pixels: &self.memory[..width * height],
             palette: &self.palette,
             revision: self.revision,
+            pixel_mask: self.dac_mask,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_read_resets_attribute_latch_and_dac_round_trips_all_components() {
+        let mut vga = super::Vga::default();
+        vga.write_port(0x3C0, 0x10);
+        vga.read_status(0x3DA);
+        vga.write_port(0x3C0, 0x11);
+        vga.write_port(0x3C0, 0x34);
+        assert_eq!(vga.read_port(0x3C1), Some(0x34));
+        for value in 0..64 {
+            vga.set_dac_index(255);
+            for component in [value, 0, 63] {
+                vga.write_dac(component);
+            }
+            vga.set_dac_read_index(255);
+            assert_eq!(vga.read_port(0x3C7), Some(0));
+            assert_eq!(vga.read_dac(), value);
+            assert_eq!(vga.read_dac(), 0);
+            assert_eq!(vga.read_dac(), 63);
+        }
+        vga.set_mode_13h();
+        vga.write_memory(0, 0xF1);
+        vga.write_port(0x3C6, 15);
+        let mut output = alloc::vec![0;super::WIDTH*super::HEIGHT*4];
+        vga.frame().unwrap().write_rgba(&mut output).unwrap();
+        assert_eq!(&output[..4], &vga.palette[1]);
+    }
+    #[test]
+    fn text_mode_restores_registers_bank_and_timing_without_replacing_vram() {
+        let mut vga = super::Vga::default();
+        let owner = vga.vram_view().as_ptr();
+        vga.set_vbe_101h(false);
+        assert!(vga.set_bank(3));
+        vga.write_memory(0, 42);
+        vga.advance_nanos(999999);
+        vga.write_port(0x3C2, 0);
+        let revision = vga.revision;
+        vga.set_mode_3h();
+        assert_eq!(vga.mode(), super::VideoMode::Text3);
+        assert_eq!(vga.bank(), 0);
+        assert_eq!(vga.pixel_clock_hz(), 28_322_000);
+        assert_eq!(vga.input_status_port(), 0x3DA);
+        assert_eq!(vga.read_port(0x3CC), Some(0x67));
+        assert_eq!(vga.raster_ticks, 0);
+        assert_eq!(vga.pending_nanos, 0);
+        assert!(vga.revision > revision);
+        assert!(vga.frame().is_none());
+        assert_eq!(vga.vram_view().as_ptr(), owner);
+        // Text backing is separate for now; the switch does not erase graphics VRAM.
+        assert_eq!(vga.vram_view()[3 * super::APERTURE_LEN], 42);
+        vga.set_mode_13h();
+        assert!(vga.frame().is_some());
+    }
+
     #[test]
     fn retrace_deadline_is_exact_with_fractional_pixels_and_mode_changes() {
         for mode in 0..3 {

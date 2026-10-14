@@ -1,0 +1,15 @@
+[package]
+name = "doslet-mt32"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+moont = { version = "=1.0.0", default-features = false }
+sha1 = { version = "0.10.6", default-features = false }
+doslet-midi-synth.workspace = true
+[dev-dependencies]
+allocation-counter = "0.8"
+doslet-mt32-gm.workspace = true
+[lints]
+workspace = true

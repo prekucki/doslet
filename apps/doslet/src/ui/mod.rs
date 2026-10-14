@@ -94,6 +94,25 @@ pub fn view(app: &Doslet) -> Element<'_, Message> {
     ]
     .spacing(12);
     let inspector = inspector
+        .push(text("GAME MIDI").size(11).color(MUTED))
+        .push(
+            iced::widget::pick_list(
+                &doslet_midi_routing::Mode::ALL[..],
+                Some(app.midi_mode),
+                Message::MidiModeSelected,
+            )
+            .width(Fill),
+        )
+        .push(text(app.midi_mode_label()).size(12).color(MUTED))
+        .push(text("HOST PORT DIALECT").size(11).color(MUTED))
+        .push(
+            iced::widget::pick_list(
+                &doslet_midi_routing::Mode::ALL[..],
+                Some(app.midi_output_mode),
+                Message::MidiOutputModeSelected,
+            )
+            .width(Fill),
+        )
         .push(text("MIDI OUTPUT").size(11).color(MUTED))
         .push(
             iced::widget::pick_list(
@@ -150,14 +169,32 @@ pub fn view(app: &Doslet) -> Element<'_, Message> {
     };
     let viewport: Element<'_, Message> = if let Some(handle) = &app.display.image {
         let handle = handle.clone();
+        let (pointer_width, pointer_height) = app.pointer_dimensions();
         responsive(move |size| {
             let width = size.width.min(size.height * 4.0 / 3.0);
             container(
-                image(handle.clone())
-                    .filter_method(image::FilterMethod::Nearest)
-                    .content_fit(iced::ContentFit::Fill)
-                    .width(width)
-                    .height(width * 3.0 / 4.0),
+                iced::widget::mouse_area(
+                    image(handle.clone())
+                        .filter_method(image::FilterMethod::Nearest)
+                        .content_fit(iced::ContentFit::Fill)
+                        .width(width)
+                        .height(width * 3.0 / 4.0),
+                )
+                .on_move(move |position| {
+                    Message::PointerMoved(
+                        (position.x / width * f32::from(pointer_width))
+                            .clamp(0.0, f32::from(pointer_width - 1))
+                            as u16,
+                        (position.y / (width * 3.0 / 4.0) * f32::from(pointer_height))
+                            .clamp(0.0, f32::from(pointer_height - 1))
+                            as u16,
+                    )
+                })
+                .on_press(Message::PointerButton(0, true))
+                .on_release(Message::PointerButton(0, false))
+                .on_right_press(Message::PointerButton(1, true))
+                .on_right_release(Message::PointerButton(1, false))
+                .on_exit(Message::PointerLeft),
             )
             .center_x(Fill)
             .center_y(Fill)
@@ -192,7 +229,7 @@ pub fn view(app: &Doslet) -> Element<'_, Message> {
             text(
                 app.session
                     .frame()
-                    .map_or("Waiting for graphics".into(), |frame| format!(
+                    .map_or("80 × 25 · text".into(), |frame| format!(
                         "{} × {} · 256 colors",
                         frame.width, frame.height
                     ))
@@ -201,6 +238,9 @@ pub fn view(app: &Doslet) -> Element<'_, Message> {
             .color(MUTED)
         ],
         viewport,
+        text("Keyboard: type into the game; arrows and Enter select menu items.")
+            .size(12)
+            .color(MUTED),
         controls,
     ]
     .spacing(16)

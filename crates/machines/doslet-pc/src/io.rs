@@ -18,6 +18,7 @@ pub struct PcBus {
     ram: Ram,
     pub vga: Vga,
     pub pic: Pic,
+    pub slave_pic: Pic,
     pub pit: Pit,
     pub mpu: Mpu401,
     pub dsp: doslet_sb_dsp::Dsp,
@@ -28,6 +29,7 @@ pub struct PcBus {
     a20: A20Gate,
     pub keyboard: Controller,
     pub cmos: Cmos,
+    system_control: u8,
 }
 impl Default for PcBus {
     fn default() -> Self {
@@ -35,6 +37,8 @@ impl Default for PcBus {
         pit.write_control(0x36).unwrap();
         pit.write_counter(0, 0).unwrap();
         pit.write_counter(0, 0).unwrap();
+        let mut slave_pic = Pic::new(0x70);
+        slave_pic.write_data(0xFF);
         Self {
             vga_status_read_generation: 0,
             observe_vga_status: true,
@@ -43,6 +47,7 @@ impl Default for PcBus {
             ram: Ram::default(),
             vga: Vga::default(),
             pic: Pic::default(),
+            slave_pic,
             pit,
             mpu: Mpu401::default(),
             dsp: doslet_sb_dsp::Dsp::default(),
@@ -53,10 +58,14 @@ impl Default for PcBus {
             keyboard: Controller::default(),
             a20: A20Gate::default(),
             cmos: Cmos::new(640, ((crate::memory::RAM_SIZE - 0x100000) / 1024) as u16),
+            system_control: 0,
         }
     }
 }
 impl PcBus {
+    pub fn text_revision(&self) -> u64 {
+        self.ram.text_revision()
+    }
     pub(crate) fn dma_sample(&mut self, channel: u8) -> Result<Option<u16>, crate::MachineError> {
         use doslet_i8237::Direction;
         let controller = usize::from(channel / 4);
@@ -258,6 +267,9 @@ impl MemoryBus for PcBus {
 }
 impl PortBus for PcBus {
     fn read_port_u8(&mut self, port: u16) -> Result<u8, BusError> {
+        if port == 0x61 {
+            return Ok(self.system_control);
+        }
         #[cfg(feature = "profiling")]
         {
             self.stats.port_reads += 1;
@@ -265,6 +277,8 @@ impl PortBus for PcBus {
             self.stats.pit_reads += u64::from((0x40..=0x42).contains(&port));
         }
         match port {
+            0x3C6..=0x3C8 => Ok(self.vga.read_port(port).unwrap()),
+            0x3C9 => Ok(self.vga.read_dac()),
             0..=0x0F => self.dma[0]
                 .read_register(port as u8)
                 .map_err(|_| BusError::UnmappedPort(port)),
@@ -296,7 +310,7 @@ impl PortBus for PcBus {
             0x3BA | 0x3DA => {
                 let value = self
                     .vga
-                    .read_port(port)
+                    .read_status(port)
                     .ok_or(BusError::UnmappedPort(port))?;
                 if self.observe_vga_status {
                     self.vga_status_read_generation =
@@ -304,9 +318,8 @@ impl PortBus for PcBus {
                 }
                 Ok(value)
             }
-            0x3B4 | 0x3B5 | 0x3D4 | 0x3D5 | 0x3C4 | 0x3C5 | 0x3CC | 0x3CE | 0x3CF => {
-                self.vga.read_port(port).ok_or(BusError::UnmappedPort(port))
-            }
+            0x3B4 | 0x3B5 | 0x3D4 | 0x3D5 | 0x3C0 | 0x3C1 | 0x3C4 | 0x3C5 | 0x3CC | 0x3CE
+            | 0x3CF => self.vga.read_port(port).ok_or(BusError::UnmappedPort(port)),
             0x70 => Ok(self.cmos.selected()),
             0x71 => Ok(self.cmos.read()),
             0x60 => Ok(self.keyboard.read_data()),
@@ -314,6 +327,8 @@ impl PortBus for PcBus {
             0x92 => Ok(if self.a20.enabled { 2 } else { 0 }),
             0x330 => Ok(self.mpu.read_data()),
             0x331 => Ok(self.mpu.status()),
+            0xA0 => Ok(self.slave_pic.read_command()),
+            0xA1 => Ok(self.slave_pic.read_data()),
             0x20 => Ok(self.pic.read_command()),
             0x21 => Ok(self.pic.read_data()),
             0x40..=0x42 => self
@@ -324,7 +339,15 @@ impl PortBus for PcBus {
         }
     }
     fn write_port_u8(&mut self, port: u16, value: u8) -> Result<(), BusError> {
+        if port == 0x61 {
+            self.system_control = value & 0x0F;
+            return Ok(());
+        }
         match port {
+            0x3C6 => {
+                self.vga.write_port(port, value);
+            }
+            0x3C7 => self.vga.set_dac_read_index(value),
             0..=0x0F => self.dma[0]
                 .write_register(port as u8, value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
@@ -345,7 +368,7 @@ impl PortBus for PcBus {
                 .write_command(value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
             0x600..=0x6FF | 0xA00..=0xAFF | 0xE00..=0xEFF => {} // Absent AWE probe banks.
-            0x3B4 | 0x3B5 | 0x3D4 | 0x3D5 | 0x3C2 | 0x3C4 | 0x3C5 | 0x3CE | 0x3CF => {
+            0x3B4 | 0x3B5 | 0x3D4 | 0x3D5 | 0x3C0 | 0x3C2 | 0x3C4 | 0x3C5 | 0x3CE | 0x3CF => {
                 if !self.vga.write_port(port, value) {
                     return Err(BusError::UnmappedPort(port));
                 }
@@ -382,6 +405,8 @@ impl PortBus for PcBus {
                 .mpu
                 .write_command(value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
+            0xA0 => self.slave_pic.write_command(value),
+            0xA1 => self.slave_pic.write_data(value),
             0x20 => self.pic.write_command(value),
             0x21 => self.pic.write_data(value),
             0x40..=0x42 => self
@@ -405,6 +430,27 @@ mod cache_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slave_pic_ports_keep_masks_and_initialization_independent_of_master() {
+        let mut bus = PcBus::default();
+        assert_eq!(bus.read_port_u8(0xA1), Ok(0xFF));
+        bus.write_port_u8(0x21, 0xFC).unwrap();
+        bus.write_port_u8(0xA1, 0x80).unwrap();
+        assert_eq!(bus.read_port_u8(0x21), Ok(0xFC));
+        assert_eq!(bus.read_port_u8(0xA1), Ok(0x80));
+        bus.write_port_u8(0xA0, 0x11).unwrap();
+        for byte in [0x70, 2, 1, 0xFB] {
+            bus.write_port_u8(0xA1, byte).unwrap();
+        }
+        assert_eq!(bus.read_port_u8(0xA1), Ok(0xFB));
+        bus.slave_pic.raise_edge(2);
+        assert_eq!(bus.slave_pic.acknowledge(), Some(0x72));
+        bus.write_port_u8(0xA0, 0x0B).unwrap();
+        assert_eq!(bus.read_port_u8(0xA0), Ok(4));
+        bus.write_port_u8(0xA0, 0x20).unwrap();
+        assert_eq!(bus.read_port_u8(0xA0), Ok(0));
+        assert!(!bus.pic.has_interrupt()); // Slave IRQ sources/cascade wiring remain pending.
+    }
     #[test]
     fn wide_memory_matches_byte_accesses_at_mapping_boundaries() {
         let mut wide = PcBus::default();

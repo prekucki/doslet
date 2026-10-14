@@ -8,6 +8,9 @@ pub(crate) struct Registers {
     graphics: [u8; 9],
     crtc_index: u8,
     crtc: [u8; 25],
+    attribute: [u8; 32],
+    attribute_index: u8,
+    attribute_data: bool,
 }
 impl Default for Registers {
     fn default() -> Self {
@@ -22,12 +25,32 @@ impl Default for Registers {
                 0x5F, 0x4F, 0x50, 0x82, 0x55, 0x81, 0xBF, 0x1F, 0, 0x4F, 0x0D, 0x0E, 0, 0, 0, 0,
                 0x9C, 0x8E, 0x8F, 0x28, 0x1F, 0x96, 0xB9, 0xA3, 0xFF,
             ],
+            attribute: [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0x0C, 0, 15, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            attribute_index: 0x20,
+            attribute_data: false,
         }
     }
 }
 impl Registers {
+    pub fn memory_config(&self) -> (u8, u8, u8, u16, u8, u8) {
+        (
+            self.sequencer[2],
+            self.sequencer[4],
+            self.graphics[5],
+            u16::from_be_bytes([self.crtc[12], self.crtc[13]]),
+            self.crtc[20],
+            self.crtc[23],
+        )
+    }
+    pub fn reset_attribute_latch(&mut self) {
+        self.attribute_data = false;
+    }
     pub fn mode_13h(&mut self) {
         self.misc = 0x63;
+        self.attribute[0x10] = 0x41;
         self.sequencer = [3, 1, 15, 0, 14];
         self.graphics = [0, 0, 0, 0, 0, 0x40, 5, 15, 0xFF];
         self.crtc = [
@@ -40,6 +63,8 @@ impl Registers {
     }
     pub fn read(&self, port: u16) -> Option<u8> {
         match port {
+            0x3C0 => Some(self.attribute_index),
+            0x3C1 => Some(self.attribute[usize::from(self.attribute_index & 31)]),
             0x3CC => Some(self.misc),
             0x3C4 => Some(self.sequencer_index),
             0x3CE => Some(self.graphics_index),
@@ -67,6 +92,14 @@ impl Registers {
     }
     pub fn write(&mut self, port: u16, value: u8) -> bool {
         match port {
+            0x3C0 => {
+                if self.attribute_data {
+                    self.attribute[usize::from(self.attribute_index & 31)] = value;
+                } else {
+                    self.attribute_index = value & 0x3F;
+                }
+                self.attribute_data = !self.attribute_data;
+            }
             0x3C2 => self.misc = value,
             0x3C4 => self.sequencer_index = value,
             0x3CE => self.graphics_index = value,

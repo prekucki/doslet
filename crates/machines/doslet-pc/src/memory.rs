@@ -42,6 +42,13 @@ impl Default for Ram {
     }
 }
 impl Ram {
+    pub(crate) fn text_revision(&self) -> u64 {
+        self.generations[0].wrapping_add(
+            self.generations[0xB8..0xC0]
+                .iter()
+                .fold(0u64, |sum, value| sum.wrapping_add(*value)),
+        )
+    }
     pub(crate) fn read(&self, address: u32) -> Result<u8, BusError> {
         self.bytes
             .get(address as usize)

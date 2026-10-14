@@ -32,6 +32,8 @@ export class Browser {
         }
     }
     command(kind, program) { this.send({kind, program}); }
+    keyEvent(scan, ascii, modifiers, pressed) { this.send({kind: 'key', scan, ascii, modifiers, pressed}); }
+    pointerEvent(x,y,button,pressed) { this.send({kind:'pointer',x,y,button,pressed}); }
     importZip(bytes) {
         // A setup transfer of compressed input. The worker then owns the source
         // and decompressed drive; no game data is retained in window state.
@@ -114,7 +116,7 @@ export class Browser {
         if (!this.midiLabels.size) throw new Error('No MIDI output ports. A system synthesizer must expose a MIDI port.');
         return [...this.midiLabels.keys()];
     }
-    selectMidi(selection) {
+    selectMidi(selection, dialect = 'gm') {
         if (selection === 'Rust synth') {
             // Resume remains synchronous with this user gesture, before await.
             return this.startRustAudio().then(() => {
@@ -124,9 +126,13 @@ export class Browser {
                 this.attachWorklet(); this.syncAudioState();
             });
         }
-        return this.selectHostMidi(selection);
+        return this.selectHostMidi(selection, dialect);
     }
-    async selectHostMidi(selection) {
+    async selectHostMidi(selection, dialect = 'gm') {
+        if (dialect === 'mt32') {
+            this.midiAccess = await navigator.requestMIDIAccess({sysex: true});
+            if (!this.midiAccess.sysexEnabled) throw new Error('MT-32 output requires Web MIDI SysEx permission');
+        }
         const id = this.midiLabels.get(selection);
         const output = this.midiAccess?.outputs.get(id);
         if (!output || output.state !== 'connected') throw new Error('MIDI output unavailable; refresh the output list');
@@ -137,9 +143,9 @@ export class Browser {
         if (this.gain) this.gain.gain.value = 0;
         const channel = new MessageChannel();
         this.hostMidi = new HostMidi(output, channel.port1,
-            error => this.events.push({kind: 'audio-error', error}));
+            error => this.events.push({kind: 'audio-error', error}), dialect === 'mt32');
         this.backend = selection; this.muted = false; this.connectedBackend = 'midi';
-        this.send({kind: 'connect', mode: 'midi', port: channel.port2}, [channel.port2]);
+        this.send({kind: 'connect', mode: 'midi', dialect, port: channel.port2}, [channel.port2]);
         this.syncAudioState();
     }
     async initializeAudio() {

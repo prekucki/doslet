@@ -1,5 +1,6 @@
 //! Window state contains snapshots and pixels, never an emulation Session.
 use crate::presentation::DisplayFrame;
+use doslet_midi_routing::Mode;
 use doslet_runtime::SessionStatus;
 use doslet_x86::{Gpr16, Registers};
 use iced::{Element, Subscription, Task, Theme};
@@ -13,6 +14,22 @@ extern "C" {
     fn new() -> Result<Browser, JsValue>;
     #[wasm_bindgen(method, catch)]
     fn command(this: &Browser, kind: &str, program: &str) -> Result<(), JsValue>;
+    #[wasm_bindgen(method, catch, js_name = keyEvent)]
+    fn key_event(
+        this: &Browser,
+        scan: u8,
+        ascii: u8,
+        modifiers: u8,
+        pressed: bool,
+    ) -> Result<(), JsValue>;
+    #[wasm_bindgen(method, catch, js_name = pointerEvent)]
+    fn pointer_event(
+        this: &Browser,
+        x: u16,
+        y: u16,
+        button: i8,
+        pressed: bool,
+    ) -> Result<(), JsValue>;
     #[wasm_bindgen(method, catch, js_name = importZip)]
     fn import_zip(this: &Browser, bytes: &[u8]) -> Result<(), JsValue>;
     #[wasm_bindgen(method)]
@@ -26,7 +43,11 @@ extern "C" {
     #[wasm_bindgen(method, catch, js_name = listMidi)]
     fn list_midi(this: &Browser) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(method, catch, js_name = selectMidi)]
-    fn select_midi(this: &Browser, selection: &str) -> Result<js_sys::Promise, JsValue>;
+    fn select_midi(
+        this: &Browser,
+        selection: &str,
+        dialect: &str,
+    ) -> Result<js_sys::Promise, JsValue>;
 }
 pub struct Graphics {
     pub width: usize,
@@ -69,6 +90,9 @@ pub struct Doslet {
     pub importing: bool,
     pub midi_choices: Vec<String>,
     pub midi_choice: String,
+    pub midi_mode: Mode,
+    pub midi_output_mode: Mode,
+    midi_summary: String,
     bridge: Option<Browser>,
     audio_state: String,
     audio_ready: bool,
@@ -81,6 +105,10 @@ pub struct Doslet {
 }
 #[derive(Clone, Debug)]
 pub enum Message {
+    PointerMoved(u16, u16),
+    PointerButton(u8, bool),
+    PointerLeft,
+    Keyboard(iced::keyboard::Event),
     RunPause,
     Step,
     Reset,
@@ -94,6 +122,8 @@ pub enum Message {
     RefreshMidi,
     MidiPorts(Result<Vec<String>, String>),
     MidiSelected(String),
+    MidiModeSelected(Mode),
+    MidiOutputModeSelected(Mode),
     MidiSwitched(String, Result<(), String>),
 }
 impl Doslet {
@@ -118,6 +148,9 @@ impl Doslet {
             importing: false,
             midi_choices: vec!["Rust synth".into()],
             midi_choice: "Rust synth".into(),
+            midi_mode: Mode::Gm,
+            midi_output_mode: Mode::Gm,
+            midi_summary: String::new(),
             bridge,
             audio_state: "inactive".into(),
             audio_ready: false,
@@ -137,7 +170,39 @@ impl Doslet {
         }
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if let Message::Keyboard(event) = &message {
+            if self.session.status() == SessionStatus::Running
+                && let Some(bridge) = &self.bridge
+            {
+                let (modifiers, key) = crate::keyboard::translate(event);
+                let (scan, ascii) = key.unwrap_or((0, 0));
+                if let Err(error) = bridge.key_event(scan, ascii, modifiers, key.is_some()) {
+                    self.notice = Some(format!("Keyboard: {error:?}"));
+                }
+            }
+            return Task::none();
+        }
         match message {
+            Message::PointerMoved(x, y) => {
+                if let Some(bridge) = &self.bridge
+                    && let Err(error) = bridge.pointer_event(x, y, -1, false)
+                {
+                    self.notice = Some(format!("Mouse: {error:?}"));
+                }
+            }
+            Message::PointerButton(button, pressed) => {
+                if let Some(bridge) = &self.bridge
+                    && let Err(error) = bridge.pointer_event(0, 0, button as i8, pressed)
+                {
+                    self.notice = Some(format!("Mouse: {error:?}"));
+                }
+            }
+            Message::PointerLeft => {
+                if let Some(bridge) = &self.bridge {
+                    let _ = bridge.pointer_event(0, 0, -2, false);
+                }
+            }
+            Message::Keyboard(_) => unreachable!("handled above"),
             Message::RefreshMidi => {
                 if let Some(bridge) = &self.bridge {
                     match bridge.list_midi() {
@@ -169,9 +234,21 @@ impl Doslet {
                 }
                 Err(error) => self.notice = Some(error),
             },
+            Message::MidiModeSelected(mode) => {
+                self.midi_mode = mode;
+                self.command("midi-mode", mode.as_str());
+            }
+            Message::MidiOutputModeSelected(mode) => {
+                self.midi_output_mode = mode;
+                // Reopen through the bridge so raw MT-32 requests SysEx access.
+                self.command("output-mode", mode.as_str());
+                if self.midi_choice != "Rust synth" {
+                    return self.update(Message::MidiSelected(self.midi_choice.clone()));
+                }
+            }
             Message::MidiSelected(selection) => {
                 if let Some(bridge) = &self.bridge {
-                    match bridge.select_midi(&selection) {
+                    match bridge.select_midi(&selection, self.midi_output_mode.as_str()) {
                         Ok(promise) => {
                             return Task::perform(
                                 async move {
@@ -358,6 +435,28 @@ impl Doslet {
             });
             bridge.release_frame();
         }
+        let state = field(&packet, "state");
+        if let Some(mode) = field(&state, "midiMode").as_string() {
+            self.midi_mode = if mode == "mt32" { Mode::Mt32 } else { Mode::Gm };
+        }
+        self.midi_summary = format!(
+            "{} · {} SysEx · {} unmapped notes · {}{}",
+            if self.midi_mode == Mode::Mt32
+                && (self.midi_choice == "Rust synth" || self.midi_output_mode == Mode::Gm)
+            {
+                "MT-32 → GM (przybliżenie)"
+            } else {
+                ""
+            },
+            number(&state, "midiSysex") as u64,
+            number(&state, "midiUnmapped") as u64,
+            field(&state, "midiDisplay").as_string().unwrap_or_default(),
+            if field(&state, "midiUpgraded").as_bool().unwrap_or(false) {
+                " · Roland detected: upgraded to MT-32"
+            } else {
+                ""
+            }
+        );
         let audio = field(&packet, "audio");
         self.audio_state = field(&audio, "state").as_string().unwrap_or_default();
         self.audio_ready = field(&audio, "ready").as_bool().unwrap_or(false);
@@ -367,6 +466,9 @@ impl Doslet {
         self.peak = number(&audio, "peak");
         self.underruns = number(&audio, "underruns") as u64;
         self.host_messages = number(&audio, "messages") as u64;
+    }
+    pub fn midi_mode_label(&self) -> String {
+        self.midi_summary.clone()
     }
     pub fn audio_label(&self) -> String {
         if self.midi_choice != "Rust synth" {
@@ -401,10 +503,35 @@ impl Doslet {
     pub fn theme(&self) -> Theme {
         crate::ui::theme()
     }
+    pub fn pointer_dimensions(&self) -> (u16, u16) {
+        (
+            640,
+            if self
+                .session
+                .frame()
+                .is_some_and(|frame| frame.height == 480)
+            {
+                480
+            } else {
+                200
+            },
+        )
+    }
     pub fn subscription(&self) -> Subscription<Message> {
         // Poll bounded presentation snapshots even while paused/importing. The
         // timer neither runs the CPU nor determines audio/device timing.
-        iced::time::every(web_time::Duration::from_millis(16)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(web_time::Duration::from_millis(16)).map(|_| Message::Tick),
+            iced::event::listen_with(|event, status, _| {
+                if status == iced::event::Status::Ignored
+                    && let iced::Event::Keyboard(event) = event
+                {
+                    Some(Message::Keyboard(event))
+                } else {
+                    None
+                }
+            }),
+        ])
     }
 }
 fn field(value: &JsValue, key: &str) -> JsValue {

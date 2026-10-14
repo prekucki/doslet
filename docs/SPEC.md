@@ -37,6 +37,21 @@ The foundation and chip libraries use `no_std`. Fixed state needs no allocator;
 buffer-owning libraries may use `alloc`. The current crate graph is documented
 in [architecture.md](architecture.md).
 
+## Native launch profiles
+
+Native `--config FILE.toml` loads a version-1 launch profile. Built-in defaults
+are overridden by profile settings, then explicit CLI options; absent CLI MIDI
+modes must not overwrite profile modes. Profile paths resolve relative to the
+TOML file; CLI paths retain shell-relative semantics. Validate unknown fields,
+types, version, source files and audio requirements before loading the session.
+The supported profile scope is game name/executable, printable ASCII arguments
+(126-byte PSP command tail), absolute DOS working directory on C:, audio/MIDI,
+and an optional single directory mounted as C: with a sparse-write policy.
+Launch setup and Reset preserve the same resolved settings. TOML is a native
+frontend dependency; runtime setup receives byte slices and no host paths.
+Multiple drives, CD-ROM mounts/MSCDEX, browser profile selection and persistent
+host saves remain pending. See [launch-profiles.md](launch-profiles.md).
+
 ## Memory and performance requirements
 
 - CPU execution must not allocate per instruction or execution step.
@@ -71,7 +86,9 @@ DS/SS defaults and segment overrides. Its selected real-mode instruction scope
 includes byte/word MOV and ALU groups, segment MOV, LEA/LES/LDS, TEST/XCHG,
 INC/DEC, stack operations, accumulator moffs, shifts/rotates, CBW/CWD,
 MUL/IMUL/DIV/IDIV, near/far calls and returns, Jcc/LOOP/JMP, INT/IRET, byte
-IN/OUT and basic flag controls. Wide word/dword IN/OUT forms preserve register
+IN/OUT, XLAT with segment/address overrides, DAA/DAS and basic flag controls.
+INS/OUTS support byte/word/dword widths, address/segment overrides and one
+element per REP step. Wide word/dword IN/OUT forms preserve register
 aliases and use overridable bus operations that default to adjacent byte ports.
 MOVS, CMPS, STOS, LODS and SCAS support byte/word
 width and bounded REP/REPE/REPNE, yielding after one element. General registers
@@ -101,11 +118,18 @@ explicitly rather than delivering INT 0.
 an independent fixed-stack `doslet-x87` unit and clears EM. The default PC uses
 that unit and reports it through CMOS equipment bits. Supported x87 forms are
 control/status initialization and transfer, FLD1/FLDZ, register duplication and
-sign change, selected m32/m64 loads/stores, FCOMPP and FDIVP/FDIVRP for exact
-finite results or masked zero/invalid results. Inexact division and m32 stores,
-nonfinite memory loads, unmasked exceptions and other instruction forms stop
-explicitly. Full 80-bit arithmetic, rounding, exception delivery and the remaining
-instruction families are pending; the current values use binary64 storage.
+sign change, FXCH ST(i), selected m32/m64 loads/stores, FCOMPP, finite-memory
+FCOMP, register FDIV/FDIVR/FDIVP/FDIVRP and finite FMULP/FSUBP/FSUBRP.
+Finite arithmetic retains a normalized 64-bit significand using integer
+intermediates, applies the control word's 24/53/64-bit precision and four rounding
+modes, and reports precision exceptions and C1. Division also supports masked
+zero/invalid results. Normal arithmetic results currently support exponents
+from -1022 through 1022; extended exponent range, subnormal arithmetic results,
+inexact memory stores, nonfinite memory loads, unmasked exceptions and other
+forms stop explicitly. The binary64 register view is diagnostic; it does not
+replace the retained arithmetic significand. Full 80-bit formats and exception
+delivery remain pending. Captured native x87 reference vectors cover 360
+division/multiplication/subtraction cases, including the Pentium FDIV probe.
 
 CPU segment translation produces an unmasked linear address; machine A20 wiring
 controls address bit 20. The default PC has 16 MiB of RAM, with A20 initially
@@ -210,9 +234,22 @@ permits read/write opens and writes to existing guest files without changing
 input buffers or host files. The headless stub runner reserves 1 MiB and 64
 write extents during setup. Merged reads borrow base/patch storage; exhaustion
 returns DOS error 8. Zero-length writes truncate/extend, including zero-filled
-gaps. New-file creation, persistence and modified-executable loading are pending.
-Each file read is bounded
-by DOS CX (at most 65535 bytes), and console writes by remaining fixed capacity.
+gaps. Create/truncate reserves up to 64 new file records during overlay setup;
+guest creation, reads and writes do not allocate. FCB find-first/find-next searches
+ordinary current-directory 8.3 files, including created files, and publishes
+directory-result fields in the DTA. Handle-based INT 21h/4Eh and 4Fh searches
+support case-insensitive 8.3 masks, C: paths, current directories, ordinary
+files and inferred subdirectories. Their 21-byte DTA prefix contains the search
+context, so independent/copied DTAs continue independently of later directory
+changes. Results include attributes, deterministic time/date, current overlay
+length and a NUL-terminated name; errors set CF with DOS codes 2, 3 or 18.
+Search execution allocates nothing. Volume labels and long-name aliases are
+not provided. Persistence and modified-executable loading
+are pending. Each file read is bounded by DOS CX (at most 65535 bytes).
+Console output uses a fixed diagnostic tail.
+The conventional-memory arena owns 1024 fixed block descriptors. PRINCE's
+233 small DOS buffers exceeded the former 64-descriptor limit despite remaining
+free memory; the larger bounded table preserves allocation-free DOS calls.
 No host filesystem call or per-step allocation occurs in the DOS service path.
 ASCII FCB parsing is bounded to 255 input bytes and supports 8.3 wildcards.
 Only C: is available; AH=0Eh supports selecting it. Directory names are inferred
@@ -220,28 +257,53 @@ from mounted file paths, with a fixed 63-byte current-directory limit. Relative
 file/attribute/overlay paths use that state; absolute paths start at the root.
 Default-drive, break-check flag, InDOS/critical-error flag pointers, DTA, vector
 get/set, DOS-version, US country information with an
-ASCII far-call uppercase callback and device-info services implement
-selected observed startup calls. Directory enumeration, write overlays, a full
-DOS ABI and non-ASCII name/code-page handling remain pending.
+ASCII far-call uppercase callback, deterministic date/time, handle timestamp
+queries and device-info services implement selected observed startup calls.
+Handle-based directory enumeration, a full DOS ABI and non-ASCII name/code-page
+handling remain pending.
 
 BIOS extended-memory queries match installed RAM, and A20 enable/disable/query
 services reflect the actual gate. Other unavailable INT 15h functions return
 AH=86h/CF=1. DPMI, XMS and VCPI installation probes report absence through their
 defined status registers; no external host is installed. Their explicit IVT
 shims prevent startup from running uninitialized RAM through a null vector.
+The MSCDEX installation probe (INT 2Fh/AX=1500h) returns BX=CX=0: no CD-ROM
+drives are installed. CD-ROM mounting and remaining MSCDEX services are pending.
 
 BIOS/DOS HLE services are installed at explicit F000h shim addresses. A guest
 INT must follow its current IVT vector, including vectors replaced by guest code.
 Only arrival at an unchanged installed IRET shim invokes the host service.
-An installed IRQ0 shim updates BDA ticks/daily rollover, invokes the current
+An installed IRQ0 shim updates BDA ticks/daily rollover and decrements the BIOS
+floppy-motor timeout (also used by CIV for delays), invokes the current
 INT 1Ch user hook and sends PIC EOI through guest instructions while preserving
 AX. Modified shims execute as guest code. INT 10h/AH=0Fh
-reports the default text or mode-13h configuration. Text rendering is pending.
+reports the default text or mode-13h configuration.
+INT 10h/AX=0003h restores the selected 80x25 text configuration, initializes
+mode/geometry/page/cursor fields in the BDA and clears eight B800h text pages
+to spaces with attribute 07h. AX=0083h preserves those text bytes while resetting
+the configuration. B800h currently uses ordinary PC RAM; presentation borrows
+that RAM and expands CP437 glyphs directly into caller RGBA storage at 720x400,
+with attributes, blink and cursor. Full VGA text-memory mapping remains pending.
+INT 10h/AH=01h/05h sets cursor shape/active page; AH=06h/07h scrolls/clears a text
+window; AH=08h/09h/0Ah reads/writes cells and AH=0Eh performs text teletype output.
+INT 10h/AH=02h/03h
+sets/queries the BDA cursor position for pages 0-7; setting the active text page's
+cursor also updates the VGA CRTC cursor address. The query returns the BDA cursor
+shape in CX. Invalid pages remain explicitly unsupported. Palette services
+AX=1010h/1012h/1015h/1017h set/query single or bounded blocks of six-bit DAC colors.
+INT 16h/AH=00h/01h/02h/05h/10h/11h uses a guest-visible 15-key BIOS ring.
+INT 21h/AH=01h/06h/07h/08h/0Bh/0Ch consumes/queries/flushes the same input, with
+DOS extended keys returning zero then scan code. Empty blocking reads yield in
+guest STI/HLT retry loops, preserving timer IRQs and bounded host execution.
+Native iced and browser Worker adapters inject BIOS keys and aggregate modifiers;
+raw AT make/break protocol and IRQ1 keyboard delivery remain pending.
 Implemented BIOS/termination services also include INT 10h/AX=0013h, INT 20h and
 INT 21h/AH=4Ch, alongside the DOS services above and bounded AH=09h string
-output. DOS carry results update the saved interrupt frame so IRET restores
-them correctly. The console reserves 4096 bytes during setup and
-reports capacity exhaustion rather than reallocating during execution.
+output plus AH=02h single-character output, including tab expansion. DOS carry
+and keyboard zero results update the saved interrupt frame so IRET restores
+them correctly. The console reserves 4096 bytes during setup and discards its
+older half when full; `console_truncated()` reports lost diagnostic history.
+Output continues to the guest text screen without reallocating.
 
 DOS filesystem implementation must separate names/handles from the host mount.
 The game directory should be a read-only input mount, with saves and other writes
@@ -252,14 +314,14 @@ bootstrap inspector.
 
 | Device | Implemented foundation | Required follow-up |
 | --- | --- | --- |
-| i8259 | Single edge-triggered PIC, fixed priority, interrupt mask and EOI | Cascading, full ICW/OCW behavior, auto-EOI and rotating/level modes |
+| i8259 | Master interrupt delivery plus independent slave register bank at A0h/A1h; fixed priority, masks, initialization and EOI | Cascading, full ICW/OCW behavior, auto-EOI and rotating/level modes |
 | i8237 | Independent four-channel register/transfer state; two PC controllers, page registers, byte/word RAM transfers, counts, masks and auto-init | Full arbitration/cascade timing, memory-to-memory and MMIO transfers |
 | i8254 | Binary modes 2/3, count latch, low/high accesses, batched clocks and IRQ0 through the functional timeline | Modes 0/1/4/5, gates, read-back, BCD and exact load-edge timing |
 | VGA | Linear A0000h aperture, mode-13h pixels, six-bit palette writes, miscellaneous/sequencer/graphics/CRTC configuration readback | Text/planar modes, register effects on rendering/memory, raster events and vendor SVGA extensions |
 | VBE | 512 KiB VRAM, banked 640×480×8 mode 101h, borrowed scanout; BIOS 4F00/01/02/03/05 and far-call bank switch | More modes, LFB/PM interface, scanline/display-start controls and timing |
 | MPU-401 | UART command/status/acknowledgements, 1024-byte output queue and allocation-free drain at 330h/331h | Synthesizer/host audio, serial timing, IRQs and intelligent mode |
 | SB16 DSP / CT1745 | Control probes, rates/mixer state, selected 8/16-bit mono/stereo playback through DMA, auto-init/pause/resume, bounded stereo PCM queue and block IRQ acknowledgements | ADC/legacy/ADPCM commands, busy/reset timing, cascaded IRQ routing and applying mixer gain to audio |
-| i8042 | Command/status/data registers, bounded controller replies, command byte, interface/self-test, output-port/A20 commands | Guest keystrokes, keyboard protocol, mouse/auxiliary channel, timing and IRQs |
+| i8042 | Controller commands/A20 and bounded keyboard ACK replies; LED, typematic, scan-set query/select, ID, enable/defaults, echo, resend and reset/self-test | Raw guest keystrokes and scancode translation, typematic timing, mouse/auxiliary channel and IRQs |
 | MC146818 | CMOS register bank and installed-memory fields at 70h/71h; initial BCD date/time | RTC ticking, clock-format conversion, alarms, periodic IRQs and persistence |
 
 Only the first sixteen bootstrap palette entries are EGA colors; the remaining
@@ -314,7 +376,12 @@ Import limits are 64 MiB compressed, 4096 entries, 64 MiB per file and 256 MiB
 expanded. Invalid/duplicate DOS paths, symbolic links, encrypted files and
 unsupported compression are rejected explicitly. Reset targets the running
 program, independently of subsequent import/selection changes. Page reload loses
-the mount and RAM writes. Guest keyboard/mouse mapping is pending.
+the mount and RAM writes. BIOS/DOS keyboard mapping and DOS mouse input are available. The selected
+INT 33h driver supports reset, visibility, position, button histories, ranges,
+graphic cursor masks, motion counters and event callbacks (000Ch/0014h).
+Callbacks execute guest far-call code through a bounded interrupt wrapper,
+preserving full general registers, segment registers and FLAGS. Raw PS/2
+mouse-controller protocol and IRQ timing remain pending.
 
 Browser presentation uses iced's tiny-skia renderer with Canvas2D. A small
 separate Rust/WASM AudioWorklet module pulls samples from a fixed 16384-byte
@@ -335,8 +402,15 @@ Rust synth sound and graphics in Firefox and Chrome.
 Optional host MIDI bypasses internal synthesis: native midir ports and browser
 Web MIDI outputs. Discovery/permission is explicit. The default stays Rust synth.
 Running status and partial messages are framed before sending; native SysEx is
-bounded to 1024 bytes and browser SysEx permission is not requested. Basic channel
-state, held/sustained notes and the partial wire prefix are replayed on output
+bounded to 1024 bytes. Browser GM ports do not request SysEx permission;
+marking a port as MT-32 explicitly requests it. Game dialect and output dialect
+are separate choices. GM remains the default; Roland MT-32 SysEx upgrades the
+game mode automatically and is reported in the inspector. MT-32 to GM outputs
+use the ROM-free approximation; raw MT-32 outputs preserve SysEx. Native moont
+supports GM through GmDevice, with CM-32L instruments and eight melodic parts.
+GM to external MT-32 ports remains unsupported. Output transitions replay RPN 0,
+channel state, held/sustained notes, and for raw MT-32, bounded DT1 packets only
+for guest-written state. The router owns the partial wire message across output
 transitions; exact voice envelopes/effects are not restored. Browser ports with
 clear() use timestamped output, while ports lacking it use a bounded cancelable
 window timer queue. Native output has a dedicated thread that owns the midir
@@ -350,6 +424,17 @@ visible independently of the host synth's own buffering. Failures pause the
 machine and report once; selecting a working output permits Run without
 resetting guest RAM. Sound Blaster PCM mixing and internal GM/MT-32 fidelity
 remain pending.
+
+The ROM-free MT-32-to-GM translator library accepts Roland DT1 SysEx (device
+10h and channel-addressed 00h–0Fh, checksum-validated), the all-parameters
+reset, part channel assignment, patch/timbre/rhythm memory, master volume,
+reverb level and display text. Notes follow MT-32 part routing, key shift and
+reversed panning; bender range, including RPN 0, becomes GM RPN 0. Rhythm keys
+35–75 use the GM kit; CM-32L sound-effect keys, aftertouch, partial reserve,
+reverb character, RQ1 requests and per-key rhythm level/pan are not translated.
+GM choices are Doslet's own; an opt-in local CM-32L ROM test compares preset
+order, power-on programs and rhythm layout with its tables without copying ROM
+data. Native and browser applications select translation by game and output dialect.
 
 The `web` Cargo profile uses LLVM opt-level 3, thin LTO and one codegen unit.
 Release Trunk builds additionally run wasm-opt -O3. These are speed-oriented

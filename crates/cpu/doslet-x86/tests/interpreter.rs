@@ -50,6 +50,132 @@ impl PortBus for TestBus {
 }
 
 #[test]
+fn repeated_port_strings_yield_wrap_word_offsets_and_preserve_flags() {
+    let mut bus = TestBus::new(&[0xF3, 0x6E]);
+    let mut cpu = Cpu::default();
+    cpu.registers.ds = 0x1000;
+    cpu.registers.set32(Gpr32::Esi, 0xABCD_FFFF);
+    cpu.registers.set32(Gpr32::Ecx, 0x1234_0002);
+    cpu.registers.set(Gpr16::Dx, 0x10);
+    bus.ram[0x1FFFF] = 0x12;
+    bus.ram[0x10000] = 0x34;
+    let flags = cpu.flags;
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(bus.ports[0x10], 0x12);
+    assert_eq!(cpu.registers.get32(Gpr32::Esi), 0xABCD_0000);
+    assert_eq!(cpu.registers.ip, 0);
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(bus.ports[0x10], 0x34);
+    assert_eq!(cpu.registers.get32(Gpr32::Ecx), 0x1234_0000);
+    assert_eq!(cpu.registers.ip, 2);
+    assert_eq!(cpu.flags, flags);
+    cpu.registers.ip = 0;
+    cpu.registers.set(Gpr16::Dx, 0xFFFF); // Zero REP count avoids invalid port access.
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(cpu.registers.ip, 2);
+}
+
+#[test]
+fn port_strings_support_word_dword_input_output_and_direction() {
+    let mut bus = TestBus::new(&[0x6D, 0x66, 0x6F]);
+    let mut cpu = Cpu::default();
+    cpu.registers.es = 0x1000;
+    cpu.registers.ds = 0x1000;
+    cpu.registers.set(Gpr16::Di, 0x100);
+    cpu.registers.set(Gpr16::Si, 0x100);
+    cpu.registers.set(Gpr16::Dx, 0x10);
+    cpu.flags |= flags::DIRECTION;
+    bus.ports[0x10] = 0x12;
+    bus.ports[0x11] = 0x34;
+    bus.ram[0x10102] = 0x56;
+    bus.ram[0x10103] = 0x78;
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(&bus.ram[0x10100..0x10102], &[0x12, 0x34]);
+    assert_eq!(cpu.registers.get(Gpr16::Di), 0xFE);
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(&bus.ports[0x10..0x14], &[0x12, 0x34, 0x56, 0x78]);
+    assert_eq!(cpu.registers.get(Gpr16::Si), 0xFC);
+}
+
+#[test]
+fn decimal_adjust_matches_all_two_digit_bcd_sums_and_differences() {
+    let mut bus = TestBus::new(&[0x00, 0xD8, 0x27, 0x28, 0xD8, 0x2F]); // ADD/SUB AL,BL; DAA/DAS.
+    let mut cpu = Cpu::default();
+    for subtract in [false, true] {
+        for left in 0u32..100 {
+            for right in 0u32..100 {
+                let bcd = |n: u32| ((n / 10) << 4) | (n % 10);
+                cpu.registers.ip = if subtract { 3 } else { 0 };
+                cpu.registers.set32(Gpr32::Eax, 0x1234_AB00 | bcd(left));
+                cpu.registers.set32(Gpr32::Ebx, bcd(right));
+                cpu.flags = 2 | flags::INTERRUPT | flags::DIRECTION;
+                cpu.step(&mut bus).unwrap();
+                let overflow = cpu.flags & flags::OVERFLOW;
+                cpu.step(&mut bus).unwrap();
+                let result = if subtract {
+                    (left + 100 - right) % 100
+                } else {
+                    (left + right) % 100
+                };
+                assert_eq!(cpu.registers.get32(Gpr32::Eax), 0x1234_AB00 | bcd(result));
+                assert_eq!(
+                    cpu.flags & flags::CARRY != 0,
+                    if subtract {
+                        left < right
+                    } else {
+                        left + right >= 100
+                    }
+                );
+                assert_eq!(cpu.flags & flags::ZERO != 0, result == 0);
+                assert_eq!(cpu.flags & flags::SIGN != 0, bcd(result) & 128 != 0);
+                assert_eq!(
+                    cpu.flags & flags::PARITY != 0,
+                    (bcd(result) as u8).count_ones().is_multiple_of(2)
+                );
+                assert_eq!(cpu.flags & flags::OVERFLOW, overflow); // Undefined OF is retained.
+                assert_eq!(
+                    cpu.flags & (flags::INTERRUPT | flags::DIRECTION),
+                    flags::INTERRUPT | flags::DIRECTION
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn xlat_uses_unsigned_al_address_width_and_segment_override_without_changing_flags() {
+    for (code, base, expected_address) in [
+        (&[0xD7][..], 0xABCD_FFF0, 0xDE),        // BX+AL wraps to 16 bits.
+        (&[0x66, 0xD7][..], 0xABCD_FFF0, 0xDE),  // Operand size has no effect.
+        (&[0x67, 0xD7][..], 0xFFFF_FFF0, 0xDE),  // 32-bit address wrap.
+        (&[0x26, 0xD7][..], 0xABCD_FFF0, 0xDE),  // ES override.
+        (&[0x64, 0x67, 0xD7][..], 0x100, 0x1EE), // FS + address override.
+    ] {
+        let mut bus = TestBus::new(code);
+        let mut cpu = Cpu::default();
+        cpu.registers.ds = 0x1000;
+        cpu.registers.es = 0x2000;
+        cpu.registers.fs = 0x3000;
+        cpu.registers.set32(Gpr32::Eax, 0x1234_ABEE);
+        cpu.registers.set32(Gpr32::Ebx, base);
+        cpu.flags |= flags::CARRY | flags::ZERO | flags::DIRECTION | flags::OVERFLOW;
+        let before = cpu.flags;
+        let segment = match code[0] {
+            0x26 => 0x20000,
+            0x64 => 0x30000,
+            _ => 0x10000,
+        };
+        bus.ram[segment + expected_address] = 0x57;
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.registers.get32(Gpr32::Eax), 0x1234_AB57);
+        assert_eq!(cpu.registers.get32(Gpr32::Ebx), base);
+        assert_eq!(cpu.flags, before);
+        assert_eq!(cpu.registers.ip, code.len() as u32);
+        assert_eq!(bus.writes, 0);
+    }
+}
+
+#[test]
 fn word_and_dword_port_accesses_preserve_aliases_width_and_flags() {
     let mut bus = TestBus::new(&[
         0x66, 0xB8, 0xD4, 0xC3, 0xB2, 0xA1, 0x66, 0xE7, 0x10, 0xB8, 0, 0, 0xE5, 0x10, 0xBA, 0x10,
@@ -603,6 +729,24 @@ fn an_absent_or_task_switched_x87_fails_instead_of_silently_initializing() {
         cpu.step(&mut bus),
         Err(doslet_x86::CpuError::X87Unavailable { .. })
     ));
+}
+
+#[test]
+fn x87_exchange_decodes_each_stack_register_without_changing_top() {
+    for index in 0..8 {
+        let mut bus = TestBus::new(&[0xD9, 0xC8 + index]);
+        let mut cpu = Cpu::default().with_x87();
+        let fpu = cpu.fpu.as_mut().unwrap();
+        for value in 0..8 {
+            fpu.push(f64::from(value)).unwrap();
+        }
+        let status = fpu.status();
+        cpu.step(&mut bus).unwrap();
+        let fpu = cpu.fpu.as_ref().unwrap();
+        assert_eq!(fpu.st0(), Ok(f64::from(7 - index)));
+        assert_eq!(fpu.st(index), Ok(7.0));
+        assert_eq!(fpu.status(), status);
+    }
 }
 
 #[test]

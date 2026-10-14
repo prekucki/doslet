@@ -50,10 +50,10 @@ cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE
 
 The game starts automatically. Its containing directory is preloaded as C:;
 guest writes use an in-memory overlay and do not modify your installation.
-Keep the executable alongside its original DOS4GW and data files. Startup begins
-with a blank display while the DOS text-mode renderer is pending; the recorded
-HDI logo appears around 7.3 seconds of emulated time. Host speed may affect how
-long startup takes. Keyboard/mouse input and playable sessions are still pending.
+Keep the executable alongside its original DOS4GW and data files. DOS text
+screens now render during startup; the recorded PRINCE HDI logo appears around
+7.3 seconds of emulated time. Host speed may affect how long startup takes.
+BIOS/DOS keyboard input is available. DOS mouse input includes position, buttons, ranges, a graphics cursor and guest callbacks.
 
 MIDI from the guest is rendered by a basic procedural synthesizer and sent to the
 default audio device. This is not a sample-based GM or Roland MT-32 synthesizer;
@@ -64,6 +64,72 @@ can be opened, a message appears and graphics continue. To disable audio:
 cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE --no-audio
 cargo run -p doslet --release --locked -- --help
 ```
+
+### Civilization and MT-32-family audio
+
+Launch your own installation of Civilization 474.03:
+
+```sh
+cargo run -p doslet --release --locked -- --game games/CIV.EXE --midi-mode mt32 --mt32-rom-dir /path/to/roms
+```
+
+Select **1 — VGA**, **5 — Roland MT-32 MIDI board**, and **1 — Mouse and Keyboard** (or **2 — Keyboard only**)
+in the game's startup prompts. Type into the game window; BIOS scan codes and
+ASCII characters support letters, digits, arrows, Enter, Escape, modifiers and
+F1–F10. Keyboard events captured by application controls stay with those controls.
+
+**GAME MIDI** chooses the game's MIDI dialect; **MIDI OUTPUT** chooses the
+renderer or host port. The default game mode is GM. Roland MT-32 SysEx
+automatically upgrades it to MT-32 and shows that change in the inspector.
+Rust synth and GM host ports use **MT-32 → GM (przybliżenie)** translation in
+MT-32 mode. This approximation needs no ROMs and does not reproduce LA synthesis.
+The inspector also shows SysEx counts, unmapped notes and the module's LCD text.
+For example, ROM-free CIV audio uses:
+
+```sh
+cargo run -p doslet --release --locked -- --game games/CIV.EXE --midi-mode mt32 --midi-output rust
+```
+
+Mark a real MT-32 or Munt port using **HOST PORT DIALECT → MT-32**, or the CLI
+`--midi-mode mt32 --midi-output PORT --midi-output-mode mt32`. These outputs
+receive the original SysEx. GM input to an MT-32 host port is unsupported.
+With a ROM directory, the default native output is moont; `--midi-output rust`
+or a port explicitly selects another output. The ROM path remains available
+when switching back to moont. In GM mode, moont uses GmDevice: CM-32L instruments
+and eight melodic parts, rather than a complete General MIDI sound bank.
+
+The ROM directory must contain `CM32L_CONTROL.ROM` (v1.02) and
+`CM32L_PCM.ROM`. Doslet validates their SHA-1 fingerprints and loads them at
+startup; ROMs are never embedded or distributed. The optional `no_std` Rust
+[moont engine](https://crates.io/crates/moont/1.0.0) emulates CM-32L, an MT-32
+family module. It processes the game's custom instrument SysEx and renders
+32-kHz stereo, resampled to the output device. MT-32 Control ROM variants and
+the module's LCD are not emulated by this backend. `--mt32-rom-dir` currently
+selects native audio; browser ROM selection is pending.
+
+The recorded local run reaches a new Roman game with its first Settler.
+Another real run processes 11 startup SysEx messages and 23 note events,
+producing nonzero PCM. These are bounded compatibility observations, not a
+completed campaign or an audio-device listening test. See
+[CIV evidence](docs/compatibility/civ.md) for commands and limits.
+
+[HEROES startup evidence](docs/compatibility/heroes.md) records the x87 fixes
+and the remaining CD-ROM requirement. [TOML launch profiles](docs/launch-profiles.md)
+store native game/audio/MIDI settings, DOS arguments and a C: directory mount.
+CLI options override profile settings:
+
+```sh
+target/release/doslet --config games/CIV.toml
+target/release/doslet --config games/PRINCE.toml --no-audio
+target/release/doslet --config games/HoMnM.toml
+```
+
+The local profiles live in ignored `games/`. HoMnM still requires CD-ROM mounting
+and MSCDEX support; its known `homm1.gog` ISO image is recorded in the profile.
+
+Guest-created files use the reserved RAM overlay. They can be reopened during
+the session; Reset or exit discards them. Persistent host saves remain pending.
+`--no-audio` retains a silent path; choose **1 — No sounds please** in CIV.
 
 To use an external or system MIDI synthesizer, click **Find MIDI outputs** in
 the UI and select its port under **MIDI OUTPUT**. **Rust synth** restores the
@@ -143,8 +209,8 @@ Unsupported compression and corrupt data produce an error.
 
 Reset recreates the running game's drive from the original ZIP. Guest writes
 use a separate 1-MiB RAM overlay and are lost on reset or page reload; creating
-new save files and persistent storage remain pending. Keyboard/mouse mapping
-remains pending. **Start game** creates and resumes Web Audio for the actual
+new files are supported in that overlay. Persistent storage remains pending.
+BIOS/DOS keyboard input and DOS mouse-driver input are mapped from the UI. **Start game** creates and resumes Web Audio for the actual
 guest MIDI stream. If the browser keeps audio suspended, click **Enable audio**;
 the same button offers **Mute** / **Unmute** once audio is running. The inspector
 reports context state, note events, peak, rendered audio frames and underruns.
@@ -160,14 +226,16 @@ Browser **Find MIDI outputs** explicitly requests Web MIDI access. Choose a
 port connected to a running system/software or hardware synthesizer; Web Audio
 and Web MIDI do not supply a system GM synthesizer. Unsupported API, denied
 permission and absent/disconnected ports are reported without removing the
-built-in option. SysEx permission is not requested; SysEx stops this browser
-output explicitly. Running status and messages split between batches are
+built-in option. GM ports receive translated channel messages without SysEx.
+Selecting an MT-32 port explicitly requests Web MIDI SysEx permission; denied
+permission is reported. SysEx messages are bounded to 1024 bytes. Running status and messages split between batches are
 assembled before sending. Ports with `clear()` use timestamped native scheduling;
 other ports use an owned, bounded timer queue so pause/reset can cancel pending
 messages. This fallback relies on window timers, unlike the Rust worklet.
 Selecting a working output after a host fault allows Run without resetting the
-machine. Switching replays basic channel state and held/sustained notes; voice
-envelopes, effect state and SysEx configuration are not reconstructed.
+machine. Switching replays channel state, RPN 0 and held/sustained notes. Raw MT-32
+outputs additionally receive guest-written configuration through bounded DT1
+packets. Voice envelopes and reverb tails are restarted.
 
 For the local acceptance installation, `mise run package-prince` generates
 ignored `target/prince-game.zip` and validates startup from that ZIP. This task
@@ -183,13 +251,13 @@ already set the compatible value.
 | --- | --- | --- |
 | x86 CPU | Selected real/protected-mode 386 operations, cached GDT/LDT segments, EIP32, 16/32-bit ModR/M/SIB, same-privilege gates, bounded REP | Full instruction/privilege coverage, paging, precise faults, timing |
 | x87 | Independent control/status/stack, selected loads/stores, constants, exact division and infinity comparison | Full 80-bit arithmetic, rounding and exception delivery |
-| i8042 / CMOS | Controller commands/A20 output, CMOS register bank and memory-size fields | Keyboard/mouse input, RTC clock/IRQ behavior and persistence |
-| PIC | Single edge-triggered controller, masks, fixed priority, CPU delivery and EOI | Cascading and remaining operating modes |
+| i8042 / CMOS | Controller/A20, keyboard command/ACK protocol, CMOS register bank and memory-size fields | Raw keyboard/mouse protocols and IRQs, RTC clock/IRQ behavior and persistence |
+| PIC | Master CPU interrupt delivery; independent slave register bank at A0h/A1h; masks, fixed priority and EOI | Cascading and remaining operating modes |
 | DMA | Independent 8237 state, PC page registers, bounded byte/word RAM transfers and auto-init | Full arbitration/cascade timing, MMIO and memory-to-memory |
 | PIT | Binary modes 2/3, latches, fractional guest clock input and IRQ0 | Remaining modes, gates and precise timing |
 | VGA/VBE | Mode-13h and banked 640×480×8 pixels, palette writes, borrowed scanout, configuration readback, selected VBE 1.2 BIOS calls | Text/planar modes, register rendering effects, raster timing, more SVGA modes |
-| DOS/BIOS | COM/MZ/overlay setup, bounded memory arena, immutable input files/directories, optional sparse RAM writes, timer/user-hook shims | Full DOS kernel, extender compatibility, mouse input, creation/persistence |
-| MPU-401 / MIDI | UART setup, bounded output at 330h/331h; independent procedural synth, guest-timed WAV, native and Web Audio output | Sample-based GM/MT-32 synthesis, serial timing, IRQs and intelligent mode |
+| DOS/BIOS | COM/MZ/overlay setup, bounded memory arena, immutable input files/directories, optional sparse RAM writes, timer/user-hook shims | Full DOS kernel, extender compatibility, raw mouse hardware, persistent storage |
+| MPU-401 / MIDI | UART setup, bounded output at 330h/331h; independent procedural synth, guest-timed WAV, native and Web Audio output | General MIDI instrument fidelity, serial timing, IRQs and intelligent mode |
 | Sound Blaster 16 | Independent DSP/mixer, selected DMA PCM playback, auto-init/pause/resume, block IRQs and bounded output queue | More commands, precise timing, mixer gain, OPL and host audio |
 | Frontends | Shared iced desktop/web view, native `--game`, browser Worker/AudioWorklet, ZIP mount/program selection, optional system MIDI on both platforms, headless CLI | Guest input, native CPU thread runner |
 | Executable inspector | Borrowed MZ metadata/relocations and LE/LX header detection | LE/LX loading and execution |
@@ -344,7 +412,8 @@ The second command needs the local `target/prince-game.zip` created by
 it checks nonzero rendered samples, ZIP execution, transfer channels,
 pause/resume/reset, output recovery, and continued audio/CPU progress during an
 800-ms window-thread stall. Web MIDI uses a mock device, including a port without
-`clear()`; this does not establish playback on a real external synthesizer.
+`clear()`; MT-32 checks cover automatic upgrade, translation, RPN replay and raw
+SysEx output with explicit permission; this does not establish playback on a real external synthesizer.
 
 Capture the guest framebuffer without opening a window:
 

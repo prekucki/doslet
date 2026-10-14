@@ -4,6 +4,41 @@ use doslet_x86::{Access, Cpu, CpuError, Gpr16, Gpr32, SegmentRegister, flags};
 struct Bus {
     ram: Box<[u8]>,
 }
+
+#[test]
+fn xlat_in_32_bit_code_uses_ebx_and_checks_segment_limits() {
+    for (code, offset) in [(&[0xD7][..], 0x200DE), (&[0x67, 0xD7][..], 0xDE)] {
+        let (mut cpu, mut bus) = Bus::setup();
+        Bus::enter(&mut cpu, &mut bus, true);
+        cpu.load_segment(&mut bus, SegmentRegister::Ds, 0x20)
+            .unwrap();
+        cpu.registers.set32(Gpr32::Ebx, 0x1FFF0);
+        cpu.registers.set32(Gpr32::Eax, 0x1234_ABEE);
+        bus.ram[0x30020..0x30020 + code.len()].copy_from_slice(code);
+        bus.ram[offset] = 0x57;
+        let before = cpu.flags;
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.registers.get32(Gpr32::Eax), 0x1234_AB57);
+        assert_eq!(cpu.flags, before);
+    }
+    let (mut cpu, mut bus) = Bus::setup();
+    Bus::enter(&mut cpu, &mut bus, true);
+    cpu.load_segment(&mut bus, SegmentRegister::Ds, 0x10)
+        .unwrap();
+    cpu.registers.set32(Gpr32::Ebx, 0x1FFF0);
+    cpu.registers.set32(Gpr32::Eax, 0x1234_ABEE);
+    bus.ram[0x30020] = 0xD7;
+    assert!(matches!(
+        cpu.step(&mut bus),
+        Err(CpuError::SegmentAccess {
+            segment: SegmentRegister::Ds,
+            offset: 0x200DE,
+            access: Access::Read,
+            ..
+        })
+    ));
+    assert_eq!(cpu.registers.get32(Gpr32::Eax), 0x1234_ABEE);
+}
 impl Bus {
     fn new() -> Self {
         Self {

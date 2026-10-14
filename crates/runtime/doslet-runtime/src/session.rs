@@ -10,7 +10,10 @@ use doslet_dos::{ComError, MzError, ProcessMemory, load_com, load_mz, load_mz_st
 use doslet_pc::PcMachine;
 use doslet_vga::IndexedFrame;
 use doslet_x86::{CpuError, Gpr16, Registers, StepOutcome, linear_address};
+mod keyboard;
+mod mouse;
 mod vesa;
+mod video;
 
 const CONSOLE_CAPACITY: usize = 4096;
 
@@ -34,6 +37,8 @@ pub enum RuntimeError {
     UnsupportedService { vector: u8, ax: u16 },
     ConsoleFull,
     InvalidProgramName,
+    InvalidLaunch,
+    InvalidWorkingDirectory(u16),
 }
 impl From<ComError> for RuntimeError {
     fn from(error: ComError) -> Self {
@@ -79,6 +84,8 @@ impl fmt::Display for RuntimeError {
             Self::InvalidProgramName => {
                 f.write_str("DOS program name must contain 1..127 non-NUL ASCII bytes")
             }
+            Self::InvalidLaunch => f.write_str("launch setup requires a ready session and a printable ASCII DOS command tail of at most 126 bytes"),
+            Self::InvalidWorkingDirectory(code) => write!(f, "invalid DOS working directory (DOS error {code})"),
         }
     }
 }
@@ -90,13 +97,54 @@ pub struct Session {
     fault: Option<RuntimeError>,
     steps: u64,
     console: Vec<u8>,
+    console_truncated: bool,
+    extended_key: Option<u8>,
+    mouse: doslet_dos::mouse::Mouse,
     memory: MemoryArena,
     drive: ReadOnlyDrive,
     dta: (u16, u16),
     overlays: u32,
     break_check: bool,
 }
+
 impl Session {
+    /// Configure the PSP and DOS working directory before guest execution.
+    pub fn configure_launch(
+        &mut self,
+        command_tail: &[u8],
+        working_directory: &[u8],
+    ) -> Result<(), RuntimeError> {
+        if self.status != SessionStatus::Ready
+            || command_tail.len() > 126
+            || !command_tail.is_ascii()
+            || command_tail
+                .iter()
+                .any(|byte| *byte < 0x20 || *byte == 0x7F)
+        {
+            return Err(RuntimeError::InvalidLaunch);
+        }
+        self.drive
+            .change_directory(working_directory)
+            .map_err(RuntimeError::InvalidWorkingDirectory)?;
+        let base = u32::from(doslet_dos::loader::PSP_SEGMENT) * 16;
+        self.machine
+            .bus
+            .write_u8(base + 0x80, command_tail.len() as u8)?;
+        for offset in 0..127 {
+            self.machine.bus.write_u8(
+                base + 0x81 + offset as u32,
+                command_tail
+                    .get(offset)
+                    .copied()
+                    .unwrap_or(if offset == command_tail.len() {
+                        0x0D
+                    } else {
+                        0
+                    }),
+            )?;
+        }
+        Ok(())
+    }
     pub fn new(program: &[u8]) -> Result<Self, RuntimeError> {
         let mut machine = PcMachine::default();
         machine.cpu.registers = load_com(&mut machine.bus, program)?;
@@ -149,6 +197,18 @@ impl Session {
     }
     fn from_machine(mut machine: PcMachine) -> Result<Self, RuntimeError> {
         bios::install(&mut machine.bus)?;
+        // Virtual mouse IRQ wrapper preserves full general and segment registers.
+        machine.bus.write_u16(0x74 * 4, 0x400)?;
+        machine.bus.write_u16(0x74 * 4 + 2, bios::SHIM_SEGMENT)?;
+        for (offset, byte) in [
+            0x66, 0x60, 0x1E, 0x06, 0x0F, 0xA0, 0x0F, 0xA8, 0x9A, 0, 0, 0, 0, 0x0F, 0xA9, 0x0F,
+            0xA1, 0x07, 0x1F, 0x66, 0x61, 0xCF,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            machine.bus.write_u8(0xF0400 + offset as u32, byte)?;
+        }
         let process_end = machine.bus.read_u16(0x10002)?;
         let memory = MemoryArena::new(0x1000, process_end, 0xA000);
         memory.write_mcbs(&mut machine.bus)?;
@@ -158,6 +218,9 @@ impl Session {
             fault: None,
             steps: 0,
             console: Vec::with_capacity(CONSOLE_CAPACITY),
+            console_truncated: false,
+            extended_key: None,
+            mouse: doslet_dos::mouse::Mouse::default(),
             memory,
             drive: ReadOnlyDrive::new(),
             dta: (0x1000, 0x80),
@@ -232,6 +295,9 @@ impl Session {
     pub fn video_mode(&self) -> doslet_vga::VideoMode {
         self.machine.bus.vga.mode()
     }
+    pub fn video_memory_configuration(&self) -> (u8, u8, u8, u16, u8, u8) {
+        self.machine.bus.vga.memory_configuration()
+    }
     pub fn registers(&self) -> &Registers {
         &self.machine.cpu.registers
     }
@@ -254,8 +320,55 @@ impl Session {
     pub fn console(&self) -> &[u8] {
         &self.console
     }
+    pub fn console_truncated(&self) -> bool {
+        self.console_truncated
+    }
+    fn console_output(&mut self, byte: u8) -> Result<(), RuntimeError> {
+        if self.console.len() == CONSOLE_CAPACITY {
+            self.console.copy_within(CONSOLE_CAPACITY / 2.., 0);
+            self.console.truncate(CONSOLE_CAPACITY / 2);
+            self.console_truncated = true;
+        }
+        self.console.push(byte);
+        if self.video_mode() == doslet_vga::VideoMode::Text3 {
+            self.teletype(byte)?;
+        }
+        Ok(())
+    }
     pub fn frame(&self) -> Option<IndexedFrame<'_>> {
         self.machine.bus.vga.frame()
+    }
+    pub fn presentation_frame(&self) -> doslet_vga::scanout::PresentationFrame<'_> {
+        use doslet_vga::scanout::{PresentationFrame, TextFrame};
+        if let Some(mut frame) = self.frame() {
+            frame.revision = frame.revision.wrapping_add(self.mouse.revision);
+            if self.mouse.visible >= 0 {
+                let dimensions = self.pointer_dimensions();
+                return PresentationFrame::Cursor {
+                    x: i32::from(self.mouse.x) * frame.width as i32 / i32::from(dimensions.0)
+                        - i32::from(self.mouse.hotspot.0),
+                    y: i32::from(self.mouse.y) * frame.height as i32 / i32::from(dimensions.1)
+                        - i32::from(self.mouse.hotspot.1),
+                    masks: &self.mouse.masks,
+                    frame,
+                };
+            }
+            return PresentationFrame::Indexed(frame);
+        }
+        let bda = self.ram_view(0x400..0x488).expect("BIOS data RAM");
+        let page = usize::from(bda[0x62].min(7));
+        let position = u16::from_le_bytes([bda[0x50 + page * 2], bda[0x51 + page * 2]]);
+        let blink = (self.emulated_nanos() / 250_000_000) & 1 == 0;
+        PresentationFrame::Text(TextFrame {
+            cells: self
+                .ram_view(0xB8000 + page * 0x1000..0xB8000 + page * 0x1000 + 4000)
+                .expect("text RAM"),
+            palette: self.machine.bus.vga.palette(),
+            revision: self.machine.bus.text_revision().wrapping_mul(2) + u64::from(blink),
+            cursor: (position >> 8) * 80 + (position & 255),
+            cursor_shape: u16::from_le_bytes([bda[0x60], bda[0x61]]),
+            blink,
+        })
     }
     /// Read-only physical video memory for differential diagnostics.
     pub fn vram_view(&self) -> &[u8] {
@@ -296,6 +409,7 @@ impl Session {
         }
     }
     fn execute_step(&mut self, budget: u32) -> Result<u32, RuntimeError> {
+        self.dispatch_mouse()?;
         if !self.machine.cpu.protected_mode() && self.machine.cpu.registers.cs == bios::SHIM_SEGMENT
         {
             let ip = self.machine.cpu.registers.ip;
@@ -315,14 +429,65 @@ impl Session {
     fn service(&mut self, vector: u8) -> Result<(), RuntimeError> {
         let ax = self.machine.cpu.registers.get(Gpr16::Ax);
         match (vector, ax >> 8) {
-            // Mouse driver is not yet installed. A reset query returns AX=0
-            // through a real vector instead of creating a null protected gate.
-            (0x33, _) if ax == 0 => self.machine.cpu.registers.set(Gpr16::Ax, 0),
+            (0x33, _) => self.mouse_service(ax)?,
             (0x10, 0x4F) => self.vesa_service(ax as u8)?,
+            (0x10, 0x10) => self.palette_service(ax)?,
+            (0x16, _) => self.keyboard_service(ax)?,
+            (0x21, 0x01 | 0x06 | 0x07 | 0x08 | 0x0B | 0x0C) => self.dos_keyboard_service(ax)?,
+            (0x21, 0x02) => {
+                let byte = self.registers().get_byte(2);
+                if byte == 9 {
+                    let page = self.machine.bus.read_u8(0x462)?;
+                    let position = self.machine.bus.read_u16(0x450 + u32::from(page) * 2)?;
+                    for _ in 0..8 - (position & 7) {
+                        self.console_output(b' ')?;
+                    }
+                    self.machine.cpu.registers.set_byte(0, b' ');
+                } else {
+                    self.console_output(byte)?;
+                    self.machine.cpu.registers.set_byte(0, byte);
+                }
+            }
+            (0x1A, 0) => {
+                let low = self.machine.bus.read_u16(0x46C)?;
+                let high = self.machine.bus.read_u16(0x46E)?;
+                let rollover = self.machine.bus.read_u8(0x470)?;
+                self.machine.cpu.registers.set(Gpr16::Cx, high);
+                self.machine.cpu.registers.set(Gpr16::Dx, low);
+                self.machine.cpu.registers.set_byte(0, rollover);
+                self.machine.bus.write_u8(0x470, 0)?;
+            }
+            (0x10, 0x08..=0x0A | 0x0E | 0x06 | 0x07 | 0x01 | 0x05) => self.text_service(ax)?,
+            (0x10, 2 | 3) if self.machine.cpu.registers.get_byte(7) < 8 => {
+                let page = self.machine.cpu.registers.get_byte(7);
+                let position_address = 0x450 + u32::from(page) * 2;
+                if ax >> 8 == 2 {
+                    let position = self.machine.cpu.registers.get(Gpr16::Dx);
+                    self.machine.bus.write_u16(position_address, position)?;
+                    if page == self.machine.bus.read_u8(0x462)?
+                        && self.machine.bus.vga.mode() == doslet_vga::VideoMode::Text3
+                    {
+                        let cell =
+                            (position >> 8) * 80 + (position & 0xFF) + u16::from(page) * 0x800;
+                        let port = self.machine.bus.vga.input_status_port() - 6;
+                        self.machine.bus.vga.write_port(port, 0x0E);
+                        self.machine.bus.vga.write_port(port + 1, (cell >> 8) as u8);
+                        self.machine.bus.vga.write_port(port, 0x0F);
+                        self.machine.bus.vga.write_port(port + 1, cell as u8);
+                    }
+                } else {
+                    let position = self.machine.bus.read_u16(position_address)?;
+                    let shape = self.machine.bus.read_u16(0x460)?;
+                    self.machine.cpu.registers.set(Gpr16::Dx, position);
+                    self.machine.cpu.registers.set(Gpr16::Cx, shape);
+                }
+            }
             (0x10, 0x0F) => {
                 let (mode, columns) = match self.machine.bus.vga.mode() {
                     doslet_vga::VideoMode::Mode13 => (0x13, 40),
-                    doslet_vga::VideoMode::Text3 => (3, 80),
+                    doslet_vga::VideoMode::Text3 => {
+                        (3 | u16::from(self.machine.bus.read_u8(0x487)? & 0x80), 80)
+                    }
                     doslet_vga::VideoMode::Vbe101 => (1, 80), // Low byte of the VBE mode.
                 };
                 self.machine
@@ -342,6 +507,12 @@ impl Session {
                 }
             }
             (0x08, _) => {
+                // BIOS floppy-motor timeout is also used as a one-tick delay
+                // by CIV's graphics driver. The counter must advance with IRQ0.
+                let motor_timeout = self.machine.bus.read_u8(0x440)?;
+                if motor_timeout != 0 {
+                    self.machine.bus.write_u8(0x440, motor_timeout - 1)?;
+                }
                 let ticks = u32::from(self.machine.bus.read_u16(0x46C)?)
                     | (u32::from(self.machine.bus.read_u16(0x46E)?) << 16);
                 let next = ticks + 1;
@@ -360,6 +531,10 @@ impl Session {
             }
             (0x2F, _) if ax == 0x1687 => {
                 self.machine.cpu.registers.set(Gpr16::Ax, 1); // No external DPMI host installed.
+            }
+            (0x2F, _) if ax == 0x1500 => {
+                self.machine.cpu.registers.set(Gpr16::Bx, 0); // No MSCDEX CD-ROM drives installed.
+                self.machine.cpu.registers.set(Gpr16::Cx, 0);
             }
             (0x2F, _) if ax == 0x4300 => {
                 self.machine.cpu.registers.set_byte(0, 0); // No external XMS driver installed.
@@ -391,6 +566,10 @@ impl Session {
                 self.machine.cpu.registers.set_byte(4, 0x86);
                 self.set_carry(true)?;
             }
+            (0x10, 0) if ax as u8 & 0x7F == 3 => {
+                self.machine.bus.vga.set_mode_3h();
+                bios::set_text_mode(&mut self.machine.bus, ax as u8 & 0x80 != 0)?;
+            }
             (0x10, 0) if ax as u8 == 0x13 => self.machine.bus.vga.set_mode_13h(),
             (0x20, _) => self.status = SessionStatus::Exited(0),
             (0x21, 0x4C) => self.status = SessionStatus::Exited(ax as u8),
@@ -421,6 +600,23 @@ impl Session {
                 self.machine.cpu.registers.set_byte(0, 3);
             }
             (0x21, 0x19) => self.machine.cpu.registers.set_byte(0, 2),
+            (0x21, 0x2A) => {
+                // Same deterministic boot date as the installed CMOS.
+                self.machine.cpu.registers.set(Gpr16::Cx, 2026);
+                self.machine.cpu.registers.set(Gpr16::Dx, 0x0A0E);
+                self.machine.cpu.registers.set_byte(0, 3);
+            }
+            (0x21, 0x2C) => {
+                let centiseconds = self.emulated_nanos() / 10_000_000;
+                self.machine.cpu.registers.set(
+                    Gpr16::Cx,
+                    (((centiseconds / 360000) % 24) << 8 | ((centiseconds / 6000) % 60)) as u16,
+                );
+                self.machine.cpu.registers.set(
+                    Gpr16::Dx,
+                    (((centiseconds / 100) % 60) << 8 | (centiseconds % 100)) as u16,
+                );
+            }
             (0x21, 0x38)
                 if ax as u8 == 0 && self.machine.cpu.registers.get(Gpr16::Dx) != 0xFFFF =>
             {
@@ -451,6 +647,92 @@ impl Session {
                     self.machine.cpu.registers.ds,
                     self.machine.cpu.registers.get(Gpr16::Dx),
                 )
+            }
+            (0x21, 0x11 | 0x12) => {
+                let r = self.registers();
+                let mut address = linear_address(r.ds, r.get(Gpr16::Dx));
+                let extended = self.machine.bus.read_u8(address)? == 255;
+                if extended {
+                    address += 7;
+                }
+                let mut pattern = [0; 11];
+                for (i, byte) in pattern.iter_mut().enumerate() {
+                    *byte = self.machine.bus.read_u8(address + 1 + i as u32)?;
+                }
+                let drive = self.machine.bus.read_u8(address)?;
+                let start = if ax >> 8 == 0x12 {
+                    self.machine.bus.read_u32(address + 24)? as usize
+                } else {
+                    0
+                };
+                if matches!(drive, 0 | 3)
+                    && let Some((next, name, length)) = self.drive.find_fcb(&pattern, start)
+                {
+                    self.machine.bus.write_u32(address + 24, next as u32)?;
+                    let mut result = [0; 44];
+                    let offset = if extended {
+                        result[0] = 255;
+                        result[6] = 0x20;
+                        7
+                    } else {
+                        0
+                    };
+                    result[offset] = 3;
+                    result[offset + 1..offset + 12].copy_from_slice(&name);
+                    result[offset + 12] = 0x20;
+                    result[offset + 29..offset + 33].copy_from_slice(&length.to_le_bytes());
+                    let dta = linear_address(self.dta.0, self.dta.1);
+                    for (i, byte) in result[..offset + 37].iter().enumerate() {
+                        self.machine.bus.write_u8(dta + i as u32, *byte)?;
+                    }
+                    self.machine.cpu.registers.set_byte(0, 0);
+                } else {
+                    self.machine.cpu.registers.set_byte(0, 255);
+                }
+            }
+            (0x21, 0x4E | 0x4F) => {
+                let dta = linear_address(self.dta.0, self.dta.1);
+                let first = ax >> 8 == 0x4E;
+                let search = if first {
+                    if let Some((path, length)) = self.read_path()? {
+                        self.drive
+                            .start_search(&path[..length], self.registers().get(Gpr16::Cx))
+                    } else {
+                        return Ok(());
+                    }
+                } else {
+                    let mut state = [0; 21];
+                    for (i, byte) in state.iter_mut().enumerate() {
+                        *byte = self.machine.bus.read_u8(dta + i as u32)?;
+                    }
+                    self.drive.resume_search(&state)
+                };
+                match search {
+                    Ok(mut search) => {
+                        if first {
+                            for (i, byte) in search.state().iter().enumerate() {
+                                self.machine.bus.write_u8(dta + i as u32, *byte)?;
+                            }
+                        }
+                        if let Some(entry) = self.drive.next_search(&mut search) {
+                            let mut result = [0; 43];
+                            result[..21].copy_from_slice(&search.state());
+                            result[21] = entry.attributes;
+                            result[22..24].copy_from_slice(&0x6000u16.to_le_bytes());
+                            result[24..26].copy_from_slice(&0x5D4Eu16.to_le_bytes()); // 2026-10-14.
+                            result[26..30].copy_from_slice(&entry.length.to_le_bytes());
+                            result[30..].copy_from_slice(&entry.name);
+                            for (i, byte) in result.iter().enumerate() {
+                                self.machine.bus.write_u8(dta + i as u32, *byte)?;
+                            }
+                            self.machine.cpu.registers.set(Gpr16::Ax, 0);
+                            self.set_carry(false)?;
+                        } else {
+                            self.dos_error(if first { 2 } else { 18 })?;
+                        }
+                    }
+                    Err(code) => self.dos_error(code)?,
+                }
             }
             (0x21, 0x2F) => {
                 self.machine.cpu.registers.es = self.dta.0;
@@ -581,6 +863,33 @@ impl Session {
                     Err(code) => self.dos_error(code)?,
                 }
             }
+            (0x21, 0x3C) => {
+                let Some((name, length)) = self.read_path()? else {
+                    return Ok(());
+                };
+                match self
+                    .drive
+                    .create(&name[..length], self.registers().get(Gpr16::Cx))
+                {
+                    Ok(handle) => {
+                        self.machine.cpu.registers.set(Gpr16::Ax, handle);
+                        self.set_carry(false)?;
+                    }
+                    Err(code) => self.dos_error(code)?,
+                }
+            }
+            (0x21, 0x57) if ax as u8 == 0 => {
+                if self.drive.is_open(self.registers().get(Gpr16::Bx)) {
+                    self.machine.cpu.registers.set(Gpr16::Cx, 0x6000); // Deterministic noon boot timestamp.
+                    self.machine
+                        .cpu
+                        .registers
+                        .set(Gpr16::Dx, (46 << 9) | (10 << 5) | 14);
+                    self.set_carry(false)?;
+                } else {
+                    self.dos_error(6)?;
+                }
+            }
             (0x21, 0x3E) => match self.drive.close(self.machine.cpu.registers.get(Gpr16::Bx)) {
                 Ok(()) => self.set_carry(false)?,
                 Err(code) => self.dos_error(code)?,
@@ -622,16 +931,13 @@ impl Session {
                         Err(code) => self.dos_error(code)?,
                     }
                 } else {
-                    if count > CONSOLE_CAPACITY - self.console.len() {
-                        return Err(RuntimeError::ConsoleFull);
-                    }
                     let (ds, dx) = (r.ds, r.get(Gpr16::Dx));
                     for offset in 0..count {
-                        self.console.push(
-                            self.machine
-                                .bus
-                                .read_u8(linear_address(ds, dx.wrapping_add(offset as u16)))?,
-                        );
+                        let byte = self
+                            .machine
+                            .bus
+                            .read_u8(linear_address(ds, dx.wrapping_add(offset as u16)))?;
+                        self.console_output(byte)?;
                     }
                     self.machine.cpu.registers.set(Gpr16::Ax, count as u16);
                     self.set_carry(false)?;
@@ -692,15 +998,12 @@ impl Session {
             (0x21, 9) => {
                 let ds = self.machine.cpu.registers.ds;
                 let mut offset = self.machine.cpu.registers.get(Gpr16::Dx);
-                loop {
+                for _ in 0..65536 {
                     let byte = self.machine.bus.read_u8(linear_address(ds, offset))?;
                     if byte == b'$' {
                         break;
                     }
-                    if self.console.len() == CONSOLE_CAPACITY {
-                        return Err(RuntimeError::ConsoleFull);
-                    }
-                    self.console.push(byte);
+                    self.console_output(byte)?;
                     offset = offset.wrapping_add(1);
                 }
                 self.machine.cpu.registers.set_byte(0, b'$');
@@ -743,6 +1046,105 @@ impl Session {
 mod tests {
     use super::*;
     #[test]
+    fn mouse_state_size_save_and_restore_round_trip() {
+        let mut session = Session::new(&[0x90]).unwrap();
+        session.mouse_service(0x15).unwrap();
+        assert_eq!(session.registers().get(Gpr16::Bx), 160);
+        session.machine.cpu.registers.es = 0x1000;
+        session.machine.cpu.registers.set(Gpr16::Dx, 0x400);
+        session.pointer_move(42, 34);
+        session.pointer_button(0, true);
+        session.mouse_service(0x16).unwrap();
+        session.pointer_move(100, 150);
+        session.pointer_button(0, false);
+        session.mouse_service(0x17).unwrap();
+        assert_eq!(
+            (session.mouse.x, session.mouse.y, session.mouse.buttons),
+            (42, 34, 1)
+        );
+        assert_eq!(session.mouse.presses[0].count, 1);
+        assert_eq!(session.mouse.releases[0].count, 0);
+    }
+    #[test]
+    fn mouse_callback_receives_events_and_restores_registers_and_stack() {
+        let mut session = Session::new(&[0xFB, 0x90, 0xEB, 0xFD]).unwrap();
+        // Callback records AX, overwrites a register, and returns with RETF.
+        for (i, byte) in [0xA3, 0x00, 0x06, 0xB8, 0x34, 0x12, 0xCB]
+            .into_iter()
+            .enumerate()
+        {
+            session
+                .machine
+                .bus
+                .write_u8(0x10200 + i as u32, byte)
+                .unwrap();
+        }
+        session.machine.cpu.registers.es = 0x1000;
+        session.machine.cpu.registers.set(Gpr16::Ax, 0x0C);
+        session.machine.cpu.registers.set(Gpr16::Cx, 7);
+        session.machine.cpu.registers.set(Gpr16::Dx, 0x200);
+        session.mouse_service(0x0C).unwrap();
+        session.machine.cpu.registers.set(Gpr16::Ax, 0xABCD);
+        let stack = session.registers().get(Gpr16::Sp);
+        session.start();
+        session.advance(10);
+        session.pointer_move(42, 34);
+        session.pointer_button(0, true);
+        session.advance(100);
+        assert_eq!(session.fault(), None);
+        assert_eq!(session.machine.bus.read_u16(0x10600).unwrap(), 3);
+        assert_eq!(session.registers().get(Gpr16::Ax), 0xABCD);
+        assert_eq!(session.registers().get(Gpr16::Sp), stack);
+        session.pointer_button(0, false);
+        session.advance(100);
+        assert_eq!(session.machine.bus.read_u16(0x10600).unwrap(), 4);
+        assert!(!session.mouse.callback_active);
+    }
+    #[test]
+    fn bios_writes_graphics_glyph_without_advancing_cursor() {
+        let mut session = Session::new(&[0x90]).unwrap();
+        session.machine.bus.vga.set_mode_13h();
+        session.machine.cpu.registers.set(Gpr16::Ax, 0x0941);
+        session.machine.cpu.registers.set(Gpr16::Bx, 12);
+        session.machine.cpu.registers.set(Gpr16::Cx, 1);
+        session.text_service(0x0941).unwrap();
+        let frame = session.frame().unwrap();
+        assert!(frame.pixels[..2560].contains(&12));
+        assert_eq!(session.machine.bus.read_u16(0x450).unwrap(), 0);
+    }
+    #[test]
+    fn bios_timer_decrements_civs_floppy_timeout_delay() {
+        let mut session = Session::new(&[0x90]).unwrap();
+        session.machine.bus.write_u8(0x440, 2).unwrap();
+        for expected in [1, 0, 0] {
+            session.service(8).unwrap();
+            assert_eq!(session.machine.bus.read_u8(0x440).unwrap(), expected);
+        }
+        assert_eq!(session.machine.bus.read_u16(0x46C).unwrap(), 3);
+    }
+    #[test]
+    fn bios_palette_single_and_block_services_return_six_bit_components() {
+        let mut session = Session::new(&[0x90]).unwrap();
+        session.machine.cpu.registers.set(Gpr16::Ax, 0x1010);
+        session.machine.cpu.registers.set(Gpr16::Bx, 7);
+        session.machine.cpu.registers.set(Gpr16::Cx, 0x203F);
+        session.machine.cpu.registers.set(Gpr16::Dx, 0x1000);
+        session.service(0x10).unwrap();
+        session.machine.cpu.registers.set(Gpr16::Ax, 0x1015);
+        session.service(0x10).unwrap();
+        assert_eq!(session.registers().get(Gpr16::Cx), 0x203F);
+        assert_eq!(session.registers().get(Gpr16::Dx) >> 8, 0x10);
+        session.machine.cpu.registers.es = 0x1000;
+        session.machine.cpu.registers.set(Gpr16::Ax, 0x1017);
+        session.machine.cpu.registers.set(Gpr16::Cx, 1);
+        session.machine.cpu.registers.set(Gpr16::Dx, 0x200);
+        session.service(0x10).unwrap();
+        assert_eq!(
+            session.ram_view(0x10200..0x10203).unwrap(),
+            &[0x10, 0x20, 0x3F]
+        );
+    }
+    #[test]
     fn guest_demo_runs_through_cpu_bios_and_mmio() {
         let mut session = Session::demo();
         session.start();
@@ -758,6 +1160,25 @@ mod tests {
                     .all(|value| usize::from(*value) == band)
             );
         }
+    }
+    #[test]
+    fn active_text_cursor_updates_crtc_and_inactive_page_keeps_it() {
+        let mut session = Session::new(&[0x90]).unwrap();
+        session.machine.cpu.registers.set(Gpr16::Ax, 3);
+        session.service(0x10).unwrap();
+        session.machine.cpu.registers.set(Gpr16::Ax, 0x0200);
+        session.machine.cpu.registers.set(Gpr16::Bx, 0);
+        session.machine.cpu.registers.set(Gpr16::Dx, 0x184F);
+        session.service(0x10).unwrap();
+        session.machine.bus.vga.write_port(0x3D4, 0x0E);
+        assert_eq!(session.machine.bus.vga.read_port(0x3D5), Some(7));
+        session.machine.bus.vga.write_port(0x3D4, 0x0F);
+        assert_eq!(session.machine.bus.vga.read_port(0x3D5), Some(0xCF));
+        session.machine.cpu.registers.set(Gpr16::Bx, 0x0700);
+        session.machine.cpu.registers.set(Gpr16::Dx, 0x0102);
+        session.service(0x10).unwrap();
+        assert_eq!(session.machine.bus.vga.read_port(0x3D5), Some(0xCF));
+        assert_eq!(session.machine.bus.read_u16(0x45E).unwrap(), 0x0102);
     }
     #[test]
     fn pause_and_step_are_bounded_and_instances_are_independent() {

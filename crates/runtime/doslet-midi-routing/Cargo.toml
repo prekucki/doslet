@@ -1,0 +1,13 @@
+[package]
+name = "doslet-midi-routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+doslet-midi-synth.workspace = true
+doslet-mt32-gm.workspace = true
+[dev-dependencies]
+allocation-counter = "0.8"
+[lints]
+workspace = true

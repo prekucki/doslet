@@ -1,5 +1,44 @@
 # Machiavelli the Prince: compatibility target
 
+## New-game startup after memory and controller fixes
+
+Local PRINCE.EXE is an external test input. Its files were read without changes.
+
+A headless execution reproduced Start New, the default setup, family name and
+crest selection. At 1101890059 steps the game reached its fatal error handler
+with "Critical memory shortage!". The failing array had 54 successful buffers
+out of 233, each requiring 64 DOS paragraphs. The 64-entry conventional-memory
+block table exhausted its metadata capacity; this was not evidence that the
+machine's 16 MiB of physical RAM was too small. During fatal cleanup, the guest
+also accessed missing keyboard command handling and the slave PIC mask at A1h.
+
+The DOS block table now has 1024 setup-owned descriptors. Keyboard commands at
+60h acknowledge LED, typematic, scan-set, identification, scanning/defaults,
+echo, resend and reset/self-test operations. Slave PIC register accesses at
+A0h/A1h are independent of the master. Slave IRQ sources and cascade delivery
+remain pending.
+
+Repeating the same game inputs after the changes reached the Venice map at
+1200000000 steps with no fault or critical-memory message. The guest MCB chain
+contained 243 blocks and 192864 free conventional-memory bytes. This verifies
+new-game startup, not a complete campaign or hardware audio playback.
+
+Reproduction (writes diagnostics to /tmp, never the game directory):
+
+```sh
+DOSLET_PROBE_FRAME=1 DOSLET_PROBE_RAM=1 \
+DOSLET_CIV_POINTER_EVENTS='450000000:320:152:0:1,451000000:320:152:0:0,650000000:320:456:0:1,651000000:320:456:0:0,850000000:320:321:0:1,851000000:320:321:0:0,1050000000:280:225:0:1,1051000000:280:225:0:0,1100000000:320:336:0:1,1101000000:320:336:0:0' \
+CARGO_TARGET_DIR=target/civ-probe cargo run -p doslet-headless --release --locked \
+  --example inspect_civ -- PRINCE/PRINCE.EXE '' 1200000000 \
+  '310000000:1c:0d,330000000:1c:0d'
+```
+
+The probe supports DOSLET_PROBE_TRACE_AFTER to single-step only the final
+interaction and stop at the local PRINCE error-handler address. That address is
+specific to this game version. Frame and memory diagnostic dumps remain local.
+
+## Earlier startup observations
+
 Status: actual HDI logo, introductory letter/map and main-menu frames have been
 captured through guest execution. Music files open through a sparse RAM overlay
 and the real MPU stream contains note events. The desktop CLI can start the game;

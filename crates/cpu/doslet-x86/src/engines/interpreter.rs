@@ -288,6 +288,141 @@ impl Cpu {
             return self.dword_step(bus, opcode, context);
         }
         match opcode {
+            0x27 | 0x2F => {
+                let old = self.registers.get_byte(0);
+                let old_carry = self.flags & flags::CARRY != 0;
+                let low = old & 15 > 9 || self.flags & flags::AUXILIARY != 0;
+                let subtract = opcode == 0x2F;
+                let mut value = old;
+                let mut carry = false;
+                if low {
+                    value = if subtract {
+                        old.wrapping_sub(6)
+                    } else {
+                        old.wrapping_add(6)
+                    };
+                    carry = old_carry || if subtract { old < 6 } else { old > 249 };
+                }
+                if old > 0x99 || old_carry {
+                    value = if subtract {
+                        value.wrapping_sub(0x60)
+                    } else {
+                        value.wrapping_add(0x60)
+                    };
+                    carry = true;
+                } else if !subtract {
+                    carry = false;
+                }
+                let mask =
+                    flags::CARRY | flags::AUXILIARY | flags::SIGN | flags::ZERO | flags::PARITY;
+                self.flags = (self.flags & !mask)
+                    | if carry { flags::CARRY } else { 0 }
+                    | if low { flags::AUXILIARY } else { 0 }
+                    | if value == 0 { flags::ZERO } else { 0 }
+                    | if value & 0x80 != 0 { flags::SIGN } else { 0 }
+                    | if value.count_ones().is_multiple_of(2) {
+                        flags::PARITY
+                    } else {
+                        0
+                    };
+                self.registers.set_byte(0, value);
+            }
+            0x6C..=0x6F => {
+                let count = if address_32 {
+                    self.registers.get32(Gpr32::Ecx)
+                } else {
+                    u32::from(self.registers.get(Gpr16::Cx))
+                };
+                if !repeat || count != 0 {
+                    let input = opcode < 0x6E;
+                    let width = if opcode & 1 == 0 {
+                        1
+                    } else if operand_32 {
+                        4
+                    } else {
+                        2
+                    };
+                    let reg = if input { Gpr32::Edi } else { Gpr32::Esi };
+                    let offset = if address_32 {
+                        self.registers.get32(reg)
+                    } else {
+                        u32::from(self.registers.get(Gpr16::decode(reg as u8)))
+                    };
+                    let address = self.registers.address(
+                        if input { SegmentRegister::Es } else { segment },
+                        offset,
+                        width,
+                        if input { Access::Write } else { Access::Read },
+                    )?;
+                    let port = self.registers.get(Gpr16::Dx);
+                    if input {
+                        match width {
+                            1 => {
+                                let value = bus.read_port_u8(port)?;
+                                bus.write_u8(address, value)?;
+                            }
+                            2 => {
+                                let value = bus.read_port_u16(port)?;
+                                bus.write_u16(address, value)?;
+                            }
+                            _ => {
+                                let value = bus.read_port_u32(port)?;
+                                bus.write_u32(address, value)?;
+                            }
+                        }
+                    } else {
+                        match width {
+                            1 => {
+                                let value = bus.read_u8(address)?;
+                                bus.write_port_u8(port, value)?;
+                            }
+                            2 => {
+                                let value = bus.read_u16(address)?;
+                                bus.write_port_u16(port, value)?;
+                            }
+                            _ => {
+                                let value = bus.read_u32(address)?;
+                                bus.write_port_u32(port, value)?;
+                            }
+                        }
+                    }
+                    let delta = u32::from(width);
+                    let next = if self.flags & flags::DIRECTION != 0 {
+                        offset.wrapping_sub(delta)
+                    } else {
+                        offset.wrapping_add(delta)
+                    };
+                    if address_32 {
+                        self.registers.set32(reg, next);
+                    } else {
+                        self.registers.set(Gpr16::decode(reg as u8), next as u16);
+                    }
+                    if repeat {
+                        if address_32 {
+                            self.registers.set32(Gpr32::Ecx, count - 1);
+                        } else {
+                            self.registers.set(Gpr16::Cx, (count - 1) as u16);
+                        }
+                        if count > 1 {
+                            self.registers.ip = ip;
+                        }
+                    }
+                }
+            }
+            0xD7 => {
+                let index = u32::from(self.registers.get_byte(0));
+                let offset = if address_32 {
+                    self.registers.get32(Gpr32::Ebx).wrapping_add(index)
+                } else {
+                    u32::from(self.registers.get(Gpr16::Bx).wrapping_add(index as u16))
+                };
+                let value = decode::Operand::Memory { segment, offset }.read(
+                    &self.registers,
+                    bus,
+                    false,
+                )?;
+                self.registers.set_byte(0, value as u8);
+            }
             0xD8..=0xDF => return self.x87_step(bus, opcode, context),
             0x9B => {
                 if self.fpu.is_none() || self.control.cr0 & 0x0A == 0x0A {

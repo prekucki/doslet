@@ -14,6 +14,10 @@ struct Channel {
     pan: u8,
     sustain: bool,
     bend: u16,
+    /// Pitch-bend sensitivity in semitones (RPN 0), up to two octaves.
+    bend_range: u8,
+    /// Selected registered parameter (MSB, LSB); 127/127 is null.
+    rpn: [u8; 2],
 }
 impl Channel {
     const DEFAULT: Self = Self {
@@ -23,6 +27,8 @@ impl Channel {
         pan: 64,
         sustain: false,
         bend: 8192,
+        bend_range: 2,
+        rpn: [127, 127],
     };
 }
 #[derive(Clone, Copy)]
@@ -208,14 +214,24 @@ impl Synth {
         }
         Ok(())
     }
-    fn step(&self, note: u8, bend: u16) -> u32 {
-        let index = usize::from(bend / 64);
-        let fraction = u64::from(bend % 64);
+    fn step(&self, note: u8, bend: u16, range: u8) -> u32 {
+        // BEND spans +/-2 semitones in 1/64-semitone entries. Larger offsets move
+        // whole semitones to the note, so the default range keeps exact results.
+        let offset = (i32::from(bend) - 8192) * i32::from(range);
+        let semitones = if offset.abs() <= 16384 {
+            0
+        } else {
+            offset.div_euclid(8192)
+        };
+        let position = (offset - semitones * 8192 + 16384) as usize;
+        let note = (i32::from(note) + semitones).clamp(0, 127) as usize;
+        let index = position / 128;
+        let fraction = (position % 128) as u64;
         let a = u64::from(tables::BEND[index]);
         let b = u64::from(tables::BEND[(index + 1).min(256)]);
-        let scale = a + ((b - a) * fraction / 64);
-        (((u64::from(tables::STEP_48000[usize::from(note)]) * scale) >> 24) * 48000
-            / u64::from(self.rate)) as u32
+        let scale = a + ((b - a) * fraction / 128);
+        (((u64::from(tables::STEP_48000[note]) * scale) >> 24) * 48000 / u64::from(self.rate))
+            as u32
     }
     fn message(&mut self) {
         let channel = self.status & 15;
@@ -246,7 +262,7 @@ impl Synth {
                     note: first,
                     velocity: second,
                     program: state.program,
-                    step: self.step(first, state.bend),
+                    step: self.step(first, state.bend, state.bend_range),
                     age: self.age,
                     noise: 0x9E37_79B9 ^ u32::from(first),
                     attacking: true,
@@ -260,6 +276,12 @@ impl Synth {
                     7 => state.volume = second,
                     10 => state.pan = second,
                     11 => state.expression = second,
+                    101 => state.rpn[0] = second,
+                    100 => state.rpn[1] = second,
+                    6 if state.rpn == [0, 0] => {
+                        state.bend_range = second.min(24);
+                        self.retune(channel);
+                    }
                     64 => {
                         state.sustain = second >= 64;
                         if !state.sustain {
@@ -281,6 +303,7 @@ impl Synth {
                         state.expression = 127;
                         state.bend = 8192;
                         state.sustain = false;
+                        state.rpn = [127, 127];
                         for v in &mut self.voices {
                             if v.channel == channel && !v.key_down {
                                 v.released = true;
@@ -309,11 +332,11 @@ impl Synth {
         }
     }
     fn retune(&mut self, channel: u8) {
-        let bend = self.channels[usize::from(channel)].bend;
+        let state = self.channels[usize::from(channel)];
         for index in 0..VOICES {
             let v = self.voices[index];
             if v.active && v.channel == channel {
-                self.voices[index].step = self.step(v.note, bend);
+                self.voices[index].step = self.step(v.note, state.bend, state.bend_range);
             }
         }
     }
@@ -453,6 +476,33 @@ mod tests {
         );
         synth.reset();
         assert_eq!(synth.channels[0].bend, 8192);
+    }
+    #[test]
+    fn rpn_zero_sets_bend_range_and_keeps_the_default_two_semitones() {
+        let mut synth = Synth::new(48000).unwrap();
+        let plain = |note: u8, bend: u16| {
+            let index = usize::from(bend / 64);
+            let a = u64::from(tables::BEND[index]);
+            let b = u64::from(tables::BEND[(index + 1).min(256)]);
+            let scale = a + (b - a) * u64::from(bend % 64) / 64;
+            ((u64::from(tables::STEP_48000[usize::from(note)]) * scale) >> 24) as u32
+        };
+        for bend in [0, 1, 63, 4096, 8191, 8192, 8255, 12000, 16383] {
+            assert_eq!(synth.step(60, bend, 2), plain(60, bend), "bend {bend}");
+        }
+        // A 12-semitone range moves an exact full-scale offset (16384) one octave.
+        assert_eq!(synth.step(48, 16384, 12), synth.step(60, 8192, 2));
+        assert_eq!(synth.step(60, 0, 12), synth.step(48, 8192, 2));
+        send(&mut synth, &[0x90, 60, 100, 0xE0, 127, 127]);
+        let two = synth.voices[0].step;
+        send(&mut synth, &[0xB0, 101, 0, 100, 0, 6, 12]);
+        assert!(synth.voices[0].step > two);
+        assert_eq!(synth.channels[0].bend_range, 12);
+        send(&mut synth, &[0xB0, 101, 127, 100, 127, 6, 1]);
+        assert_eq!(
+            synth.channels[0].bend_range, 12,
+            "null RPN ignores data entry"
+        );
     }
     #[test]
     fn fixed_voice_pool_and_batch_partition_keep_output_identical() {

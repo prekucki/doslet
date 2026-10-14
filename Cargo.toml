@@ -39,7 +39,10 @@ doslet-pc = { path = "crates/machines/doslet-pc" }
 doslet-executable = { path = "crates/system/doslet-executable" }
 doslet-dos = { path = "crates/system/doslet-dos" }
 doslet-runtime = { path = "crates/runtime/doslet-runtime" }
+doslet-midi-routing = { path = "crates/runtime/doslet-midi-routing" }
 doslet-midi-synth = { path = "crates/runtime/doslet-midi-synth" }
+doslet-mt32 = { path = "crates/hardware/audio/doslet-mt32" }
+doslet-mt32-gm = { path = "crates/hardware/audio/doslet-mt32-gm" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

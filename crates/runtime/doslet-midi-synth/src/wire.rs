@@ -101,14 +101,16 @@ impl Decoder {
     }
 }
 
-const CC: [u8; 6] = [0, 32, 7, 10, 11, 64];
-const DEFAULT_CC: [u8; 6] = [0, 0, 100, 64, 127, 0];
+const CC: [u8; 8] = [0, 32, 7, 10, 11, 64, 1, 91];
+const DEFAULT_CC: [u8; 8] = [0, 0, 100, 64, 127, 0, 0, 0];
 pub const REPLAY_CAPACITY: usize = 16384;
 pub struct State {
     velocity: [[u8; 128]; 16],
     held: [[bool; 128]; 16],
     program: [u8; 16],
-    controls: [[u8; 6]; 16],
+    controls: [[u8; 8]; 16],
+    rpn: [[u8; 2]; 16],
+    bend_range: [[u8; 2]; 16],
     bend: [u16; 16],
 }
 impl Default for State {
@@ -124,6 +126,8 @@ impl State {
             program: [0; 16],
             controls: [DEFAULT_CC; 16],
             bend: [8192; 16],
+            rpn: [[127; 2]; 16],
+            bend_range: [[2, 0]; 16],
         }
     }
     pub fn receive(&mut self, message: &[u8]) {
@@ -157,6 +161,12 @@ impl State {
             0xC0 => self.program[c] = a as u8,
             0xE0 => self.bend[c] = a as u16 | (u16::from(b) << 7),
             0xB0 => {
+                match a {
+                    101 => self.rpn[c][0] = b,
+                    100 => self.rpn[c][1] = b,
+                    6 | 38 if self.rpn[c] == [0, 0] => self.bend_range[c][usize::from(a == 38)] = b,
+                    _ => {}
+                }
                 if let Some(i) = CC.iter().position(|&cc| usize::from(cc) == a) {
                     self.controls[c][i] = b;
                 }
@@ -171,6 +181,7 @@ impl State {
                     self.controls[c][4] = 127;
                     self.controls[c][5] = 0;
                     self.bend[c] = 8192;
+                    self.rpn[c] = [127; 2];
                 }
                 if self.controls[c][5] < 64 {
                     for n in 0..128 {
@@ -191,6 +202,16 @@ impl State {
                 output[used..used + bytes.len()].copy_from_slice(bytes);
                 used += bytes.len();
             };
+            for (cc, value) in [
+                (101, 0),
+                (100, 0),
+                (6, self.bend_range[c][0]),
+                (38, self.bend_range[c][1]),
+                (101, self.rpn[c][0]),
+                (100, self.rpn[c][1]),
+            ] {
+                append(&[0xB0 | channel, cc, value]);
+            }
             for (i, &cc) in CC.iter().enumerate() {
                 append(&[0xB0 | channel, cc, self.controls[c][i]]);
             }
@@ -200,11 +221,25 @@ impl State {
                 (self.bend[c] & 127) as u8,
                 (self.bend[c] >> 7) as u8,
             ]);
+        }
+        used += self.write_notes(&mut output[used..]);
+        used
+    }
+    /// Active and sustain-held notes only, after restoring device parameters.
+    pub fn write_notes(&self, output: &mut [u8]) -> usize {
+        let mut used = 0;
+        for c in 0..16 {
             for n in 0..128 {
                 if self.velocity[c][n] != 0 {
-                    append(&[0x90 | channel, n as u8, self.velocity[c][n]]);
+                    output[used..used + 3].copy_from_slice(&[
+                        0x90 | c as u8,
+                        n as u8,
+                        self.velocity[c][n],
+                    ]);
+                    used += 3;
                     if !self.held[c][n] {
-                        append(&[0x80 | channel, n as u8, 0]);
+                        output[used..used + 3].copy_from_slice(&[0x80 | c as u8, n as u8, 0]);
+                        used += 3;
                     }
                 }
             }
@@ -225,6 +260,31 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replay_restores_rpn_bend_range_and_the_current_selector() {
+        let mut state = State::new();
+        for message in [
+            [0xB0, 101, 0],
+            [0xB0, 100, 0],
+            [0xB0, 6, 12],
+            [0xB0, 38, 25],
+            [0xB0, 101, 127],
+            [0xB0, 100, 127],
+        ] {
+            state.receive(&message);
+        }
+        let mut replay = [0; REPLAY_CAPACITY];
+        let count = state.write(&mut replay);
+        let mut restored = State::new();
+        let mut decoder = Decoder::new();
+        for &byte in &replay[..count] {
+            if let Some(message) = decoder.push(byte).unwrap() {
+                restored.receive(message);
+            }
+        }
+        assert_eq!(restored.bend_range[0], [12, 25]);
+        assert_eq!(restored.rpn[0], [127, 127]);
+    }
     #[test]
     fn framing_restores_running_status_across_batches_and_realtime() {
         let mut d = Decoder::new();

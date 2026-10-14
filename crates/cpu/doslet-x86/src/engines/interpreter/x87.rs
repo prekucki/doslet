@@ -27,6 +27,24 @@ impl Cpu {
         };
         if modrm >> 6 == 3 {
             match (opcode, modrm) {
+                (0xDE, 0xC8..=0xCF | 0xE0..=0xEF) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .arithmetic_pop(modrm & 7, modrm < 0xD0, modrm & 8 == 0)
+                    .map_err(arithmetic_error)?,
+                (0xD8, 0xF0..=0xFF) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .divide(modrm & 7, modrm & 8 != 0)
+                    .map_err(arithmetic_error)?,
+                (0xD9, 0xC8..=0xCF) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .exchange(modrm & 7)
+                    .map_err(stack_error)?,
                 (0xDE, 0xF0..=0xFF) => self
                     .fpu
                     .as_mut()
@@ -78,6 +96,25 @@ impl Cpu {
                 context.address_32,
             )?;
             match (opcode, (modrm >> 3) & 7) {
+                (0xD8 | 0xDC, 3) => {
+                    let address = operand.address(
+                        &self.registers,
+                        if opcode == 0xD8 { 4 } else { 8 },
+                        Access::Read,
+                    )?;
+                    let low = decode::read_dword(bus, address)?;
+                    let value = if opcode == 0xD8 {
+                        f64::from(f32::from_bits(low))
+                    } else {
+                        let high = decode::read_dword(bus, address + 4)?;
+                        f64::from_bits(u64::from(low) | (u64::from(high) << 32))
+                    };
+                    self.fpu
+                        .as_mut()
+                        .unwrap()
+                        .compare_memory_pop(value)
+                        .map_err(arithmetic_error)?;
+                }
                 (0xD9 | 0xDD, 0) => {
                     let address = operand.address(
                         &self.registers,
@@ -111,7 +148,12 @@ impl Cpu {
                         if opcode == 0xD9 { 4 } else { 8 },
                         Access::Write,
                     )?;
-                    let value = self.fpu.as_ref().unwrap().st0().map_err(stack_error)?;
+                    let value = self
+                        .fpu
+                        .as_ref()
+                        .unwrap()
+                        .store_value()
+                        .map_err(arithmetic_error)?;
                     if opcode == 0xD9 && f64::from(value as f32) != value {
                         return Err(CpuError::UnsupportedOperand {
                             cs: context.cs,

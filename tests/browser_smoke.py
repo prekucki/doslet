@@ -64,9 +64,14 @@ class Marionette:
         raise AssertionError(f"Timed out: {expression}; state: {self.script('return window.result || null;')}")
 
 
-def game_zip():
+def game_zip(mt32=False):
     # Original fixture: draw color 42, transmit a note, busy-loop indefinitely.
     program = bytes.fromhex("b81300cd10b800a08ec031ffb900fab02af3aa ba3103 b03fee ba3003 ec b090ee b045ee b064ee ebfe")
+    if mt32:
+        message = [0xf0,0x41,0x10,0x16,0x12,0x20,0,0,*b"MT32 test"]
+        message += [(-sum(message[5:])) & 127,0xf7,0x91,69,100]
+        program = bytes.fromhex("b81300cd10b800a08ec031ffb900fab02af3aa ba3103 b03fee ba3003 ec")
+        program += b"".join(bytes([0xb0,byte,0xee]) for byte in message) + bytes.fromhex("ebfe")
     data = io.BytesIO()
     with zipfile.ZipFile(data, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("GAME/TEST.COM", program)
@@ -96,6 +101,7 @@ def main():
             bridge.releaseFrame();
         }}
     }}, 16);
+    window.mtZip = new Uint8Array({game_zip(True)});
     window.startTest = () => {{
         bridge.resumeAudio().then(() => result.resumed = true).catch(e => result.error = String(e));
         bridge.importZip(new Uint8Array({game_zip()}));
@@ -196,7 +202,7 @@ def main():
                         open: () => Promise.resolve(),
                         send: (bytes, when) => sent.push({bytes: Array.from(bytes), when})};
                     Object.defineProperty(navigator, 'requestMIDIAccess', {configurable: true,
-                        value: () => Promise.resolve({outputs: new Map([['test-port', mockOutput]])})});
+                        value: options => Promise.resolve({sysexEnabled: !!options?.sysex, outputs: new Map([['test-port', mockOutput]])})});
                     bridge.listMidi().then(ports => bridge.selectMidi(ports[0]))
                         .then(() => result.hostSelected = true).catch(e => result.error = String(e));
                     return true;
@@ -220,6 +226,20 @@ def main():
                 assert not driver.script("return result.error || null;")
                 driver.wait("result.audio.state === 'running' && result.audio.peak > 0.01")
                 print("Web MIDI device mock: complete messages, timestamps and backend replay: OK", flush=True)
+                driver.script("result.events = []; bridge.command('midi-mode','gm'); bridge.importZip(mtZip); return true;")
+                driver.wait("result.events.some(e => e.kind === 'imported')")
+                driver.script("bridge.command('start-game','GAME/TEST.COM'); return true;")
+                driver.wait("result.state.midiMode === 'mt32' && result.state.midiUpgraded && result.state.midiSysex === 1 && result.audio.notes === 1 && result.audio.peak > 0.01")
+                driver.script("sent = []; bridge.selectMidi('0: Test synth').then(() => result.mtGmSelected = true).catch(e => result.error=String(e)); return true;")
+                driver.wait("result.mtGmSelected && sent.some(e => e.bytes[0] === 0x90 && e.bytes[1] === 69)")
+                assert not driver.script("return sent.some(e => e.bytes[0] === 0xf0);")
+                driver.wait("sent.some(e => e.bytes[0] === 0xb0 && e.bytes[1] === 6 && e.bytes[2] === 12)")
+                driver.script("sent = []; bridge.selectMidi('0: Test synth','mt32').then(() => result.mtRawSelected = true).catch(e => result.error=String(e)); return true;")
+                driver.wait("result.mtRawSelected && sent.some(e => e.bytes[0] === 0xf0) && sent.some(e => e.bytes[0] === 0x91 && e.bytes[1] === 69)")
+                driver.script("bridge.selectMidi('Rust synth').then(() => result.mtRustSelected = true).catch(e => result.error=String(e)); return true;")
+                driver.wait("result.mtRustSelected && result.audio.state === 'running' && result.audio.notes === 1 && result.audio.peak > 0.01")
+                assert not driver.script("return result.events.some(e => ['error','audio-error'].includes(e.kind));"), driver.script("return result.events;")
+                print("MT-32 auto upgrade, GM translation, RPN replay, raw SysEx port and return to Rust: OK", flush=True)
                 if args.benchmark:
                     driver.script("""
                         bridge.command('pause', '');
@@ -277,7 +297,7 @@ def main():
                     (ROOT / 'target/prince-wasm-benchmark.json').write_text(json.dumps(runs, indent=2))
                 if args.prince:
                     driver.script("""
-                        result.events = [];
+                        result.events = []; bridge.command('midi-mode','gm');
                         fetch('/prince.zip').then(r => r.arrayBuffer()).then(bytes => bridge.importZip(new Uint8Array(bytes)));
                         return true;
                     """)

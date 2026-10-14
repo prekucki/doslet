@@ -8,7 +8,7 @@ let ended = false;
 let anchor = null, nextVideo = 0, failed = false;
 let snapshotPending = null;
 // Transferable host presentation buffers. Guest RAM and VRAM never cross realms.
-let midiPool = Array.from({length: 16}, () => new ArrayBuffer(1024));
+let midiPool = Array.from({length: 16}, () => new ArrayBuffer(16384));
 const videoPool = Array.from({length: 2}, () => new ArrayBuffer(640 * 480 * 4));
 // setTimeout(0) acquires a minimum delay in nested timer chains. A message task
 // yields to commands without imposing that extra delay when the CPU is behind.
@@ -30,7 +30,7 @@ function sendBytes(nanos, bytes) {
 function sendSnapshot() {
     while (snapshotPending && midiPool.length) {
         const {bytes, offset, nanos} = snapshotPending;
-        const end = Math.min(offset + 1024, bytes.length);
+        const end = Math.min(offset + 16384, bytes.length);
         sendBytes(nanos, bytes.subarray(offset, end));
         snapshotPending.offset = end;
         if (end === bytes.length) snapshotPending = null;
@@ -59,7 +59,9 @@ function present(force = false) {
     nextVideo = now + 16;
     const state = {kind: 'state', epoch, status: engine.status(), steps: engine.steps(),
         nanos: engine.nanos(), cs: engine.cs(), ip: engine.ip(), ax: engine.ax(),
-        cx: engine.cx(), di: engine.di(), fault: engine.fault()};
+        cx: engine.cx(), di: engine.di(), fault: engine.fault(), midiMode: engine.midi_mode(),
+        midiUpgraded: engine.midi_upgraded(), midiSysex: engine.midi_sysex(),
+        midiUnmapped: engine.midi_unmapped(), midiDisplay: engine.midi_display()};
     self.postMessage(state);
     if (!videoPool.length) return;
     const count = engine.convert_frame();
@@ -71,14 +73,21 @@ function present(force = false) {
 }
 self.onmessage = ({data}) => {
     try {
+        if (data.kind === 'key') {
+            engine.key_event(data.scan, data.ascii, data.modifiers, data.pressed);
+            return;
+        }
+        if (data.kind === 'pointer') { engine.pointer_event(data.x,data.y,data.button,data.pressed); return; }
+        if (data.kind === 'midi-mode') { engine.set_midi_mode(data.program); syncAudio(audioRunning); present(true); return; }
         if (data.kind === 'video-return') { videoPool.push(data.buffer); return; }
         if (data.kind === 'connect') {
             if (port) port.close();
             port = data.port; clockMode = data.mode || 'worklet';
+            engine.set_output_mode(clockMode === 'midi' ? data.dialect || 'gm' : 'gm');
             // A newly connected output recovers host/audio faults without
             // recreating the machine. Session::start still rejects CPU faults.
             failed = false;
-            midiPool = Array.from({length: 16}, () => new ArrayBuffer(1024));
+            midiPool = Array.from({length: 16}, () => new ArrayBuffer(16384));
             const connected = port;
             port.onmessage = ({data: message}) => {
                 if (connected !== port) return;
