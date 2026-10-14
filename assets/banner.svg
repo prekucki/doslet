@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="220" viewBox="0 0 880 220" role="img" aria-labelledby="title desc">
+  <title id="title">Doslet</title>
+  <desc id="desc">A little DOS. Room to explore. Rust, reusable components, desktop and WebAssembly.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#172638"/><stop offset="1" stop-color="#0c111a"/></linearGradient>
+    <pattern id="grid" width="22" height="22" patternUnits="userSpaceOnUse"><path d="M22 0H0V22" fill="none" stroke="#58dfbe" stroke-opacity=".055"/></pattern>
+  </defs>
+  <rect width="880" height="220" rx="22" fill="url(#bg)"/>
+  <rect width="880" height="220" rx="22" fill="url(#grid)"/>
+  <rect x="36" y="43" width="90" height="90" rx="20" fill="#102b2b" stroke="#58dfbe" stroke-opacity=".35"/>
+  <path d="m58 69 19 16-19 16m27 0h21" fill="none" stroke="#58dfbe" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="151" y="108" fill="#ebf1f7" font-family="system-ui,sans-serif" font-size="68" font-weight="650" letter-spacing="-3">doslet</text>
+  <text x="153" y="145" fill="#97a6b9" font-family="system-ui,sans-serif" font-size="20">A little DOS. Room to explore.</text>
+  <text x="39" y="190" fill="#58dfbe" font-family="system-ui,sans-serif" font-size="12" letter-spacing="2">RUST  /  REUSABLE EMULATION  /  DESKTOP + WASM</text>
+  <g fill="#58dfbe" opacity=".8">
+    <rect x="608" y="117" width="18" height="18" rx="3"/><rect x="630" y="95" width="18" height="18" rx="3"/><rect x="652" y="73" width="18" height="18" rx="3"/>
+    <rect x="674" y="73" width="18" height="18" rx="3"/><rect x="696" y="95" width="18" height="18" rx="3"/><rect x="718" y="117" width="18" height="18" rx="3"/>
+    <rect x="740" y="95" width="18" height="18" rx="3"/><rect x="762" y="73" width="18" height="18" rx="3"/><rect x="784" y="51" width="18" height="18" rx="3"/>
+  </g>
+</svg>

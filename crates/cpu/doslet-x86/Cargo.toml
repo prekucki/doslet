@@ -1,0 +1,13 @@
+[package]
+name = "doslet-x86"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+doslet-bus.workspace = true
+doslet-x87.workspace = true
+
+[lints]
+workspace = true

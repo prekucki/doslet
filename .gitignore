@@ -1,0 +1,7 @@
+/target/
+/web/dist/
+/web/out/
+/web/.stage/
+/PRINCE
+/games/
+*.log

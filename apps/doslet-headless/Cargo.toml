@@ -1,0 +1,16 @@
+[package]
+name = "doslet-headless"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[features]
+profiling = ["doslet-runtime/profiling"]
+[dependencies]
+doslet-runtime.workspace = true
+doslet-midi-synth.workspace = true
+doslet-executable.workspace = true
+doslet-x86.workspace = true
+doslet-dos.workspace = true
+[lints]
+workspace = true

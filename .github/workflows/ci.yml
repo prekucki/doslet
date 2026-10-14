@@ -1,0 +1,73 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      NO_COLOR: "true"
+    # Plain shell steps only: checkout/setup/cache actions commonly run on Node.
+    steps:
+      - name: Fetch the source with Git
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          auth_helper="${RUNNER_TEMP}/doslet-git-askpass.sh"
+          cat > "$auth_helper" <<'SCRIPT'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+          esac
+          SCRIPT
+          chmod 700 "$auth_helper"
+          GIT_ASKPASS="$auth_helper" GIT_TERMINAL_PROMPT=0 git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Install native audio build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Check native code
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test components and allocation behavior
+        run: cargo test --workspace --locked
+
+      - name: Build the desktop application
+        run: cargo build -p doslet --locked
+
+      - name: Run the guest demo
+        run: cargo run -p doslet-headless --locked -- demo
+
+      - name: Check all emulation libraries for WebAssembly
+        run: cargo check -p doslet -p doslet-web-worker -p doslet-web-audio -p doslet-time -p doslet-executable --target wasm32-unknown-unknown --locked
+
+      - name: Install Rust Trunk
+        run: cargo install trunk --version 0.21.13 --locked
+
+      - name: Install matching Rust WASM bindings tool
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+
+      - name: Build the browser bundle
+        working-directory: web
+        run: trunk build --locked

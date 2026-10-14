@@ -1,0 +1,42 @@
+[tools]
+"cargo:trunk" = "0.21.13"
+# Keep this version aligned with wasm-bindgen in Cargo.lock.
+"cargo:wasm-bindgen-cli" = "0.2.129"
+# wasm-opt is used by Trunk's --release post-processing step.
+"github:WebAssembly/binaryen" = "version_133"
+
+[tasks.test]
+description = "Run the component and allocation tests"
+run = "cargo test --workspace --locked"
+
+[tasks.check]
+description = "Format and lint all native targets"
+run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets --locked -- -D warnings"]
+
+[tasks.run]
+description = "Launch the iced desktop application"
+run = "cargo run -p doslet --locked"
+
+[tasks.demo]
+description = "Run the guest COM demo without a window"
+run = "cargo run -p doslet-headless --locked -- demo"
+
+[tasks.inspect-prince]
+description = "Inspect the locally supplied PRINCE executable"
+run = "cargo run -p doslet-headless --locked -- inspect PRINCE/PRINCE.EXE"
+
+[tasks.package-prince]
+description = "Create ignored target/prince-game.zip and validate game startup from it"
+run = "cargo test -p doslet --release --locked --offline local_prince_zip_round_trip -- --ignored --nocapture"
+
+[tasks.web]
+description = "Serve the iced WebAssembly application"
+dir = "web"
+run = "trunk serve --locked"
+env = { NO_COLOR = "true" }
+
+[tasks.web-build]
+description = "Build the WebAssembly application with LLVM and wasm-opt speed optimizations"
+dir = "web"
+run = "trunk build --release --locked"
+env = { NO_COLOR = "true" }

@@ -1,0 +1,18 @@
+[package]
+name = "doslet-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[features]
+profiling = ["doslet-pc/profiling"]
+[dependencies]
+doslet-bus.workspace = true
+doslet-x86.workspace = true
+doslet-pc.workspace = true
+doslet-dos.workspace = true
+doslet-vga.workspace = true
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+allocation-counter = "0.8.1"
+[lints]
+workspace = true

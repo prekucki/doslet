@@ -1,0 +1,19 @@
+[package]
+name = "doslet-web-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[lib]
+crate-type = ["cdylib", "rlib"]
+[dependencies]
+doslet-runtime.workspace = true
+doslet-dos.workspace = true
+doslet-x86.workspace = true
+doslet-midi-synth.workspace = true
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.129"
+console_error_panic_hook = "0.1.7"
+[lints]
+workspace = true

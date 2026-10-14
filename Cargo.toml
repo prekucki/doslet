@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+exclude = ["apps/common"]
+members = [
+    "crates/foundation/*",
+    "crates/cpu/*",
+    "crates/hardware/controllers/*",
+    "crates/hardware/video/*",
+    "crates/hardware/audio/*",
+    "crates/hardware/clocks/*",
+    "crates/machines/*",
+    "crates/system/*",
+    "crates/runtime/*",
+    "apps/*",
+]
+default-members = ["apps/doslet-headless"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "GPL-2.0-or-later"
+
+[workspace.dependencies]
+doslet-bus = { path = "crates/foundation/doslet-bus" }
+doslet-time = { path = "crates/foundation/doslet-time" }
+doslet-x86 = { path = "crates/cpu/doslet-x86" }
+doslet-x87 = { path = "crates/cpu/doslet-x87" }
+doslet-i8259 = { path = "crates/hardware/controllers/doslet-i8259" }
+doslet-i8254 = { path = "crates/hardware/controllers/doslet-i8254" }
+doslet-i8237 = { path = "crates/hardware/controllers/doslet-i8237" }
+doslet-i8042 = { path = "crates/hardware/controllers/doslet-i8042" }
+doslet-mc146818 = { path = "crates/hardware/clocks/doslet-mc146818" }
+doslet-vga = { path = "crates/hardware/video/doslet-vga" }
+doslet-mpu401 = { path = "crates/hardware/audio/doslet-mpu401" }
+doslet-sb-dsp = { path = "crates/hardware/audio/doslet-sb-dsp" }
+doslet-sb-mixer = { path = "crates/hardware/audio/doslet-sb-mixer" }
+doslet-pc = { path = "crates/machines/doslet-pc" }
+doslet-executable = { path = "crates/system/doslet-executable" }
+doslet-dos = { path = "crates/system/doslet-dos" }
+doslet-runtime = { path = "crates/runtime/doslet-runtime" }
+doslet-midi-synth = { path = "crates/runtime/doslet-midi-synth" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.web]
+inherits = "release"
+opt-level = 3

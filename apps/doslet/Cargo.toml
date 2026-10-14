@@ -1,0 +1,29 @@
+[package]
+name = "doslet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+doslet-runtime.workspace = true
+doslet-midi-synth.workspace = true
+doslet-dos.workspace = true
+web-time = "1.1.0"
+doslet-x86.workspace = true
+iced = { version = "0.14.0", default-features = false, features = ["image-without-codecs", "crisp", "fira-sans"] }
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = "4", features = ["derive"] }
+cpal = "0.15.3"
+midir = "0.11.1"
+iced = { version = "0.14.0", default-features = false, features = ["wgpu", "tokio", "x11", "wayland"] }
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+iced = { version = "0.14.0", default-features = false, features = ["tiny-skia"] }
+console_error_panic_hook = "0.1.7"
+web-sys = { version = "0.3.106", features = ["Blob", "File", "FileList", "HtmlInputElement", "HtmlElement", "Document", "Window", "Event", "EventTarget", "Node", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioScheduledSourceNode", "GainNode", "AudioParam", "console", "AudioContextOptions"] }
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+js-sys = "0.3.106"
+log = "0.4.34"
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+
+[watch]
+watch = [".."]
+ignore = ["../target", "dist", "../PRINCE"]
+
+[[hooks]]
+stage = "post_build"
+command = "cargo"
+command_arguments = ["run", "--manifest-path", "../Cargo.toml", "-p", "doslet-web-build", "--locked", "--quiet"]

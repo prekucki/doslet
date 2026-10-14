@@ -1,0 +1,23 @@
+[package]
+name = "doslet-pc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[features]
+profiling = []
+[dependencies]
+doslet-i8042.workspace = true
+doslet-mc146818.workspace = true
+doslet-mpu401.workspace = true
+doslet-sb-dsp.workspace = true
+doslet-sb-mixer.workspace = true
+doslet-bus.workspace = true
+doslet-time.workspace = true
+doslet-x86.workspace = true
+doslet-i8259.workspace = true
+doslet-i8254.workspace = true
+doslet-i8237.workspace = true
+doslet-vga.workspace = true
+[lints]
+workspace = true

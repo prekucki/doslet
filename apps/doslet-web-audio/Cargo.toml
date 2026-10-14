@@ -1,0 +1,16 @@
+[package]
+name = "doslet-web-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[lib]
+crate-type = ["cdylib", "rlib"]
+[dependencies]
+doslet-midi-synth.workspace = true
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.129"
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+allocation-counter = "0.8.1"
+[lints]
+workspace = true
