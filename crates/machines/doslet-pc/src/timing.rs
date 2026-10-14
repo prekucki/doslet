@@ -25,9 +25,12 @@ impl PcMachine {
         self.advance_hardware_steps(1)
     }
     pub(crate) fn idle_steps_to_event(&self, budget: u32) -> u32 {
+        self.steps_to_event_nanos(budget, 1_000_000)
+    }
+    pub(crate) fn steps_to_event_nanos(&self, budget: u32, deadline: u64) -> u32 {
         // Bound hardware-only work to one millisecond of guest time even when
         // no wake source is programmed. This is independent of host refresh.
-        let mut nanos = 1_000_000;
+        let mut nanos = deadline.min(1_000_000);
         if let Some(ticks) = self
             .bus
             .pit
@@ -109,7 +112,7 @@ impl PcMachine {
     }
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use doslet_bus::{MemoryBus, PortBus};
     #[test]
@@ -125,7 +128,7 @@ mod tests {
             assert_eq!(machine.time().as_nanos(), nanos);
         }
     }
-    fn idle_machine(dma: bool) -> PcMachine {
+    pub(crate) fn idle_machine(dma: bool) -> PcMachine {
         let mut machine = PcMachine::default();
         for (i, byte) in [0xF4, 0xEB, 0xFD].iter().enumerate() {
             machine.bus.write_u8(i as u32, *byte).unwrap();

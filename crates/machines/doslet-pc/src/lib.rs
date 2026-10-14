@@ -5,6 +5,7 @@ mod audio;
 pub mod io;
 pub mod memory;
 mod timing;
+mod vga_wait;
 
 use core::fmt;
 use doslet_bus::BusError;
@@ -22,6 +23,9 @@ pub struct ExecutionStats {
     pub vga_status_reads: u64,
     pub pit_reads: u64,
     pub bda_tick_reads: u64,
+    /// Logical IN/AND/Jcc units accounted for without interpreter dispatch.
+    pub vga_wait_steps: u64,
+    pub vga_wait_batches: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +77,7 @@ pub struct PcMachine {
     pub cpu: Cpu,
     pub bus: PcBus,
     timing: timing::Timing,
+    vga_wait: vga_wait::WaitState,
 }
 impl Default for PcMachine {
     fn default() -> Self {
@@ -84,10 +89,17 @@ impl Default for PcMachine {
             cpu: Cpu::default().with_x87(),
             bus,
             timing: timing::Timing::default(),
+            vga_wait: vga_wait::WaitState::default(),
         }
     }
 }
 impl PcMachine {
+    /// Disable recognition as well as batching for interpreter comparisons.
+    pub fn set_vga_wait_acceleration(&mut self, enabled: bool) {
+        self.vga_wait.enabled = enabled;
+        self.bus.observe_vga_status = enabled;
+        self.vga_wait.candidate = None;
+    }
     /// Consume empty logical steps up to the first device deadline. CPU work
     /// and eligible IRQ delivery still happen through step(). The caller owns
     /// the finite budget and accounts for the returned logical step count.
@@ -116,12 +128,20 @@ impl PcMachine {
     pub fn step(&mut self) -> Result<StepOutcome, MachineError> {
         self.step_with_idle_budget(1).map(|(outcome, _)| outcome)
     }
-    /// Normal execution consumes one logical step. Only a halted CPU may use
-    /// the remaining budget to advance directly to a device deadline.
+    /// Normal execution consumes one logical step. HLT and confirmed VGA wait
+    /// iterations may account for bounded hardware-only logical steps.
     pub fn step_with_idle_budget(
         &mut self,
         budget: u32,
     ) -> Result<(StepOutcome, u32), MachineError> {
+        if self.vga_wait.ready(budget)
+            && let Some(consumed) = self.advance_vga_wait(budget)?
+        {
+            return Ok((StepOutcome::Continue, consumed));
+        }
+        let read_generation = self.bus.vga_status_read_generation;
+        let candidate_valid = self.vga_wait.candidate.is_some() && self.validate_vga_wait();
+        let mut interrupted = false;
         #[cfg(feature = "profiling")]
         if self.cpu.is_halted() {
             self.bus.stats.idle_steps += 1;
@@ -130,6 +150,7 @@ impl PcMachine {
         }
         let outcome = if self.cpu.accepts_maskable_interrupt() {
             if let Some(vector) = self.bus.pic.acknowledge() {
+                interrupted = true;
                 #[cfg(feature = "profiling")]
                 {
                     self.bus.stats.irq_entries += 1;
@@ -148,6 +169,11 @@ impl PcMachine {
             self.cpu.step(&mut self.bus)?
         };
         self.advance_hardware()?;
+        self.observe_vga_wait(
+            candidate_valid,
+            interrupted,
+            self.bus.vga_status_read_generation != read_generation,
+        );
         // An interrupt-enabled HLT idles in bounded clock steps until an IRQ.
         if outcome == StepOutcome::Halted && self.cpu.accepts_maskable_interrupt() {
             let idle = self.advance_idle(budget.saturating_sub(1))?;

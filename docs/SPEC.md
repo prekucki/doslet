@@ -119,7 +119,14 @@ delivers eligible PIC interrupts at instruction boundaries; STI and SS reloads
 inhibit one following instruction. Interrupt-enabled HLT idles until delivery;
 the machine can combine idle scheduling units up to the earliest PIT/DSP event,
 remaining batch budget or 1-ms guest-time limit. Pending eligible IRQs and
-IF-disabled HLT do not fast-forward. Architectural exception delivery and
+IF-disabled HLT do not fast-forward. The PC also recognizes the exact unprefixed
+`IN AL,DX; AND AL,08h; JZ/JNZ -5` pattern on the active VGA input-status port.
+After discovery and a complete confirming iteration, whole taken iterations can
+advance together strictly before a VGA retrace/PIT/DSP event, remaining budget
+or 1-ms bound. AL, flags and instruction phase remain equivalent to ordinary
+stepping. IF-disabled waits retain pending PIC state; pending eligible IRQs,
+interrupt shadows, TF/RF/VM, paging, changed code/CS/DX and inactive ports fall
+back. Ordinary one-step/debug execution cannot batch. Architectural exception delivery and
 complete historical CPU-model behavior are not implemented. Unsupported opcodes,
 operands, ports and services stop the session with a diagnostic; a faulted
 instruction is not guaranteed to have rolled back its earlier side effects.

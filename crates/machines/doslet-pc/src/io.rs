@@ -9,6 +9,10 @@ use doslet_mpu401::Mpu401;
 use doslet_vga::{APERTURE_LEN, APERTURE_START, Vga};
 
 pub struct PcBus {
+    /// CPU-independent notification generation. Only successful active VGA
+    /// status reads increment it; the PC compares before/after one CPU step.
+    pub(crate) vga_status_read_generation: u32,
+    pub(crate) observe_vga_status: bool,
     #[cfg(feature = "profiling")]
     pub(crate) stats: crate::ExecutionStats,
     ram: Ram,
@@ -32,6 +36,8 @@ impl Default for PcBus {
         pit.write_counter(0, 0).unwrap();
         pit.write_counter(0, 0).unwrap();
         Self {
+            vga_status_read_generation: 0,
+            observe_vga_status: true,
             #[cfg(feature = "profiling")]
             stats: crate::ExecutionStats::default(),
             ram: Ram::default(),
@@ -190,8 +196,20 @@ impl PortBus for PcBus {
             // No AWE/EMU8000 is installed. Its probe ranges float high on
             // this ISA machine; they must not identify a nonexistent synth.
             0x600..=0x6FF | 0xA00..=0xAFF | 0xE00..=0xEFF => Ok(0xFF),
-            0x3B4 | 0x3B5 | 0x3D4 | 0x3D5 | 0x3C4 | 0x3C5 | 0x3CC | 0x3CE | 0x3CF | 0x3BA
-            | 0x3DA => self.vga.read_port(port).ok_or(BusError::UnmappedPort(port)),
+            0x3BA | 0x3DA => {
+                let value = self
+                    .vga
+                    .read_port(port)
+                    .ok_or(BusError::UnmappedPort(port))?;
+                if self.observe_vga_status {
+                    self.vga_status_read_generation =
+                        self.vga_status_read_generation.wrapping_add(1);
+                }
+                Ok(value)
+            }
+            0x3B4 | 0x3B5 | 0x3D4 | 0x3D5 | 0x3C4 | 0x3C5 | 0x3CC | 0x3CE | 0x3CF => {
+                self.vga.read_port(port).ok_or(BusError::UnmappedPort(port))
+            }
             0x70 => Ok(self.cmos.selected()),
             0x71 => Ok(self.cmos.read()),
             0x60 => Ok(self.keyboard.read_data()),

@@ -4,6 +4,32 @@ use doslet_runtime::{Session, SessionStatus};
 include!("../../../../tests/fixtures/relocated_mz.rs");
 include!("../../../../tests/fixtures/protected_graphics.rs");
 #[test]
+fn confirmed_vga_waits_allocate_nothing_and_keep_logical_time_and_budget() {
+    // Set mode 13h and repeatedly finish/start vertical retrace.
+    let program = [
+        0xB8, 0x13, 0, 0xCD, 0x10, 0xBA, 0xDA, 3, 0xEC, 0x24, 8, 0x75, 0xFB, 0xEC, 0x24, 8, 0x74,
+        0xFB, 0xEB, 0xF4,
+    ];
+    let mut fast = Session::new(&program).unwrap();
+    let mut reference = Session::new(&program).unwrap();
+    reference.set_vga_wait_acceleration(false);
+    fast.start();
+    reference.start();
+    let measured = allocation_counter::measure(|| {
+        assert_eq!(fast.advance(1_000_000), 1_000_000);
+    });
+    assert_eq!(reference.advance(1_000_000), 1_000_000);
+    assert_eq!(fast.status(), SessionStatus::Running);
+    assert_eq!(fast.steps(), 1_000_000);
+    assert_eq!(fast.emulated_nanos(), 121_212_121);
+    assert_eq!(fast.registers(), reference.registers());
+    assert_eq!(fast.eflags(), reference.eflags());
+    assert_eq!(measured.count_total, 0);
+    assert_eq!(measured.bytes_total, 0);
+    #[cfg(feature = "profiling")]
+    assert!(fast.execution_stats().vga_wait_steps > 900_000);
+}
+#[test]
 fn interrupt_enabled_hlt_fast_forward_allocates_nothing_and_preserves_budget() {
     let mut session = Session::new(&[0xF4, 0xEB, 0xFD]).unwrap();
     session.start();

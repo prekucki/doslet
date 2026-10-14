@@ -194,6 +194,10 @@ impl Cpu {
     pub fn accepts_maskable_interrupt(&self) -> bool {
         self.flags & flags::INTERRUPT != 0 && self.interrupt_shadow == 0
     }
+    /// An STI or SS reload still inhibits the next instruction boundary.
+    pub fn has_interrupt_shadow(&self) -> bool {
+        self.interrupt_shadow != 0
+    }
 
     /// One bounded execution step. REP STOSB performs at most one write per step.
     /// Errors stop execution; precise guest exception delivery is not implemented yet.

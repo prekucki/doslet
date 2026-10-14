@@ -77,6 +77,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--prince', action='store_true', help='also run the local, ignored target/prince-game.zip')
     parser.add_argument('--benchmark', action='store_true', help='pair saved baseline and current Worker WASM on the local PRINCE ZIP; no audio/rendering')
+    parser.add_argument('--benchmark-baseline', type=Path, default=ROOT / 'target/perf-baseline',
+                        help='directory containing reference doslet_web_worker.js and its WASM')
     args = parser.parse_args()
     bridge_path = next(DIST.glob("snippets/*/src/browser/bridge.js")).relative_to(DIST)
     page = f"""<!doctype html><html><head><base href="/"></head><body>
@@ -112,7 +114,7 @@ def main():
                 name = self.path.removeprefix('/baseline/')
                 if name not in ['doslet_web_worker.js', 'doslet_web_worker_bg.wasm']:
                     self.send_error(404); return
-                data = (ROOT / 'target/perf-baseline' / name).read_bytes()
+                data = (args.benchmark_baseline / name).read_bytes()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/wasm' if name.endswith('.wasm') else 'text/javascript')
                 self.end_headers(); self.wfile.write(data)

@@ -113,13 +113,7 @@ impl Vga {
         self.dac_cursor = usize::from(index) * 3;
     }
     pub fn read_port(&self, port: u16) -> Option<u8> {
-        if port
-            == if self.registers.misc & 1 != 0 {
-                0x3DA
-            } else {
-                0x3BA
-            }
-        {
+        if port == self.input_status_port() {
             let (total, visible, lines, sync_start, sync_end) = self.raster_geometry();
             let phase = self.raster_phase();
             let x = phase % total;
@@ -135,12 +129,48 @@ impl Vga {
         }
         self.registers.read(port)
     }
+    /// Active input-status decode without resolving raster time.
+    #[inline]
+    pub fn input_status_port(&self) -> u16 {
+        if self.registers.misc & 1 != 0 {
+            0x3DA
+        } else {
+            0x3BA
+        }
+    }
     pub fn pixel_clock_hz(&self) -> u32 {
         if self.mode == VideoMode::Text3 {
             28_322_000
         } else {
             25_175_000
         }
+    }
+    /// Selected input-status port and exact guest-nanosecond deadline of the
+    /// next vertical-retrace bit transition. This is a query without read side
+    /// effects; a future attribute-controller flip-flop model must revisit wait
+    /// batching equivalence before adding status-read side effects.
+    pub fn retrace_deadline(&self, port: u16) -> Option<u64> {
+        if port != self.input_status_port() {
+            return None;
+        }
+        let (line, _, _, start, end) = self.raster_geometry();
+        let phase = self.raster_phase();
+        let start = line * start;
+        let end = line * end;
+        let pixels = if phase < start {
+            start - phase
+        } else if phase < end {
+            end - phase
+        } else {
+            self.raster_total() - phase + start
+        };
+        let fraction = (self.pending_nanos * u64::from(self.pixel_clock_hz())
+            + self.pixel_fraction)
+            % 1_000_000_000;
+        Some(
+            (u64::from(pixels) * 1_000_000_000 - fraction)
+                .div_ceil(u64::from(self.pixel_clock_hz())),
+        )
     }
     fn raster_geometry(&self) -> (u32, u32, u32, u32, u32) {
         match self.mode {
@@ -220,6 +250,35 @@ impl Vga {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retrace_deadline_is_exact_with_fractional_pixels_and_mode_changes() {
+        for mode in 0..3 {
+            for initial in [0, 121, 122, 1000, 999999, 16_700_001] {
+                let mut vga = super::Vga::default();
+                if mode == 1 {
+                    vga.set_mode_13h();
+                }
+                if mode == 2 {
+                    vga.set_vbe_101h(false);
+                }
+                vga.advance_nanos(initial);
+                for _ in 0..4 {
+                    let before = vga.read_port(0x3DA).unwrap() & 8;
+                    let deadline = vga.retrace_deadline(0x3DA).unwrap();
+                    assert!(deadline > 0);
+                    vga.advance_nanos((deadline - 1) as u32);
+                    assert_eq!(vga.read_port(0x3DA).unwrap() & 8, before);
+                    assert_eq!(vga.retrace_deadline(0x3DA), Some(1));
+                    vga.advance_nanos(1);
+                    assert_ne!(vga.read_port(0x3DA).unwrap() & 8, before);
+                }
+                assert_eq!(vga.retrace_deadline(0x3BA), None);
+                vga.write_port(0x3C2, 0);
+                assert_eq!(vga.retrace_deadline(0x3DA), None);
+                assert!(vga.retrace_deadline(0x3BA).is_some());
+            }
+        }
+    }
     #[test]
     fn lazy_raster_time_matches_eager_pixels_across_modes_reads_and_large_inputs() {
         let mut lazy = super::Vga::default();

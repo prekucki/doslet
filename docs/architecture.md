@@ -172,8 +172,17 @@ PIT, selected raster status and DSP rates retain fractional clock conversion.
 Interrupt-enabled HLT can combine those same logical steps until the first
 PIT/DSP deadline, the remaining budget, or 1 ms of guest time. IRQ eligibility
 still takes precedence. VGA accumulates bounded guest nanoseconds and resolves
-raster phase when status is read or at its 1-ms flush bound. No polling loop is
-classified as idle. Optional profiling counters are absent from ordinary builds.
+raster phase when status is read or at its 1-ms flush bound. The PC composition
+recognizes only confirmed unprefixed `IN AL,DX; AND AL,08h; JZ/JNZ -5` status
+waits. A CPU-independent bus notification on actual VGA status I/O gates discovery,
+so unrelated CPU transfers require no code inspection. VGA exposes an exact
+next-retrace deadline with retained pixel fractions;
+PC combines it with PIT/DSP deadlines and skips whole three-unit iterations
+strictly before an event. Code/segment/port/state checks protect the fast path;
+the CPU library has no VGA dependency. IF-disabled waits preserve pending PIC
+requests. TF, interrupt shadows, paging, changed code and one-step execution fall
+back. A runtime switch disables recognition for reference measurements. Optional
+profiling counters are absent from ordinary builds.
 No chip reads a host clock or depends on UI refresh. Precise CPU/bus timing and
 complete arbitration/cascading remain future work.
 

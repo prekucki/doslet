@@ -197,6 +197,10 @@ impl Session {
     pub fn cpu_halted(&self) -> bool {
         self.machine.cpu.is_halted()
     }
+    /// Reference/debug execution can disable recognition and wait batching.
+    pub fn set_vga_wait_acceleration(&mut self, enabled: bool) {
+        self.machine.set_vga_wait_acceleration(enabled);
+    }
     #[cfg(feature = "profiling")]
     pub fn execution_stats(&self) -> doslet_pc::ExecutionStats {
         self.machine.execution_stats()

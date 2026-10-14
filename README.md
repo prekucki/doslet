@@ -237,14 +237,19 @@ To measure execution separately from indexed-to-RGBA conversion:
 cargo run -p doslet-headless --release --features profiling --locked -- run-stub PRINCE/PRINCE.EXE --steps 300000000 --profile-cpu
 ```
 
-The optional feature counts CPU/IRQ/HLT scheduling units and selected bus reads,
+The optional feature counts CPU/IRQ/HLT scheduling units, skipped VGA-wait units
+and batches, and actual dispatched bus reads,
 samples guest PCs at varying intervals, and drains MIDI without synthesizing it.
 The timed CPU boundary excludes sampling, UI rendering and host audio. A game
 still running at the finite step limit reports budget exhaustion and exits with
 code 1 after printing its profile. Ordinary builds contain no profiling counters.
 Interrupt-enabled HLT waits can advance together up to the next PIT/DSP deadline,
-the remaining step budget, or 1 ms of guest time. Arbitrary polling loops continue
-to execute normally.
+the remaining step budget, or 1 ms of guest time. Confirmed
+`IN AL,DX; AND AL,08h; JZ/JNZ -5` loops on the active VGA status port can batch
+whole iterations strictly before the next raster/PIT/DSP event; other polling
+loops execute normally. Append `--no-vga-waits` to disable recognition and
+batching for reference measurements. [The driver report](docs/compatibility/prince-svga.md)
+records the supported scope and differential checks.
 
 ## A local game target
 

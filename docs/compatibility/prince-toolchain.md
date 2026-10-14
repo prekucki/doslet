@@ -44,3 +44,6 @@ a debugger, an IDE or an assembler release.
 The practical confirmed stack is therefore a Watcom-linked 32-bit DOS program
 using DOS/4GW, an identifiable Sound Drive audio layer, and graphics modules
 whose SDK provenance still needs investigation.
+
+The [graphics-driver analysis](prince-svga.md) records the shared private ABI,
+actual VS module loading/execution, and the separate VGA polling loops.

@@ -107,7 +107,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "demo" | "run-com" | "run-mz" | "run-stub" | "bench"
     ) {
         println!(
-            "Doslet headless\n\n  demo [--steps N] [--frame PATH.ppm]\n  run-com PATH [--steps N] [--frame PATH.ppm]\n  run-mz PATH [--steps N] [--frame PATH.ppm]\n  run-stub PATH [--steps N] [--frame PATH.ppm] [--midi-log PATH] [--midi-wave PATH.wav] (experimental game startup)\n  inspect [PATH]  (default: PRINCE/PRINCE.EXE)\n  bench [--steps N]\n\nRunner diagnostics: --trace N, --trace-tail, --peek HEXADDRESS:DECIMALLENGTH (1..128 bytes), --find-ascii PATTERN (1..128 bytes, up to 16 extended-RAM matches), --profile-cpu (requires Cargo feature profiling).\nDemo runs an original COM program. PRINCE intro graphics and guest MIDI are observed; interactive sound is confirmed separately in the UI."
+            "Doslet headless\n\n  demo [--steps N] [--frame PATH.ppm]\n  run-com PATH [--steps N] [--frame PATH.ppm]\n  run-mz PATH [--steps N] [--frame PATH.ppm]\n  run-stub PATH [--steps N] [--frame PATH.ppm] [--midi-log PATH] [--midi-wave PATH.wav] (experimental game startup)\n  inspect [PATH]  (default: PRINCE/PRINCE.EXE)\n  bench [--steps N]\n\nRunner diagnostics: --trace N, --trace-tail, --peek HEXADDRESS:DECIMALLENGTH (1..128 bytes), --find-ascii PATTERN (1..128 bytes, up to 16 extended-RAM matches), --profile-cpu (requires Cargo feature profiling), --no-vga-waits (disable VGA wait recognition/batching).\nDemo runs an original COM program. PRINCE intro graphics and guest MIDI are observed; interactive sound is confirmed separately in the UI."
         );
         if command != "help" && command != "--help" && command != "-h" {
             return Err(format!("unknown command: {command}").into());
@@ -154,6 +154,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut finds: Vec<Vec<u8>> = Vec::new();
     while let Some(option) = args.next() {
         match option.as_str() {
+            "--no-vga-waits" => session.set_vga_wait_acceleration(false),
             "--profile-cpu" => {
                 #[cfg(feature = "profiling")]
                 {
