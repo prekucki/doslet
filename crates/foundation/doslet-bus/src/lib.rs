@@ -21,6 +21,10 @@ impl CodeOwnerId {
             .ok()
             .map(Self)
     }
+    /// Nonzero for every issued identity.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,15 +44,18 @@ impl fmt::Display for BusError {
 
 impl core::error::Error for BusError {}
 
-/// Identity and write generations for an immutable, side-effect-free code span.
-/// Owners must be unique across bus lifetimes, including replacement buses.
-/// Every write (including borrowed mutation) must change the relevant generation;
-/// mapping changes must change `mapping`. Return None if a counter is exhausted.
+/// Validity of one side-effect-free code span, resolved when it is decoded.
+/// `space` packs a unique owner identity (high 32 bits) with the address-mapping
+/// generation (low 32 bits); owners are never reused, including by replacement
+/// buses. `pages` are the physical pages of the first and last byte and
+/// `generations` their write generations. Every write, including borrowed
+/// mutation, must change the relevant generation, and every mapping change must
+/// change `space`. Exhausted counters make spans unavailable instead of wrapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CodeStamp {
-    pub owner: CodeOwnerId,
-    pub mapping: u64,
-    pub pages: [u64; 2],
+pub struct CodeCheck {
+    pub space: u64,
+    pub pages: [u32; 2],
+    pub generations: [u64; 2],
 }
 
 /// Accesses preserve device side effects, including when a word spans regions.
@@ -57,8 +64,14 @@ pub trait MemoryBus {
     fn write_u8(&mut self, address: u32, value: u8) -> Result<(), BusError>;
 
     /// Optional cache contract. Defaults keep other buses on the interpreter.
-    fn code_stamp(&self, _address: u32, _length: u8) -> Option<CodeStamp> {
+    /// Decode time: resolve the span; None keeps it on byte fetching.
+    fn code_check(&self, _address: u32, _length: u8) -> Option<CodeCheck> {
         None
+    }
+    /// Hit time: true only if no byte of the span changed since `code_check`
+    /// and the same storage is still mapped. False negatives are allowed.
+    fn code_valid(&self, _check: &CodeCheck) -> bool {
+        false
     }
     /// Borrow up to `length` contiguous ordinary-memory code bytes. Inspecting
     /// them must have no device side effects. A short view is allowed.

@@ -152,13 +152,16 @@ CMOS clock ticking and complete device-event scheduling are still pending.
 
 The CPU also owns a fixed 512-entry decoded-instruction cache for selected
 default-32-bit forms. `MemoryBus` optionally supplies side-effect-free code views
-and `CodeStamp` tokens. A token identifies the RAM owner, mapping generation and
-both 4-KiB page generations touched by an instruction. Every RAM write and
-borrowed mutable view advances the relevant generations, so DOS services and
-wide CPU writes share the same invalidation path. The PC retains 32 KiB of page
-generations beside its 16-MiB RAM. Setup-only atomic owner identities distinguish
-replacement buses; they contain no guest state. Checked counters never wrap;
-exhaustion falls back to interpretation. A20 changes advance the mapping token.
+and `CodeCheck` values, resolved once when an instruction is decoded. A check
+records the RAM owner and mapping generation as one code-space token, plus the
+physical 4-KiB pages touched by the instruction and their write generations; a
+hit compares that token and both generations without translating the address
+again. Every RAM write and borrowed mutable view advances the relevant
+generations, so DOS services and wide CPU writes share the same invalidation
+path. The PC retains 32 KiB of page generations beside its 16-MiB RAM.
+Setup-only atomic owner identities distinguish replacement buses; they contain
+no guest state. Checked counters never wrap; exhaustion falls back to
+interpretation. A20 changes advance the mapping generation in the token.
 
 Cache entries contain operations, immediates and addressing expressions rather
 than resolved data addresses. Register-dependent addresses and segment checks

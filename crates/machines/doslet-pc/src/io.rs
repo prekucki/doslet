@@ -126,6 +126,7 @@ impl PcBus {
     pub fn set_a20(&mut self, enabled: bool) {
         if self.a20.enabled != enabled {
             self.a20.generation = self.a20.generation.saturating_add(1);
+            self.ram.set_mapping(self.a20.generation);
         }
         self.a20.enabled = enabled;
         self.keyboard.set_a20_line(enabled);
@@ -177,15 +178,18 @@ impl PcBus {
     }
 }
 impl MemoryBus for PcBus {
-    #[inline]
-    fn code_stamp(&self, address: u32, length: u8) -> Option<doslet_bus::CodeStamp> {
+    fn code_check(&self, address: u32, length: u8) -> Option<doslet_bus::CodeCheck> {
         if length == 0 {
             return None;
         }
-        self.ram.code_stamp(
-            self.wide_ram_range(address, u32::from(length))?,
-            self.a20.generation,
-        )
+        // Physical pages depend only on the address, length and A20 state, which
+        // the RAM's code space tracks; hits need not translate again.
+        self.ram
+            .code_check(self.wide_ram_range(address, u32::from(length))?)
+    }
+    #[inline]
+    fn code_valid(&self, check: &doslet_bus::CodeCheck) -> bool {
+        self.ram.code_valid(check)
     }
     fn code_bytes(&self, address: u32, length: u8) -> Option<&[u8]> {
         // Decoding may inspect a short view at RAM/MMIO/A20 boundaries, but

@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, vec};
 use core::ops::Range;
-use doslet_bus::{BusError, CodeOwnerId, CodeStamp};
+use doslet_bus::{BusError, CodeCheck, CodeOwnerId};
 
 pub const RAM_SIZE: usize = 16 * 1024 * 1024;
 const PAGE_SIZE: usize = 4096;
@@ -25,14 +25,20 @@ pub(crate) struct Ram {
     bytes: Box<[u8]>,
     generations: Box<[u64]>,
     identity: Option<CodeOwnerId>,
+    /// Owner identity (high 32 bits) and mapping generation (low 32 bits),
+    /// precomputed for cache hits; 0 when spans are unavailable.
+    code_space: u64,
 }
 impl Default for Ram {
     fn default() -> Self {
-        Self {
+        let mut ram = Self {
             bytes: vec![0; RAM_SIZE].into_boxed_slice(),
             generations: vec![0; RAM_SIZE / PAGE_SIZE].into_boxed_slice(),
             identity: CodeOwnerId::fresh(),
-        }
+            code_space: 0,
+        };
+        ram.set_mapping(0);
+        ram
     }
 }
 impl Ram {
@@ -69,20 +75,55 @@ impl Ram {
             self.generations[page] = next;
         } else {
             self.identity = None;
+            self.code_space = 0;
         }
     }
-    pub(crate) fn code_stamp(&self, range: Range<usize>, mapping: u64) -> Option<CodeStamp> {
+    /// Record the machine's address-mapping generation. Generations beyond
+    /// 32 bits make code spans unavailable rather than wrapping.
+    pub(crate) fn set_mapping(&mut self, mapping: u64) {
+        self.code_space = match (self.identity, u32::try_from(mapping)) {
+            (Some(owner), Ok(mapping)) if mapping != u32::MAX => {
+                u64::from(owner.get()) << 32 | u64::from(mapping)
+            }
+            _ => 0,
+        };
+    }
+    pub(crate) fn code_check(&self, range: Range<usize>) -> Option<CodeCheck> {
+        if range.is_empty() || range.end > self.bytes.len() || self.code_space == 0 {
+            return None;
+        }
+        let pages = [range.start / PAGE_SIZE, (range.end - 1) / PAGE_SIZE];
+        Some(CodeCheck {
+            space: self.code_space,
+            pages: pages.map(|page| page as u32),
+            generations: pages.map(|page| self.generations[page]),
+        })
+    }
+    #[inline]
+    pub(crate) fn code_valid(&self, check: &CodeCheck) -> bool {
+        let current = |page: u32| self.generations.get(page as usize).copied();
+        check.space == self.code_space
+            && current(check.pages[0]) == Some(check.generations[0])
+            && current(check.pages[1]) == Some(check.generations[1])
+    }
+    /// The former per-hit stamp, kept as the reference for code-check tests.
+    #[cfg(test)]
+    pub(crate) fn stamp_reference(
+        &self,
+        range: Range<usize>,
+        mapping: u64,
+    ) -> Option<(CodeOwnerId, u64, [u64; 2])> {
         if range.is_empty() || range.end > self.bytes.len() || mapping == u64::MAX {
             return None;
         }
-        Some(CodeStamp {
-            owner: self.identity?,
+        Some((
+            self.identity?,
             mapping,
-            pages: [
+            [
                 self.generations[range.start / PAGE_SIZE],
                 self.generations[(range.end - 1) / PAGE_SIZE],
             ],
-        })
+        ))
     }
 }
 
@@ -90,16 +131,45 @@ impl Ram {
 mod tests {
     use super::*;
     #[test]
-    fn borrowed_mutation_bumps_both_pages_and_exhaustion_disables_stamps() {
+    fn borrowed_mutation_bumps_both_pages_and_exhaustion_disables_checks() {
         let mut ram = Ram::default();
         let range = PAGE_SIZE - 2..PAGE_SIZE + 2;
-        let before = ram.code_stamp(range.clone(), 0).unwrap();
+        let before = ram.code_check(range.clone()).unwrap();
+        assert_eq!(before.pages, [0, 1]);
         ram.view_mut(range.clone()).unwrap().fill(42);
-        let after = ram.code_stamp(range.clone(), 0).unwrap();
-        assert_eq!(after.pages, [before.pages[0] + 1, before.pages[1] + 1]);
+        let after = ram.code_check(range.clone()).unwrap();
+        assert_eq!(
+            after.generations,
+            [before.generations[0] + 1, before.generations[1] + 1]
+        );
+        assert!(!ram.code_valid(&before) && ram.code_valid(&after));
         ram.generations[0] = u64::MAX;
         ram.write(0, 1).unwrap();
-        assert_eq!(ram.code_stamp(range, 0), None);
+        assert_eq!(ram.code_check(range), None);
+        assert!(!ram.code_valid(&after));
         assert_eq!(ram.read(0), Ok(1));
+    }
+    #[test]
+    fn mapping_generations_change_the_space_and_exhaust_without_wrapping() {
+        let mut ram = Ram::default();
+        let range = 0..4;
+        let first = ram.code_check(range.clone()).unwrap();
+        ram.set_mapping(1);
+        assert!(!ram.code_valid(&first));
+        let second = ram.code_check(range.clone()).unwrap();
+        assert_eq!(second.space & 0xFFFF_FFFF, 1);
+        assert_eq!(second.space >> 32, first.space >> 32);
+        ram.set_mapping(u64::from(u32::MAX) - 1);
+        assert!(ram.code_check(range.clone()).is_some());
+        for mapping in [u64::from(u32::MAX), u64::MAX] {
+            ram.set_mapping(mapping);
+            assert_eq!(ram.code_check(range.clone()), None);
+            assert!(!ram.code_valid(&second));
+        }
+        // Foreign or corrupt page indices are rejected rather than indexed.
+        let mut check = first;
+        check.pages[1] = u32::MAX;
+        ram.set_mapping(0);
+        assert!(ram.code_valid(&first) && !ram.code_valid(&check));
     }
 }

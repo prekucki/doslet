@@ -451,3 +451,96 @@ fn direct_cs_writes_and_wrapping_instruction_ends_keep_reference_behavior() {
     state(&cached, &reference);
     memory(&cached, &reference);
 }
+
+type Stamp = (doslet_bus::CodeOwnerId, u64, [u64; 2]);
+/// The former per-hit stamp, recomputed from the current bus state.
+fn stamp(bus: &PcBus, address: u32, length: u8) -> Option<Stamp> {
+    let range = bus.wide_ram_range(address, u32::from(length))?;
+    bus.ram.stamp_reference(range, bus.a20.generation)
+}
+
+#[test]
+fn code_checks_match_the_former_stamp_under_writes_a20_and_replacement() {
+    let mut bus = PcBus::default();
+    let spans: [(u32, u8); 8] = [
+        (0x0FFE, 4),    // crosses pages 0 and 1
+        (0x10FFC, 15),  // crosses a page boundary
+        (0x0FFF0, 15),  // physical alias of the next span with A20 disabled
+        (0x10FFF0, 15), // above 1 MiB
+        (0x0FFFFD, 5),  // crosses the A20 boundary
+        (0x9FFFE, 4),   // touches the VGA aperture: never checked
+        (0xFFFFF8, 8),  // last RAM bytes
+        (0x20000, 1),
+    ];
+    let mut checks = [None; 8];
+    let mut decoded = [None; 8];
+    let (mut valid, mut stale) = (0, 0);
+    let mut seed = 0x2468_ACE1_u32;
+    for round in 0..4000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let (base, _) = spans[seed as usize % spans.len()];
+        let target = base.wrapping_add((seed >> 8) % 24).wrapping_sub(4);
+        // Device-memory writes may be rejected; only RAM effects matter here.
+        match (seed >> 16) % 8 {
+            0 => drop(bus.write_u8(target, seed as u8)),
+            1 => drop(bus.write_u16(target, seed as u16)),
+            2 => drop(bus.write_u32(target, seed)),
+            3 => {
+                let start = target as usize;
+                if let Some(view) = bus.ram.view_mut(start..start + 3) {
+                    view.fill(seed as u8);
+                }
+            }
+            4 => bus.set_a20(!bus.a20_enabled()),
+            _ => {
+                let span = (seed >> 20) as usize % spans.len();
+                let (address, length) = spans[span];
+                checks[span] = bus.code_check(address, length);
+                decoded[span] = stamp(&bus, address, length);
+                assert_eq!(checks[span].is_some(), decoded[span].is_some());
+            }
+        }
+        for (span, &(address, length)) in spans.iter().enumerate() {
+            assert_eq!(
+                bus.code_check(address, length).is_some(),
+                stamp(&bus, address, length).is_some()
+            );
+            if let Some(check) = &checks[span] {
+                let expected = stamp(&bus, address, length) == decoded[span];
+                assert_eq!(
+                    bus.code_valid(check),
+                    expected,
+                    "round {round}, span {span}"
+                );
+                valid += u32::from(expected);
+                stale += u32::from(!expected);
+            }
+        }
+    }
+    assert!(valid > 1000 && stale > 1000, "{valid}/{stale}");
+    let replacement = PcBus::default();
+    for check in checks.iter().flatten() {
+        assert!(!replacement.code_valid(check));
+    }
+}
+
+#[test]
+fn buses_with_identical_histories_reject_each_others_checks() {
+    let mut a = PcBus::default();
+    let mut b = PcBus::default();
+    for bus in [&mut a, &mut b] {
+        bus.set_a20(true);
+        bus.write_u32(0x10FFE, 0x1234_5678).unwrap();
+    }
+    let check = a.code_check(0x10FFE, 4).unwrap();
+    let other = b.code_check(0x10FFE, 4).unwrap();
+    // Only the owner identity distinguishes the two spans.
+    assert_eq!(
+        (check.pages, check.generations, check.space & 0xFFFF_FFFF),
+        (other.pages, other.generations, other.space & 0xFFFF_FFFF)
+    );
+    assert!(a.code_valid(&check) && b.code_valid(&other));
+    assert!(!b.code_valid(&check) && !a.code_valid(&other));
+}

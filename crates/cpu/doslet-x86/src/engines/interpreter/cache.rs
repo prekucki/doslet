@@ -2,7 +2,7 @@
 use super::{Cpu, CpuError, StepOutcome};
 use crate::state::SegmentWindow;
 use crate::{Access, Gpr32, Registers, SegmentCache, SegmentRegister, decode::Operand, flags};
-use doslet_bus::{CodeStamp, CpuBus};
+use doslet_bus::{CodeCheck, CpuBus};
 
 const CAPACITY: usize = 512;
 const NO_REGISTER: u8 = 8;
@@ -19,7 +19,7 @@ pub struct DecodeCacheStats {
     pub context_switches: u64,
     /// Resident entries discarded by a context transition.
     pub context_invalidations: u64,
-    /// Mutually exclusive reasons for a matching entry's stale code stamp.
+    /// Mutually exclusive reasons for a matching entry's stale code check.
     pub write_invalidations: u64,
     pub mapping_invalidations: u64,
     pub owner_invalidations: u64,
@@ -43,7 +43,7 @@ struct Context {
 #[derive(Clone, Copy)]
 struct Entry {
     address: u32,
-    stamp: CodeStamp,
+    check: CodeCheck,
     instruction: Instruction,
 }
 pub(super) struct Cache {
@@ -113,8 +113,7 @@ impl Cache {
             && entry.address == address
         {
             let segment_valid = window.address(r.ip, entry.instruction.length).is_some();
-            let stamp = bus.code_stamp(address, entry.instruction.length);
-            if segment_valid && stamp == Some(entry.stamp) {
+            if segment_valid && bus.code_valid(&entry.check) {
                 #[cfg(feature = "profiling")]
                 {
                     self.stats.hits += 1;
@@ -125,12 +124,13 @@ impl Cache {
             #[cfg(feature = "profiling")]
             {
                 self.stats.invalidations += 1;
+                // Classify with a fresh check; only profiling builds pay for it.
                 if !segment_valid {
                     self.stats.segment_invalidations += 1;
-                } else if let Some(stamp) = stamp {
-                    if stamp.owner != entry.stamp.owner {
+                } else if let Some(check) = bus.code_check(address, entry.instruction.length) {
+                    if check.space >> 32 != entry.check.space >> 32 {
                         self.stats.owner_invalidations += 1;
-                    } else if stamp.mapping != entry.stamp.mapping {
+                    } else if check.space != entry.check.space {
                         self.stats.mapping_invalidations += 1;
                     } else {
                         self.stats.write_invalidations += 1;
@@ -160,14 +160,14 @@ impl Cache {
         // Failed probes leave registers/bus untouched. Let byte fetching report
         // the original fault and partial IP progress at a code-segment boundary.
         window.address(r.ip, instruction.length)?;
-        let stamp = bus.code_stamp(address, instruction.length)?;
+        let check = bus.code_check(address, instruction.length)?;
         #[cfg(feature = "profiling")]
         {
             self.stats.evictions += u64::from(self.entries[index].is_some());
         }
         self.entries[index] = Some(Entry {
             address,
-            stamp,
+            check,
             instruction,
         });
         Some(instruction)
