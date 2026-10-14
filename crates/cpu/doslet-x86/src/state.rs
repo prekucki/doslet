@@ -159,6 +159,22 @@ impl SegmentCache {
     }
 }
 
+/// Offsets accepted by `Registers::address` for one segment and access kind.
+/// Valid while the selector, its hidden cache and PE mode stay unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SegmentWindow {
+    base: u32,
+    first: u32,
+    last: u32,
+}
+impl SegmentWindow {
+    #[inline]
+    pub(crate) fn address(self, offset: u32, length: u8) -> Option<u32> {
+        let last = offset.checked_add(u32::from(length) - 1)?;
+        (offset >= self.first && last <= self.last).then(|| self.base.wrapping_add(offset))
+    }
+}
+
 impl Registers {
     pub fn selector(&self, segment: SegmentRegister) -> u16 {
         match segment {
@@ -250,6 +266,35 @@ impl Registers {
         }
         Ok(cache.base.wrapping_add(offset))
     }
+    /// Resolve the offset-independent checks of `address` once.
+    pub(crate) fn window(&self, segment: SegmentRegister, access: Access) -> Option<SegmentWindow> {
+        let cache = self.segment_cache(segment);
+        if !cache.usable || (self.protected && cache.selector != self.selector(segment)) {
+            return None;
+        }
+        if self.protected {
+            let code = cache.access & 8 != 0;
+            let valid = match access {
+                Access::Execute => code,
+                Access::Read => !code || cache.access & 2 != 0,
+                Access::Write => !code && cache.access & 2 != 0,
+            };
+            if !valid {
+                return None;
+            }
+        }
+        let (first, last) = if cache.access & 0x1C == 0x14 {
+            let upper = if cache.default32 { u32::MAX } else { 0xFFFF };
+            (cache.limit.checked_add(1)?, upper)
+        } else {
+            (0, cache.limit)
+        };
+        Some(SegmentWindow {
+            base: cache.base,
+            first,
+            last,
+        })
+    }
     pub fn get(&self, register: Gpr16) -> u16 {
         self.general[register as usize] as u16
     }
@@ -278,5 +323,78 @@ impl Registers {
         } else {
             (*target & 0xFFFF00FF) | (u32::from(value) << 8)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(r: &Registers, segment: SegmentRegister) {
+        let limit = r.caches[segment as usize].limit;
+        let offsets = [
+            0,
+            1,
+            limit.wrapping_sub(1),
+            limit,
+            limit.wrapping_add(1),
+            0xFFFE,
+            0xFFFF,
+            0x10000,
+            u32::MAX - 14,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+        for access in [Access::Read, Access::Write, Access::Execute] {
+            let window = r.window(segment, access);
+            for offset in offsets {
+                for length in [1, 2, 4, 15] {
+                    assert_eq!(
+                        window.and_then(|w| w.address(offset, length)),
+                        r.address(segment, offset, length, access).ok(),
+                        "{r:?} {segment:?} {access:?} offset={offset:#x} length={length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn segment_windows_accept_exactly_the_offsets_of_address() {
+        let limits = [0, 0xFFF, 0xFFFE, 0xFFFF, 0x10000, 0xFFFF_FFFE, 0xFFFF_FFFF];
+        let accesses = [0x93, 0x91, 0x97, 0x95, 0x9B, 0x99, 0x9F];
+        for (protected, usable, selector) in [
+            (false, true, 0x28),
+            (false, true, 0x30),
+            (false, false, 0x28),
+            (true, true, 0x28),
+            (true, true, 0x30),
+            (true, false, 0x28),
+        ] {
+            for access in accesses {
+                for default32 in [false, true] {
+                    for limit in limits {
+                        for segment in [SegmentRegister::Cs, SegmentRegister::Ds] {
+                            let mut r = Registers {
+                                cs: 0x28,
+                                ds: 0x28,
+                                protected,
+                                ..Registers::default()
+                            };
+                            r.caches[segment as usize] = SegmentCache {
+                                selector,
+                                base: 0xFFFF_F000,
+                                limit,
+                                access,
+                                flags: 0,
+                                default32,
+                                usable,
+                            };
+                            check(&r, segment);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -1,5 +1,6 @@
 //! Single-instruction cache. Unsupported forms use the original interpreter.
 use super::{Cpu, CpuError, StepOutcome};
+use crate::state::SegmentWindow;
 use crate::{Access, Gpr32, Registers, SegmentCache, SegmentRegister, decode::Operand, flags};
 use doslet_bus::{CodeStamp, CpuBus};
 
@@ -48,6 +49,8 @@ struct Entry {
 pub(super) struct Cache {
     entries: [Option<Entry>; CAPACITY],
     context: Option<Context>,
+    /// Execute window of `context`; None leaves its faults to the interpreter.
+    window: Option<SegmentWindow>,
     pub enabled: bool,
     #[cfg(feature = "profiling")]
     pub stats: DecodeCacheStats,
@@ -57,6 +60,7 @@ impl Default for Cache {
         Self {
             entries: [None; CAPACITY],
             context: None,
+            window: None,
             enabled: true,
             #[cfg(feature = "profiling")]
             stats: DecodeCacheStats::default(),
@@ -75,9 +79,10 @@ impl Cache {
     pub fn clear(&mut self) {
         self.entries.fill(None);
         self.context = None;
+        self.window = None;
     }
     fn instruction<B: CpuBus>(&mut self, r: &Registers, bus: &B) -> Option<Instruction> {
-        if !self.enabled || !r.code32() {
+        if !self.enabled {
             return None;
         }
         let context = Context {
@@ -85,6 +90,9 @@ impl Cache {
             selector: r.cs,
             protected: r.protected,
         };
+        if !context.cs.default32 {
+            return None;
+        }
         if self.context != Some(context) {
             #[cfg(feature = "profiling")]
             {
@@ -95,22 +103,16 @@ impl Cache {
             }
             self.clear();
             self.context = Some(context);
+            // The context fixes every CS check except the instruction's offset range.
+            self.window = r.window(SegmentRegister::Cs, Access::Execute);
         }
-        let address = r
-            .address(SegmentRegister::Cs, r.ip, 1, Access::Execute)
-            .ok()?;
+        let window = self.window?;
+        let address = window.address(r.ip, 1)?;
         let index = ((address ^ (address >> 9)) as usize) & (CAPACITY - 1);
         if let Some(entry) = self.entries[index]
             && entry.address == address
         {
-            let segment_valid = r
-                .address(
-                    SegmentRegister::Cs,
-                    r.ip,
-                    entry.instruction.length,
-                    Access::Execute,
-                )
-                .is_ok();
+            let segment_valid = window.address(r.ip, entry.instruction.length).is_some();
             let stamp = bus.code_stamp(address, entry.instruction.length);
             if segment_valid && stamp == Some(entry.stamp) {
                 #[cfg(feature = "profiling")]
@@ -157,13 +159,7 @@ impl Cache {
         };
         // Failed probes leave registers/bus untouched. Let byte fetching report
         // the original fault and partial IP progress at a code-segment boundary.
-        r.address(
-            SegmentRegister::Cs,
-            r.ip,
-            instruction.length,
-            Access::Execute,
-        )
-        .ok()?;
+        window.address(r.ip, instruction.length)?;
         let stamp = bus.code_stamp(address, instruction.length)?;
         #[cfg(feature = "profiling")]
         {

@@ -153,7 +153,9 @@ Both paths consume one scheduling step and preserve the existing IRQ boundaries.
 PC RAM tracks checked write generations for 4-KiB pages, including mutations
 through wide write views. A code span checks both page generations, its RAM
 owner identity and A20 mapping generation. CS-cache/context changes clear the
-instruction cache. Counter exhaustion disables caching rather than wrapping.
+instruction cache. Offset-independent CS checks are resolved once per context;
+hits still check the instruction's complete offset range. Counter exhaustion
+disables caching rather than wrapping.
 MMIO, noncontiguous A20 spans, code-address wrap and failed whole-instruction
 segment validation retain byte fetching and its partial fault progress. Storage
 is fixed/reserved during setup; execution does not allocate cache entries.

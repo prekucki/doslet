@@ -317,3 +317,137 @@ fn profiling_distinguishes_context_discards_collisions_and_failed_probes() {
     assert_eq!(stats.failed_decodes, 2);
     assert_eq!(stats.fallback_hits, 0);
 }
+
+fn cs_fault(result: Result<doslet_x86::StepOutcome, crate::MachineError>) -> bool {
+    matches!(
+        result,
+        Err(crate::MachineError::Cpu(
+            doslet_x86::CpuError::SegmentAccess {
+                segment: SegmentRegister::Cs,
+                access: Access::Execute,
+                ..
+            }
+        ))
+    )
+}
+
+#[test]
+fn host_cr0_writes_resynchronize_hidden_segments_in_both_directions() {
+    let mut cached = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut cached, &mut reference] {
+        code(m, 0x10000, &[0xB8, 1, 0, 0, 0]);
+        m.step().unwrap();
+        // Leaving PE through the public field: the selector-8 cache no longer
+        // matches CS, so real-mode CS 1000h executes the bytes as 16-bit code.
+        m.cpu.control.cr0 &= !1;
+        m.cpu.registers.cs = 0x1000;
+        m.cpu.registers.ip = 0;
+        m.cpu.registers.set32(Gpr32::Eax, 0);
+    }
+    assert_eq!(cached.step(), reference.step());
+    state(&cached, &reference);
+    assert_eq!(cached.cpu.registers.ip, 3);
+    assert_eq!(cached.cpu.registers.get32(Gpr32::Eax), 1);
+    for m in [&mut cached, &mut reference] {
+        // Entering PE through the field materializes CS 1000h's real-mode cache.
+        m.cpu.control.cr0 |= 1;
+        m.cpu.registers.ip = 0;
+    }
+    assert_eq!(cached.step(), reference.step());
+    state(&cached, &reference);
+    assert_eq!(cached.cpu.registers.ip, 3);
+    for m in [&mut cached, &mut reference] {
+        // The materialized cache belongs to selector 1000h, not a later write.
+        m.cpu.registers.cs = 0x2000;
+        m.cpu.registers.ip = 0;
+    }
+    let result = cached.step();
+    assert_eq!(result, reference.step());
+    state(&cached, &reference);
+    assert!(cs_fault(result));
+}
+
+#[test]
+fn mov_cr0_transitions_in_both_directions_match_reference_on_repeated_passes() {
+    let mut cached = machine(true);
+    let mut reference = machine(false);
+    // 10100h: leave PE; JMP FAR 1000:00000200 (linear 10200h).
+    let leave = [
+        0x0F, 0x20, 0xC0, 0x24, 0xFE, 0x0F, 0x22, 0xC0, 0xEA, 0x00, 0x02, 0, 0, 0x00, 0x10,
+    ];
+    // 10200h: enter PE; JMP FAR 0008:00010300 to flat 32-bit code.
+    let enter = [
+        0x0F, 0x20, 0xC0, 0x0C, 0x01, 0x0F, 0x22, 0xC0, 0x66, 0xEA, 0x00, 0x03, 0x01, 0, 0x08, 0,
+    ];
+    // 10300h: MOV EAX,1; JMP 10100h.
+    let body = [0xB8, 1, 0, 0, 0, 0xE9, 0xF6, 0xFD, 0xFF, 0xFF];
+    for m in [&mut cached, &mut reference] {
+        code(m, 0x10200, &enter);
+        code(m, 0x10300, &body);
+        code(m, 0x10100, &leave);
+    }
+    for pass in 0..3 {
+        for step in 0..10 {
+            let result = cached.step();
+            assert_eq!(result, reference.step(), "pass {pass}, step {step}");
+            result.unwrap();
+            state(&cached, &reference);
+            if step == 3 {
+                assert_eq!(cached.cpu.registers.cs, 0x1000);
+                assert!(!cached.cpu.registers.code32());
+            }
+        }
+        assert_eq!(cached.cpu.registers.ip, 0x10100);
+        assert!(cached.cpu.registers.code32());
+        assert_eq!(cached.cpu.registers.get32(Gpr32::Eax) & 1, 1);
+    }
+    #[cfg(feature = "profiling")]
+    {
+        // PE changes switch CS contexts; decoded forms still use the cache.
+        let stats = cached.cpu.decode_cache_stats();
+        assert!(stats.context_switches >= 5);
+        assert!(stats.misses > stats.failed_decodes);
+    }
+}
+
+#[test]
+fn direct_cs_writes_and_wrapping_instruction_ends_keep_reference_behavior() {
+    let mut cached = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut cached, &mut reference] {
+        code(m, 0x10000, &[0xB8, 1, 0, 0, 0]);
+        m.step().unwrap();
+        // The public selector no longer matches the hidden CS cache.
+        m.cpu.registers.cs = 16;
+        m.cpu.registers.ip = 0x10000;
+    }
+    let result = cached.step();
+    assert_eq!(result, reference.step());
+    state(&cached, &reference);
+    assert!(cs_fault(result));
+    for m in [&mut cached, &mut reference] {
+        m.cpu.registers.cs = 8;
+        m.cpu.registers.ip = 0x10000;
+        m.cpu.registers.set32(Gpr32::Eax, 0);
+    }
+    assert_eq!(cached.step(), reference.step());
+    state(&cached, &reference);
+    assert_eq!(cached.cpu.registers.get32(Gpr32::Eax), 1);
+    for m in [&mut cached, &mut reference] {
+        // A 4-GiB code segment based at 10002h maps EIP FFFFFFFEh to 10000h.
+        // The cached MOV EAX,imm32 overflows IP + length - 1, so it falls
+        // back to byte fetching; the window/address unit test pins the check.
+        let descriptor = [0xFF, 0xFF, 0x02, 0x00, 0x01, 0x9B, 0xCF, 0x00];
+        for (i, value) in descriptor.into_iter().enumerate() {
+            m.bus.write_u8(0x800 + 24 + i as u32, value).unwrap();
+        }
+        m.cpu
+            .load_segment(&mut m.bus, SegmentRegister::Cs, 24)
+            .unwrap();
+        m.cpu.registers.ip = 0xFFFF_FFFE;
+    }
+    assert_eq!(cached.step(), reference.step());
+    state(&cached, &reference);
+    memory(&cached, &reference);
+}

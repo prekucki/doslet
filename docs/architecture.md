@@ -162,8 +162,9 @@ exhaustion falls back to interpretation. A20 changes advance the mapping token.
 
 Cache entries contain operations, immediates and addressing expressions rather
 than resolved data addresses. Register-dependent addresses and segment checks
-remain execution work. CS context changes clear entries; hits validate the entire
-code span and its generation token. Short/noncontiguous code views and unsupported
+remain execution work. CS context changes clear entries and resolve the selector,
+hidden-cache, PE-mode and execute checks once; hits validate the entire code span's
+offset range and its generation token. Short/noncontiguous code views and unsupported
 forms use the original byte-fetching interpreter, preserving partial fault IP
 progress. One cached instruction still consumes exactly one bounded step; REP
 and IRQ delivery retain their existing paths. No decoded blocks or JIT exist.

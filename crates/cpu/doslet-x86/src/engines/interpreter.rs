@@ -225,7 +225,11 @@ impl Cpu {
         if self.control.cr0 & 0x80000000 != 0 {
             return Err(CpuError::PagingUnavailable { cs, ip });
         }
-        self.registers.sync_mode(self.protected_mode());
+        // CR0 is public, so compare at every step but resynchronise only on PE changes.
+        let protected = self.protected_mode();
+        if self.registers.protected != protected {
+            self.registers.sync_mode(protected);
+        }
         if let Some(result) = self.cached_step(bus) {
             return result;
         }
