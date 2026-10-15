@@ -433,8 +433,10 @@ object-relative profile identities remain future work.
 Compilation happens in explicit `Session::prepare_dynamic` maintenance calls
 between execution batches, with at most two blocks per ordinary frontend call.
 It may allocate and adds host latency; `Session::advance` remains allocation-free.
-Compiler failure or the 4096-block lifetime compilation limit stops further
-compilation once, preserving interpreter fallback. See
+The code cache holds at most 4096 resident functions in 16 groups. When full,
+preparation evicts the least recently used group and continues compiling;
+hot groups remain usable. Genuine compiler failures stop further compilation
+once, preserving interpreter fallback. See
 [the native core contract](docs/architecture.md#native-dynamic-core) for boundaries.
 
 Selected interpreter instructions in default-32-bit code use a fixed single-instruction

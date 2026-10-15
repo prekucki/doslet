@@ -6,14 +6,16 @@ use crate::{DynamicExitReason, DynamicExitRecord, DynamicStats};
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use doslet_bus::{CodeCheck, CpuBus, MemoryBus};
 use doslet_x86_jit::{
-    CompiledBlock, CompiledTrace, Compiler, Instruction, MAX_INSTRUCTIONS, Operation,
-    TraceInstruction, TraceOperation, TraceSource,
+    CompiledBlock, CompiledTrace, Compiler, Instruction, MAX_COMPILED_BLOCKS, MAX_INSTRUCTIONS,
+    Operation, TraceInstruction, TraceOperation, TraceSource,
 };
 
 const CAPACITY: usize = 1024;
 const MAX_BYTES: usize = 15 * MAX_INSTRUCTIONS;
 const HOT_COUNT: u16 = 16;
 const EXIT_CAPACITY: usize = 8192;
+const CODE_BANKS: usize = 16;
+const FUNCTIONS_PER_BANK: usize = MAX_COMPILED_BLOCKS / CODE_BANKS;
 
 fn exit_reason(reason: doslet_x86_jit::TraceExitReason) -> DynamicExitReason {
     use doslet_x86_jit::TraceExitReason as R;
@@ -273,7 +275,12 @@ impl ValidatedSegments {
 }
 
 #[derive(Clone, Copy)]
-enum NativeBlock {
+struct NativeBlock {
+    bank: usize,
+    function: NativeFunction,
+}
+#[derive(Clone, Copy)]
+enum NativeFunction {
     Registers(CompiledBlock),
     Trace {
         code: CompiledTrace,
@@ -369,30 +376,18 @@ struct Entry {
 struct Template {
     block: PreparedBlock,
     compiled: Option<NativeBlock>,
+    attempted: bool,
 }
 struct NativeCode {
     block: PreparedBlock,
     code: NativeBlock,
 }
-// This pool survives execution-cache collisions and CS changes. It grows only
-// during explicit preparation, bounded by Compiler's lifetime capacity.
-fn compile_unique(
-    compiler: &mut Option<Compiler>,
-    pool: &mut BTreeMap<u64, NativeCode>,
+// Compiler ownership determines which executable-memory bank may be reclaimed.
+fn compile_native(
+    compiler: &mut Compiler,
     block: &PreparedBlock,
     exit_profiling: bool,
-) -> Result<(NativeBlock, bool), String> {
-    let hash = block.fingerprint();
-    if let Some(native) = pool
-        .get(&hash)
-        .filter(|native| native.block.same_code(block))
-    {
-        return Ok((native.code, false));
-    }
-    if compiler.is_none() {
-        *compiler = Some(Compiler::new()?);
-    }
-    let compiler = compiler.as_mut().unwrap();
+) -> Result<NativeFunction, String> {
     let code = if let Some(trace) = &block.trace {
         let instructions = &trace.instructions[..usize::from(trace.count)];
         let code = if exit_profiling {
@@ -405,25 +400,27 @@ fn compile_unique(
         } else {
             None
         };
-        NativeBlock::Trace {
+        NativeFunction::Trace {
             code,
             register_fallback,
         }
     } else {
-        NativeBlock::Registers(compiler.compile(&block.instructions[..usize::from(block.count)])?)
+        NativeFunction::Registers(
+            compiler.compile(&block.instructions[..usize::from(block.count)])?,
+        )
     };
-    pool.insert(
-        hash,
-        NativeCode {
-            block: block.clone(),
-            code,
-        },
-    );
-    Ok((code, true))
+    Ok(code)
+}
+struct CodeBank {
+    compiler: Compiler,
+    last_used: u64,
 }
 pub(super) struct Cache {
     entries: Vec<Entry>,
-    compiler: Option<Compiler>,
+    banks: Vec<CodeBank>,
+    bank_limit: usize,
+    bank_function_limit: usize,
+    use_clock: u64,
     enabled: bool,
     failure: Option<String>,
     stats: DynamicStats,
@@ -437,7 +434,10 @@ impl Default for Cache {
     fn default() -> Self {
         Self {
             entries: (0..CAPACITY).map(|_| Entry::default()).collect(),
-            compiler: None,
+            banks: Vec::with_capacity(CODE_BANKS),
+            bank_limit: CODE_BANKS,
+            bank_function_limit: FUNCTIONS_PER_BANK,
+            use_clock: 0,
             enabled: true,
             failure: None,
             stats: DynamicStats::default(),
@@ -447,6 +447,84 @@ impl Default for Cache {
             exit_records: Vec::new(),
             exit_dropped: 0,
         }
+    }
+}
+impl Cache {
+    fn touch_bank(&mut self, bank: usize) {
+        self.use_clock = self.use_clock.saturating_add(1);
+        self.banks[bank].last_used = self.use_clock;
+    }
+
+    fn compile_unique(&mut self, block: &PreparedBlock) -> Result<(NativeBlock, bool), String> {
+        let hash = block.fingerprint();
+        if let Some(native) = self.pool.get(&hash).filter(|n| n.block.same_code(block)) {
+            let code = native.code;
+            self.touch_bank(code.bank);
+            return Ok((code, false));
+        }
+        // A trace and its register fallback must fit in the same bank. Check
+        // both slots before emitting either function, including the final slot.
+        let required = 1 + usize::from(block.trace.is_some() && block.register_count >= 2);
+        let bank = if let Some(index) = self
+            .banks
+            .iter()
+            .position(|bank| bank.compiler.remaining_capacity() >= required)
+        {
+            index
+        } else {
+            // Construct first: a setup failure leaves existing code usable.
+            let fresh = CodeBank {
+                compiler: Compiler::with_capacity(self.bank_function_limit)?,
+                last_used: 0,
+            };
+            if self.banks.len() < self.bank_limit {
+                self.banks.push(fresh);
+                self.banks.len() - 1
+            } else {
+                let index = self
+                    .banks
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, bank)| bank.last_used)
+                    .unwrap()
+                    .0;
+                // No generated call is active during host maintenance. Remove
+                // every handle before dropping executable storage or reusing IDs.
+                for entry in &mut self.entries {
+                    if entry.compiled.is_some_and(|code| code.bank == index) {
+                        entry.compiled = None;
+                        entry.attempted = false;
+                        // Eviction must not queue cold historical entries for
+                        // immediate recompilation without fresh execution.
+                        entry.hits = 0;
+                    }
+                }
+                for template in &mut self.templates {
+                    if template.compiled.is_some_and(|code| code.bank == index) {
+                        template.compiled = None;
+                    }
+                }
+                self.pool.retain(|_, native| native.code.bank != index);
+                self.banks[index] = fresh;
+                self.stats.code_cache_evictions += 1;
+                index
+            }
+        };
+        let function = compile_native(
+            &mut self.banks[bank].compiler,
+            block,
+            !self.exit_records.is_empty(),
+        )?;
+        let code = NativeBlock { bank, function };
+        self.touch_bank(bank);
+        self.pool.insert(
+            hash,
+            NativeCode {
+                block: block.clone(),
+                code,
+            },
+        );
+        Ok((code, true))
     }
 }
 impl core::fmt::Debug for Cache {
@@ -464,7 +542,7 @@ impl Cpu {
         if enabled != self.dynamic.exit_records.is_empty() {
             return Ok(());
         }
-        if self.dynamic.compiler.is_some() {
+        if !self.dynamic.banks.is_empty() {
             return Err("set exit profiling before native preparation");
         }
         self.dynamic.exit_records = if enabled {
@@ -533,6 +611,7 @@ impl Cpu {
             templates.push(Template {
                 block,
                 compiled: None,
+                attempted: false,
             });
             cursor += length;
         }
@@ -576,7 +655,8 @@ impl Cpu {
     }
 
     /// Host maintenance: compile at most `limit.min(8)` hot blocks. May allocate
-    /// and request executable memory. Failure latches once; interpretation keeps
+    /// and request executable memory. Full code banks are reclaimed by LRU.
+    /// Compiler failure latches once; interpretation keeps
     /// working, and already compiled code remains available.
     pub fn prepare_dynamic(&mut self, limit: usize) -> usize {
         let cache = &mut self.dynamic;
@@ -585,19 +665,16 @@ impl Cpu {
         }
         let mut completed = 0;
         // Previously observed blocks are prepared before their first execution.
-        for template in &mut cache.templates {
-            if template.compiled.is_some() {
+        for index in 0..cache.templates.len() {
+            if cache.templates[index].attempted {
                 continue;
             }
-            let result = compile_unique(
-                &mut cache.compiler,
-                &mut cache.pool,
-                &template.block,
-                !cache.exit_records.is_empty(),
-            );
+            let block = cache.templates[index].block.clone();
+            let result = cache.compile_unique(&block);
+            cache.templates[index].attempted = true;
             match result {
                 Ok((code, compiled)) => {
-                    template.compiled = Some(code);
+                    cache.templates[index].compiled = Some(code);
                     cache.stats.compiled_blocks += u64::from(compiled);
                     completed += 1;
                 }
@@ -614,7 +691,7 @@ impl Cpu {
         for _ in 0..CAPACITY {
             let index = cache.cursor;
             cache.cursor = (cache.cursor + 1) % CAPACITY;
-            let entry = &mut cache.entries[index];
+            let entry = &cache.entries[index];
             if entry.attempted || entry.hits < HOT_COUNT {
                 continue;
             }
@@ -624,16 +701,12 @@ impl Cpu {
             if block.count < 2 {
                 continue;
             }
-            entry.attempted = true;
-            let result = compile_unique(
-                &mut cache.compiler,
-                &mut cache.pool,
-                block,
-                !cache.exit_records.is_empty(),
-            );
+            let block = block.clone();
+            let result = cache.compile_unique(&block);
+            cache.entries[index].attempted = true;
             match result {
                 Ok((code, compiled)) => {
-                    entry.compiled = Some(code);
+                    cache.entries[index].compiled = Some(code);
                     cache.stats.compiled_blocks += u64::from(compiled);
                     completed += 1;
                 }
@@ -853,7 +926,9 @@ impl Cpu {
             }
         }
         let (registers, ip) = self.registers.native_state();
-        let compiler = self.dynamic.compiler.as_ref().unwrap();
+        self.dynamic.use_clock = self.dynamic.use_clock.saturating_add(1);
+        self.dynamic.banks[code.bank].last_used = self.dynamic.use_clock;
+        let compiler = &self.dynamic.banks[code.bank].compiler;
         let profiling = !self.dynamic.exit_records.is_empty();
         let event = |exit_ip, reason, steps: u32| DynamicExitRecord {
             cs: key.selector,
@@ -865,8 +940,8 @@ impl Cpu {
             count: 1,
             steps: u64::from(steps),
         };
-        match code {
-            NativeBlock::Registers(code) => {
+        match code.function {
+            NativeFunction::Registers(code) => {
                 let steps = compiler.execute(code, registers, &mut self.flags, ip, budget);
                 if profiling {
                     let looping = block.instructions[..usize::from(block.register_count)]
@@ -890,7 +965,7 @@ impl Cpu {
                 }
                 steps
             }
-            NativeBlock::Trace {
+            NativeFunction::Trace {
                 code,
                 register_fallback,
             } => {
@@ -1002,5 +1077,239 @@ impl Cpu {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod code_cache_tests {
+    use super::*;
+
+    fn block(value: u32, trace: bool) -> PreparedBlock {
+        let value = value.to_le_bytes();
+        // MOV EAX,imm32; INC EAX; [MOV EBX,[EBX]]; unsupported NOP.
+        let bytes = [
+            0xB8, value[0], value[1], value[2], value[3], 0x40, 0x8B, 0x1B, 0x90,
+        ];
+        PreparedBlock::decode(&bytes[..if trace { 9 } else { 6 }])
+    }
+
+    fn small_cache(profiled: bool) -> Cache {
+        Cache {
+            bank_limit: 2,
+            bank_function_limit: 2,
+            exit_records: if profiled {
+                alloc::vec![DynamicExitRecord::default(); EXIT_CAPACITY]
+            } else {
+                Vec::new()
+            },
+            ..Cache::default()
+        }
+    }
+
+    fn check_trace(cache: &Cache, code: NativeBlock, value: u32) {
+        let NativeFunction::Trace { code: trace, .. } = code.function else {
+            panic!("expected RAM trace")
+        };
+        let mut registers = [0; 8];
+        let mut flags = 0x203;
+        let mut ip = 0x1000;
+        assert_eq!(
+            cache.banks[code.bank].compiler.execute_trace(
+                trace,
+                &mut registers,
+                &mut flags,
+                &mut ip,
+                3,
+                0,
+                &123_u32.to_le_bytes(),
+            ),
+            3
+        );
+        assert_eq!(registers[0], value + 1);
+        assert_eq!(registers[3], 123);
+        assert_eq!(flags & 0x201, 0x201);
+        assert_eq!(ip, 0x1008);
+    }
+
+    #[test]
+    fn lru_retires_the_cold_bank_clears_all_handles_and_keeps_hot_code() {
+        for profiled in [false, true] {
+            let mut cache = small_cache(profiled);
+            let a = block(10, true);
+            let b = block(20, false);
+            let c = block(30, false);
+            let d = block(40, true);
+            let (code_a, _) = cache.compile_unique(&a).unwrap();
+            let (code_b, _) = cache.compile_unique(&b).unwrap();
+            let (code_c, _) = cache.compile_unique(&c).unwrap();
+            assert_ne!(code_a.bank, code_b.bank);
+            assert_eq!(code_b.bank, code_c.bank);
+            for (index, (block, compiled)) in [
+                (a.clone(), code_a),
+                (b.clone(), code_b),
+                (c.clone(), code_c),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                cache.entries[index] = Entry {
+                    prepared: Some(block.clone()),
+                    compiled: Some(compiled),
+                    attempted: true,
+                    hits: HOT_COUNT,
+                    ..Entry::default()
+                };
+                cache.templates.push(Template {
+                    block,
+                    compiled: Some(compiled),
+                    attempted: true,
+                });
+            }
+            // Touch the older bank: eviction must follow recency, not creation order.
+            cache.touch_bank(code_a.bank);
+            let (code_d, _) = cache.compile_unique(&d).unwrap();
+            assert_eq!(code_d.bank, code_b.bank);
+            assert!(cache.entries[0].compiled.is_some());
+            assert!(cache.templates[0].compiled.is_some());
+            for index in [1, 2] {
+                assert!(cache.entries[index].compiled.is_none());
+                assert!(!cache.entries[index].attempted);
+                assert_eq!(cache.entries[index].hits, 0);
+                assert!(cache.templates[index].compiled.is_none());
+                assert!(cache.templates[index].attempted);
+            }
+            assert_eq!(cache.pool.len(), 2);
+            assert!(cache.pool.contains_key(&a.fingerprint()));
+            assert!(cache.pool.contains_key(&d.fingerprint()));
+            assert_eq!(cache.stats.code_cache_evictions, 1);
+            assert!(cache.failure.is_none());
+            check_trace(&cache, code_a, 10);
+            check_trace(&cache, code_d, 40);
+            // Reuse a full bank without eviction, then recompile an evicted block.
+            assert!(!cache.compile_unique(&a).unwrap().1);
+            assert_eq!(cache.stats.code_cache_evictions, 1);
+            assert!(cache.compile_unique(&b).unwrap().1);
+            assert_eq!(cache.stats.code_cache_evictions, 2);
+            assert_eq!(cache.banks.len(), 2);
+        }
+    }
+
+    #[test]
+    fn preparation_continues_after_multiple_evictions_without_replaying_cold_templates() {
+        let mut cpu = Cpu {
+            dynamic: small_cache(false),
+            ..Cpu::default()
+        };
+        let template = block(100, true);
+        cpu.dynamic.templates.push(Template {
+            block: template.clone(),
+            compiled: None,
+            attempted: false,
+        });
+        assert_eq!(cpu.prepare_dynamic(1), 1);
+        let other = block(101, true);
+        cpu.dynamic.compile_unique(&other).unwrap();
+        let replacement = block(102, true);
+        cpu.dynamic.compile_unique(&replacement).unwrap();
+        assert!(cpu.dynamic.templates[0].compiled.is_none());
+        assert!(cpu.dynamic.templates[0].attempted);
+        for index in 0..8 {
+            cpu.dynamic.entries[index] = Entry {
+                prepared: Some(block(index as u32, true)),
+                hits: HOT_COUNT,
+                ..Entry::default()
+            };
+        }
+        for _ in 0..8 {
+            assert_eq!(cpu.prepare_dynamic(1), 1);
+            assert!(cpu.dynamic_error().is_none());
+            assert_eq!(cpu.dynamic_stats().compilation_failures, 0);
+            assert!(cpu.dynamic.banks.len() <= 2);
+            assert!(cpu.dynamic.pool.len() <= 2);
+        }
+        assert!(cpu.dynamic_stats().code_cache_evictions >= 8);
+        assert!(!cpu.dynamic.pool.contains_key(&template.fingerprint()));
+        let entry = cpu
+            .dynamic
+            .entries
+            .iter()
+            .find(|entry| entry.compiled.is_some())
+            .unwrap();
+        let value = u32::from_le_bytes(
+            entry.prepared.as_ref().unwrap().bytes[1..5]
+                .try_into()
+                .unwrap(),
+        );
+        check_trace(&cpu.dynamic, entry.compiled.unwrap(), value);
+    }
+
+    #[test]
+    fn preparation_compiles_past_the_previous_lifetime_limit() {
+        let mut cpu = Cpu::default();
+        for value in 0..=MAX_COMPILED_BLOCKS {
+            cpu.dynamic.entries[0] = Entry {
+                prepared: Some(block(value as u32, false)),
+                hits: HOT_COUNT,
+                ..Entry::default()
+            };
+            cpu.dynamic.cursor = 0;
+            assert_eq!(cpu.prepare_dynamic(1), 1);
+            assert!(cpu.dynamic_error().is_none());
+        }
+        assert_eq!(
+            cpu.dynamic_stats().compiled_blocks,
+            MAX_COMPILED_BLOCKS as u64 + 1
+        );
+        assert_eq!(cpu.dynamic_stats().compilation_failures, 0);
+        assert_eq!(cpu.dynamic_stats().code_cache_evictions, 1);
+        assert_eq!(cpu.dynamic.banks.len(), CODE_BANKS);
+        let resident: usize = cpu
+            .dynamic
+            .banks
+            .iter()
+            .map(|bank| FUNCTIONS_PER_BANK - bank.compiler.remaining_capacity())
+            .sum();
+        assert!(resident <= MAX_COMPILED_BLOCKS);
+        let code = cpu.dynamic.entries[0].compiled.unwrap();
+        let NativeFunction::Registers(function) = code.function else {
+            panic!("expected register block")
+        };
+        let mut registers = [0; 8];
+        let mut flags = 0x202;
+        let mut ip = 0x1000;
+        assert_eq!(
+            cpu.dynamic.banks[code.bank].compiler.execute(
+                function,
+                &mut registers,
+                &mut flags,
+                &mut ip,
+                2
+            ),
+            2
+        );
+        assert_eq!(registers[0], MAX_COMPILED_BLOCKS as u32 + 1);
+        assert_eq!(ip, 0x1006);
+    }
+
+    #[test]
+    fn trace_and_fallback_reserve_two_slots_before_compiling() {
+        let mut cache = Cache {
+            bank_limit: 2,
+            bank_function_limit: 3,
+            ..Cache::default()
+        };
+        let (register, _) = cache.compile_unique(&block(0, false)).unwrap();
+        let (trace, _) = cache.compile_unique(&block(1, true)).unwrap();
+        assert_eq!(register.bank, trace.bank);
+        assert_eq!(cache.banks[trace.bank].compiler.remaining_capacity(), 0);
+        let (next, _) = cache.compile_unique(&block(2, true)).unwrap();
+        assert_ne!(trace.bank, next.bank);
+        // Only one slot remains; another two-function trace must retire a bank,
+        // never leave an orphan trace after a failing fallback compilation.
+        let (final_code, _) = cache.compile_unique(&block(3, true)).unwrap();
+        assert_eq!(cache.stats.code_cache_evictions, 1);
+        check_trace(&cache, next, 2);
+        check_trace(&cache, final_code, 3);
+        assert!(cache.failure.is_none());
     }
 }

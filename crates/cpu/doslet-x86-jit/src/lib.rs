@@ -16,7 +16,7 @@ mod trace;
 pub use trace::*;
 
 pub const MAX_INSTRUCTIONS: usize = 16;
-/// A compiler instance stops accepting code at this bound. Recreate the CPU to reset it.
+/// Maximum functions owned by one compiler. The CPU uses smaller LRU banks.
 pub const MAX_COMPILED_BLOCKS: usize = 4096;
 
 #[derive(Clone, Copy, Debug)]
@@ -69,16 +69,28 @@ pub struct Compiler {
     module: Option<JITModule>,
     functions: Vec<Entry>,
     traces: Vec<trace::TraceEntry>,
+    capacity: usize,
 }
 impl Compiler {
     pub fn new() -> Result<Self, String> {
+        Self::with_capacity(MAX_COMPILED_BLOCKS)
+    }
+    /// Bound one independently reclaimable executable-memory bank.
+    pub fn with_capacity(capacity: usize) -> Result<Self, String> {
+        if !(1..=MAX_COMPILED_BLOCKS).contains(&capacity) {
+            return Err("invalid JIT compilation capacity".into());
+        }
         let builder = JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names())
             .map_err(|e| e.to_string())?;
         Ok(Self {
             module: Some(JITModule::new(builder)),
-            functions: Vec::with_capacity(MAX_COMPILED_BLOCKS),
+            functions: Vec::with_capacity(capacity),
             traces: Vec::new(),
+            capacity,
         })
+    }
+    pub fn remaining_capacity(&self) -> usize {
+        self.capacity - self.functions.len() - self.traces.len()
     }
     /// Validates the complete IR before emitting code. The only accessible memory
     /// is eight borrowed general registers plus separate EFLAGS and EIP words.
@@ -96,7 +108,7 @@ impl Compiler {
                 return Err("JIT loop branch must follow a body and terminate the block".into());
             }
         }
-        if self.functions.len() + self.traces.len() >= MAX_COMPILED_BLOCKS {
+        if self.remaining_capacity() == 0 {
             return Err("JIT compilation capacity exhausted".into());
         }
         let loop_condition = match instructions.last().unwrap().operation {
@@ -495,6 +507,62 @@ impl Drop for Compiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bank_capacity_is_shared_by_register_and_trace_functions() {
+        assert!(Compiler::with_capacity(0).is_err());
+        assert!(Compiler::with_capacity(MAX_COMPILED_BLOCKS + 1).is_err());
+        for profiled in [false, true] {
+            let mut compiler = Compiler::with_capacity(2).unwrap();
+            let instruction = Instruction {
+                length: 1,
+                operation: Operation::Inc {
+                    register: 0,
+                    decrement: false,
+                },
+            };
+            let register = compiler.compile(&[instruction]).unwrap();
+            assert_eq!(compiler.remaining_capacity(), 1);
+            let instruction = TraceInstruction {
+                offset: 0,
+                length: 1,
+                operation: TraceOperation::Inc {
+                    register: 0,
+                    decrement: true,
+                },
+            };
+            let trace = if profiled {
+                compiler.compile_trace_profiled(&[instruction])
+            } else {
+                compiler.compile_trace(&[instruction])
+            }
+            .unwrap();
+            assert_eq!(compiler.remaining_capacity(), 0);
+            assert!(compiler.compile_trace(&[instruction]).is_err());
+            assert!(
+                compiler
+                    .compile(&[Instruction {
+                        length: 1,
+                        operation: Operation::Exchange { left: 0, right: 1 }
+                    }])
+                    .is_err()
+            );
+            let mut registers = [0; 8];
+            let mut flags = 0x202;
+            let mut ip = 0;
+            assert_eq!(
+                compiler.execute(register, &mut registers, &mut flags, &mut ip, 1),
+                1
+            );
+            assert_eq!(registers[0], 1);
+            assert_eq!(
+                compiler.execute_trace(trace, &mut registers, &mut flags, &mut ip, 1, 0, &[]),
+                1
+            );
+            assert_eq!(registers[0], 0);
+            assert_eq!(ip, 2);
+        }
+    }
 
     #[test]
     fn compiler_rejects_invalid_ir_before_codegen_and_keeps_stores_in_the_state() {

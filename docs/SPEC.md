@@ -314,8 +314,13 @@ progress on internal branches and unavailable memory. The RAM borrow prevents
 concurrent mapping changes or device writes during that native call. Generated
 stores guard active code pages and update generations before continuing. Execution
 statistics distinguish RAM-trace steps/entries from total native work.
-Preparation accepts at most eight blocks per call and 4096 per CPU lifetime;
-compiler failure/exhaustion latches once and preserves interpreter fallback.
+Preparation accepts at most eight blocks per call. Executable storage holds at
+most 4096 resident functions across 16 independently owned modules. Preparation
+evicts the least recently used module when full, clearing all its handles before
+freeing code; execution never compiles or evicts. Trace and register fallback
+capacity is checked together. Cold imported templates are eagerly attempted once,
+then evicted blocks are prepared again only when execution makes them eligible.
+Compiler failures latch once and preserve interpreter fallback.
 `--no-dynamic-core` disables JIT at runtime; `--no-default-features` omits it from
 native application builds. WASM has no Cranelift dependency and stays interpreted.
 

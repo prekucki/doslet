@@ -389,14 +389,22 @@ entries bind those blocks to CS state, offset, privilege and a bus `CodeCheck`.
 The execution cache has 1024 slots allocated at CPU setup. An independent pool
 retains compiled IR by code fingerprint, with full byte comparison before reuse;
 execution-cache collisions and address changes do not discard native code.
-Pool insertion happens only during explicit preparation and is bounded by the
-4096-compilation lifetime limit. Code discovery performs no
+Pool insertion happens only during explicit preparation. Code discovery performs no
 allocation. A hot block becomes eligible after 16 observations; compilation is
 explicit host maintenance through `Session::prepare_dynamic`, capped at eight
 blocks per call (two in ordinary frontend execution). `Session::advance` never
-calls the compiler. A compiler instance accepts at most 4096 blocks over its
-lifetime, including evictions/recompilations. A failure latches once and stops
-further compilation; existing blocks and interpreter fallback remain usable.
+calls the compiler. Executable storage is split into at most 16 independently
+owned Cranelift modules, each holding at most 256 functions (4096 resident
+functions total). A trace and its optional register fallback reserve their two
+slots in the same module before either is emitted. Native entry and preparation
+mark a module recently used. When no module has space, preparation retires the
+least recently used module, removes its execution, template and pool handles,
+and frees its executable storage before installing replacement code. Hot
+modules remain usable; evicted blocks can become eligible again without a
+session restart. `DynamicStats::code_cache_evictions` counts retired modules.
+Imported templates are eagerly attempted once; eviction alone does not eagerly
+recompile cold profile entries. Genuine compiler failures still latch once and
+stop further compilation; existing blocks and interpreter fallback remain usable.
 
 The first native subset consists of 2–16 straight-line dword register MOV,
 ALU/CMP/TEST, INC/DEC, XCHG and NEG/NOT instructions in protected default-32-bit
@@ -451,7 +459,7 @@ against used selectors and full hidden descriptors within the execution-cache
 key (CS, entry IP, privilege and mode). A separately compiled register prefix
 remains usable when the larger RAM trace cannot run; it is attempted only after
 zero trace progress and fits the same resolved hardware budget. Both functions
-count toward the lifetime compilation cap. Replacing the prepared trace clears the
+occupy slots in the same bounded code bank. Replacing the prepared trace clears the
 result. Changed DS/SS state cannot reuse stale assumptions.
 
 `MemoryBus::native_ram` optionally returns `NativeRam` with a borrowed immutable
@@ -482,7 +490,7 @@ Trace nodes carry registers, flags and remaining budget in SSA, preserving
 state across internal branches/backedges. The first version computes full flags
 and checks the remaining hardware-bounded budget per instruction. Every exit
 returns the actual completed-step count, including completed native stores. `ram_trace_steps` and `ram_trace_entries` identify this
-subset of total native execution. The lifetime compilation cap is shared with
+subset of total native execution. The resident-function limit is shared with
 the register-only compiler.
 
 Optional exit diagnostics must be enabled before native compilation. The CPU

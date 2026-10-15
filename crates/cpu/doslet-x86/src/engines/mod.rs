@@ -39,6 +39,8 @@ pub struct DynamicStats {
     pub executed_steps: u64,
     pub invalidations: u64,
     pub compilation_failures: u64,
+    /// Least-recently-used executable-memory banks retired during preparation.
+    pub code_cache_evictions: u64,
     pub prepared_hits: u64,
     /// Hardware/IRQ scheduling boundaries amortized across native and RAM work.
     pub execution_batches: u64,

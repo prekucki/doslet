@@ -267,7 +267,7 @@ impl Compiler {
                 return Err("JIT trace branch enters an instruction".into());
             }
         }
-        if self.functions.len() + self.traces.len() >= MAX_COMPILED_BLOCKS {
+        if self.remaining_capacity() == 0 {
             return Err("JIT compilation capacity exhausted".into());
         }
         let has_stores = instructions.iter().any(|i| {
