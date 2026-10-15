@@ -2367,6 +2367,16 @@ enabled = false
     #[test]
     #[ignore = "requires the user's local PRINCE installation; run from repository root"]
     fn local_prince_moont_queue_survives_repeated_restoration() {
+        check_local_prince_moont_queue(121_000_000_000, true);
+    }
+
+    #[test]
+    #[ignore = "requires local PRINCE and DOSLET_MT32_ROM_DIR; run from repository root"]
+    fn local_prince_moont_queue_survives_ten_guest_minutes() {
+        check_local_prince_moont_queue(600_000_000_000, false);
+    }
+
+    fn check_local_prince_moont_queue(until: u64, restore: bool) {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let legacy = root.join("PRINCE/PRINCE.EXE");
         let path = if legacy.is_file() {
@@ -2378,16 +2388,26 @@ enabled = false
             std::env::var_os("DOSLET_MT32_ROM_DIR").expect("set DOSLET_MT32_ROM_DIR"),
         );
         let mut app = Doslet::new();
+        let cli = crate::cli::Cli {
+            config: Some(root.join("games/PRINCE.toml")),
+            no_audio: true,
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        app.launch = cli.launch;
         app.session = crate::native_input::load_game_with_settings(&path, &app.launch).unwrap();
-        app.mt32 = Some(Doslet::load_mt32(&directory, 44100, Mode::Gm).unwrap());
         app.mt32_rom_dir = Some(directory);
+        app.mt32 = Some(app.restored_mt32(44100).unwrap());
         app.pcm_mixer.reset(44100, 0).unwrap();
         app.session.start();
-        for batch in 0..100000 {
-            if batch != 0 && batch % 20000 == 0 {
+        let mut batch = 0;
+        while app.session.emulated_nanos() < until {
+            if restore && batch != 0 && batch % 20000 == 0 {
                 app.mt32 = Some(app.restored_mt32(44100).unwrap());
             }
-            app.session.advance(CHUNK);
+            app.session.prepare_dynamic(2);
+            assert_ne!(app.session.advance(CHUNK), 0);
             assert_eq!(
                 app.session.status(),
                 SessionStatus::Running,
@@ -2403,7 +2423,14 @@ enabled = false
                     app.mt32.as_ref().unwrap().sysex_messages()
                 )
             });
+            batch += 1;
         }
+        eprintln!(
+            "PRINCE moont: guest={} ms, notes={}, SysEx={}",
+            app.session.emulated_nanos() / 1_000_000,
+            app.mt32.as_ref().unwrap().note_events(),
+            app.mt32.as_ref().unwrap().sysex_messages()
+        );
     }
 
     #[test]

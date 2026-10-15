@@ -11,6 +11,35 @@ fn invalid_roms_and_rates_are_rejected_before_parsing() {
 
 #[test]
 #[ignore = "requires DOSLET_MT32_ROM_DIR with local CM-32L ROMs"]
+fn local_rom_gm_voice_stealing_keeps_servicing_midi() {
+    let path = std::path::PathBuf::from(std::env::var_os("DOSLET_MT32_ROM_DIR").unwrap());
+    let control = std::fs::read(path.join("CM32L_CONTROL.ROM")).unwrap();
+    let pcm = std::fs::read(path.join("CM32L_PCM.ROM")).unwrap();
+    let mut engine = Timeline::with_gm(&control, &pcm, 44100, true).unwrap();
+    let mut output = [[0.0; 2]; 256];
+    let mut nanos = 0;
+    for program in 0..128 {
+        for byte in [0xC0, program] {
+            engine.push_byte(byte).unwrap();
+        }
+        for key in 36..100 {
+            for byte in [0x90, key, 100] {
+                engine.push_byte(byte).unwrap_or_else(|error| {
+                    panic!(
+                        "program={program} key={key} notes={}: {error}",
+                        engine.note_events()
+                    )
+                });
+            }
+            nanos += 10_000_000;
+            while engine.render_until(nanos, &mut output).unwrap() != 0 {}
+        }
+    }
+    assert_eq!(engine.note_events(), 8192);
+}
+
+#[test]
+#[ignore = "requires DOSLET_MT32_ROM_DIR with local CM-32L ROMs"]
 fn local_rom_large_snapshot_does_not_overflow_or_advance_output_time() {
     use doslet_midi_synth::wire::{REPLAY_CAPACITY, State};
     let path = std::path::PathBuf::from(std::env::var_os("DOSLET_MT32_ROM_DIR").unwrap());
