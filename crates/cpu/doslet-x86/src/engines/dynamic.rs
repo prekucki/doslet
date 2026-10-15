@@ -783,7 +783,9 @@ impl Cpu {
         if budget < 2 || !self.dynamic_ready() {
             return 0;
         }
-        let Some(mut instruction) = self.batch_instruction(bus) else {
+        // Native blocks and batched instructions cannot load segment registers,
+        // so the CS context and data windows stay valid for the whole slice.
+        let Some((code, mut windows)) = self.batch_context() else {
             return 0;
         };
         let budget = budget.min(256).min(limit(bus));
@@ -791,6 +793,9 @@ impl Cpu {
         let mut native_steps = 0;
         let mut native_blocks = 0;
         while completed < budget {
+            let Some(instruction) = self.batch_lookup(code, bus) else {
+                break;
+            };
             let remaining = budget - completed;
             let steps = if remaining >= 2 && instruction.native_candidate() {
                 self.try_native_block(NativeBus::Write(bus), remaining, || remaining)
@@ -801,17 +806,11 @@ impl Cpu {
                 completed += steps;
                 native_steps += steps;
                 native_blocks += 1;
-            } else {
-                self.execute_batched(bus, instruction);
+            } else if self.try_batched(bus, &mut windows, code, instruction) {
                 completed += 1;
-            }
-            if completed == budget {
+            } else {
                 break;
             }
-            let Some(next) = self.batch_instruction(bus) else {
-                break;
-            };
-            instruction = next;
         }
         self.dynamic.stats.execution_batches += u64::from(completed != 0);
         self.dynamic.stats.executed_blocks += native_blocks;

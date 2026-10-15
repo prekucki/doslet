@@ -519,116 +519,6 @@ impl Instruction {
     }
 }
 
-#[cfg(all(
-    feature = "dynamic-core",
-    not(target_arch = "wasm32"),
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-impl Instruction {
-    fn batch_safe<B: CpuBus>(self, cpu: &Cpu, bus: &B) -> bool {
-        let r = &cpu.registers;
-        let length = if self.dword { 4 } else { 1 };
-        let span = |segment, offset, length, access| {
-            r.address(segment, offset, length, access)
-                .ok()
-                .filter(|address| bus.is_plain_ram(*address, length))
-        };
-        let target = |target: Target, length, access| match target.resolve(r) {
-            Operand::Register(_) => true,
-            Operand::Memory { segment, offset } => span(segment, offset, length, access).is_some(),
-        };
-        let source = |value, length| match value {
-            Value::Immediate(_) => true,
-            Value::Operand(operand) => target(operand, length, Access::Read),
-        };
-        let jump = |address| {
-            r.address(SegmentRegister::Cs, address, 1, Access::Execute)
-                .is_ok()
-        };
-        let push = || {
-            let sp = cpu.stack_pointer().wrapping_sub(4);
-            let sp = if r.stack32() {
-                sp
-            } else {
-                u32::from(sp as u16)
-            };
-            span(SegmentRegister::Ss, sp, 4, Access::Write).is_some()
-        };
-        let pop = || span(SegmentRegister::Ss, cpu.stack_pointer(), 4, Access::Read);
-        match self.operation {
-            Operation::Move {
-                target: dst,
-                source: src,
-            } => source(src, length) && target(dst, length, Access::Write),
-            Operation::Alu {
-                target: dst,
-                source: src,
-                store,
-                ..
-            } => {
-                target(dst, length, Access::Read)
-                    && source(src, length)
-                    && (!store || target(dst, length, Access::Write))
-            }
-            Operation::Exchange { target: dst, .. } => {
-                target(dst, length, Access::Read) && target(dst, length, Access::Write)
-            }
-            Operation::Unary { target: dst, .. } => {
-                target(dst, 4, Access::Read) && target(dst, 4, Access::Write)
-            }
-            Operation::Lea { .. } | Operation::Inc { .. } => true,
-            Operation::Push(value) => source(value, 4) && push(),
-            Operation::Pop(_) => pop().is_some(),
-            Operation::Branch {
-                condition,
-                displacement,
-            } => {
-                condition.is_some_and(|condition| !flags::condition(cpu.flags, condition))
-                    || jump(
-                        r.ip.wrapping_add(u32::from(self.length))
-                            .wrapping_add_signed(displacement),
-                    )
-            }
-            Operation::Call(displacement) => {
-                jump(
-                    r.ip.wrapping_add(u32::from(self.length))
-                        .wrapping_add_signed(displacement),
-                ) && push()
-            }
-            Operation::CallIndirect(value) => {
-                let address = match value {
-                    Value::Immediate(value) => Some(value),
-                    Value::Operand(Target::Register(register)) => {
-                        Some(r.get32(Gpr32::decode(register)))
-                    }
-                    Value::Operand(target) => match target.resolve(r) {
-                        Operand::Memory { segment, offset } => {
-                            span(segment, offset, 4, Access::Read)
-                                .and_then(|address| bus.code_bytes(address, 4))
-                                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                                .map(u32::from_le_bytes)
-                        }
-                        Operand::Register(_) => unreachable!(),
-                    },
-                };
-                address.is_some_and(jump) && push()
-            }
-            Operation::Return(_) => pop()
-                .and_then(|address| bus.code_bytes(address, 4))
-                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                .is_some_and(|bytes| jump(u32::from_le_bytes(bytes))),
-            Operation::Input
-            | Operation::Output
-            | Operation::Loop { .. }
-            | Operation::String { .. }
-            | Operation::MulDiv { .. }
-            | Operation::Extend { .. }
-            | Operation::MoveExtend { .. }
-            | Operation::Unsupported => false,
-        }
-    }
-}
-
 /// Decode default-32-bit trace operations without resolving data addresses.
 /// Used segment assumptions are validated and cached at native entry.
 #[cfg(all(
@@ -822,7 +712,7 @@ enum Source {
 /// Data-segment windows resolved once per batch. Batched instructions cannot
 /// load segment registers, so the hidden caches stay unchanged throughout.
 #[derive(Default)]
-struct Windows([[Option<Option<SegmentWindow>>; 2]; 6]);
+pub(super) struct Windows([[Option<Option<SegmentWindow>>; 2]; 6]);
 impl Windows {
     #[inline]
     fn linear<B: CpuBus>(
@@ -886,16 +776,13 @@ impl Cpu {
         if budget < 2 || !self.batch_ready() || !self.decode_cache.enabled {
             return 0;
         }
-        let Some((code, _)) = self.decode_cache.code_context(&self.registers) else {
+        let Some((code, mut windows)) = self.batch_context() else {
             return 0;
         };
         let budget = budget.min(BATCH_STEPS).min(limit(bus));
-        let mut windows = Windows::default();
         let mut completed = 0;
         while completed < budget {
-            // Batched instructions cannot change the CS context resolved above.
-            let ip = self.registers.ip;
-            let Some(instruction) = self.decode_cache.instruction_in(code, ip, bus) else {
+            let Some(instruction) = self.batch_lookup(code, bus) else {
                 break;
             };
             if !self.try_batched(bus, &mut windows, code, instruction) {
@@ -915,7 +802,7 @@ impl Cpu {
     /// linear addresses. Returns false, with no effect, when any check fails:
     /// the reference step then reports faults and touches devices itself.
     /// Effects follow `execute_cached` in order and in flag computation.
-    fn try_batched<B: CpuBus>(
+    pub(super) fn try_batched<B: CpuBus>(
         &mut self,
         bus: &mut B,
         windows: &mut Windows,
@@ -1223,6 +1110,24 @@ impl Cpu {
         }
     }
 
+    /// The CS execute window and empty data windows for one slice.
+    pub(super) fn batch_context(&mut self) -> Option<(SegmentWindow, Windows)> {
+        let (code, _) = self.decode_cache.code_context(&self.registers)?;
+        Some((code, Windows::default()))
+    }
+
+    /// Look up the current instruction; batched instructions cannot change the
+    /// CS context resolved by `batch_context`.
+    #[inline]
+    pub(super) fn batch_lookup<B: CpuBus>(
+        &mut self,
+        code: SegmentWindow,
+        bus: &B,
+    ) -> Option<Instruction> {
+        self.decode_cache
+            .instruction_in(code, self.registers.ip, bus)
+    }
+
     /// The per-step checks of `step` are invariant across a batch: batched
     /// instructions cannot set TF, change CR0, load segments or open a shadow.
     fn batch_ready(&self) -> bool {
@@ -1235,25 +1140,6 @@ impl Cpu {
     }
 }
 
-#[cfg(all(
-    feature = "dynamic-core",
-    not(target_arch = "wasm32"),
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-impl Cpu {
-    pub(super) fn batch_instruction<B: CpuBus>(&mut self, bus: &B) -> Option<Instruction> {
-        let instruction = self.decode_cache.instruction(&self.registers, bus)?;
-        instruction.batch_safe(self, bus).then_some(instruction)
-    }
-
-    pub(super) fn execute_batched<B: CpuBus>(&mut self, bus: &mut B, instruction: Instruction) {
-        // Complete operand/stack/branch checks precede all effects. The bus's
-        // plain-RAM contract guarantees successful accesses until a mutation;
-        // this instruction cannot change mappings or its own later addresses.
-        self.execute_cached(bus, instruction)
-            .expect("validated batch instruction and plain-RAM bus contract");
-    }
-}
 struct Reader<'a> {
     bytes: &'a [u8],
     position: usize,
