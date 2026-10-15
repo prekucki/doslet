@@ -1478,7 +1478,7 @@ fn batches_stop_before_if_changes_ports_mmio_and_faults() {
         &[0xA1, 0, 0, 0x0A, 0][..], // VGA aperture
         &[0xA1, 0, 0, 0x10, 0][..], // Outside the DS limit
         &[0x8E, 0xD0][..],          // MOV SS,AX
-        &[0xF3, 0xA5][..],          // REP MOVSD
+        &[0xF3, 0xA6][..],          // REPE CMPSB stays uncached
     ] {
         let mut native = machine(true);
         let mut reference = machine(false);
@@ -1499,6 +1499,32 @@ fn batches_stop_before_if_changes_ports_mmio_and_faults() {
             state(&native, &reference);
         }
     }
+}
+
+#[test]
+fn ram_batches_repeat_strings_one_iteration_per_step() {
+    let mut native = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut native, &mut reference] {
+        clear_shadow(m);
+        // REP MOVSD copies four dwords from 20000h to 21000h, then CLI ends the slice.
+        code(m, 0x10000, &[0xF3, 0xA5, 0xFA]);
+        for offset in 0..16 {
+            m.bus.write_u8(0x20000 + offset, offset as u8 + 1).unwrap();
+        }
+        m.cpu.registers.set32(Gpr32::Esi, 0x20000);
+        m.cpu.registers.set32(Gpr32::Edi, 0x21000);
+        m.cpu.registers.set32(Gpr32::Ecx, 4);
+        m.cpu.flags = 2;
+    }
+    assert_eq!(native.step_with_idle_budget(256).unwrap().1, 4);
+    for _ in 0..4 {
+        reference.step().unwrap();
+    }
+    assert_eq!(native.cpu.registers.get32(Gpr32::Ecx), 0);
+    assert_eq!(native.cpu.registers.ip, 0x10002);
+    state(&native, &reference);
+    memory(&native, &reference);
 }
 
 #[test]
