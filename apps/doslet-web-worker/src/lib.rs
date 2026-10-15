@@ -484,7 +484,7 @@ impl WorkerEngine {
         let count = self.session.drain_pcm_timed(&mut self.pcm);
         for (frame, wire) in self.pcm[..count]
             .iter()
-            .zip(self.pcm_wire.chunks_exact_mut(4))
+            .zip(self.pcm_wire.as_chunks_mut::<4>().0.iter_mut())
         {
             wire.copy_from_slice(&[
                 frame.nanos as f64,

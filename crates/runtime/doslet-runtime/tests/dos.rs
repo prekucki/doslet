@@ -39,7 +39,12 @@ fn bios_mode_03h_returns_from_graphics_and_resets_text_state() {
         );
         let text = session.ram_view(0xB8000..0xC0000).unwrap();
         if mode == 3 {
-            assert!(text.chunks_exact(2).all(|cell| cell == [0x20, 7]));
+            assert!(
+                text.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|cell| *cell == [0x20, 7])
+            );
         } else {
             assert_eq!(&text[..2], &[0x58, 0x1E]);
             assert_eq!(&text[text.len() - 2..], &[0x59, 0x2F]);
@@ -67,7 +72,7 @@ fn bios_cursor_positions_are_independent_per_page_and_queries_return_shape() {
         );
         assert_eq!(session.ram_view(0x10200..0x10202).unwrap(), &[0x5A, 3]);
         let cursors = session.ram_view(0x450..0x460).unwrap();
-        for (index, cursor) in cursors.chunks_exact(2).enumerate() {
+        for (index, cursor) in cursors.as_chunks::<2>().0.iter().enumerate() {
             assert_eq!(
                 cursor,
                 if index == usize::from(page) {

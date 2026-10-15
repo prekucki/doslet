@@ -15,7 +15,7 @@ impl CodeOwnerId {
     /// caching. Moving that owner retains its ID, replacing it needs a fresh ID.
     pub fn fresh() -> Option<Self> {
         NEXT_CODE_OWNER
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .ok()

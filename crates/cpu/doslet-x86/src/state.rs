@@ -131,7 +131,7 @@ impl Default for Registers {
             caches: [SegmentCache::default(); 6],
             cpl: 0,
             cs_lineage: NEXT_LINEAGE
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
                 .unwrap_or(0),

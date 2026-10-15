@@ -120,8 +120,10 @@ fn snapshot(session: &Session) -> String {
         .and_then(|address| read(session, address, 32))
         .map(|bytes| {
             bytes
-                .chunks_exact(4)
-                .map(|part| format!("{:08X}", u32::from_le_bytes(part.try_into().unwrap())))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|part| format!("{:08X}", u32::from_le_bytes(*part)))
                 .collect::<Vec<_>>()
                 .join(" ")
         })

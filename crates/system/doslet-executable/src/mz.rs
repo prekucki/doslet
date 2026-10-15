@@ -148,10 +148,12 @@ impl<'a> MzImage<'a> {
 
     /// Borrow the validated relocation table without allocating an entry list.
     pub fn relocations(&self) -> impl ExactSizeIterator<Item = Relocation> + '_ {
-        self.relocations.chunks_exact(4).map(|entry| Relocation {
-            offset: u16::from_le_bytes([entry[0], entry[1]]),
-            segment: u16::from_le_bytes([entry[2], entry[3]]),
-        })
+        self.relocations.as_chunks::<4>().0.iter().map(
+            |&[offset_lo, offset_hi, segment_lo, segment_hi]| Relocation {
+                offset: u16::from_le_bytes([offset_lo, offset_hi]),
+                segment: u16::from_le_bytes([segment_lo, segment_hi]),
+            },
+        )
     }
 }
 

@@ -2083,7 +2083,9 @@ mod tests {
             session
                 .ram_view(0xB8000..0xB8000 + 4000)
                 .unwrap()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|cell| char::from(cell[0]))
                 .collect()
         };
@@ -2444,7 +2446,13 @@ enabled = false
         assert_eq!((frame.width, frame.height), (640, 480));
         let mut pixels = vec![0; frame.width * frame.height * 4];
         frame.write_rgba(&mut pixels).unwrap();
-        assert!(pixels.chunks_exact(4).any(|pixel| pixel[..3] != [0, 0, 0]));
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[..3] != [0, 0, 0])
+        );
         app.display.refresh(&app.session);
         assert!(app.display.image.is_some());
         let _ = app.update(Message::Reset);

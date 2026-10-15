@@ -713,7 +713,7 @@ static NEXT_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 static NEXT_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 pub(super) fn new_epoch() -> Result<u64, RuntimeError> {
     let epoch = NEXT_EPOCH
-        .fetch_update(
+        .try_update(
             core::sync::atomic::Ordering::Relaxed,
             core::sync::atomic::Ordering::Relaxed,
             |current| current.checked_add(1),

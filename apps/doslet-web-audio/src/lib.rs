@@ -99,7 +99,9 @@ impl AudioEngine {
         let mut frames = [doslet_pcm::EMPTY; 128];
         for (wire, frame) in self
             .pcm_wire
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .zip(frames[..count].iter_mut())
         {
             if wire.iter().any(|v| !v.is_finite())

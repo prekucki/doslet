@@ -222,11 +222,9 @@ fn summarize(name: &str, song: Song) {
                             peak_keys = peak_keys.max(keys);
                         }
                     }
-                    0x80 | 0x90 => {
-                        if held[channel][usize::from(a)] {
-                            held[channel][usize::from(a)] = false;
-                            keys -= 1;
-                        }
+                    0x80 | 0x90 if held[channel][usize::from(a)] => {
+                        held[channel][usize::from(a)] = false;
+                        keys -= 1;
                     }
                     _ => {}
                 }
@@ -323,7 +321,7 @@ fn trace(path: &str) -> Result<()> {
         if hex.len() % 2 != 0 {
             return Err("odd trace byte count".into());
         }
-        for pair in hex.as_bytes().chunks_exact(2) {
+        for pair in hex.as_bytes().as_chunks::<2>().0.iter() {
             let byte = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
             if let Some(message) = decoder.push(byte).map_err(|e| format!("wire: {e:?}"))? {
                 let channel = usize::from(message[0] & 15);

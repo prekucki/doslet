@@ -371,15 +371,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         if session.waiting_for_key() {
             let text = session.ram_view(0xB8000..0xB8000 + 4000).unwrap();
             let changed = text
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .zip(screen.iter())
                 .any(|(cell, old)| cell[0] != *old);
             if changed || !shown {
-                for (cell, byte) in text.chunks_exact(2).zip(screen.iter_mut()) {
+                for (cell, byte) in text.as_chunks::<2>().0.iter().zip(screen.iter_mut()) {
                     *byte = cell[0];
                 }
                 println!("\nTEXT at {} steps:", session.steps());
-                for row in screen.chunks_exact(80) {
+                for row in screen.as_chunks::<80>().0.iter() {
                     println!("{}", String::from_utf8_lossy(row).trim_end());
                 }
                 shown = true;
@@ -516,7 +518,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map_err(|e| format!("frame: {e:?}"))?;
         let mut file = fs::File::create("/tmp/doslet-probe.ppm")?;
         write!(file, "P6\n{} {}\n255\n", frame.width(), frame.height())?;
-        for pixel in rgba.chunks_exact(4) {
+        for pixel in rgba.as_chunks::<4>().0.iter() {
             file.write_all(&pixel[..3])?;
         }
     }

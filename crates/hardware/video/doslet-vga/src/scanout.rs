@@ -13,8 +13,8 @@ impl IndexedFrame<'_> {
         if output.len() != self.pixels.len() * 4 {
             return Err(FrameSizeError);
         }
-        for (pixel, rgba) in self.pixels.iter().zip(output.chunks_exact_mut(4)) {
-            rgba.copy_from_slice(&self.palette[usize::from(*pixel & self.pixel_mask)]);
+        for (pixel, rgba) in self.pixels.iter().zip(output.as_chunks_mut::<4>().0) {
+            *rgba = self.palette[usize::from(*pixel & self.pixel_mask)];
         }
         Ok(())
     }
@@ -95,8 +95,9 @@ impl PresentationFrame<'_> {
                 Ok(())
             }
             Self::Text(f) => {
-                for (index, cell) in f.cells.chunks_exact(2).take(2000).enumerate() {
-                    let (ch, attribute) = (cell[0], cell[1]);
+                for (index, &[ch, attribute]) in
+                    f.cells.as_chunks::<2>().0.iter().take(2000).enumerate()
+                {
                     let glyph =
                         &crate::font::FONT_16[usize::from(ch) * 16..usize::from(ch) * 16 + 16];
                     let fg = usize::from(attribute & 15);

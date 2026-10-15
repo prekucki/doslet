@@ -304,7 +304,13 @@ pub(crate) mod tests {
         assert_eq!((frame.width, frame.height), (640, 480));
         let mut pixels = vec![0; frame.width * frame.height * 4];
         frame.write_rgba(&mut pixels).unwrap();
-        assert!(pixels.chunks_exact(4).any(|pixel| pixel[..3] != [0, 0, 0]));
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[..3] != [0, 0, 0])
+        );
         println!(
             "ZIP-mounted real game: {} steps, {} MIDI bytes, nonblank 640x480",
             session.steps(),

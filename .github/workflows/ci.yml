@@ -37,7 +37,23 @@ jobs:
           git checkout --detach FETCH_HEAD
 
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import tomllib
+
+          with open("mise.toml", "rb") as config:
+              rust = tomllib.load(config)["tools"]["rust"]
+          command = ["rustup", "toolchain", "install", rust["version"], "--profile", "minimal"]
+          for component in rust["components"]:
+              command.extend(["--component", component])
+          for target in rust["targets"]:
+              command.extend(["--target", target])
+          subprocess.run(command, check=True)
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"RUSTUP_TOOLCHAIN={rust['version']}\n")
+          PY
 
       - name: Check formatting
         run: cargo fmt --all --check
