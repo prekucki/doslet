@@ -66,6 +66,12 @@ fn main() -> iced::Result {
 fn run(boot: impl iced::application::BootFn<app::Doslet, app::Message> + 'static) -> iced::Result {
     let window = iced::window::Settings {
         #[cfg(not(target_arch = "wasm32"))]
+        size: presentation::DEFAULT_WINDOW_SIZE,
+        #[cfg(not(target_arch = "wasm32"))]
+        min_size: Some(presentation::MIN_WINDOW_SIZE),
+        #[cfg(target_arch = "wasm32")]
+        size: iced::Size::new(1120.0, 760.0),
+        #[cfg(not(target_arch = "wasm32"))]
         exit_on_close_request: false,
         #[cfg(target_os = "linux")]
         platform_specific: iced::window::settings::PlatformSpecific {
@@ -81,7 +87,6 @@ fn run(boot: impl iced::application::BootFn<app::Doslet, app::Message> + 'static
         .theme(app::Doslet::theme)
         .subscription(app::Doslet::subscription)
         .window(window)
-        .window_size((1120.0, 760.0))
         .centered()
         .run()
 }

@@ -167,7 +167,10 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
             .color(MUTED),
         );
     }
-    bottom = bottom.push(space::horizontal()).push(mpu_indicator(app));
+    if !narrow {
+        bottom = bottom.push(space::horizontal());
+    }
+    bottom = bottom.push(mpu_indicator(app));
     if let Some(iced::widget::image::Handle::Rgba { width, height, .. }) = &app.display.image {
         bottom = bottom.push(text(format!("{width} × {height}")).size(12).color(MUTED));
     }
@@ -246,6 +249,11 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         }
         shell = shell.push(container(alert).padding([2, 16]).width(Fill));
     }
+    let bottom: Element<'_, Message> = if narrow {
+        bottom.wrap().into()
+    } else {
+        bottom.into()
+    };
     shell = shell.push(container(bottom).padding([5, 16]).width(Fill));
     let shell: Element<'_, Message> = shell.into();
     if app.configurator.open {

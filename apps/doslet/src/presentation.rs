@@ -3,6 +3,12 @@ use doslet_runtime::Session;
 use iced::Size;
 use iced::widget::image::Handle;
 
+// Logical pixels keep the UI usable independently of the monitor's DPI.
+#[cfg(not(target_arch = "wasm32"))]
+pub const DEFAULT_WINDOW_SIZE: Size = Size::new(960.0, 640.0);
+#[cfg(not(target_arch = "wasm32"))]
+pub const MIN_WINDOW_SIZE: Size = Size::new(400.0, 160.0);
+
 #[derive(Default)]
 pub struct DisplayFrame {
     pub image: Option<Handle>,
@@ -33,6 +39,7 @@ pub struct DisplaySizing {
     pub actual_size: bool,
     viewport: Size,
     scale_factor: f32,
+    resize_passes: u8,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,6 +49,7 @@ impl Default for DisplaySizing {
             actual_size: false,
             viewport: Size::ZERO,
             scale_factor: 1.0,
+            resize_passes: 0,
         }
     }
 }
@@ -86,26 +94,40 @@ impl DisplaySizing {
             SizingMessage::ActualSize => {
                 if frame.dimensions().is_some() {
                     self.actual_size = true;
-                    return window::latest().and_then(|id| {
-                        window::size(id).then(move |size| {
-                            window::scale_factor(id)
-                                .map(move |scale| SizingMessage::WindowMetrics(id, size, scale))
-                        })
-                    });
+                    self.resize_passes = 4;
+                    return query_window_metrics();
                 }
             }
-            SizingMessage::Fit => self.actual_size = false,
-            SizingMessage::Viewport(size) => self.viewport = size,
+            SizingMessage::Fit => {
+                self.actual_size = false;
+                self.resize_passes = 0;
+            }
+            SizingMessage::Viewport(size) => {
+                self.viewport = size;
+                // Narrowing can wrap the toolbar. Measure the resulting layout
+                // again before settling the height, only during a 1:1 request.
+                if self.resize_passes > 0 {
+                    return query_window_metrics();
+                }
+            }
             SizingMessage::ScaleFactor(scale) => self.scale_factor = scale,
             SizingMessage::WindowMetrics(id, size, scale) => {
                 self.scale_factor = scale;
                 // A pending window query must not undo a later click on Fit.
                 if self.actual_size
+                    && self.resize_passes > 0
                     && self.viewport.width > 0.0
                     && self.viewport.height > 0.0
                     && let Some(pixels) = frame.dimensions()
                 {
                     let target = actual_window_size(size, self.viewport, pixels, scale);
+                    if (target.width - size.width).abs() < 1.0
+                        && (target.height - size.height).abs() < 1.0
+                    {
+                        self.resize_passes = 0;
+                        return Task::none();
+                    }
+                    self.resize_passes -= 1;
                     return window::maximize(id, false).chain(window::resize(id, target));
                 }
             }
@@ -115,13 +137,23 @@ impl DisplaySizing {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn query_window_metrics() -> iced::Task<SizingMessage> {
+    use iced::window;
+    window::latest().and_then(|id| {
+        window::size(id).then(move |size| {
+            window::scale_factor(id).map(move |scale| SizingMessage::WindowMetrics(id, size, scale))
+        })
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn actual_window_size(window: Size, viewport: Size, pixels: Size, scale: f32) -> Size {
     // Window/widget dimensions are logical pixels; guest pixels must occupy
     // physical display pixels. Measure the surrounding UI instead of encoding
     // its padding, toolbar, sidebar and variable footer heights here.
     Size::new(
-        window.width - viewport.width + pixels.width / scale,
-        window.height - viewport.height + pixels.height / scale,
+        (window.width - viewport.width + pixels.width / scale).max(MIN_WINDOW_SIZE.width),
+        (window.height - viewport.height + pixels.height / scale).max(MIN_WINDOW_SIZE.height),
     )
 }
 
@@ -198,6 +230,19 @@ mod tests {
         assert_eq!(
             actual_window_size(window, viewport, pixels, 2.0),
             Size::new(744.0, 510.0)
+        );
+    }
+
+    #[test]
+    fn compact_window_remeasures_wrapped_controls_without_large_inner_margins() {
+        let pixels = Size::new(720.0, 400.0);
+        let first = actual_window_size(DEFAULT_WINDOW_SIZE, Size::new(960.0, 550.0), pixels, 2.0);
+        assert_eq!(first, Size::new(400.0, 290.0));
+        let wrapped = actual_window_size(first, Size::new(400.0, 170.0), pixels, 2.0);
+        assert_eq!(wrapped, Size::new(400.0, 320.0));
+        assert_eq!(
+            actual_window_size(wrapped, Size::new(400.0, 200.0), pixels, 2.0),
+            wrapped
         );
     }
 }
