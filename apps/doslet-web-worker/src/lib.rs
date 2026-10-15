@@ -468,6 +468,25 @@ impl WorkerEngine {
     pub fn midi_mode(&self) -> String {
         self.routing.mode().as_str().into()
     }
+    pub fn guest_pcm_rate(&self) -> u32 {
+        self.session.audio_status().rate
+    }
+    pub fn guest_pcm_bits(&self) -> u8 {
+        self.session.audio_status().configured_format.map_or(
+            0,
+            |format| {
+                if format.word { 16 } else { 8 }
+            },
+        )
+    }
+    pub fn guest_pcm_channels(&self) -> u8 {
+        self.session.audio_status().configured_format.map_or(
+            0,
+            |format| {
+                if format.stereo { 2 } else { 1 }
+            },
+        )
+    }
     pub fn midi_upgraded(&self) -> bool {
         self.routing.upgraded()
     }
@@ -621,6 +640,36 @@ fn parse_mode(mode: &str) -> Result<Mode, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("../../../tests/fixtures/sb16_pcm.rs");
+    #[test]
+    fn guest_pcm_metadata_comes_from_guest_dsp_commands() {
+        let mut engine = WorkerEngine::new();
+        assert_eq!(engine.guest_pcm_bits(), 0);
+        engine.session = Session::new(&sb16_pcm_program()).unwrap();
+        engine.start();
+        engine.advance(10000);
+        assert_eq!(engine.guest_pcm_rate(), 16000);
+        assert_eq!(engine.guest_pcm_bits(), 8);
+        assert_eq!(engine.guest_pcm_channels(), 1);
+    }
+    include!("../../../tests/fixtures/opl3.rs");
+    #[test]
+    fn worker_transports_guest_opl3_audio_in_pcm_packets() {
+        let mut engine = WorkerEngine::new();
+        engine.session = Session::new(&opl3_tone_program()).unwrap();
+        engine.start();
+        let mut nonzero = 0;
+        for _ in 0..50 {
+            engine.advance(10000);
+            let count = engine.drain_pcm();
+            nonzero += engine.pcm[..count]
+                .iter()
+                .filter(|f| f.samples != [0; 2])
+                .count();
+        }
+        assert_eq!(engine.status(), 1);
+        assert!(nonzero > 1000);
+    }
     #[test]
     fn worker_exposes_guest_yield_before_the_next_batch() {
         let mut engine = WorkerEngine::new();

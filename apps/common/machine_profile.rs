@@ -45,6 +45,30 @@ fn required(t: &dyn TableLike, k: &str) -> Result<String, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("{k} is required"))
 }
+pub(crate) fn cpu_mhz(t: &dyn TableLike) -> Result<Option<u16>, String> {
+    let mhz = t
+        .get("cpu_mhz")
+        .map(|item| {
+            item.as_integer()
+                .filter(|v| (1..=1000).contains(v))
+                .map(|v| v as u16)
+                .ok_or("machine.cpu_mhz must be an integer from 1 to 1000")
+        })
+        .transpose()?;
+    let legacy = t
+        .get("clock_hz")
+        .map(|item| {
+            item.as_integer()
+                .filter(|v| (1_000_000..=1_000_000_000).contains(v) && v % 1_000_000 == 0)
+                .map(|v| (v / 1_000_000) as u16)
+                .ok_or("machine.clock_hz must be a whole number of MHz from 1 to 1000")
+        })
+        .transpose()?;
+    if mhz.is_some() && legacy.is_some() && mhz != legacy {
+        return Err("machine.cpu_mhz and machine.clock_hz disagree".into());
+    }
+    Ok(mhz.or(legacy))
+}
 pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
     let doc = text.parse::<DocumentMut>().map_err(|e| e.to_string())?;
     let t = doc.as_table();
@@ -74,6 +98,7 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
                 "engine",
                 "timing",
                 "clock_hz",
+                "cpu_mhz",
                 "memory_mib",
                 "x87",
                 "video",
@@ -92,12 +117,13 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
                 return Err(format!("machine.{key} supports only {expected}"));
             }
         }
-        for (key, expected) in [("clock_hz", 33_000_000), ("vram_kib", 512)] {
-            if let Some(item) = m.get(key)
-                && item.as_integer() != Some(expected)
-            {
-                return Err(format!("machine.{key} must be {expected}"));
-            }
+        if let Some(item) = m.get("vram_kib")
+            && item.as_integer() != Some(512)
+        {
+            return Err("machine.vram_kib must be 512".into());
+        }
+        if let Some(v) = cpu_mhz(m)? {
+            spec.hardware.cpu_mhz = v;
         }
         if let Some(v) = number(m, "memory_mib")? {
             spec.hardware.memory_mib = v;
@@ -298,13 +324,21 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
 fn parse_v1(t: &dyn TableLike) -> Result<MachineSpec, String> {
     fields(
         t,
-        &["version", "name", "game", "drives", "midi", "audio"],
+        &[
+            "version", "name", "game", "drives", "midi", "audio", "machine",
+        ],
         "",
     )?;
     let mut spec = MachineSpec {
         name: string(t, "name")?.unwrap_or_default(),
         ..Default::default()
     };
+    if let Some(machine) = section(t, "machine")? {
+        fields(machine, &["cpu_mhz", "clock_hz"], "machine.")?;
+        if let Some(v) = cpu_mhz(machine)? {
+            spec.hardware.cpu_mhz = v;
+        }
+    }
     if let Some(game) = section(t, "game")? {
         fields(
             game,
@@ -426,7 +460,7 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
     ] {
         d["machine"][k] = value(v);
     }
-    d["machine"]["clock_hz"] = value(33_000_000);
+    d["machine"]["cpu_mhz"] = value(i64::from(spec.hardware.cpu_mhz));
     d["machine"]["vram_kib"] = value(512);
     d["machine"]["memory_mib"] = value(i64::from(spec.hardware.memory_mib));
     d["machine"]["x87"] = value(spec.hardware.x87);
@@ -561,6 +595,7 @@ mod tests {
             ..Default::default()
         };
         s.hardware.keyboard = KeyboardMode::At;
+        s.hardware.cpu_mhz = 132;
         s.input.deadzone_percent = 20;
         s.input.capture = false;
         s.input.hide_cursor = true;
@@ -568,6 +603,35 @@ mod tests {
             parse_machine_profile(&export_machine_profile(&s)).unwrap(),
             s
         );
+    }
+    #[test]
+    fn cpu_clock_supports_both_profile_versions_and_rejects_ambiguous_values() {
+        for version in [1, 2] {
+            for setting in [
+                "cpu_mhz=132",
+                "clock_hz=132000000",
+                "cpu_mhz=132\nclock_hz=132000000",
+            ] {
+                let spec =
+                    parse_machine_profile(&format!("version={version}\n[machine]\n{setting}"))
+                        .unwrap();
+                assert_eq!(spec.hardware.cpu_mhz, 132);
+            }
+            for setting in [
+                "cpu_mhz=0",
+                "cpu_mhz=1001",
+                "cpu_mhz=33.5",
+                "cpu_mhz='132'",
+                "clock_hz=33500000",
+                "cpu_mhz=132\nclock_hz=33000000",
+            ] {
+                assert!(
+                    parse_machine_profile(&format!("version={version}\n[machine]\n{setting}"))
+                        .is_err(),
+                    "{setting}"
+                );
+            }
+        }
     }
     #[test]
     fn reject_unknown_and_unsupported() {

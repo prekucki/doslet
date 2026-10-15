@@ -41,8 +41,8 @@ impl Signal {
     }
 }
 
-// The idle subscription is the sole listener. Running execution drains the
-// queue on its existing timer, with this subscription removed.
+// A signal has one subscription listener. Multiple producer notifications
+// collapse into one pending wakeup until that listener polls again.
 pub(super) struct Wakeups(Signal);
 
 impl Stream for Wakeups {

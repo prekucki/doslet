@@ -53,6 +53,7 @@ pub struct Dsp {
     dma_parameters: [u8; 3],
     dma_parameter_len: usize,
     playback: Option<Playback>,
+    configured_format: Option<Format>,
     left: Option<i16>,
     irq8: bool,
     irq16: bool,
@@ -74,6 +75,7 @@ impl Default for Dsp {
             dma_parameters: [0; 3],
             dma_parameter_len: 0,
             playback: None,
+            configured_format: None,
             left: None,
             irq8: false,
             irq16: false,
@@ -120,6 +122,10 @@ impl Dsp {
         self.playback
             .filter(|state| !state.paused)
             .map(|state| state.format)
+    }
+    /// Last guest DMA format, retained between blocks and cleared by DSP reset.
+    pub fn configured_format(&self) -> Option<Format> {
+        self.configured_format
     }
     pub fn irq_status(&self) -> u8 {
         u8::from(self.irq8) | (u8::from(self.irq16) << 1)
@@ -209,6 +215,7 @@ impl Dsp {
                             paused: false,
                         });
                         self.left = None;
+                        self.configured_format = self.playback.map(|state| state.format);
                         self.dma_parameter_len = 0;
                     } else {
                         self.parameter = Some(command);
@@ -293,6 +300,37 @@ impl Dsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn guest_format_survives_single_cycle_completion_but_not_reset() {
+        let mut dsp = Dsp::default();
+        assert_eq!(dsp.configured_format(), None);
+        for byte in [0xB0, 0x30, 1, 0] {
+            dsp.write_command(byte).unwrap();
+        }
+        let format = Some(Format {
+            word: true,
+            stereo: true,
+            signed: true,
+        });
+        assert_eq!(dsp.configured_format(), format);
+        dsp.accept_sample(1000).unwrap();
+        dsp.accept_sample(2000).unwrap();
+        assert_eq!(dsp.playback_format(), None);
+        assert_eq!(dsp.configured_format(), format);
+        for byte in [0xC0, 0, 0, 0] {
+            dsp.write_command(byte).unwrap();
+        }
+        assert_eq!(
+            dsp.configured_format(),
+            Some(Format {
+                word: false,
+                stereo: false,
+                signed: false
+            })
+        );
+        dsp.write_reset(1);
+        assert_eq!(dsp.configured_format(), None);
+    }
     #[test]
     fn sb16_dac_remains_enabled_without_legacy_speaker_commands() {
         let mut dsp = Dsp::default();

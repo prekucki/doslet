@@ -10,6 +10,15 @@ use doslet_mc146818::Cmos;
 use doslet_mpu401::Mpu401;
 use doslet_vga::{APERTURE_LEN, APERTURE_START, Vga};
 
+fn opl_offset(port: u16) -> u8 {
+    match port {
+        0x388..=0x38B => (port - 0x388) as u8,
+        0x220..=0x223 => (port - 0x220) as u8,
+        0x228..=0x229 => (port - 0x228) as u8,
+        _ => unreachable!("OPL route"),
+    }
+}
+
 pub struct PcBus {
     config: HardwareConfig,
     routes: Routes,
@@ -34,9 +43,11 @@ pub struct PcBus {
     pub mpu: Mpu401,
     pub dsp: doslet_sb_dsp::Dsp,
     pub mixer: doslet_sb_mixer::Mixer,
+    pub opl: doslet_opl3::Opl3,
     pub dma: [doslet_i8237::Dma; 2],
     dma_pages: [u8; 8],
     pub(crate) pcm: crate::audio::PcmQueue,
+    pub(crate) digital_pcm: [doslet_pcm::Frame; 2],
     a20: A20Gate,
     pub keyboard: Controller,
     pub cmos: Cmos,
@@ -84,8 +95,10 @@ impl PcBus {
                 config.sb_dma16,
             ),
             dma: core::array::from_fn(|_| doslet_i8237::Dma::default()),
+            opl: doslet_opl3::Opl3::default(),
             dma_pages: [0; 8],
             pcm: crate::audio::PcmQueue::default(),
+            digital_pcm: [doslet_pcm::EMPTY; 2],
             keyboard: Controller::default(),
             a20: A20Gate::default(),
             cmos: Cmos::new(640, ((config.memory_bytes() - 0x100000) / 1024) as u16),
@@ -409,6 +422,7 @@ impl PortBus for PcBus {
                 .map_err(|_| BusError::UnmappedPort(port)),
             Endpoint::DmaPage => Ok(self.dma_pages[Self::dma_page_channel(port)]),
             Endpoint::MixerIndex => Ok(self.mixer.index()),
+            Endpoint::Opl => Ok(self.opl.read(opl_offset(port), self.guest_nanos)),
             Endpoint::MixerData => {
                 self.mixer.set_interrupt_status(self.dsp.irq_status());
                 self.mixer.read().map_err(|_| BusError::UnmappedPort(port))
@@ -470,6 +484,7 @@ impl PortBus for PcBus {
                 .map_err(|_| BusError::UnmappedPort(port))?,
             Endpoint::DmaPage => self.dma_pages[Self::dma_page_channel(port)] = value,
             Endpoint::MixerIndex => self.mixer.select(value),
+            Endpoint::Opl => self.opl.write(opl_offset(port), value, self.guest_nanos),
             Endpoint::MixerData => {
                 if let Some((irq, dma8, dma16)) = self.mixer.proposed_routing(value)
                     && (!irq.is_some_and(|v| self.routes.allows_irq(v))

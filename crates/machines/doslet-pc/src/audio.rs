@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, vec};
 use doslet_pcm::{EMPTY, Frame};
 
-/// One preallocated owner for produced SB16 stereo frames. The host drains into
+/// One preallocated owner for mixed SB16 DMA/FM stereo frames. The host drains into
 /// supplied storage; a full queue stops execution instead of discarding audio.
 pub(crate) struct PcmQueue {
     frames: Box<[Frame]>,

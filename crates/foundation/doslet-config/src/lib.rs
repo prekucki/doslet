@@ -160,7 +160,7 @@ pub const CATALOG: &[Component] = &[
     Component {
         id: "cpu.i386",
         name: "i386 interpreter",
-        support: "Selected instruction subset; functional 33 MHz timing",
+        support: "Selected instruction subset; configurable nominal CPU clock",
     },
     Component {
         id: "fpu.x87",
@@ -175,7 +175,7 @@ pub const CATALOG: &[Component] = &[
     Component {
         id: "sound.sb16",
         name: "Sound Blaster 16",
-        support: "DSP / PCM; fixed I/O 220h",
+        support: "DSP / PCM and AdLib / OPL3 FM; I/O 220h and 388h",
     },
     Component {
         id: "midi.mpu401",
@@ -198,6 +198,7 @@ impl MachineSpec {
         self.hardware.validate().map_err(|e| {
             ConfigError::new(
                 match e {
+                    HardwareError::CpuClock => "machine.cpu_mhz",
                     HardwareError::MemorySize => "machine.memory_mib",
                     HardwareError::SoundIrq => "sound.irq",
                     HardwareError::SoundDma8 => "sound.dma8",
@@ -399,6 +400,11 @@ impl MachineSpec {
             io.push(ResourceClaim { owner, first, last });
         }
         if self.hardware.sb16 {
+            io.push(ResourceClaim {
+                owner: "OPL3",
+                first: 0x388,
+                last: 0x38b,
+            });
             io.push(ResourceClaim {
                 owner: "SB16",
                 first: 0x220,

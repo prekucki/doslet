@@ -9,7 +9,7 @@ pub const DEFAULT_WINDOW_SIZE: Size = Size::new(960.0, 640.0);
 #[cfg(not(target_arch = "wasm32"))]
 pub const MIN_WINDOW_SIZE: Size = Size::new(400.0, 160.0);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DisplayFrame {
     pub image: Option<Handle>,
     #[cfg(not(target_arch = "wasm32"))]

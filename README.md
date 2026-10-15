@@ -60,6 +60,9 @@ The browser version needs no installation and no server.
   port on your computer (TiMidity, Munt or a hardware synth), Web MIDI in the
   browser, or CM-32L emulation that uses your own ROMs. Doslet recognizes MT-32
   music automatically and can translate it for General MIDI devices.
+- **AdLib / Sound Blaster FM.** Nuked OPL3 renders the guest's FM register writes
+  and mixes them with digital Sound Blaster audio. Synthetic tests cover timers,
+  stereo output and mixing; real-game FM playback still needs verification.
 - **A configurable machine.** You can set the RAM size, x87, SB16, MPU-401,
   keyboard and joystick, and mount CD-ROM images (served to the game through
   MSCDEX). Saves can be kept on disk or in the browser's IndexedDB. All of this
@@ -135,8 +138,10 @@ MT-32 ROMs and the Linux desktop launcher.
 
 ## Under the hood
 
-Each box below is a separate crate. The emulation libraries are `no_std`, use
-static bus dispatch in hot paths and never access the host directly. Windows,
+Each box below is a separate crate. The emulation libraries use static bus
+dispatch in hot paths and never access the host directly. They retain `no_std`
+except the OPL3 adapter's upstream dependency, which makes the PC/runtime graph
+require `std`; see the [future-work list](docs/backlog.md). Windows,
 files, audio and the network are handled by the frontends.
 
 ```mermaid
@@ -147,7 +152,7 @@ flowchart TD
   Runtime --> DOS["doslet-dos · vfs · iso9660<br/><sub>processes · files · CD-ROM</sub>"]
   PC["doslet-pc<br/><sub>ports · memory pages · IRQ · DMA</sub>"] --> CPU["doslet-x86 + x87<br/><sub>optional Cranelift JIT</sub>"]
   PC --> Chips["8259 PIC · 8254 PIT · 8237 DMA<br/>8042 · CMOS · gameport"]
-  PC --> AV["VGA/VBE · SB16 DSP + mixer · MPU-401"]
+  PC --> AV["VGA/VBE · SB16 DSP + mixer · Nuked OPL3 · MPU-401"]
   CPU --> Bus["doslet-bus<br/><sub>memory and port contracts</sub>"]
   PC --> Bus
   App --> Audio["MIDI routing · Rust synth · MT-32 → GM · CM-32L"]
@@ -167,7 +172,7 @@ describe these design rules in detail.
 ## Roadmap
 
 - Wider CPU coverage: paging, precise faults and the full privilege model
-- Sound Blaster digital audio and OPL (AdLib) music in host output
+- Real-game acceptance of Sound Blaster digital audio and OPL (AdLib) music
 - More VGA/SVGA modes and register-level effects
 - A fuller DOS kernel and support for more DOS extenders
 - MT-32 ROM selection and launch profiles in the browser
@@ -196,6 +201,8 @@ version, and the diagnostic that Doslet printed.
 Doslet is licensed under [GPL-2.0-or-later](LICENSE). Files that include
 third-party code keep their original copyright notices, and third-party
 libraries keep their own licenses. The vendored iced patches are MIT-licensed;
-see the [vendor notes](vendor/README.md). The demo program included with Doslet
+see the [vendor notes](vendor/README.md). The `nuked-opl3` dependency is
+[LGPL-2.1-or-later](https://github.com/tgies/nuked-opl3-rs/blob/main/LICENSE).
+The demo program included with Doslet
 is original. The commercial games named above are external test inputs and are
 not distributed with Doslet.

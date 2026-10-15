@@ -1,6 +1,21 @@
 use doslet_pcm::{Error, Frame, Mixer};
 
 #[test]
+fn spectrum_analysis_and_reset_do_not_allocate_after_setup() {
+    let mut spectrum = doslet_pcm::spectrum::Spectrum::new(48000);
+    let measured = allocation_counter::measure(|| {
+        for i in 0..48000 {
+            let sample = libm::sinf(i as f32 * core::f32::consts::TAU * 2000.0 / 48000.0);
+            spectrum.push([sample, -sample]);
+        }
+        assert!(spectrum.levels()[8] > 0.8);
+        spectrum.reset();
+    });
+    assert_eq!(measured.count_total, 0);
+    assert_eq!(measured.bytes_total, 0);
+}
+
+#[test]
 fn resampling_is_independent_of_packet_and_callback_partitioning() {
     for source_rate in [8000_u32, 11025, 22050, 44100, 48000] {
         for output_rate in [44100, 48000] {

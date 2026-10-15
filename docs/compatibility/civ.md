@@ -37,9 +37,35 @@ native CM-32L engine does, using external Control v1.02 and PCM ROMs.
 
 ## Remaining audio scope
 
-AdLib/Sound Blaster selection reproduces a write to port 0B8Ah at startup,
-followed by OPL probing at 388h. OPL synthesis and the unidentified auxiliary
-port are unsupported; do not treat this path as working audio. Roland audio
+AdLib/Sound Blaster selection writes zero to 0B8Ah before probing OPL at 388h.
+The local `ASOUND.CVL` contains this sequence. 0B8Ah is the Pro Audio Spectrum
+audio-filter register, as documented in the
+[86Box PAS implementation](https://github.com/86Box/86Box/blob/master/src/sound/snd_pas16.c).
+Doslet has no PAS card: this one register reads FFh and ignores writes, without
+aliasing it to OPL or accepting other unknown ports.
+
+A 2026-10-16 headless run selected VGA, AdLib/Sound Blaster and keyboard input:
+
+```sh
+cargo run -p doslet-headless --release --locked --example inspect_civ -- games/civ/CIV.EXE 141 150000000
+```
+
+It completed 150 million steps with `Running`, no fault and mode-13h graphics,
+producing 814079 nonzero FM stereo frames through the PCM queue. These frames
+were drained without host playback; the reported `mixed_peak=0` reflects the
+inactive host mixer in this probe, not silent OPL samples. This verifies startup
+and guest FM generation, not audible playback, music fidelity or gameplay.
+
+The local `ASOUND.CVL`, `ISOUND.CVL` and `RSOUND.CVL` also contain a routine
+that reads RTC time through INT 1Ah/AH=02h, converts BCD hours/minutes/seconds
+to binary, sets hundredths to zero, and calls DOS INT 21h/AH=2Dh. This is a
+DOS/RTC synchronization sequence, not a request to change the host clock.
+The probable purpose is restoring DOS time after sound-driver timer use;
+that motivation is inferred from the driver context. Doslet implements this
+service within the guest, with validation and matching AH=2Ch reads, rather
+than reporting success without applying the requested time.
+
+Roland audio
 is enabled with `--mt32-rom-dir`, using selection 5 in the game. Browser ROM
 selection and MT-32 synthesis integration remain pending.
 

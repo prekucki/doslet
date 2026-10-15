@@ -1,4 +1,4 @@
-//! Independent CT1745 mixer configuration. PCM mixing and interrupt inputs are pending.
+//! Independent CT1745 mixer registers and FM output levels.
 #![no_std]
 
 #[derive(Debug)]
@@ -21,6 +21,24 @@ impl Default for Mixer {
     }
 }
 impl Mixer {
+    /// Apply the CT1745 master and FM levels independently to both channels.
+    /// Each step below 31 attenuates by approximately 2 dB; zero mutes.
+    pub fn fm_samples(&self, mut samples: [i16; 2]) -> [i16; 2] {
+        for (channel, sample) in samples.iter_mut().enumerate() {
+            let master = self.registers[0x30 + channel] >> 3;
+            let fm = self.registers[0x34 + channel] >> 3;
+            if master == 0 || fm == 0 {
+                *sample = 0;
+            } else {
+                let mut gain = 32768_i64;
+                for _ in 0..(62 - u16::from(master) - u16::from(fm)) {
+                    gain = gain * 26029 / 32768;
+                }
+                *sample = (i64::from(*sample) * gain / 32768) as i16;
+            }
+        }
+        samples
+    }
     /// Machine builder selects the initial, already validated ISA resources.
     pub fn with_routing(irq: u8, dma8: u8, dma16: u8) -> Self {
         let mut mixer = Self::default();
@@ -136,6 +154,33 @@ impl Mixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn master_and_fm_levels_attenuate_each_channel_and_zero_mutes() {
+        let mut mixer = Mixer::default();
+        for register in [0x30, 0x31, 0x34, 0x35] {
+            mixer.select(register);
+            mixer.write(0xF8).unwrap();
+        }
+        assert_eq!(mixer.fm_samples([10000, -10000]), [10000, -10000]);
+        mixer.select(0x34);
+        mixer.write(0xF0).unwrap();
+        let samples = mixer.fm_samples([10000, -10000]);
+        assert!((7900..8000).contains(&samples[0]));
+        assert_eq!(samples[1], -10000);
+        mixer.select(0x26);
+        mixer.write(0).unwrap();
+        assert!(
+            mixer
+                .fm_samples([10000, -10000])
+                .iter()
+                .all(|v| v.abs() <= 10)
+        );
+        for register in [0x34, 0x35] {
+            mixer.select(register);
+            mixer.write(0).unwrap();
+        }
+        assert_eq!(mixer.fm_samples([10000, -10000]), [0; 2]);
+    }
     #[test]
     fn legacy_volume_aliases_and_reset_preserve_irq_dma_selection() {
         let mut mixer = Mixer::default();

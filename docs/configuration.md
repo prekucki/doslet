@@ -22,7 +22,7 @@ Browser preparation runs through the emulation Worker and host adapters.
 
 | Page | Available settings |
 | --- | --- |
-| Machine | Current i386 interpreter, functional 33-MHz timing, 4/8/16/32 MiB RAM, optional x87 subset, VGA/VBE with 512 KiB VRAM |
+| Machine | Current i386 interpreter, configurable nominal CPU clock (33 MHz by default), 4/8/16/32 MiB RAM, optional x87 subset, VGA/VBE with 512 KiB VRAM |
 | Sound | Optional SB16 at 220h, IRQ 5/7, 8-bit DMA 0/1/3, 16-bit DMA 5/6/7; independent MPU-401 UART at 330h |
 | Input | BIOS compatibility or AT keyboard delivery; optional ISA gameport at 201h; mouse capture; controller identity/index, axes, buttons and dead zone |
 | Resources | Resolved I/O ownership and sound resources; invalid assignments identify their configuration field |
@@ -35,6 +35,14 @@ system sound bank and mixes with Sound Blaster PCM; it always receives GM.
 Only the current CPU, timing and video implementations are selectable. The
 interpreter and x87 implement documented subsets, rather than complete historical
 processors. See [the specification](SPEC.md) for their implemented instructions.
+
+`machine.cpu_mhz` sets the nominal CPU clock from 1 to 1000 MHz (integer),
+defaulting to 33. The Machine page offers common values; TOML accepts the full
+range. Apply restarts the machine with the selected clock. Higher values allow
+more guest CPU work per emulated second while PIT, video and audio retain their
+own rates. This functional timing model is not a cycle-accurate historical CPU.
+Legacy `machine.clock_hz` is accepted in whole MHz; if both fields are present,
+they must agree. Export writes `cpu_mhz`.
 
 AT keyboard mode uses physical key locations and release events. BIOS mode
 retains scan-code/ASCII injection. Text entered in application controls stays
@@ -128,7 +136,7 @@ platform = "pc-at"
 cpu = "i386"
 engine = "interpreter"
 timing = "functional"
-clock_hz = 33000000
+cpu_mhz = 33
 memory_mib = 16
 x87 = true
 video = "vga-vbe"

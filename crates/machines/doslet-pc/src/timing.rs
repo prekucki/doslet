@@ -1,27 +1,43 @@
 use crate::{MachineError, PcMachine};
 use doslet_time::EmuTime;
 
-// Four 33-MHz clocks are 121 ns plus 7/33 ns. Keeping that fraction
-// directly removes variable-frequency division from ordinary CPU steps.
-#[derive(Default)]
+// Precompute four CPU clocks in nanoseconds plus a retained fraction, keeping
+// division out of ordinary single steps even with a configurable frequency.
 struct StepClock {
     fraction: u64,
+    mhz: u64,
+    whole: u64,
+    remainder: u64,
+}
+impl Default for StepClock {
+    fn default() -> Self {
+        Self::new(33)
+    }
 }
 impl StepClock {
+    fn new(mhz: u16) -> Self {
+        let mhz = u64::from(mhz);
+        Self {
+            fraction: 0,
+            mhz,
+            whole: 4000 / mhz,
+            remainder: 4000 % mhz,
+        }
+    }
     fn advance(&mut self, steps: u32) -> u64 {
         if steps == 1 {
-            let fraction = self.fraction + 7;
-            let carry = u64::from(fraction >= 33);
-            self.fraction = fraction - carry * 33;
-            121 + carry
+            let fraction = self.fraction + self.remainder;
+            let carry = u64::from(fraction >= self.mhz);
+            self.fraction = fraction - carry * self.mhz;
+            self.whole + carry
         } else {
-            let fraction = self.fraction + u64::from(steps) * 7;
-            self.fraction = fraction % 33;
-            u64::from(steps) * 121 + fraction / 33
+            let fraction = self.fraction + u64::from(steps) * self.remainder;
+            self.fraction = fraction % self.mhz;
+            u64::from(steps) * self.whole + fraction / self.mhz
         }
     }
     fn steps_until_nanos(&self, nanos: u64) -> u64 {
-        (u128::from(nanos) * 33)
+        (u128::from(nanos) * u128::from(self.mhz))
             .saturating_sub(u128::from(self.fraction))
             .div_ceil(4000)
             .min(u128::from(u64::MAX)) as u64
@@ -36,8 +52,13 @@ pub(crate) struct Timing {
 }
 impl Default for Timing {
     fn default() -> Self {
+        Self::new(33)
+    }
+}
+impl Timing {
+    pub(crate) fn new(cpu_mhz: u16) -> Self {
         Self {
-            cpu: StepClock::default(),
+            cpu: StepClock::new(cpu_mhz),
             time: EmuTime::ZERO,
             pit_fraction: 0,
             pcm_fraction: 0,
@@ -45,7 +66,7 @@ impl Default for Timing {
     }
 }
 impl PcMachine {
-    /// Functional clock: four nominal 33-MHz clocks per execution/IRQ/idle
+    /// Functional clock: four configured nominal CPU clocks per execution/IRQ/idle
     /// step. This is deterministic across batches, not cycle-accurate timing.
     pub(crate) fn advance_hardware(&mut self) -> Result<(), MachineError> {
         self.advance_hardware_steps(1)
@@ -84,6 +105,13 @@ impl Timing {
             nanos = nanos.min(deadline);
         }
         let steps = self.cpu.steps_until_nanos(nanos);
+        let steps = if bus.hardware_config().sb16 {
+            bus.opl.next_sample_nanos().map_or(steps, |deadline| {
+                steps.min(self.cpu.steps_until_nanos(deadline))
+            })
+        } else {
+            steps
+        };
         budget.min(steps.max(1) as u32)
     }
 }
@@ -112,6 +140,10 @@ impl PcMachine {
                 .map_err(MachineError::Keyboard)?;
             self.bus.update_keyboard_irq();
         }
+        self.advance_digital_audio(nanos)?;
+        self.advance_fm_audio(nanos)
+    }
+    fn advance_digital_audio(&mut self, nanos: u64) -> Result<(), MachineError> {
         if !self.hardware_config().sb16 {
             self.timing.pcm_fraction = 0;
             return Ok(());
@@ -125,7 +157,7 @@ impl PcMachine {
             return Ok(());
         }
         self.timing.pcm_fraction -= 1_000_000_000;
-        if self.bus.pcm.is_full() {
+        if !self.bus.opl.started() && self.bus.pcm.is_full() {
             return Err(MachineError::AudioQueueFull);
         }
         let channel = self
@@ -153,11 +185,16 @@ impl PcMachine {
                     .time()
                     .as_nanos()
                     .saturating_sub(self.timing.pcm_fraction / rate);
-                self.bus.pcm.push(doslet_pcm::Frame {
+                let frame = doslet_pcm::Frame {
                     nanos: end,
                     duration: duration as u32,
                     samples,
-                });
+                };
+                self.bus.digital_pcm[0] = self.bus.digital_pcm[1];
+                self.bus.digital_pcm[1] = frame;
+                if !self.bus.opl.started() {
+                    self.bus.pcm.push(frame);
+                }
             }
             if event.raised_irq {
                 let irq = self
@@ -173,6 +210,43 @@ impl PcMachine {
         }
         Ok(())
     }
+    fn advance_fm_audio(&mut self, nanos: u64) -> Result<(), MachineError> {
+        if !self.hardware_config().sb16 {
+            return Ok(());
+        }
+        let bus = &mut self.bus;
+        let mut full = false;
+        bus.opl.advance(nanos as u32, bus.guest_nanos, |time, fm| {
+            let fm = bus.mixer.fm_samples(fm);
+            let digital = bus.digital_pcm.iter().rev().find(|frame| {
+                frame.duration != 0
+                    && frame.nanos <= time
+                    && time - frame.nanos < u64::from(frame.duration)
+            });
+            let mut samples = fm;
+            if let Some(digital) = digital {
+                for (sample, digital) in samples.iter_mut().zip(digital.samples) {
+                    *sample = sample.saturating_add(digital);
+                }
+            }
+            // Silent FM needs no queued frames. A timer-only detection probe
+            // must not create an endless silent audio stream.
+            if (samples != [0; 2] || digital.is_some())
+                && !bus.pcm.push(doslet_pcm::Frame {
+                    nanos: time,
+                    duration: 1_000_000_000_u32.div_ceil(doslet_opl3::SAMPLE_RATE),
+                    samples,
+                })
+            {
+                full = true;
+            }
+        });
+        if full {
+            Err(MachineError::AudioQueueFull)
+        } else {
+            Ok(())
+        }
+    }
 }
 #[cfg(test)]
 pub(crate) mod tests {
@@ -180,21 +254,52 @@ pub(crate) mod tests {
     use doslet_bus::{MemoryBus, PortBus};
     #[test]
     fn step_clock_matches_reference_and_deadlines_at_every_fraction() {
-        for prefix in 0..33 {
-            let mut clock = StepClock::default();
-            let mut reference =
-                doslet_time::ClockRate::new(core::num::NonZeroU32::new(33_000_000).unwrap());
-            assert_eq!(clock.advance(prefix), reference.advance(prefix * 4));
-            for nanos in [0, 1, 120, 121, 122, 1000, 1_000_000, u64::MAX] {
-                assert_eq!(
-                    clock.steps_until_nanos(nanos),
-                    reference.ticks_until_nanos(nanos).div_ceil(4)
+        for mhz in [1, 8, 25, 33, 66, 100, 132, 133, 1000] {
+            for prefix in 0..u32::from(mhz) {
+                let mut clock = StepClock::new(mhz);
+                let mut reference = doslet_time::ClockRate::new(
+                    core::num::NonZeroU32::new(u32::from(mhz) * 1_000_000).unwrap(),
                 );
-            }
-            for steps in [0, 1, 1, 7, 33, 8250, 1000000] {
-                assert_eq!(clock.advance(steps), reference.advance(steps * 4));
+                assert_eq!(clock.advance(prefix), reference.advance(prefix * 4));
+                for nanos in [0, 1, 120, 121, 122, 1000, 1_000_000, u64::MAX] {
+                    assert_eq!(
+                        clock.steps_until_nanos(nanos),
+                        reference.ticks_until_nanos(nanos).div_ceil(4)
+                    );
+                }
+                for steps in [0, 1, 1, 7, 33, 8250, 1000000] {
+                    assert_eq!(clock.advance(steps), reference.advance(steps * 4));
+                }
             }
         }
+    }
+    #[test]
+    fn cpu_clock_changes_work_per_guest_second_without_changing_device_clocks() {
+        let mut machines = [33, 132].map(|cpu_mhz| {
+            PcMachine::from_config(doslet_config::HardwareConfig {
+                cpu_mhz,
+                ..Default::default()
+            })
+            .unwrap()
+        });
+        for (machine, steps) in machines.iter_mut().zip([8250, 33000]) {
+            machine.bus.pit.write_control(0x34).unwrap();
+            machine.bus.pit.write_counter(0, 0xA9).unwrap();
+            machine.bus.pit.write_counter(0, 4).unwrap();
+            for _ in 0..steps {
+                machine.advance_hardware().unwrap();
+            }
+            assert_eq!(machine.time().as_nanos(), 1_000_000);
+            machine.bus.pit.write_control(0).unwrap();
+        }
+        let [slow, fast] = &mut machines;
+        assert_eq!(slow.bus.pit.read_counter(0), fast.bus.pit.read_counter(0));
+        assert_eq!(slow.bus.pit.read_counter(0), fast.bus.pit.read_counter(0));
+        assert_eq!(
+            slow.bus.vga.read_status(0x3DA),
+            fast.bus.vga.read_status(0x3DA)
+        );
+        assert_eq!(slow.bus.guest_nanos, fast.bus.guest_nanos);
     }
     #[test]
     fn single_and_batched_hardware_advances_preserve_clock_fraction() {

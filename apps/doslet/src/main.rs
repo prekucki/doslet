@@ -1,5 +1,14 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod app;
+#[cfg(not(target_arch = "wasm32"))]
+mod desktop;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "native_gamepad/wakeup.rs"]
+mod wakeup;
+#[cfg(target_arch = "wasm32")]
+use app as frontend;
+#[cfg(not(target_arch = "wasm32"))]
+use desktop as frontend;
 #[cfg(target_arch = "wasm32")]
 #[path = "browser_app.rs"]
 mod app;
@@ -49,8 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    let app = app::Doslet::from_cli(cli)?;
-    // Transfer ownership once at iced startup. Execution owns the state directly.
+    let app = desktop::Doslet::from_cli(cli)?;
+    // Transfer the presentation proxy once; the worker retains machine ownership.
     let initial = std::cell::Cell::new(Some(app));
     run(move || *initial.take().expect("iced boots the application once"))?;
     Ok(())
@@ -63,7 +72,9 @@ fn main() -> iced::Result {
     run(app::Doslet::new)
 }
 
-fn run(boot: impl iced::application::BootFn<app::Doslet, app::Message> + 'static) -> iced::Result {
+fn run(
+    boot: impl iced::application::BootFn<frontend::Doslet, app::Message> + 'static,
+) -> iced::Result {
     let window = iced::window::Settings {
         #[cfg(not(target_arch = "wasm32"))]
         size: presentation::DEFAULT_WINDOW_SIZE,
@@ -82,10 +93,10 @@ fn run(boot: impl iced::application::BootFn<app::Doslet, app::Message> + 'static
         ..Default::default()
     };
 
-    iced::application(boot, app::Doslet::update, app::Doslet::view)
+    iced::application(boot, frontend::Doslet::update, frontend::Doslet::view)
         .title("Doslet · A little DOS")
-        .theme(app::Doslet::theme)
-        .subscription(app::Doslet::subscription)
+        .theme(frontend::Doslet::theme)
+        .subscription(frontend::Doslet::subscription)
         .window(window)
         .centered()
         .run()

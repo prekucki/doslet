@@ -18,11 +18,14 @@ pub use idle_loop::IdleProofMark;
 pub use io::PcBus;
 #[cfg(test)]
 mod config_tests;
+#[cfg(test)]
+mod opl_tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioStatus {
     pub dsp: doslet_sb_dsp::Diagnostics,
     pub rate: u32,
     pub format: Option<doslet_sb_dsp::Format>,
+    pub configured_format: Option<doslet_sb_dsp::Format>,
     pub speaker: bool,
     pub irq: Option<u8>,
     pub dma8: Option<u8>,
@@ -128,7 +131,7 @@ impl PcMachine {
                 Cpu::default()
             },
             bus,
-            timing: timing::Timing::default(),
+            timing: timing::Timing::new(config.cpu_mhz),
             vga_wait: vga_wait::WaitState::default(),
             memory_wait_sites: None,
             memory_wait_steps: 0,
@@ -300,6 +303,7 @@ impl PcMachine {
             dsp: self.bus.dsp.diagnostics(),
             rate: self.bus.dsp.sample_rate(),
             format: self.bus.dsp.playback_format(),
+            configured_format: self.bus.dsp.configured_format(),
             speaker: self.bus.dsp.speaker_enabled(),
             irq: self
                 .hardware_config()

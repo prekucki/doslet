@@ -2,11 +2,12 @@ use crate::native_synth::{APPLE_LABEL, Timeline};
 use crate::presentation::{DisplayFrame, DisplaySizing, SizingMessage};
 use doslet_midi_routing::{Mode, Routing, SNAPSHOT_CAPACITY};
 use doslet_runtime::{RuntimeError, Session, SessionStatus};
-use iced::{Element, Subscription, Task, Theme};
+use iced::Task;
 use std::time::{Duration, Instant};
 
 const MAX_STEPS_PER_TICK: u32 = 400_000;
 const CHUNK: u32 = 10_000;
+const MAX_WORK_PER_TICK: Duration = Duration::from_millis(8);
 struct PreparedOutput {
     audio: Option<crate::audio::Output>,
     host_midi: Option<crate::native_midi::Output>,
@@ -68,7 +69,8 @@ pub struct Doslet {
     pub program: Option<String>,
     #[cfg(test)]
     active_archive: Option<(crate::archive::GameArchive, String)>,
-    theme: Theme,
+    pub(crate) worker_owned: bool,
+    pub(crate) presentation_revision: u64,
     anchor: Option<(Instant, u64)>,
     midi: Timeline,
     mt32: Option<doslet_mt32::Timeline>,
@@ -152,7 +154,8 @@ impl Doslet {
             program: None,
             #[cfg(test)]
             active_archive: None,
-            theme: crate::ui::theme(),
+            worker_owned: false,
+            presentation_revision: 0,
             anchor: None,
             midi: Timeline::new(48000).unwrap(),
             mt32: None,
@@ -639,7 +642,9 @@ impl Doslet {
             self.session.midi_stats().1,
             self.routing.input_note_events(),
         );
-        self.display.refresh(&self.session);
+        if !self.worker_owned {
+            self.display.refresh(&self.session);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             if self.session.status() != SessionStatus::Running {
@@ -952,12 +957,14 @@ impl Doslet {
     fn log_errors(&mut self) {
         let fault = self.session.fault();
         if fault != self.logged_fault {
+            self.presentation_revision = self.presentation_revision.wrapping_add(1);
             if let Some(error) = fault {
                 eprintln!("[ERROR doslet] {}: {error}", self.name);
             }
             self.logged_fault = fault;
         }
         if self.notice != self.logged_notice {
+            self.presentation_revision = self.presentation_revision.wrapping_add(1);
             if let Some(error) = &self.notice {
                 eprintln!("[ERROR doslet] {}: {error}", self.name);
             }
@@ -1061,7 +1068,7 @@ impl Doslet {
         let _ = self.session.release_keys();
         self.clear_presentation();
     }
-    fn save_core_profile(&self) {
+    pub(crate) fn save_core_profile(&self) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = &self.launch.core_profile {
             crate::native_input::save_core_profile(&self.session, path);
@@ -1192,6 +1199,7 @@ impl Doslet {
             let Some(update) = gamepads.poll() else {
                 break;
             };
+            self.presentation_revision = self.presentation_revision.wrapping_add(1);
             match update {
                 GamepadUpdate::State(state) => {
                     let settings = &self.configurator.active.input;
@@ -1308,9 +1316,14 @@ impl Doslet {
         }
     }
     fn tick(&mut self) {
-        self.tick_at(Instant::now());
+        let now = Instant::now();
+        self.tick_while(now, || now.elapsed() < MAX_WORK_PER_TICK);
     }
+    #[cfg(test)]
     fn tick_at(&mut self, now: Instant) {
+        self.tick_while(now, || true);
+    }
+    fn tick_while(&mut self, now: Instant, mut can_continue: impl FnMut() -> bool) {
         self.poll_gamepads();
         if self.configurator.pending {
             return;
@@ -1347,9 +1360,11 @@ impl Doslet {
         }
         let mut budget = MAX_STEPS_PER_TICK;
         let previous_memory_wait_steps = self.session.memory_wait_steps();
+        let mut prepared = false;
         while budget != 0
             && self.session.status() == SessionStatus::Running
             && self.session.emulated_nanos() < target
+            && can_continue()
         {
             #[cfg(not(target_arch = "wasm32"))]
             if self
@@ -1359,7 +1374,10 @@ impl Doslet {
             {
                 break;
             }
-            self.session.prepare_dynamic(2);
+            if !prepared {
+                self.session.prepare_dynamic(2);
+                prepared = true;
+            }
             if !self.dynamic_error_reported
                 && let Some(error) = self.session.dynamic_error()
             {
@@ -1721,14 +1739,26 @@ impl Doslet {
             stats.unmapped_notes
         )
     }
-    pub fn view(&self) -> Element<'_, Message> {
-        crate::ui::view(self)
-    }
-    pub fn theme(&self) -> Theme {
-        self.theme.clone()
+    pub fn audio_spectrum(&self) -> [f32; doslet_pcm::spectrum::BANDS] {
+        if self.session.status() != SessionStatus::Running {
+            return [0.0; doslet_pcm::spectrum::BANDS];
+        }
+        self.audio
+            .as_ref()
+            .map_or([0.0; doslet_pcm::spectrum::BANDS], |audio| audio.spectrum())
     }
     pub fn pointer_dimensions(&self) -> (u16, u16) {
         self.session.pointer_dimensions()
+    }
+    pub fn guest_audio_description(&self) -> String {
+        let status = self.session.audio_status();
+        let (bits, channels) = status.configured_format.map_or((0, 0), |format| {
+            (
+                if format.word { 16 } else { 8 },
+                if format.stereo { 2 } else { 1 },
+            )
+        });
+        crate::ui::guest_pcm_description(status.rate, bits, channels)
     }
     pub fn has_mouse_capture(&self) -> bool {
         self.mouse_capture.is_some() && !self.mouse_capture_pending
@@ -1742,42 +1772,99 @@ impl Doslet {
                 && self.workspace.panel.is_none()
                 && !self.configurator.pending
     }
-    pub fn subscription(&self) -> Subscription<Message> {
-        let ticking =
-            self.session.status() == SessionStatus::Running || self.session.storage_waiting();
-        let tick = if ticking {
-            iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
+    pub(crate) fn worker_tick(&mut self) -> Task<Message> {
+        if self.session.status() == SessionStatus::Running || self.session.storage_waiting() {
+            self.update(Message::Tick)
         } else {
-            Subscription::none()
+            self.poll_gamepads();
+            self.log_errors();
+            Task::none()
+        }
+    }
+    pub(crate) fn worker_delay(&self, progressed: bool) -> Duration {
+        if self.session.status() != SessionStatus::Running && !self.session.storage_waiting() {
+            return Duration::from_millis(16);
+        }
+        if !progressed || self.host_lag_nanos() == 0 {
+            Duration::from_millis(1)
+        } else {
+            // Behind the host clock: check commands and continue immediately.
+            Duration::ZERO
+        }
+    }
+    pub(crate) fn host_lag_nanos(&self) -> u64 {
+        let Some((start, guest)) = self.anchor else {
+            return 0;
         };
-        Subscription::batch([
-            tick,
-            if ticking {
-                Subscription::none()
-            } else {
-                self.gamepads
-                    .as_ref()
-                    .map_or_else(Subscription::none, |pads| {
-                        pads.subscription().map(|()| Message::GamepadsReady)
-                    })
+        let target =
+            guest.saturating_add(start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        target.saturating_sub(self.session.emulated_nanos())
+    }
+    pub(crate) fn snapshot(&mut self, include_config: bool) -> crate::desktop::Snapshot {
+        use crate::desktop::{Registers, SessionSnapshot, Snapshot};
+        use doslet_x86::Gpr16;
+        self.display.refresh(&self.session);
+        let registers = self.session.registers();
+        Snapshot {
+            session: SessionSnapshot {
+                status: self.session.status(),
+                steps: self.session.steps(),
+                registers: Registers {
+                    cs: registers.cs,
+                    ip: registers.ip,
+                    values: [
+                        Gpr16::Ax,
+                        Gpr16::Cx,
+                        Gpr16::Dx,
+                        Gpr16::Bx,
+                        Gpr16::Sp,
+                        Gpr16::Bp,
+                        Gpr16::Si,
+                        Gpr16::Di,
+                    ]
+                    .map(|r| registers.get(r)),
+                },
+                fault: self.session.fault(),
+                pending_commit: self.session.pending_commit(),
+                storage_waiting: self.session.storage_waiting(),
+                dirty: self.session.dirty_overlay(),
             },
-            iced::window::close_requests().map(Message::CloseRequested),
-            DisplaySizing::subscription().map(Message::DisplaySizing),
-            iced::event::listen_with(|event, status, _| {
-                if matches!(event, iced::Event::Window(iced::window::Event::Unfocused)) {
-                    return Some(Message::FocusLost);
-                }
-                if let iced::Event::Keyboard(event) = event {
-                    Some(if status == iced::event::Status::Ignored {
-                        Message::Keyboard(event)
-                    } else {
-                        Message::KeyboardCaptured(event)
-                    })
-                } else {
-                    None
-                }
-            }),
-        ])
+            workspace: self.workspace.clone(),
+            configurator: include_config.then(|| self.configurator.presentation_copy()),
+            display: self.display.clone(),
+            name: self.name.clone(),
+            notice: self.notice.clone(),
+            midi_choices: self.midi_choices.clone(),
+            midi_choice: self.midi_choice.clone(),
+            midi_mode: self.midi_mode,
+            midi_output_mode: self.midi_output_mode,
+            midi_activity: self.midi_activity.clone(),
+            spectrum: self.audio_spectrum(),
+            pointer_dimensions: self.pointer_dimensions(),
+            captured: self.has_mouse_capture(),
+            hide_cursor: self.hide_host_cursor(),
+            audio_label: self.audio_label(),
+            storage_label: self.storage_label(),
+            midi_label: self.midi_mode_label(),
+            guest_audio: self.guest_audio_description(),
+            lag_nanos: if self.session.status() == SessionStatus::Running {
+                self.host_lag_nanos()
+            } else {
+                0
+            },
+            #[cfg(test)]
+            guest_nanos: self.session.emulated_nanos(),
+            #[cfg(test)]
+            heroes_movie: self
+                .session
+                .ram_view(0x68EFC..0x68EFC + 0x76C)
+                .and_then(|movie| {
+                    let dword =
+                        |offset| u32::from_le_bytes(movie[offset..offset + 4].try_into().unwrap());
+                    ((dword(4), dword(8), dword(0xC)) == (640, 480, 161))
+                        .then(|| (dword(0x678), dword(0x768)))
+                }),
+        }
     }
 }
 
@@ -1947,6 +2034,30 @@ mod tests {
         assert!(!app.session.dynamic_core_enabled());
     }
     include!("../../../tests/fixtures/sb16_pcm.rs");
+    include!("../../../tests/fixtures/opl3.rs");
+    #[test]
+    fn opl3_fm_flows_through_native_pcm_mixer_without_host_device() {
+        let mut app = Doslet::new();
+        app.session = Session::new(&opl3_tone_program()).unwrap();
+        app.session.start();
+        for _ in 0..50 {
+            app.session.advance(10000);
+            app.process_audio().unwrap();
+        }
+        assert_eq!(
+            app.session.status(),
+            SessionStatus::Running,
+            "{:?}",
+            app.session.fault()
+        );
+        assert!(app.pcm_mixer.nonzero() > 1000);
+        assert!(
+            app.samples
+                .iter()
+                .flatten()
+                .any(|sample| sample.abs() > 0.01)
+        );
+    }
     #[test]
     fn uncaptured_hidden_cursor_keeps_absolute_motion_and_passes_escape_to_dos() {
         let mut app = Doslet::new();
@@ -2245,6 +2356,79 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the recorded local HoMM build and ISO"]
+    fn local_heroes_132mhz_intro_matches_independent_frame() {
+        use clap::Parser;
+        let config =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../games/HoMnM.toml");
+        for cpu_mhz in [132] {
+            let cli = crate::cli::Cli::parse_from([
+                std::ffi::OsString::from("doslet"),
+                "--config".into(),
+                config.clone().into_os_string(),
+                "--no-audio".into(),
+                "--cpu-mhz".into(),
+                cpu_mhz.to_string().into(),
+            ]);
+            let mut app = Doslet::from_cli(cli).unwrap();
+            assert_eq!(app.session.hardware_config().cpu_mhz, cpu_mhz);
+            let mut midi = [0; 1024];
+            let mut pcm = [doslet_pcm::EMPTY; 128];
+            let mut matched = false;
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while app.session.emulated_nanos() < 40_000_000_000
+                && app.session.status() == SessionStatus::Running
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "HoMM intro timed out at {cpu_mhz} MHz"
+                );
+                if let Some(storage) = &mut app.storage {
+                    storage.service(&mut app.session).unwrap();
+                }
+                if app.session.storage_waiting() {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                app.session.prepare_dynamic(2);
+                app.session.advance(10000);
+                while app.session.drain_midi(&mut midi) != 0 {}
+                while app.session.drain_pcm_timed(&mut pcm) != 0 {}
+                // Version-specific Smacker counters and an independently decoded
+                // frame hash. CLI clocks do not depend on the user's current TOML value.
+                let movie = app.session.ram_view(0x68EFC..0x68EFC + 0x76C).unwrap();
+                let dword =
+                    |offset| u32::from_le_bytes(movie[offset..offset + 4].try_into().unwrap());
+                if (dword(4), dword(8), dword(0xC), dword(0x678)) == (640, 480, 161, 153) {
+                    assert_eq!(dword(0x768), 0, "skipped frames at {cpu_mhz} MHz");
+                    let pixels = app.session.ram_view(0x1A690..0x1A690 + 640 * 480).unwrap();
+                    let hash = pixels.iter().fold(0xcbf29ce484222325_u64, |h, b| {
+                        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+                    });
+                    if hash == 0xE1C26C1E2CA04DC3 {
+                        matched = true;
+                        println!(
+                            "HoMM {cpu_mhz} MHz: frame=153 skipped=0 indexed_hash={hash:016x} steps={}",
+                            app.session.steps()
+                        );
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                app.session.status(),
+                SessionStatus::Running,
+                "{:?}",
+                app.session.fault()
+            );
+            assert!(
+                matched,
+                "did not reproduce reference frame 152 at {cpu_mhz} MHz"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires the user's local games and TOML profiles; runs without a window or audio device"]
     fn local_toml_profiles_load_real_games_without_audio() {
         use clap::Parser;
@@ -2445,6 +2629,28 @@ enabled = false
         let _ = app.update(Message::RunPause);
         app.tick_at(start + Duration::from_secs(180));
         assert!(app.session.emulated_nanos() < 80_000_000);
+    }
+
+    #[test]
+    fn worker_turn_yields_between_chunks_and_waits_only_when_caught_up_or_blocked() {
+        let mut app = Doslet::new();
+        app.session = Session::new(&[0x40, 0xEB, 0xFD]).unwrap();
+        app.session.start();
+        let now = Instant::now();
+        app.anchor = Some((now - Duration::from_secs(1), 0));
+        let mut chunks = 0;
+        app.tick_while(now, || {
+            chunks += 1;
+            chunks <= 2
+        });
+        assert_eq!(app.session.steps(), u64::from(2 * CHUNK));
+        assert_eq!(app.session.status(), SessionStatus::Running);
+        assert_eq!(app.worker_delay(true), Duration::ZERO);
+        assert_eq!(app.worker_delay(false), Duration::from_millis(1));
+        app.anchor = Some((Instant::now(), 0));
+        assert_eq!(app.worker_delay(true), Duration::from_millis(1));
+        app.session.pause();
+        assert_eq!(app.worker_delay(true), Duration::from_millis(16));
     }
 
     #[test]

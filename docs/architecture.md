@@ -46,11 +46,24 @@ AT keyboard crate implements scan sets 1/2 and guest-time typematic. Its IRQ1
 shim updates the BIOS key ring only when executed through the guest IVT.
 The gameport implements guest-time charge deadlines at port 201h.
 
-The native UI uses its 16-ms timer only while execution is running or storage
-is pending. Otherwise, the controller worker wakes it through coalesced event
-notifications. During execution, the existing timer drains controller events.
-A paused session with no pending work does not request periodic UI updates.
-Guest VGA timing remains independent of this host timer.
+The native `doslet-emulation` thread creates and exclusively owns the Session,
+JIT, storage adapter and sample synthesizers. It processes at most 256 queued
+commands between bounded execution turns. Each turn has a 400000-step budget,
+10000-step chunks and an 8-ms host-work check between chunks; JIT preparation
+runs once per turn and may exceed that time check. The worker continues without
+sleeping when behind the host clock, and waits briefly when caught up or blocked
+on audio/storage. Its guest clock remains independent of UI refresh.
+
+The iced state owns presentation snapshots and sends commands through a
+256-entry nonblocking queue. Overflow pauses execution and releases held input.
+A single snapshot slot replaces obsolete frames while preserving pending host
+effects; execution needs no shared machine mutex or guest-memory clone. RGBA
+conversion occurs on the worker at most once per 16 ms and only on request.
+Coalesced notifications wake iced; acknowledging a running snapshot requests
+the next one. A stalled UI stops presentation work without stopping
+emulation. Paused sessions request no periodic UI updates. Editor command
+sequence numbers prevent older snapshots from overwriting newer local edits.
+Shutdown joins the owner after saving its dynamic-core profile.
 
 ## Dependency graph
 
@@ -94,6 +107,7 @@ graph TD
   PC --> MPU[doslet-mpu401]
   PC --> DSP[doslet-sb-dsp]
   PC --> Mixer[doslet-sb-mixer]
+  PC --> OPL[doslet-opl3 / Nuked OPL3]
   PC --> KBC[doslet-i8042]
   KBC --> Keyboard[doslet-at-keyboard]
   PC --> Gameport[doslet-gameport]
@@ -152,7 +166,12 @@ drain MIDI into caller-provided storage. The independent no_std MIDI synthesizer
 receives those wire bytes and renders into supplied stereo buffers. Its timeline
 maps guest nanoseconds to sample frames; MIDI timestamps currently have bounded
 batch resolution. Native CPAL owns a reserved host audio queue and shares only
-those frames with the output callback. The machine remains owned by iced state.
+those frames with the output callback. The machine remains owned by the
+emulation thread.
+The output callback and browser AudioWorklet feed the final stereo PCM into a
+fixed-buffer 1024-point FFT in `doslet-pcm`. Sixteen frequency levels with release
+decay reach the status bar as small snapshots. Analysis allocates no memory after
+setup, includes underrun silence and does not affect guest hardware timing.
 In the browser, `doslet-web-worker` exclusively owns the machine and storage.
 The window's iced state receives diagnostics and RGBA presentation buffers; it
 cannot advance or borrow the machine. Two transferable video buffers are reused;
@@ -195,7 +214,7 @@ The no_std wire decoder reconstructs complete messages and keeps basic replay
 state outside sample synthesis. Native port output bypasses sample generation.
 A dedicated native thread owns the midir connection. A preallocated bounded
 queue carries complete messages and guest timestamps; a condition variable wakes
-the sender at the next deadline or a pause/reset/stop request. The UI executes
+the sender at the next deadline or a pause/reset/stop request. The emulation thread executes
 up to 80 ms ahead and retains one mutable Session owner. The queue mutex never
 covers host IO. Short message storage is inline; bounded SysEx payload ownership
 is transferred explicitly. Cancellation removes pending messages and requests
@@ -267,7 +286,27 @@ PC ports 220h-based DSP/mixer accesses route to them. The DSP owns command
 parameters and two response bytes; the mixer owns its configuration registers.
 The DSP consumes explicit byte/word DMA units and returns stereo PCM/block IRQ
 events. A preallocated machine queue owns produced frames until the host drains
-them. Full hardware timing and applying mixer gain to audio remain pending.
+them. Full hardware timing and applying digital-PCM mixer gain remain pending.
+DSP diagnostics expose the last configured DMA format until reset, even after
+a transfer ends. Both frontends use this with the guest sample rate in the
+spectrum tooltip; browser metadata travels in the Worker state snapshot.
+The independent `doslet-opl3` adapter owns a Nuked OPL3 chip, two register
+latches and integer guest-time timers. With SB16 enabled, the machine routes
+388h–38Bh, 220h–223h and 228h–229h to this one chip. Timer-only probes do not
+start sample production. Synthesis writes start a guest-clock 48-kHz FM stream;
+the chip's resampler converts its native output. The machine sums FM and held
+DMA samples into a single timestamp-ordered PCM queue, with saturating addition.
+The CT1745 master/FM levels apply approximate 2-dB attenuation steps to FM;
+digital-PCM mixer gain remains pending. Native and browser output consume the
+existing PCM transport. Register writes are immediate; chip busy/write-delay
+timing and OPL interrupt delivery remain unimplemented.
+
+The published `nuked-opl3` dependency requires `std`. This is an explicit
+exception for the FM integration, including the transitive PC/runtime graph;
+the remaining emulation libraries retain their `no_std` source boundaries.
+State still has one mutable owner and synthesis allocates nothing after setup.
+See the [`no_std` backlog item](backlog.md).
+
 The absent AWE/EMU8000 probe banks are explicit machine wiring, rather than an
 emulated synth. Neither DSP nor mixer depends on the CPU or host audio.
 
@@ -365,9 +404,10 @@ The PIC and PIT have no bus or CPU dependency. Their methods operate on explicit
 port values and clock ticks. The PC adapter chooses their I/O addresses and
 connects PIT output periods to the PIC request latch. The machine delivers
 eligible interrupts at CPU boundaries with the CPU's STI/SS inhibition state.
-Its functional timeline advances four nominal 33-MHz clocks per bounded step,
-using 121 ns plus a retained 7/33-ns fraction. Single steps use addition and
-carry; batches preserve the same fraction. PIT, selected raster status and DSP
+Its functional timeline advances four configured nominal CPU clocks per bounded
+step (33 MHz by default, configurable from 1 to 1000 MHz). Setup precomputes
+whole nanoseconds and the fractional remainder; single steps use addition and
+carry without division. Batches preserve the same fraction. PIT, selected raster status and DSP
 rates retain fractional clock conversion.
 The runtime handles cooperative INT 2Fh/1680h yields by returning AL=00h and
 ending the current bounded batch after the BIOS shim returns. It exposes the

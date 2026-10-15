@@ -11,6 +11,7 @@ struct Queue {
     consumed: u64,
     underruns: u64,
     peak: f32,
+    spectrum: doslet_pcm::spectrum::Spectrum,
     error: Option<String>,
 }
 impl Queue {
@@ -20,6 +21,7 @@ impl Queue {
         }
         if self.len == 0 {
             self.underruns += 1;
+            self.spectrum.push([0.0; 2]);
             return [0.0; 2];
         }
         let frame = self.frames[self.head];
@@ -27,6 +29,7 @@ impl Queue {
         self.len -= 1;
         self.consumed += 1;
         self.peak = self.peak.max(frame[0].abs()).max(frame[1].abs());
+        self.spectrum.push(frame);
         frame
     }
 }
@@ -55,6 +58,7 @@ impl Output {
             consumed: 0,
             underruns: 0,
             peak: 0.0,
+            spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
             error: None,
         }));
         let config = supported.config();
@@ -101,7 +105,11 @@ impl Output {
         Ok(())
     }
     pub fn set_active(&self, active: bool) {
-        self.queue.lock().unwrap_or_else(|e| e.into_inner()).active = active;
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.active = active;
+        if !active {
+            q.spectrum.reset();
+        }
     }
     pub fn clear(&self) {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -110,6 +118,14 @@ impl Output {
         q.consumed = 0;
         q.underruns = 0;
         q.peak = 0.0;
+        q.spectrum.reset();
+    }
+    pub fn spectrum(&self) -> [f32; doslet_pcm::spectrum::BANDS] {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spectrum
+            .levels()
     }
     pub fn stats(&self) -> (u64, u64, f32) {
         let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -146,4 +162,37 @@ fn build<T: cpal::SizedSample + Copy + Send + 'static>(
             None,
         )
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spectrum_tracks_consumed_frames_and_fades_on_output_underrun() {
+        let mut queue = Queue {
+            frames: vec![[0.0; 2]; CAPACITY].into_boxed_slice(),
+            head: 0,
+            len: 1024,
+            active: true,
+            consumed: 0,
+            underruns: 0,
+            peak: 0.0,
+            spectrum: doslet_pcm::spectrum::Spectrum::new(48000),
+            error: None,
+        };
+        for (i, frame) in queue.frames[..1024].iter_mut().enumerate() {
+            *frame = [(i as f32 * std::f32::consts::TAU * 2000.0 / 48000.0).sin(); 2];
+        }
+        // Queuing samples must not animate the display ahead of playback.
+        assert_eq!(queue.spectrum.levels(), [0.0; doslet_pcm::spectrum::BANDS]);
+        for _ in 0..1024 {
+            queue.next();
+        }
+        assert!(queue.spectrum.levels()[8] > 0.8);
+        for _ in 0..48000 {
+            assert_eq!(queue.next(), [0.0; 2]);
+        }
+        assert!(queue.spectrum.levels().iter().all(|level| *level < 0.01));
+    }
 }

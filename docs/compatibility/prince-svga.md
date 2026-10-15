@@ -200,7 +200,7 @@ disable recognition as well as batching for reference measurements.
 There are two distinct scheduling operations. Fast-forwarding guest hardware
 avoids interpreted polling iterations even in a headless run. Sleeping the host
 is appropriate only after the guest reaches its wall/audio pacing target: the
-future native execution thread can wait until a scheduled deadline or input/control
+native execution thread can wait until a scheduled deadline or input/control
 wakeup, and
 the browser Worker can yield and schedule its next turn. Neither operation
 should block the iced/window thread, change the guest's CPU HLT state or use

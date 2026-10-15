@@ -1,6 +1,6 @@
 //! Native controller snapshots carry stable IDs and connection ordering.
+use crate::wakeup;
 use gilrs::{Axis, Button, EventType, GilrsBuilder};
-mod wakeup;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -324,9 +324,6 @@ impl NativeGamepads {
             worker: Some(worker),
             wakeup,
         }
-    }
-    pub fn subscription(&self) -> iced::Subscription<()> {
-        iced::Subscription::run_with(self.wakeup.clone(), wakeup::Signal::stream)
     }
     /// Clear before draining: a producer racing with the drain can wake us again.
     pub fn acknowledge(&self) {

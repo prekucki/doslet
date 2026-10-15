@@ -59,7 +59,18 @@ Settings → Input. Turn off **Capture mouse on click** to use absolute movement
 and pass Esc directly to the game. Browser capture uses Pointer Lock.
 
 By default, MIDI from the guest is rendered by a basic procedural synthesizer
-and mixed with Sound Blaster PCM on the default audio device. The default synth
+and mixed with Sound Blaster PCM and AdLib/OPL3 FM on the default audio device.
+FM is included when **SB16** is enabled in Settings. Select AdLib or Sound Blaster
+music in the game's own setup to use FM; the MIDI output selector does not route
+FM through an external MIDI device. No OPL instrument ROM is required.
+The bottom bar shows a 16-band spectrum of the local audio output, from bass
+on the left to treble on the right. It fades during silence and clears on pause
+or mute. Audio produced by an external MIDI synthesizer is not measured.
+Hover over the spectrum to see the guest's Sound Blaster PCM rate, bit depth
+and mono/stereo format. The last configured format remains visible between
+effects and clears on DSP reset; FM and MIDI have no guest PCM format.
+Synthetic tests cover FM output and mixing; real-game FM playback is unverified.
+The default MIDI synth
 is not a sample-based GM or Roland MT-32 synthesizer. If no audio device
 can be opened, a message appears and graphics continue. To disable audio:
 
@@ -82,6 +93,12 @@ require a C linker, `pkg-config`, ALSA and udev development files
 (`libasound2-dev` and `libudev-dev` on Ubuntu/Debian); launching requires a working Wayland or X11
 session and graphics driver. Dependency resolution and native compilation are
 separate from checking a live window.
+
+Desktop emulation and synthesis run on a dedicated thread. The Details panel
+shows the nominal CPU MHz and **emulation lag** against the host clock. A growing
+lag means execution is falling behind; increasing the configured MHz also
+increases the required host work. A stalled window does not stop emulation:
+presentation resumes with the latest image instead of replaying queued frames.
 
 On desktop, **1:1** beside **GUEST DISPLAY** resizes the window to show each guest
 pixel as one physical screen pixel, including on HiDPI displays. It uses the raw
@@ -327,8 +344,9 @@ synthesizes 48-kHz stereo directly in AudioWorklet; samples do not pass through
 iced or the window thread. Bounded MIDI packets carry guest timestamps and
 watermarks over a direct MessageChannel. Guest timing remains independent of
 display refresh. Slow emulation can still underrun; the worklet emits silence
-and preserves guest time until data arrives. Sound Blaster PCM mixing and
-original GM/MT-32 instrument fidelity remain pending.
+and preserves guest time until data arrives. Sound Blaster PCM and OPL3 FM use
+the existing timestamped PCM transport to the worklet. Original GM/MT-32
+instrument fidelity remains pending.
 
 Browser **Find MIDI outputs** explicitly requests Web MIDI access. Choose a
 port connected to a running system/software or hardware synthesizer; Web Audio

@@ -33,7 +33,10 @@ DOS and graphics implementation beyond the first slice.
    borrowed scanout and diagnostics to every frontend.
 7. iced and browser APIs must remain in application/presentation code.
 
-The foundation and chip libraries use `no_std`. Fixed state needs no allocator;
+The foundation and chip libraries use `no_std`, except the OPL3 adapter and its
+upstream Nuked OPL3 dependency. This currently makes the PC/runtime graph require
+`std`; [freestanding support is future work](backlog.md).
+Fixed state needs no allocator;
 buffer-owning libraries may use `alloc`. The current crate graph is documented
 in [architecture.md](architecture.md).
 
@@ -221,8 +224,10 @@ instruction is not guaranteed to have rolled back its earlier side effects.
 Execution steps are scheduling units, not physical clock cycles or retired
 instruction counts. Each repeated string iteration counts as one step. Integer emulated
 time and rational peripheral clock conversion exist independently. The PC now
-advances a functional timeline by four nominal 33-MHz clocks per execution,
-IRQ-entry or idle step. Fractional time is retained for PIT 1,193,182-Hz input,
+advances a functional timeline by four nominal CPU clocks per execution,
+IRQ-entry or idle step. `machine.cpu_mhz` selects 1–1000 MHz, defaulting to 33;
+it changes CPU work per guest second without changing peripheral rates.
+Fractional time is retained for PIT 1,193,182-Hz input,
 selected VGA pixel clocks and DSP sample rates. This is deterministic across
 host batches; it is not cycle-accurate CPU/bus arbitration or complete peripheral
 timing. Timing-sensitive compatibility still needs real-run evidence.
@@ -488,6 +493,12 @@ cursor also updates the VGA CRTC cursor address. The query returns the BDA curso
 shape in CX. Invalid pages remain explicitly unsupported. Palette services
 AX=1010h/1012h/1015h/1017h set/query single or bounded blocks of six-bit DAC colors.
 INT 16h/AH=00h/01h/02h/05h/10h/11h uses a guest-visible 15-key BIOS ring.
+DOS INT 21h/AH=2Ch reads a session-local time of day. AH=2Dh validates
+CH:CL:DH:DL (hours, minutes, seconds, hundredths), returns AL=00h on success
+or FFh without changing the clocks for invalid input, and updates the BIOS
+tick count and CMOS time fields. Setting time does not rewind emulated
+nanoseconds, PIT phase, OPL or scheduled audio. CMOS time still does not tick
+between explicit writes, and the DOS date remains the fixed boot date.
 INT 21h/AH=01h/06h/07h/08h/0Bh/0Ch consumes/queries/flushes the same input, with
 DOS extended keys returning zero then scan code. Empty blocking reads yield in
 guest STI/HLT retry loops, preserving timer IRQs and bounded host execution.
@@ -522,7 +533,8 @@ bootstrap inspector.
 | VGA | Linear A0000h aperture, mode-13h pixels, six-bit palette writes, miscellaneous/sequencer/graphics/CRTC configuration readback | Text/planar modes, register effects on rendering/memory, raster events and vendor SVGA extensions |
 | VBE | 512 KiB VRAM, banked 640×480×8 mode 101h, borrowed scanout; BIOS 4F00/01/02/03/05 and far-call bank switch | More modes, LFB/PM interface, scanline/display-start controls and timing |
 | MPU-401 | UART command/status/acknowledgements, 1024-byte output queue and allocation-free drain at 330h/331h | Synthesizer/host audio, serial timing, IRQs and intelligent mode |
-| SB16 DSP / CT1745 | Control probes, rates/mixer state, selected 8/16-bit mono/stereo playback through DMA, auto-init/pause/resume, bounded stereo PCM queue and block IRQ acknowledgements | ADC/legacy/ADPCM commands, busy/reset timing, cascaded IRQ routing and applying mixer gain to audio |
+| SB16 DSP / CT1745 | Control probes, rates/mixer state, selected 8/16-bit mono/stereo playback through DMA, auto-init/pause/resume, bounded stereo PCM queue and block IRQ acknowledgements | ADC/legacy/ADPCM commands, busy/reset timing, cascaded IRQ routing and applying mixer gain to digital PCM |
+| AdLib / OPL3 | Nuked OPL3 FM, both register banks, guest-clock timer status, SB aliases, 48-kHz stereo PCM mixed with DMA and approximate master/FM gain | Busy/write-delay timing, OPL IRQ delivery, real-game audio acceptance and freestanding no_std support |
 | i8042 / AT keyboard | Controller commands/A20, bounded replies, scan sets 1/2, make/break, IRQ1, guest-time typematic, LED/query/ID/reset commands | Scan set 3, mouse/auxiliary protocol |
 | ISA gameport | Two axes/two buttons at 201h; guest-time charge deadlines | Additional joysticks and gameport MIDI |
 | MC146818 | CMOS register bank and installed-memory fields at 70h/71h; initial BCD date/time | RTC ticking, clock-format conversion, alarms, periodic IRQs and persistence |
@@ -548,12 +560,16 @@ The PC has no AWE/EMU8000; reads in its declared probe banks 600h–6FFh,
 A00h–AFFh and E00h–EFFh float high and writes have no receiver. Other unsupported
 ports still stop explicitly. SB16 reports DSP 4.05 and mixer IRQ7/DMA1/DMA5
 configuration. Functional DMA/PCM/IRQ execution is covered by synthetic and real
-startup runs; host playback and MIDI synthesis remain pending. A 4096-frame
+startup runs; native and browser adapters consume the timestamped PCM stream.
+Real-game FM playback remains unverified. A 4096-frame
 preallocated PCM queue stops explicitly when the host fails to drain it.
 Uninstalled WSS codec windows 530h–537h, 608h–60Bh, E84h–E87h and F44h–F47h
 float high on reads and ignore writes so DOS setup probes detect no codec.
 The uninstalled legacy Sound Blaster base windows 210h, 230h, 240h, 250h, 260h
 and 280h behave the same; the emulated DSP remains at 220h.
+The absent Pro Audio Spectrum filter register at B8Ah also floats high and
+ignores writes. Civilization's AdLib driver clears it before probing OPL;
+it is not an alias of the emulated OPL3 bank at 38Ah.
 PIC advanced configuration is not yet validated; use its documented subset.
 PIT unsupported control modes return an error. The machine adapter's current
 port error identifies the rejected port, not yet the precise chip command.
@@ -571,10 +587,16 @@ rather than embedding dependencies on CPU or host audio.
 
 ## Frontend contract
 
-The desktop and web application share iced view construction. Native state owns
-the Session; browser window state contains only snapshots and presentation data.
-The native frontend runs at most 400000 execution steps per UI timer callback, in
-10000-step chunks. The browser Worker owns its Session and runs at most 400000
+The desktop and web application share iced view construction. Both window states
+contain snapshots and presentation data. A dedicated native thread owns the
+Session, JIT and sample synthesis; a bounded command queue transfers input and
+control. A single latest-snapshot slot and coalesced notifications bound frame
+traffic to at most one publication per 16 ms. UI acknowledgements request further
+frames; emulation continues independently when presentation stalls.
+The native worker runs at most 400000 execution steps per turn in 10000-step
+chunks, checking an 8-ms host-work budget between chunks. JIT preparation runs
+once per turn and can exceed that soft time budget. The worker waits only when
+caught up or blocked. The browser Worker owns its Session and runs at most 400000
 steps and about 8 ms of host work per turn, yielding between turns. A host
 monotonic clock paces native and silent browser execution; active worklet playback
 paces the browser Worker with bounded lookahead. The machine's own
@@ -673,8 +695,8 @@ native SysEx payloads use bounded host allocations. Pause/reset cancel future
 messages and request silence before subsequent replay. Dispatch lateness is
 visible independently of the host synth's own buffering. Failures pause the
 machine and report once; selecting a working output permits Run without
-resetting guest RAM. Sound Blaster PCM mixing and internal GM/MT-32 fidelity
-remain pending.
+resetting guest RAM. Sound Blaster PCM and OPL3 FM share the PCM output path;
+internal GM/MT-32 fidelity remains a separate limitation.
 
 The ROM-free MT-32-to-GM translator library accepts Roland DT1 SysEx (device
 10h and channel-addressed 00h–0Fh, checksum-validated), the all-parameters
@@ -696,8 +718,8 @@ The `web` Cargo profile uses LLVM opt-level 3, thin LTO and one codegen unit.
 Release Trunk builds additionally run wasm-opt -O3. These are speed-oriented
 build settings; no measured browser performance improvement is claimed.
 
-The native runner still executes on the UI thread in bounded batches; a native
-CPU thread remains future work. Browser Workers use the same Session boundary.
+Native and browser workers use the same Session boundary and retain one mutable
+machine owner. Neither frontend shares guest memory with its UI.
 The emulator must not depend on the UI refresh frequency for guest timing.
 
 ## Milestones and acceptance

@@ -260,3 +260,90 @@ The `inspect_civ` example's `DOSLET_PROBE_RAM=1` now writes a borrowed physical
 VRAM dump to `/tmp/doslet-probe-vram.bin` in addition to low/extended RAM dumps.
 Reproduce this sample with the mounted ISO, `DOSLET_PROBE_FRAME=1`, a 250M budget
 and no scheduled key. Dumps remain local; no game assets are added to the repo.
+
+## Intro frame loss: independent decoding and CPU timing experiment
+
+The 2026-10-16 diagnostic reproduces the purple strips and eroded title with
+the C: installation and D: ISO from `games/HoMnM.toml`, without input or host
+audio playback. VRAM and the game's RAM image are identical at 250M steps.
+Disabling the native core, decode cache, VGA wait acceleration and idle-loop
+recognition produces identical RAM/VRAM dumps and checkpoint images through
+300M steps. This rules out those optimizations for this recorded path.
+
+The intro is the CD's `HEROES/DANIM/INTRO02U.SMK`. A separate Rust diagnostic
+using crates.io `smk = 0.1.0` decodes it independently. Completed guest frames
+77 through 109 match the complete reference sequence exactly. The game's own
+Smacker frame counter then advances from 109 to 111, 113, 115 and 117 without
+decoding the intervening frames. Replaying precisely that omitted-frame
+sequence through the independent decoder reproduces all 66 captured guest
+frames with zero differing pixels, including the corrupted title. The
+[frame comparison](heroes-animation-frames.csv) records both comparisons.
+This establishes lost delta-frame history rather than a bank/LFB or double
+buffer presentation error in this sample.
+
+Single-stepping 200M–270M steps found no x87 opcode sites in the flat protected
+game code (CS=0180h). Pixel changes lead to the integer Smacker block decoder;
+no RAM-to-RAM rectangle copy at 00212778h was observed in that window. These
+observations concern this intro interval, not all earlier game calculations.
+
+A controlled copy of the workspace under `target/heroes-clock-ab` changes only
+the nominal CPU step cost from four 33-MHz clocks to one, including the matching
+deadline conversion. Production timing and game files remain unchanged. In
+that experiment the Smacker skipped-frame counter remains zero through movie
+frame 153. RAM images sampled at guest seconds 25–29 match independent frames
+117, 126, 134, 143 and 152 exactly. A sample taken during decompression at
+second 24 is partial and is not counted as a completed-frame comparison.
+Thus the current functional CPU/device time ratio can make the soundtrack-led
+player drop required video deltas. The tested faster ratio avoids the observed
+corruption; it is not a claim of cycle accuracy or a global speed change.
+
+Reproduce the baseline and instruction-level observations:
+
+```sh
+cargo run -p doslet-headless --example audit_heroes_animation --release --locked -- \
+  games/HoMnM/HEROES.EXE games/HoMnM/homm1.gog target/heroes-animation/default
+cargo run -p doslet-headless --example audit_heroes_animation --release --locked -- \
+  games/HoMnM/HEROES.EXE games/HoMnM/homm1.gog target/heroes-animation/reference reference
+cargo run -p doslet-headless --example audit_heroes_animation --release --locked -- \
+  games/HoMnM/HEROES.EXE games/HoMnM/homm1.gog target/heroes-animation/trace-frames trace
+```
+
+The observer uses addresses from this specific local build. It writes frames,
+packets and RAM dumps only to the chosen diagnostic directory. Local independent
+decoder sources, its lockfile and experiment artifacts remain in ignored
+`target/smacker-reference` and `target/heroes-animation`. `smk` is not an
+application dependency. Review of its production source found no build script,
+unsafe code, network/process operations or writes; its only dependency is `log`.
+This static review is not a security certification. The registry checksum for
+the reviewed `smk 0.1.0` package is
+`206125ea6519083d366404d5b1b7150d476e7c54db9171aa3aaf3f25ecec1349`.
+
+### Configurable clock and native worker checks
+
+The production `machine.cpu_mhz` setting reproduces the faster-clock experiment:
+at 132 MHz, movie frame 153 reports zero skipped frames and its indexed image
+matches independent frame 152 (FNV-1a `e1c26c1e2ca04dc3`) at step 956434018.
+This check services positional ISO requests, prepares the default native core
+and drains audio without a window or host audio device. A separate 66-MHz run
+still reported one skipped frame; that setting is not verified as a clean intro.
+
+```sh
+cargo test -p doslet --release --locked \
+  local_heroes_132mhz_intro_matches_independent_frame -- --ignored --nocapture
+```
+
+The native worker also has a 35-second pacing observer. It retains Rust sample
+synthesis, uses the current local profile's CPU setting, and requests occasional
+fresh snapshots without opening a window or audio device. The specific-build
+Smacker counters are test-only observations. At 40 MHz an initial run observed
+three skipped frames and sampled host lag of 0.2–10.5 ms. A subsequent 50-MHz run
+with concurrent compilation and another game test reached 8.5 seconds of host
+lag and two skipped movie frames. These are different host-load conditions,
+not a controlled CPU-speed comparison or an audible-playback acceptance test.
+Separating the worker protects UI responsiveness; it does not establish that
+the host can sustain every configured MHz value.
+
+```sh
+cargo test -p doslet --release --locked \
+  local_heroes_worker_pacing -- --ignored --nocapture
+```

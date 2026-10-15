@@ -9,6 +9,8 @@ pub enum KeyboardMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HardwareConfig {
+    /// Nominal functional CPU clock; each execution step costs four clocks.
+    pub cpu_mhz: u16,
     pub memory_mib: u8,
     pub x87: bool,
     pub sb16: bool,
@@ -23,6 +25,7 @@ pub struct HardwareConfig {
 impl Default for HardwareConfig {
     fn default() -> Self {
         Self {
+            cpu_mhz: 33,
             memory_mib: 16,
             x87: true,
             sb16: true,
@@ -38,6 +41,7 @@ impl Default for HardwareConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HardwareError {
+    CpuClock,
     MemorySize,
     SoundIrq,
     SoundDma8,
@@ -46,6 +50,9 @@ pub enum HardwareError {
 
 impl HardwareConfig {
     pub fn validate(self) -> Result<(), HardwareError> {
+        if !(1..=1000).contains(&self.cpu_mhz) {
+            return Err(HardwareError::CpuClock);
+        }
         if !matches!(self.memory_mib, 4 | 8 | 16 | 32) {
             return Err(HardwareError::MemorySize);
         }

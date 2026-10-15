@@ -15,6 +15,7 @@ pub struct AudioEngine {
     left: [f32; BLOCK],
     right: [f32; BLOCK],
     peak: f32,
+    spectrum: doslet_pcm::spectrum::Spectrum,
     frames: u64,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
@@ -30,6 +31,7 @@ impl AudioEngine {
             left: [0.0; BLOCK],
             right: [0.0; BLOCK],
             peak: 0.0,
+            spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
             frames: 0,
         }
     }
@@ -62,6 +64,7 @@ impl AudioEngine {
             .reset(self.stream.sample_rate(), nanos as u64)
             .expect("existing sample rate");
         self.peak = 0.0;
+        self.spectrum.reset();
         self.frames = 0;
     }
     /// The caller fills the fixed MIDI buffer first. Numeric errors avoid
@@ -88,6 +91,7 @@ impl AudioEngine {
             self.left[i] = frame[0];
             self.right[i] = frame[1];
             self.peak = self.peak.max(frame[0].abs()).max(frame[1].abs());
+            self.spectrum.push(*frame);
         }
         self.frames += rendered as u64;
         0
@@ -137,6 +141,12 @@ impl AudioEngine {
     pub fn peak(&self) -> f32 {
         self.peak
     }
+    pub fn spectrum_band(&self, band: usize) -> f32 {
+        self.spectrum.levels().get(band).copied().unwrap_or(0.0)
+    }
+    pub fn clear_spectrum(&mut self) {
+        self.spectrum.reset();
+    }
     pub fn underruns(&self) -> f64 {
         self.stream.underruns() as f64
     }
@@ -145,6 +155,40 @@ impl AudioEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spectrum_measures_played_pcm_and_clears_on_pause_or_reset() {
+        let mut engine = AudioEngine::new(48000);
+        for batch in 0..16 {
+            for (offset, frame) in engine
+                .pcm_wire
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                let i = batch * 128 + offset;
+                let sample =
+                    ((i as f32 * 2000.0 * core::f32::consts::TAU / 48000.0).sin() * 16000.0) as i16;
+                frame.copy_from_slice(&[
+                    (i as u64 * 1_000_000_000 / 48000) as f64,
+                    20834.0,
+                    f64::from(sample),
+                    -f64::from(sample),
+                ]);
+            }
+            assert_eq!(engine.receive_pcm(128), 0);
+        }
+        assert_eq!(engine.receive(100_000_000.0, 0), 0);
+        assert_eq!(engine.render(2048), 0);
+        assert!(engine.spectrum_band(8) > 0.8);
+        engine.clear_spectrum();
+        assert_eq!(engine.spectrum.levels(), [0.0; doslet_pcm::spectrum::BANDS]);
+        // Reset also removes a partially collected window.
+        assert_eq!(engine.render(128), 0);
+        engine.reset(0.0);
+        assert_eq!(engine.spectrum.levels(), [0.0; doslet_pcm::spectrum::BANDS]);
+    }
+
     #[test]
     fn pcm_only_worklet_renders_and_reset_underrun_do_not_replay_stale_audio() {
         let mut engine = AudioEngine::new(48000);

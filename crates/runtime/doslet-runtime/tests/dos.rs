@@ -4,6 +4,48 @@ use doslet_runtime::{Session, SessionStatus};
 include!("../../../../tests/fixtures/relocated_mz.rs");
 
 #[test]
+fn dos_set_time_returns_status_and_get_time_observes_only_valid_changes() {
+    for (cx, dx, status, expected_cx, expected_dx) in [
+        (0x0C22_u16, 0x382A_u16, 0_u8, 0x0C22_u16, 0x382A_u16),
+        (0x1800, 0, 0xFF, 0, 0),
+        (0x003C, 0, 0xFF, 0, 0),
+        (0, 0x3C00, 0xFF, 0, 0),
+        (0, 100, 0xFF, 0, 0),
+    ] {
+        let mut code = vec![0xFA, 0xB9]; // CLI; MOV CX,time.
+        code.extend_from_slice(&cx.to_le_bytes());
+        code.push(0xBA);
+        code.extend_from_slice(&dx.to_le_bytes());
+        code.extend_from_slice(&[
+            0xB8, 0, 0x2D, 0xF9, 0xCD, 0x21, // Set time with CF initially set.
+            0xA3, 0, 2, 0x9C, 0x5B, // Store AX; PUSHF / POP BX.
+            0xB4, 0x2C, 0xCD, 0x21, // Get time.
+            0x89, 0x0E, 2, 2, 0x89, 0x16, 4, 2, // Store CX:DX.
+            0xB8, 0, 0x4C, 0xCD, 0x21,
+        ]);
+        let mut session = Session::new(&code).unwrap();
+        session.start();
+        session.advance(200);
+        assert_eq!(
+            session.status(),
+            SessionStatus::Exited(0),
+            "{:?}",
+            session.fault()
+        );
+        assert_eq!(session.ram_view(0x10200..0x10202).unwrap(), &[status, 0x2D]);
+        assert_eq!(
+            session.ram_view(0x10202..0x10204).unwrap(),
+            &expected_cx.to_le_bytes()
+        );
+        assert_eq!(
+            session.ram_view(0x10204..0x10206).unwrap(),
+            &expected_dx.to_le_bytes()
+        );
+        assert_ne!(session.registers().get(doslet_x86::Gpr16::Bx) & 1, 0);
+    }
+}
+
+#[test]
 fn bios_mode_03h_returns_from_graphics_and_resets_text_state() {
     for mode in [3, 0x83] {
         let program = [

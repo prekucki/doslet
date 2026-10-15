@@ -1,5 +1,5 @@
 //! Presentation of guest MPU traffic, independent of the selected audio output.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MidiActivity {
     now: u64,
     bytes: u64,

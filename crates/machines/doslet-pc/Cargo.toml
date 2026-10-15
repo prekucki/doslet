@@ -18,6 +18,7 @@ doslet-mc146818.workspace = true
 doslet-mpu401.workspace = true
 doslet-sb-dsp.workspace = true
 doslet-sb-mixer.workspace = true
+doslet-opl3.workspace = true
 doslet-bus.workspace = true
 doslet-time.workspace = true
 doslet-x86.workspace = true

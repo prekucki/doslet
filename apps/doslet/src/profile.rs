@@ -8,6 +8,7 @@ use toml_edit::{DocumentMut, Item, TableLike};
 
 #[derive(Default)]
 struct Profile {
+    cpu_mhz: Option<u16>,
     name: Option<String>,
     executable: Option<PathBuf>,
     arguments: Vec<String>,
@@ -83,7 +84,9 @@ impl Profile {
         let table = document.as_table();
         fields(
             table,
-            &["version", "name", "game", "drives", "midi", "audio"],
+            &[
+                "version", "name", "game", "drives", "midi", "audio", "machine",
+            ],
             "",
         )?;
         if table.get("version").and_then(Item::as_integer) != Some(1) {
@@ -94,6 +97,10 @@ impl Profile {
             writable: true,
             ..Self::default()
         };
+        if let Some(machine) = section(table, "machine")? {
+            fields(machine, &["cpu_mhz", "clock_hz"], "machine.")?;
+            profile.cpu_mhz = crate::machine_profile::cpu_mhz(machine)?;
+        }
         if let Some(game) = section(table, "game")? {
             fields(
                 game,
@@ -340,6 +347,7 @@ impl Cli {
             }
             .map_err(|error| format!("{}: {error}", config.display()))?;
             self.game = self.game.or(profile.executable);
+            self.cpu_mhz = self.cpu_mhz.or(profile.cpu_mhz);
             self.midi_mode = self.midi_mode.or(profile.game_mode);
             self.midi_output_mode = self.midi_output_mode.or(profile.host_mode);
             let explicit_audio = self.midi_output.is_some() || self.mt32_rom_dir.is_some();
@@ -376,6 +384,9 @@ impl Cli {
         }
         if let Some(memory) = self.memory_mib {
             self.launch.hardware.memory_mib = memory;
+        }
+        if let Some(mhz) = self.cpu_mhz {
+            self.launch.hardware.cpu_mhz = mhz;
         }
         self.launch.hardware.x87 &= !self.no_x87;
         self.launch.hardware.sb16 &= !self.no_sb16;
@@ -518,6 +529,39 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     include!("../../../tests/fixtures/relocated_mz.rs");
     include!("../../../tests/fixtures/iso9660.rs");
+    #[test]
+    fn cpu_clock_profile_cli_precedence_and_machine_construction() {
+        for version in [1, 2] {
+            let fixture = Fixture::new(&format!(
+                "version={version}\n[game]\nexecutable='../TINY.EXE'\n[machine]\ncpu_mhz=132\n"
+            ));
+            for (options, mhz) in [
+                (&["--no-audio"][..], 132),
+                (&["--no-audio", "--cpu-mhz", "66"][..], 66),
+            ] {
+                let cli = fixture.cli(options).resolve().unwrap();
+                assert_eq!(cli.launch.hardware.cpu_mhz, mhz);
+                assert_eq!(
+                    cli.launch.machine_spec.as_ref().unwrap().hardware.cpu_mhz,
+                    mhz
+                );
+                let session = crate::native_input::load_game_with_settings(
+                    cli.game.as_deref().unwrap(),
+                    &cli.launch,
+                )
+                .unwrap();
+                assert_eq!(session.hardware_config().cpu_mhz, mhz);
+            }
+        }
+        for mhz in ["0", "1001"] {
+            assert!(
+                Cli::try_parse_from(["doslet", "--cpu-mhz", mhz])
+                    .unwrap()
+                    .resolve()
+                    .is_err()
+            );
+        }
+    }
     #[test]
     fn version_two_hardware_paths_and_cli_precedence_preserve_persistent_policy() {
         let fixture = Fixture::new(

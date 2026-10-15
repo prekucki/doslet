@@ -42,6 +42,7 @@ doslet-vga = { path = "crates/hardware/video/doslet-vga" }
 doslet-mpu401 = { path = "crates/hardware/audio/doslet-mpu401" }
 doslet-sb-dsp = { path = "crates/hardware/audio/doslet-sb-dsp" }
 doslet-sb-mixer = { path = "crates/hardware/audio/doslet-sb-mixer" }
+doslet-opl3 = { path = "crates/hardware/audio/doslet-opl3" }
 doslet-pcm = { path = "crates/hardware/audio/doslet-pcm" }
 doslet-pc = { path = "crates/machines/doslet-pc" }
 doslet-executable = { path = "crates/system/doslet-executable" }

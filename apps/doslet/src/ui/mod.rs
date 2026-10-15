@@ -1,4 +1,8 @@
-use crate::app::{Doslet, Message};
+#[cfg(target_arch = "wasm32")]
+use crate::app::Doslet;
+use crate::app::Message;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::desktop::Doslet;
 use doslet_runtime::SessionStatus;
 use doslet_x86::Gpr16;
 use iced::widget::{
@@ -33,7 +37,7 @@ pub enum Action {
     ActualSize(bool),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Workspace {
     pub panel: Option<Panel>,
     #[cfg(target_arch = "wasm32")]
@@ -170,6 +174,7 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     if !narrow {
         bottom = bottom.push(space::horizontal());
     }
+    bottom = bottom.push(audio_spectrum(app));
     bottom = bottom.push(mpu_indicator(app));
     if let Some(iced::widget::image::Handle::Rgba { width, height, .. }) = &app.display.image {
         bottom = bottom.push(text(format!("{width} × {height}")).size(12).color(MUTED));
@@ -450,6 +455,18 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
         text(app.midi_mode_label()).size(12).color(MUTED),
     ]
     .spacing(14);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        body = body.push(
+            text(format!(
+                "Core: {} MHz · emulation lag {:.1} ms",
+                app.configurator.active.hardware.cpu_mhz,
+                app.lag_nanos as f64 / 1e6,
+            ))
+            .size(12)
+            .color(MUTED),
+        );
+    }
     if let Some(fault) = app.session.fault() {
         body = body.push(text(fault.to_string()).size(13).color(DANGER));
     }
@@ -620,6 +637,59 @@ pub(crate) fn panel(_: &Theme) -> container::Style {
             radius: 10.0.into(),
         },
         ..Default::default()
+    }
+}
+
+fn audio_spectrum(app: &Doslet) -> Element<'_, Message> {
+    let mut bars = iced::widget::Row::new().spacing(2);
+    for level in app.audio_spectrum() {
+        let lit = (level * 8.0).round() as usize;
+        let mut bar = iced::widget::Column::new().spacing(1);
+        for segment in (0..8).rev() {
+            let color = if segment >= lit {
+                Color::from_rgb8(34, 44, 38)
+            } else if segment >= 7 {
+                Color::from_rgb8(226, 125, 113)
+            } else if segment >= 5 {
+                Color::from_rgb8(221, 192, 106)
+            } else {
+                Color::from_rgb8(117, 202, 145)
+            };
+            bar = bar.push(
+                container(space::horizontal().width(4))
+                    .height(2)
+                    .style(move |_| container::Style {
+                        background: Some(color.into()),
+                        ..Default::default()
+                    }),
+            );
+        }
+        bars = bars.push(bar);
+    }
+    tooltip(
+        container(bars).padding([4, 6]),
+        container(
+            text(format!(
+                "Audio spectrum · bass → treble\n{}\nFM / MIDI · synthesized audio\nExternal MIDI audio is not measured.",
+                app.guest_audio_description(),
+            ))
+            .size(12),
+        )
+        .padding(10)
+        .style(panel),
+        tooltip::Position::Top,
+    )
+    .into()
+}
+
+pub(crate) fn guest_pcm_description(rate: u32, bits: u8, channels: u8) -> String {
+    if bits == 0 {
+        "Guest PCM · not configured".into()
+    } else {
+        format!(
+            "Guest PCM · {rate} Hz · {bits}-bit · {}",
+            if channels == 2 { "Stereo" } else { "Mono" },
+        )
     }
 }
 

@@ -147,6 +147,8 @@ pub struct Doslet {
     frames: u64,
     underruns: u64,
     peak: f64,
+    spectrum: [f32; doslet_pcm::spectrum::BANDS],
+    guest_pcm: (u32, u8, u8),
     host_messages: u64,
     pcm_frames: u64,
     mouse_captured: bool,
@@ -220,6 +222,8 @@ impl Doslet {
             frames: 0,
             underruns: 0,
             peak: 0.0,
+            spectrum: [0.0; doslet_pcm::spectrum::BANDS],
+            guest_pcm: (0, 0, 0),
             host_messages: 0,
             pcm_frames: 0,
             mouse_captured: false,
@@ -643,6 +647,11 @@ impl Doslet {
             .collect();
         self.mouse_captured = field(&packet, "mouseCaptured").as_bool().unwrap_or(false);
         let state = field(&packet, "state");
+        self.guest_pcm = (
+            number(&state, "guestPcmRate") as u32,
+            number(&state, "guestPcmBits") as u8,
+            number(&state, "guestPcmChannels") as u8,
+        );
         if !state.is_null() && !state.is_undefined() {
             self.session.status = match number(&state, "status") as u32 {
                 0 => SessionStatus::Ready,
@@ -789,6 +798,19 @@ impl Doslet {
         self.notes = number(&audio, "notes") as u64;
         self.frames = number(&audio, "frames") as u64;
         self.peak = number(&audio, "peak");
+        let spectrum = field(&audio, "spectrum");
+        self.spectrum.fill(0.0);
+        if Array::is_array(&spectrum) {
+            let spectrum = Array::from(&spectrum);
+            for (band, value) in self.spectrum.iter_mut().enumerate() {
+                *value = spectrum
+                    .get(band as u32)
+                    .as_f64()
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0) as f32;
+            }
+        }
         self.pcm_frames = number(&audio, "pcmNonzero") as u64;
         self.underruns = number(&audio, "underruns") as u64;
         self.host_messages = number(&audio, "messages") as u64;
@@ -847,6 +869,20 @@ impl Doslet {
     }
     pub fn theme(&self) -> Theme {
         crate::ui::theme()
+    }
+    pub fn audio_spectrum(&self) -> [f32; doslet_pcm::spectrum::BANDS] {
+        if self.session.status() == SessionStatus::Running
+            && self.audio_ready
+            && !self.muted
+            && (self.audio_state == "running" || self.audio_state == "MIDI port")
+        {
+            self.spectrum
+        } else {
+            [0.0; doslet_pcm::spectrum::BANDS]
+        }
+    }
+    pub fn guest_audio_description(&self) -> String {
+        crate::ui::guest_pcm_description(self.guest_pcm.0, self.guest_pcm.1, self.guest_pcm.2)
     }
     pub fn pointer_dimensions(&self) -> (u16, u16) {
         (

@@ -21,6 +21,7 @@ class DosletProcessor extends AudioWorkletProcessor {
         this.port.onmessage = ({data}) => {
             if (data.kind === 'disconnect') {
                 this.active = false;
+                this.engine.clear_spectrum();
                 if (this.portToWorker) this.portToWorker.close();
                 this.portToWorker = null;
             }
@@ -49,13 +50,17 @@ class DosletProcessor extends AudioWorkletProcessor {
                 this.epoch = data.epoch; this.engine.reset(data.nanos);
                 this.active = data.active; this.failed = false; this.warming = true; this.baseGuest = data.nanos;
             } else if (data.epoch === this.epoch && !this.failed) {
-                if (data.kind === 'active') this.active = data.active;
+                if (data.kind === 'active') {
+                    this.active = data.active;
+                    if (!this.active) this.engine.clear_spectrum();
+                }
                 if (data.kind === 'end') this.warming = false;
                 if (data.kind === 'poll') {
                     const message = {kind: 'progress', epoch: this.epoch, nanos: this.engine.nanos(),
                         frames: this.engine.frames(), notes: this.engine.notes(),
                         peak: this.engine.peak(), underruns: this.engine.underruns()};
                     message.pcmFrames = this.engine.pcm_frames(); message.pcmNonzero = this.engine.pcm_nonzero();
+                    message.spectrum = Array.from({length: 16}, (_, i) => this.engine.spectrum_band(i));
                     this.port.postMessage(message); this.portToWorker.postMessage(message);
                 }
                 if (data.kind === 'midi') {

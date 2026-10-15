@@ -89,6 +89,8 @@ function present(force = false) {
         nanos: engine.nanos(), waitingForIo:engine.waiting_for_io(), dirty:engine.dirty_overlay(), pendingCommit:engine.pending_commit(), cs: engine.cs(), ip: engine.ip(), ax: engine.ax(),
         cx: engine.cx(), di: engine.di(), fault: engine.fault(), midiMode: engine.midi_mode(),
         midiUpgraded: engine.midi_upgraded(), midiSysex: engine.midi_sysex(),
+        guestPcmRate: engine.guest_pcm_rate(), guestPcmBits: engine.guest_pcm_bits(),
+        guestPcmChannels: engine.guest_pcm_channels(),
         midiBytes: engine.midi_bytes(), midiNotes: engine.midi_notes(),
         pointerInUse: engine.pointer_in_use(),
         midiUnmapped: engine.midi_unmapped(), midiDisplay: engine.midi_display()};

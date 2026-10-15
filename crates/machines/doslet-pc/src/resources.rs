@@ -85,8 +85,9 @@ pub(crate) enum Endpoint {
     PitData,
     PitControl,
     Gameport,
+    Opl,
 }
-const ENDPOINTS: [Endpoint; 30] = [
+const ENDPOINTS: [Endpoint; 31] = [
     Endpoint::Absent,
     Endpoint::Probe,
     Endpoint::AweProbe,
@@ -117,6 +118,7 @@ const ENDPOINTS: [Endpoint; 30] = [
     Endpoint::PitData,
     Endpoint::PitControl,
     Endpoint::Gameport,
+    Endpoint::Opl,
 ];
 impl Endpoint {
     fn id(self) -> u16 {
@@ -161,6 +163,9 @@ impl Routes {
             }
         }
         this.fallback(0x3CD, Endpoint::Probe);
+        // Pro Audio Spectrum audio-filter register. Some AdLib drivers clear
+        // it before probing OPL; this machine has no PAS card to receive it.
+        this.fallback(0xB8A, Endpoint::Probe);
         for port in 0..=15 {
             this.claim_port(
                 DeviceId::Motherboard,
@@ -234,6 +239,14 @@ impl Routes {
             this.claim_dma(DeviceId::Motherboard, channel)?;
         }
         if config.sb16 {
+            for port in (0x220..=0x223).chain(0x228..=0x229).chain(0x388..=0x38B) {
+                this.claim_port(
+                    DeviceId::Sb16,
+                    port,
+                    Some(Endpoint::Opl),
+                    Some(Endpoint::Opl),
+                )?;
+            }
             for (port, endpoint, write) in [
                 (0x224, Endpoint::MixerIndex, true),
                 (0x225, Endpoint::MixerData, true),
@@ -291,6 +304,7 @@ impl Routes {
         match endpoint {
             Endpoint::Vga | Endpoint::VgaStatus => DeviceId::Vga,
             Endpoint::MixerIndex
+            | Endpoint::Opl
             | Endpoint::MixerData
             | Endpoint::DspReset
             | Endpoint::DspData
@@ -371,10 +385,10 @@ mod tests {
     fn overlap_fails_before_partial_claim_and_fallback_is_weaker() {
         let mut r = Routes::build(HardwareConfig::default()).unwrap();
         assert_eq!(
-            r.claim_port(DeviceId::Gameport, 0x220, Some(Endpoint::Gameport), None),
+            r.claim_port(DeviceId::Gameport, 0x230, Some(Endpoint::Gameport), None),
             Ok(())
         );
-        assert_eq!(r.read(0x220), Endpoint::Gameport);
+        assert_eq!(r.read(0x230), Endpoint::Gameport);
         assert!(matches!(
             r.claim_port(DeviceId::Gameport, 0x224, Some(Endpoint::Gameport), None),
             Err(ResourceError::Port {

@@ -34,12 +34,21 @@ rom_directory = "/path/to/mt32-roms"
 
 [audio]
 enabled = true
+
+[machine]
+cpu_mhz = 33
 ```
 
 `version` is required and must be the integer 1. The remaining fields are
 optional, but the final settings must include an executable from the profile
 or `--game`. An omitted name uses the executable filename. Unknown fields,
 wrong types and unsupported versions are errors.
+
+`machine.cpu_mhz` accepts integer values from 1 to 1000, defaulting to 33.
+It controls nominal CPU work per guest second, independently of device clock
+rates. `--cpu-mhz MHZ` overrides the profile. A higher value gives HoMM's Smacker
+decoder more execution steps per guest audio deadline; see the
+[recorded comparison](compatibility/heroes.md#intro-frame-loss-independent-decoding-and-cpu-timing-experiment).
 
 Without `[[drives]]`, the executable's containing directory is mounted as C:.
 An explicit single C: directory mount can expose a larger game tree:

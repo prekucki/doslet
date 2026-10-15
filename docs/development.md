@@ -93,8 +93,8 @@ Tasks that use your own game files belong in an untracked `mise.local.toml`.
 | VGA/VBE | Mode-13h and banked 640×480×8 pixels, palette writes, borrowed scanout, configuration readback, selected VBE 1.2 BIOS calls | Text/planar modes, register rendering effects, raster timing, more SVGA modes |
 | DOS/BIOS | COM/MZ/overlay setup, bounded memory arena, immutable input files/directories, optional sparse RAM writes, timer/user-hook shims | Full DOS kernel, extender compatibility, raw mouse hardware, persistent storage |
 | MPU-401 / MIDI | UART setup, bounded output at 330h/331h; independent procedural synth, guest-timed WAV, native and Web Audio output | General MIDI instrument fidelity, serial timing, IRQs and intelligent mode |
-| Sound Blaster 16 | Independent DSP/mixer, selected DMA PCM playback, auto-init/pause/resume, block IRQs and bounded output queue | More commands, precise timing, mixer gain, OPL and host audio |
-| Frontends | Shared iced desktop/web view, native `--game`, browser Worker/AudioWorklet, ZIP mount/program selection, optional system MIDI on both platforms, headless CLI | Guest input, native CPU thread runner |
+| Sound Blaster 16 / AdLib | Independent DSP/mixer and Nuked OPL3 FM, selected DMA PCM playback, guest-clock OPL timers, stereo FM/DMA mixing, auto-init/pause/resume, block IRQs and bounded output queue | More DSP commands, precise timing, digital-PCM mixer gain and real-game FM audio acceptance |
+| Frontends | Shared iced desktop/web view, native emulation thread, browser Worker/AudioWorklet, ZIP mount/program selection, optional system MIDI on both platforms, headless CLI | Further presentation-copy reduction |
 | Executable inspector | Borrowed MZ metadata/relocations and LE/LX header detection | LE/LX loading and execution |
 
 ## Component layout
@@ -115,8 +115,10 @@ apps/
 └── doslet-headless/     demo, COM/MZ runners, inspector and benchmark
 ```
 
-The portable emulation and MIDI synthesis libraries compile with `no_std`;
-components that own buffers use `alloc`. The optional `doslet-x86-jit` native
+The portable emulation and MIDI synthesis libraries retain `no_std`, except the
+OPL3 adapter's upstream dependency, which currently requires `std` throughout
+the PC/runtime graph. See the [future-work list](backlog.md).
+Components that own buffers use `alloc`. The optional `doslet-x86-jit` native
 compiler adapter uses `std` and executable memory. CPU execution uses static bus
 dispatch. Scanout borrows device
 memory, and RGBA conversion writes into caller-owned storage. A regression test
@@ -204,6 +206,7 @@ the remaining step budget, or 1 ms of guest time. Confirmed
 loops (AH=08h for TEST) on the active VGA status port can batch
 whole iterations strictly before the next raster/PIT/DSP event. Append
 `--no-vga-waits` to disable recognition and batching for reference measurements.
+
 Other busy-wait loops are skipped once proven idle. The session single-steps one
 pass from a starting point while RAM records the previous value of every byte
 written. The pass is proven when the CPU returns to an identical architectural

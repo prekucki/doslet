@@ -47,6 +47,7 @@ pub enum Edit {
     Toggle,
     Page(Page),
     Memory(u8),
+    CpuMhz(u16),
     X87(bool),
     Sb16(bool),
     Mpu(bool),
@@ -127,6 +128,23 @@ impl Default for ConfiguratorState {
     }
 }
 impl ConfiguratorState {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn presentation_copy(&self) -> Self {
+        Self {
+            open: self.open,
+            page: self.page,
+            draft: self.draft.clone(),
+            active: self.active.clone(),
+            profile_text: self.profile_text.clone(),
+            profile_editor: iced::widget::text_editor::Content::with_text(&self.profile_text),
+            profile_path: self.profile_path.clone(),
+            save_path: self.save_path.clone(),
+            message: self.message.clone(),
+            pending: self.pending,
+            discard_changes: self.discard_changes,
+            controllers: self.controllers.clone(),
+        }
+    }
     pub fn set_active(&mut self, spec: MachineSpec) {
         self.active = spec.clone();
         self.draft = spec;
@@ -147,6 +165,7 @@ impl ConfiguratorState {
             Edit::Toggle => self.open = !self.open,
             Edit::Page(p) => self.page = *p,
             Edit::Memory(v) => self.draft.hardware.memory_mib = *v,
+            Edit::CpuMhz(v) => self.draft.hardware.cpu_mhz = *v,
             Edit::X87(v) => self.draft.hardware.x87 = *v,
             Edit::Sb16(v) => self.draft.hardware.sb16 = *v,
             Edit::Mpu(v) => self.draft.hardware.mpu401 = *v,
@@ -301,11 +320,23 @@ impl ConfiguratorState {
             Page::Machine => {
                 body = body
                     .push(pair(
-                        field("Processor", text("i386 · 33 MHz").size(15).into()),
+                        field("Processor", text("i386").size(15).into()),
                         field("Display", text("VGA / VBE · 512 KiB").size(15).into()),
                         narrow,
                     ))
                     .push(rule::horizontal(1))
+                    .push(field(
+                        "CPU clock (MHz)",
+                        pick_list(
+                            &[8u16, 16, 25, 33, 50, 66, 100, 132, 133, 200, 266, 500, 1000][..],
+                            Some(h.cpu_mhz),
+                            Edit::CpuMhz,
+                        )
+                        .width(Fill)
+                        .text_size(14)
+                        .padding(8)
+                        .into(),
+                    ))
                     .push(pair(
                         field(
                             "Memory (MiB)",

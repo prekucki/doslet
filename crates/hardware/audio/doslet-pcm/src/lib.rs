@@ -1,6 +1,7 @@
 //! Timestamped stereo PCM and a bounded guest-clock resampler/mixer.
 #![no_std]
 extern crate alloc;
+pub mod spectrum;
 use alloc::{boxed::Box, vec};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

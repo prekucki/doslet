@@ -15,6 +15,7 @@ use doslet_vfs::{HandleTable, MountId, NodeId, OpenFile};
 use doslet_vga::IndexedFrame;
 use doslet_x86::{CpuError, Gpr16, Registers, StepOutcome, linear_address};
 mod cdrom;
+mod clock;
 mod idle;
 use cdrom::CdromImage;
 pub use idle::IdleLoopStats;
@@ -117,6 +118,8 @@ pub struct Session {
     mouse: doslet_dos::mouse::Mouse,
     mouse_fraction: [f64; 2],
     mouse_last_read: Option<u64>,
+    dos_time_origin_nanos: u64,
+    dos_time_origin_centis: u32,
     memory: MemoryArena,
     drive: ReadOnlyDrive,
     dta: (u16, u16),
@@ -283,6 +286,8 @@ impl Session {
             mouse: doslet_dos::mouse::Mouse::default(),
             mouse_fraction: [0.0; 2],
             mouse_last_read: None,
+            dos_time_origin_nanos: 0,
+            dos_time_origin_centis: 0,
             memory,
             drive: ReadOnlyDrive::new(),
             dta: (0x1000, 0x80),
@@ -862,7 +867,7 @@ impl Session {
                 self.machine.cpu.registers.set_byte(0, 3);
             }
             (0x21, 0x2C) => {
-                let centiseconds = self.emulated_nanos() / 10_000_000;
+                let centiseconds = self.dos_time_centis();
                 self.machine.cpu.registers.set(
                     Gpr16::Cx,
                     (((centiseconds / 360000) % 24) << 8 | ((centiseconds / 6000) % 60)) as u16,
@@ -872,6 +877,7 @@ impl Session {
                     (((centiseconds / 100) % 60) << 8 | (centiseconds % 100)) as u16,
                 );
             }
+            (0x21, 0x2D) => self.set_dos_time()?,
             (0x21, 0x38)
                 if ax as u8 == 0 && self.machine.cpu.registers.get(Gpr16::Dx) != 0xFFFF =>
             {

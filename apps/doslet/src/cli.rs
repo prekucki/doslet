@@ -32,6 +32,9 @@ pub struct Cli {
     /// Load a TOML launch profile; explicit CLI options override profile values
     #[arg(long, value_name = "TOML")]
     pub config: Option<PathBuf>,
+    /// Nominal CPU clock in MHz (1..=1000, default 33); not cycle-accurate
+    #[arg(long, value_name = "MHZ")]
+    pub cpu_mhz: Option<u16>,
     /// RAM size in MiB (4, 8, 16 or 32)
     #[arg(long)]
     pub memory_mib: Option<u8>,

@@ -4,6 +4,33 @@ use doslet_runtime::{Session, SessionStatus};
 include!("../../../../tests/fixtures/relocated_mz.rs");
 include!("../../../../tests/fixtures/protected_graphics.rs");
 include!("../../../../tests/fixtures/iso9660.rs");
+include!("../../../../tests/fixtures/opl3.rs");
+
+#[test]
+fn opl3_guest_io_synthesis_and_pcm_drain_allocate_nothing_after_setup() {
+    let mut session = Session::new(&opl3_tone_program()).unwrap();
+    let mut pcm = [doslet_pcm::EMPTY; 128];
+    session.start();
+    let mut count = 0;
+    let mut nonzero = 0;
+    let measured = allocation_counter::measure(|| {
+        for _ in 0..50 {
+            session.advance(10000);
+            let len = session.drain_pcm_timed(&mut pcm);
+            count += len;
+            nonzero += pcm[..len].iter().filter(|f| f.samples != [0; 2]).count();
+        }
+    });
+    assert_eq!(
+        session.status(),
+        SessionStatus::Running,
+        "{:?}",
+        session.fault()
+    );
+    assert!(count > 2000 && nonzero > 1000);
+    assert_eq!(measured.count_total, 0);
+    assert_eq!(measured.bytes_total, 0);
+}
 
 #[cfg(all(
     feature = "dynamic-core",
