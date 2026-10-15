@@ -93,6 +93,7 @@ graph TD
   PC --> CMOS[doslet-mc146818]
   CPU --> Bus
   CPU --> X87[doslet-x87]
+  CPU -. native dynamic-core feature .-> JIT[doslet-x86-jit / Cranelift]
   Time[doslet-time: independent clock primitives]
 ```
 
@@ -278,7 +279,8 @@ version, selector and PE mode match the last resolution skips the full context
 comparison, and exhausted counters restore it. Short/noncontiguous code views and unsupported
 forms use the original byte-fetching interpreter, preserving partial fault IP
 progress. One cached instruction still consumes exactly one bounded step; REP
-and IRQ delivery retain their existing paths. No decoded blocks or JIT exist.
+and IRQ delivery retain their existing paths. The optional native core below
+uses a separate block cache.
 
 The CPU owns hidden segment caches, descriptor-table state and optional x87
 state. Its decoder selects 16/32-bit addressing and validates cache permissions
@@ -367,6 +369,164 @@ library drive stays read-only.
 This makes chip tests independent of CPU instruction coverage. Future cards can
 compose existing chips without introducing cycles: the Sound Blaster card may
 depend on OPL, while the PC machine connects it to DMA and interrupts.
+
+## Native dynamic core
+
+The native frontends enable `dynamic-core` by default on x86-64 and AArch64.
+`doslet-x86` remains a `no_std` CPU library with static bus dispatch. Its optional
+`doslet-x86-jit` dependency is a host compiler adapter using `std` and Cranelift;
+it is excluded from WASM and from builds without the feature. The adapter has
+no PC, DOS or filesystem dependency and never owns guest RAM. Its small unsafe boundary
+converts finalized compiler output to private function pointers, invokes them
+with borrowed general registers, EFLAGS and EIP, optionally borrowing a bounded
+RAM span for a trace, and frees executable storage on drop. The rest
+of the workspace retains `unsafe_code = forbid`.
+
+There are two distinct representations. Address-independent prepared blocks
+contain decoded register IR or a bounded RAM/control-flow trace and at most 240
+expected code bytes. Execution cache
+entries bind those blocks to CS state, offset, privilege and a bus `CodeCheck`.
+The execution cache has 1024 slots allocated at CPU setup. An independent pool
+retains compiled IR by code fingerprint, with full byte comparison before reuse;
+execution-cache collisions and address changes do not discard native code.
+Pool insertion happens only during explicit preparation and is bounded by the
+4096-compilation lifetime limit. Code discovery performs no
+allocation. A hot block becomes eligible after 16 observations; compilation is
+explicit host maintenance through `Session::prepare_dynamic`, capped at eight
+blocks per call (two in ordinary frontend execution). `Session::advance` never
+calls the compiler. A compiler instance accepts at most 4096 blocks over its
+lifetime, including evictions/recompilations. A failure latches once and stops
+further compilation; existing blocks and interpreter fallback remain usable.
+
+The first native subset consists of 2–16 straight-line dword register MOV,
+ALU/CMP/TEST, INC/DEC, XCHG and NEG/NOT instructions in protected default-32-bit
+code. A terminal short/near relative Jcc/JMP whose target is exactly the block's
+start can form a native loop; its branch counts toward the 16-instruction limit.
+It shares the existing instruction decoder with the interpreter. Native
+code reads/writes eight general registers, EFLAGS and EIP. The register-only
+compiler retains its original ABI. I/O, unsupported control transfers, segment
+changes, x87, REP and other widths terminate a
+block and execute through the interpreter. Whole-block CS checks protect fetch
+limits. TF/RF/VM, paging, halted state and interrupt shadows prevent native
+execution. Ordinary single stepping stays on the interpreter.
+
+For straight blocks, the compiler tracks arithmetic flag liveness backwards:
+only flags needed by a later ADC/SBB or at block exit are materialized. INC/DEC
+preserve carry across these chains. Native loops conservatively compute full
+arithmetic flags and carry them with the registers through an SSA backedge.
+The generated function checks the hardware-bounded remaining step budget before
+each whole iteration and returns the actual completed-step count. It writes
+architectural state only on return: EIP points to the loop start after a taken
+backedge, or after the branch when the condition is false. A budget remainder
+smaller than one iteration uses the existing execution path. No guest memory
+can change while this register-only loop holds its borrow, so code validation
+occurs once on entry, rather than on every iteration.
+Generated code stores only changed registers and works directly
+on borrowed CPU state, without copying a ten-word temporary at every call.
+
+A separate RAM trace compiler accepts up to 16 reachable instructions
+inside one 240-byte code span. It follows relative branches and supports dword
+MOV/ALU memory sources with 32-bit base/index/displacement addressing. LEA,
+memory-left CMP/TEST, byte MOV/CMP/TEST and byte MOV stores extend the register
+scope; AH-style aliases preserve all other bits of their parent dword. Dword
+memory XCHG resolves its address and value from the old registers, guards the
+load and store, then exchanges operands and updates page generations. In the
+single-owner machine the exclusive RAM borrow prevents hardware activity from
+interleaving with the exchange. PUSH/POP32,
+near direct/indirect CALL and RET/RET imm16 use guarded ordinary-RAM stack
+accesses. SS must be full flat with a 32-bit stack; CALL/RET additionally require
+full flat executable CS, making their dynamic targets valid offsets. PUSH ESP
+uses its old value, POP ESP overrides the incremented pointer, and indirect CALL
+reads its target before writing the return address. Every failed guard exits
+before the current instruction's register or memory effects. Direct calls follow
+known targets and retain return sites during discovery; runtime CALL/RET targets
+matching a prepared instruction transfer in SSA, otherwise they return to dispatch.
+Discovery uses fixed arrays and rejects overlapping instruction starts. Other
+stores, word overrides, far calls/returns and unsupported successors are interpreter exits.
+The full contiguous span, including gaps and all branch bytes, is checked for
+code generations and CS bounds; external exits receive conservative CS checks.
+Every used data segment must be flat, fully readable and cover all 32-bit
+offsets; store segments must also be writable. Positive validation is cached
+against used selectors and full hidden descriptors within the execution-cache
+key (CS, entry IP, privilege and mode). A separately compiled register prefix
+remains usable when the larger RAM trace cannot run; it is attempted only after
+zero trace progress and fits the same resolved hardware budget. Both functions
+count toward the lifetime compilation cap. Replacing the prepared trace clears the
+result. Changed DS/SS state cannot reuse stale assumptions.
+
+`MemoryBus::native_ram` optionally returns `NativeRam` with a borrowed immutable
+backing slice, linear base and one excluded interval. Its default declines native
+reads. The PC exposes `500h` through the configured RAM end only while A20 is enabled: IVT/BDA stay
+outside the span and the VGA aperture is explicitly excluded. Backing bytes in
+that interval are never CPU-visible through native access. Each native access
+checks the complete byte/dword against the view, exclusion and 32-bit overflow
+before forming a host pointer; unaligned dwords use little-endian order. Failed guards return before the load, preserving
+prior progress, full flags and EIP. The pointer is never retained between calls.
+No device or mapping can change during the immutable borrow.
+
+`MemoryBus::native_ram_mut` optionally supplies `NativeRamMut` with disjoint
+exclusive borrows of the RAM backing span and the full physical 4-KiB
+page-generation table, with the same mandatory excluded-interval guard. The PC requires A20 enabled and an available code space. Borrowing does
+not itself invalidate pages. Generated stores check complete byte/dword bounds,
+32-bit overflow, generation-table bounds and non-exhausted counters, and reject
+the pages occupied by the active trace (including gaps). A successful store
+updates each touched page generation once before further execution. Other
+compiled blocks therefore fail their next generation check; self-modifying
+stores leave native execution before changing active code. The interpreter
+handles the store and invalidation. No pointer survives the exclusive borrow.
+The read-only compiler API rejects traces containing stores. The read-only CPU
+API may execute their register prefix, but never their stores. Writable execution
+requires an exclusive bus borrow.
+
+Trace nodes carry registers, flags and remaining budget in SSA, preserving
+state across internal branches/backedges. The first version computes full flags
+and checks the remaining hardware-bounded budget per instruction. Every exit
+returns the actual completed-step count, including completed native stores. `ram_trace_steps` and `ram_trace_entries` identify this
+subset of total native execution. The lifetime compilation cap is shared with
+the register-only compiler.
+
+Optional exit diagnostics must be enabled before native compilation. The CPU
+allocates 8,192 aggregation slots during setup, then records CS, entry/exit IP,
+linear addresses, reason, count and completed steps without execution-time
+allocation. Refused entries are separate from actual native returns, including
+zero-step guard failures. Profiled traces use a private reason-bearing return
+ABI; ordinary generated functions remain uninstrumented. The diagnostic runner
+checks guest state against interpretation and exports metadata CSV separately
+from timing benchmarks. See [exit measurements](compatibility/native-core.md#measured-native-exit-reasons).
+
+The PC delivers pending eligible IRQs before entering a slice of at most 256
+steps, bounded by the caller's budget and strictly before the next PIT/DSP/AT-keyboard
+deadline and the 1-ms hardware advance limit. A slice combines native blocks
+with decoded ordinary-RAM operations, near branches and stack accesses. The
+bus must explicitly guarantee the complete operand spans are writable ordinary
+RAM via `MemoryBus::is_plain_ram`; segment, stack and branch bounds are checked
+before execution. Faultable accesses, MMIO, I/O, mode/IF changes, REP and other
+unsupported forms stop the slice before their effects. The interpreter handles
+that boundary instruction with current hardware time and interrupt state.
+The PC updates clocks and scheduling counters once per slice. Native execution
+counters also accumulate locally, while `Session::advance` commits its total
+step count once per host batch. VGA polling candidates retain their existing
+per-instruction observation. This reduces interrupt checks without delaying IRQ
+delivery. Native blocks that do not fit fall back without native side effects.
+Every entry checks page, mapping and owner generations. After a generation change,
+identical bytes may rebind existing code; changed bytes require new IR and
+compilation. RAM writes inside a slice still invalidate code before the next
+instruction/block lookup. No large RAM/VRAM buffer is cloned.
+
+Optional `--core-profile FILE` preparation stores at most 256 observed hot blocks
+in a versioned file of at most 62,726 bytes. It records linear address hints and
+exact post-relocation code bytes, never host code or pointers. Imports are bounded,
+fully decoded and compiled again. Runtime binding decodes the complete current
+block and searches the prepared pool by fingerprint plus exact bytes and length;
+a historical shorter register prefix cannot pin a newer RAM trace. Address hints
+remain format metadata. Byte comparison and the current CS/code checks
+are mandatory before a first native entry. Invalid profiles report a warning and
+leave ordinary execution available. Profiles currently use observed addresses,
+not executable object identities. Identical register code can bind at a new
+address, while changed relocation bytes lose a hit and safely rediscover code.
+LE/LX static object traversal and relocation-aware
+binding remain future work. Profiles may contain proprietary guest code and stay
+local, outside the original game directory.
 
 ## Service interception
 

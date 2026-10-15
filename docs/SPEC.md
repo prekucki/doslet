@@ -254,10 +254,85 @@ fallbacks. Differential tests cover dynamic operands, faults and invalidation;
 the opt-in local PRINCE test compares bounded execution through 300 million
 steps, including full final RAM/VRAM, scanout/palette, MIDI, PCM and guest time.
 
-A decoded-block backend may share architectural state and instruction semantics
-with the interpreter. It must invalidate cached code when relevant guest memory
-changes. Native JIT backends are optional future components. The initial WASM
-path uses the interpreter and does not generate host machine code.
+Native x86-64/AArch64 frontends enable a Cranelift dynamic core by default through
+the `dynamic-core` feature. Its first scope is bounded blocks of 2–16 register-only
+dword MOV/ALU/CMP/TEST, INC/DEC, XCHG and NEG/NOT in protected 32-bit code. A final
+short/near relative Jcc/JMP back to the block's start can form a native loop;
+the 16-instruction bound includes that branch. A separate RAM trace
+supports dword register MOV/ALU memory sources, LEA, memory-left CMP/TEST,
+byte MOV/CMP/TEST (including high-byte registers and MOV stores), PUSH/POP32,
+near direct/indirect CALL, RET/RET imm16, dword memory XCHG and relative branches through at most
+16 reachable instructions in a 240-byte span. Stack accesses require full flat
+SS with a 32-bit stack; CALL/RET additionally require full flat executable CS.
+Their targets can transfer directly to another instruction in the same prepared
+graph; external targets return to dispatch with exact stack state. All used data segments
+must be flat, fully readable 32-bit ranges at each entry. An optional bus view
+borrows a RAM backing span with an optional excluded interval. The PC requires
+A20 enabled, starts at 500h to exclude IVT/BDA accounting, and forbids the VGA
+aperture even though backing bytes exist there. Every complete one- or four-byte
+access checks both bounds and exclusion before touching memory; a failed check exits before that
+instruction with the previous state and exact completed-step count. Byte/dword
+MOV stores, PUSH and CALL stack writes can continue inside native execution. Store
+segments must also be writable; successful validation is cached against used
+segment selectors/descriptors and the execution key. Each store increments the
+generations of touched 4-KiB pages. Writes to an active trace page or exhausted
+generations exit before the store. PUSH ESP uses the old ESP; POP ESP finishes
+with the popped value. Indirect CALL resolves its source before the stack write.
+Memory XCHG resolves both operands from the old registers and completes all guards
+before changing either; RAM exchange cannot interleave with hardware events in
+this single-owner machine. Other stores, word-operand overrides, far calls/returns and device operations
+remain interpreter boundaries.
+Entry validates full CS bounds and
+RAM code generations; changed generations require exact byte comparison before
+reusing compiled code. Debug flags, paging, interrupt shadows and budgets that
+cannot accommodate the whole register block retain ordinary stepping. The machine ends
+execution slices strictly before hardware deadlines and delivers eligible IRQs first.
+Each slice combines native blocks with validated decoded ordinary-RAM/near-branch
+work for at most 256 steps. MMIO, I/O, faults, mode/IF changes and unsupported
+instructions remain boundaries. Hardware clocks and execution counters advance
+once per slice; RAM writes still invalidate code immediately. The bus must opt
+into the ordinary-RAM batching contract, which defaults to disabled.
+
+Discovery and native execution allocate nothing. Explicit host preparation between
+batches may allocate and request executable memory through `doslet-x86-jit`, the
+optional `std` compiler adapter. Its private unsafe invocation boundary accepts
+borrowed general registers, EFLAGS and EIP, plus an optional bounded RAM slice
+valid only during that call. Writable traces additionally borrow the physical
+page-generation table exclusively. Read-only compiler calls reject writable traces;
+read-only CPU calls may execute a register prefix but never stores. The adapter
+never retains host RAM pointers or accesses devices. Straight-block flag liveness eliminates overwritten arithmetic flags
+while preserving carry dependencies and complete flags at every native exit.
+Native loops carry registers and full arithmetic flags between iterations in
+generated code and store architectural state only when returning. They check
+the remaining hardware-bounded slice budget before each whole iteration and
+return the exact completed-step count. A remainder too small for another
+iteration uses the existing path. Loop flag generation is conservative; it does
+not yet eliminate overwritten flags across the backedge.
+RAM/CFG traces preserve full flags at every instruction boundary and check the
+remaining hardware-bounded budget per instruction, allowing exact partial
+progress on internal branches and unavailable memory. The RAM borrow prevents
+concurrent mapping changes or device writes during that native call. Generated
+stores guard active code pages and update generations before continuing. Execution
+statistics distinguish RAM-trace steps/entries from total native work.
+Preparation accepts at most eight blocks per call and 4096 per CPU lifetime;
+compiler failure/exhaustion latches once and preserves interpreter fallback.
+`--no-dynamic-core` disables JIT at runtime; `--no-default-features` omits it from
+native application builds. WASM has no Cranelift dependency and stays interpreted.
+
+Opt-in exit profiling, configured before native compilation, aggregates reasons,
+entry/exit addresses, counts and native steps in a fixed 8,192-slot table allocated
+at setup. Overflow is reported as dropped observations. Actual native returns,
+including zero-step guard exits, are distinguished from refused entries. Normal
+generated code contains no exit instrumentation. Profiling is diagnostic evidence
+and is not used to report uninstrumented throughput.
+
+An optional bounded execution profile saves observed code bytes and address hints.
+On a later launch these bytes are decoded/compiled before execution and bound only
+after matching actual RAM and current segment assumptions. Changed relocation
+bytes fall back to discovery; identical register code may bind at another address.
+Full static LE/LX object analysis and
+relocation-aware object/offset identities are not implemented in this first core.
+See [architecture.md](architecture.md#native-dynamic-core) for cache/profile bounds.
 
 ## DOS and BIOS contract
 

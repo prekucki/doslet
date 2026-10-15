@@ -28,9 +28,28 @@ fn compare_buffers(a: &Session, b: &Session) {
 #[test]
 #[ignore = "requires the local PRINCE installation; compares 300 million guest steps"]
 fn local_prince_decode_cache_matches_reference_during_execution() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../PRINCE/PRINCE.EXE");
+    compare_local_prince(false);
+}
+
+#[test]
+#[cfg(all(
+    feature = "dynamic-core",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[ignore = "requires the local PRINCE installation; compares 300 million guest steps"]
+fn local_prince_dynamic_core_matches_reference_during_execution() {
+    compare_local_prince(true);
+}
+
+fn compare_local_prince(dynamic: bool) {
+    let path = std::env::var_os("DOSLET_PRINCE_EXE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../PRINCE/PRINCE.EXE")
+        });
     let mut cached = native_input::load_game(&path).unwrap();
     let mut reference = native_input::load_game(&path).unwrap();
+    cached.set_dynamic_core(dynamic);
     reference.set_decode_cache(false);
     cached.start();
     reference.start();
@@ -42,6 +61,9 @@ fn local_prince_decode_cache_matches_reference_during_execution() {
     let mut batches = 0;
     while remaining != 0 {
         let budget = [1, 7, 31, 257, 1009, 4096, 10000][batches % 7].min(remaining);
+        if dynamic {
+            cached.prepare_dynamic(2);
+        }
         let done = cached.advance(budget);
         assert_eq!(done, reference.advance(budget));
         assert_eq!(
@@ -55,7 +77,14 @@ fn local_prince_decode_cache_matches_reference_during_execution() {
         batches += 1;
         assert_eq!(cached.status(), SessionStatus::Running);
         assert_eq!(cached.registers(), reference.registers(), "batch {batches}");
-        assert_eq!(cached.eflags(), reference.eflags());
+        assert_eq!(
+            cached.eflags(),
+            reference.eflags(),
+            "batch {batches}, steps {}, registers {:?}, native {:?}",
+            cached.steps(),
+            cached.registers(),
+            cached.dynamic_stats(),
+        );
         assert_eq!(cached.control_registers(), reference.control_registers());
         assert_eq!(cached.emulated_nanos(), reference.emulated_nanos());
         assert_eq!(cached.a20_enabled(), reference.a20_enabled());
@@ -82,8 +111,18 @@ fn local_prince_decode_cache_matches_reference_during_execution() {
     #[cfg(feature = "profiling")]
     {
         let stats = cached.decode_cache_stats();
-        assert!(stats.hits > 100_000_000);
+        if !dynamic {
+            assert!(stats.hits > 100_000_000);
+        }
         println!("{stats:?}");
+    }
+    if dynamic {
+        assert!(cached.dynamic_stats().executed_steps > 0);
+        println!(
+            "Dynamic core: {:?}; compiler status: {:?}",
+            cached.dynamic_stats(),
+            cached.dynamic_error()
+        );
     }
     println!(
         "Compared {batches} bounded batches, full final RAM/VRAM, VGA/palette, MIDI and PCM through 300000000 steps"

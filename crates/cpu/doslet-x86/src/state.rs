@@ -381,6 +381,14 @@ impl Registers {
     pub fn set32(&mut self, register: Gpr32, value: u32) {
         self.general[register as usize] = value;
     }
+    #[cfg(all(
+        feature = "dynamic-core",
+        not(target_arch = "wasm32"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn native_state(&mut self) -> (&mut [u32; 8], &mut u32) {
+        (&mut self.general, &mut self.ip)
+    }
     pub fn get_byte(&self, code: u8) -> u8 {
         let value = self.general[usize::from(code & 3)];
         if code & 4 == 0 {

@@ -58,10 +58,70 @@ pub struct CodeCheck {
     pub generations: [u64; 2],
 }
 
+/// One borrowed RAM backing span, optionally containing one excluded interval.
+/// Every access must fit `bytes` and avoid `[excluded_start, excluded_start +
+/// excluded_len)` in CPU address space; zero length disables the exclusion.
+/// Excluded bytes are backing storage only, not CPU-visible ordinary RAM.
+/// Accesses outside the exclusion must have no device or accounting effects;
+/// mappings cannot change while borrowed and no pointer may outlive the borrow.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeRam<'a> {
+    pub linear_base: u32,
+    pub bytes: &'a [u8],
+    pub excluded_start: u32,
+    pub excluded_len: u32,
+}
+
+/// An exclusive ordinary-RAM view with explicit code-cache invalidation.
+/// `page_generations` is the complete physical 4-KiB page table: a CPU-visible
+/// address indexes it with `address >> 12`, independently of `linear_base`.
+/// Allowed bytes use that same identity mapping and require no device or
+/// access-accounting callbacks. Every complete access must avoid the optional
+/// excluded interval, as described for `NativeRam`; its backing bytes are never
+/// CPU-visible through this view. Borrowing alone does not invalidate pages.
+///
+/// Before any write, the caller must check the complete byte span and every
+/// affected generation, and decline the write if any generation is `u64::MAX`.
+/// Each completed write increments every distinct affected page exactly once,
+/// without wrapping. Executing native code must also reject writes to any page
+/// containing its currently validated instructions. No pointer may outlive the
+/// borrow, and mappings cannot change while it is held.
+#[derive(Debug)]
+pub struct NativeRamMut<'a> {
+    pub linear_base: u32,
+    pub bytes: &'a mut [u8],
+    pub page_generations: &'a mut [u64],
+    pub excluded_start: u32,
+    pub excluded_len: u32,
+}
+
 /// Accesses preserve device side effects, including when a word spans regions.
 pub trait MemoryBus {
     fn read_u8(&mut self, address: u32) -> Result<u8, BusError>;
     fn write_u8(&mut self, address: u32, value: u8) -> Result<(), BusError>;
+
+    /// Optional batching contract for a complete ordinary, writable RAM span.
+    /// True guarantees byte/word/dword accesses within the span succeed without
+    /// device effects, changing mappings, or observing/raising hardware events.
+    /// Writes must still invalidate code checks. The guarantee lasts until the
+    /// next mutable bus operation; ROM, MMIO and wrapping spans return false.
+    fn is_plain_ram(&self, _address: u32, _length: u8) -> bool {
+        false
+    }
+
+    /// Optional read-only native execution view. Implementations may expose a
+    /// conservative subset of RAM, or decline entirely. Generated code must
+    /// check every complete access against the span and exclusion, and never
+    /// retain pointers.
+    fn native_ram(&self) -> Option<NativeRam<'_>> {
+        None
+    }
+
+    /// Optional exclusive native RAM view. The caller must maintain the page
+    /// generations according to `NativeRamMut` before releasing the borrow.
+    fn native_ram_mut(&mut self) -> Option<NativeRamMut<'_>> {
+        None
+    }
 
     /// Optional cache contract. Defaults keep other buses on the interpreter.
     /// Decode time: resolve the span; None keeps it on byte fetching.

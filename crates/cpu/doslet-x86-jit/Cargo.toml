@@ -1,0 +1,16 @@
+[package]
+name = "doslet-x86-jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[target.'cfg(all(not(target_arch = "wasm32"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+cranelift-codegen = "=0.132.3"
+cranelift-frontend = "=0.132.3"
+cranelift-jit = "=0.132.3"
+cranelift-module = "=0.132.3"
+
+# Only the private executable-code boundary may use unsafe Rust.
+[lints.rust]
+unsafe_code = "deny"

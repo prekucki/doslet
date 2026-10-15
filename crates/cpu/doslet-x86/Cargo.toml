@@ -7,10 +7,14 @@ license.workspace = true
 
 [features]
 profiling = []
+dynamic-core = ["dep:doslet-x86-jit"]
 
 [dependencies]
 doslet-bus.workspace = true
 doslet-x87.workspace = true
+
+[target.'cfg(all(not(target_arch = "wasm32"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+doslet-x86-jit = { path = "../doslet-x86-jit", optional = true }
 
 [lints]
 workspace = true

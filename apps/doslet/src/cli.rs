@@ -59,6 +59,14 @@ pub struct Cli {
     #[arg(long)]
     pub experimental_heroes_timer_waits: bool,
 
+    /// Use the interpreter instead of the native dynamic core
+    #[arg(long)]
+    pub no_dynamic_core: bool,
+
+    /// Load/save observed JIT blocks between runs (local profile, outside game data)
+    #[arg(long, value_name = "FILE")]
+    pub core_profile: Option<PathBuf>,
+
     /// MIDI port index/name, rust, or moont
     #[arg(long, value_name = "PORT")]
     pub midi_output: Option<String>,
@@ -119,6 +127,32 @@ mod tests {
         assert_eq!(cli.game.unwrap(), PathBuf::from("my game/PRINCE.EXE"));
         assert!(cli.no_audio);
         assert!(Cli::try_parse_from(["doslet"]).unwrap().game.is_none());
+    }
+
+    #[test]
+    fn native_core_options_survive_launch_resolution() {
+        let cli = Cli::try_parse_from([
+            "doslet",
+            "--no-dynamic-core",
+            "--core-profile",
+            "target/game.core-profile",
+        ])
+        .unwrap()
+        .resolve()
+        .unwrap();
+        assert!(cli.launch.no_dynamic_core);
+        assert_eq!(
+            cli.launch.core_profile,
+            Some(PathBuf::from("target/game.core-profile"))
+        );
+        assert!(
+            !Cli::try_parse_from(["doslet"])
+                .unwrap()
+                .resolve()
+                .unwrap()
+                .launch
+                .no_dynamic_core
+        );
     }
 
     #[test]

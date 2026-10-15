@@ -237,6 +237,35 @@ impl PcBus {
     }
 }
 impl MemoryBus for PcBus {
+    fn native_ram_mut(&mut self) -> Option<doslet_bus::NativeRamMut<'_>> {
+        if !self.a20.enabled {
+            return None;
+        }
+        let size = self.ram.len();
+        let mut view = self.ram.native_view_mut(0x500..size)?;
+        view.excluded_start = APERTURE_START;
+        view.excluded_len = APERTURE_LEN as u32;
+        Some(view)
+    }
+    fn native_ram(&self) -> Option<doslet_bus::NativeRam<'_>> {
+        // A20-on identity mapping. Exclude IVT/BDA by starting above 0x4ff,
+        // and mark the VGA backing bytes as a forbidden interval. The native
+        // complete-access guard must reject the interval before touching RAM.
+        if !self.a20.enabled {
+            return None;
+        }
+        let start = 0x500;
+        Some(doslet_bus::NativeRam {
+            linear_base: start as u32,
+            bytes: self.ram.view(start..self.ram.len())?,
+            excluded_start: APERTURE_START,
+            excluded_len: APERTURE_LEN as u32,
+        })
+    }
+    #[inline]
+    fn is_plain_ram(&self, address: u32, length: u8) -> bool {
+        length != 0 && self.wide_ram_range(address, u32::from(length)).is_some()
+    }
     fn code_check(&self, address: u32, length: u8) -> Option<doslet_bus::CodeCheck> {
         if length == 0 {
             return None;
@@ -497,6 +526,35 @@ mod cache_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_write_view_requires_flat_a20_and_tracks_physical_pages() {
+        let mut bus = PcBus::default();
+        assert!(bus.native_ram_mut().is_none());
+        bus.set_a20(true);
+        let address = APERTURE_START + APERTURE_LEN as u32;
+        let before = bus.code_check(address, 4).unwrap();
+        {
+            let view = bus.native_ram_mut().unwrap();
+            assert_eq!(view.linear_base, 0x500);
+            assert_eq!(view.bytes.len(), crate::memory::RAM_SIZE - 0x500);
+            assert_eq!(view.excluded_start, APERTURE_START);
+            assert_eq!(view.excluded_len, APERTURE_LEN as u32);
+            assert_eq!(view.page_generations.len(), crate::memory::RAM_SIZE / 4096);
+        }
+        assert!(bus.code_valid(&before));
+        {
+            let view = bus.native_ram_mut().unwrap();
+            let page = (address >> 12) as usize;
+            assert_ne!(view.page_generations[page], u64::MAX);
+            let offset = (address - view.linear_base) as usize;
+            view.bytes[offset..offset + 4].copy_from_slice(&42u32.to_le_bytes());
+            view.page_generations[page] += 1;
+        }
+        assert!(!bus.code_valid(&before));
+        assert_eq!(bus.read_u32(address), Ok(42));
+        bus.set_a20(false);
+        assert!(bus.native_ram_mut().is_none());
+    }
     #[test]
     fn absent_tseng_bank_register_does_not_echo_probe_patterns_or_change_vbe_bank() {
         let mut bus = PcBus::default();

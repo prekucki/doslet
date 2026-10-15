@@ -18,6 +18,8 @@ pub struct LaunchSettings {
     pub persist: bool,
     pub cdrom: Option<(u8, PathBuf)>,
     pub heroes_timer_waits: bool,
+    pub no_dynamic_core: bool,
+    pub core_profile: Option<PathBuf>,
 }
 impl Default for LaunchSettings {
     fn default() -> Self {
@@ -31,6 +33,8 @@ impl Default for LaunchSettings {
             persist: false,
             cdrom: None,
             heroes_timer_waits: false,
+            no_dynamic_core: false,
+            core_profile: None,
         }
     }
 }
@@ -92,6 +96,10 @@ pub fn load_game_with_settings(
         session = session.with_cdrom_image(*letter, fs::read(image)?)?;
     }
     session.configure_launch(&settings.command_tail, &settings.working_directory)?;
+    session.set_dynamic_core(!settings.no_dynamic_core);
+    if let Some(path) = &settings.core_profile {
+        load_core_profile(&mut session, path);
+    }
     if settings.heroes_timer_waits {
         session.set_memory_wait_sites(0x281098, [0x1E281C, 0x1E2881, 0x1E331A]);
         eprintln!(
@@ -100,6 +108,55 @@ pub fn load_game_with_settings(
     }
     Ok(session)
 }
+/// Optional preparation hints; malformed input cannot prevent interpretation.
+pub fn load_core_profile(session: &mut Session, path: &Path) {
+    use std::io::Read;
+    if !session.dynamic_core_enabled() {
+        return;
+    }
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.take(doslet_x86::DYNAMIC_PROFILE_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        session.load_dynamic_profile(&bytes)?;
+        session.prepare_dynamic(8);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!(
+            "[WARN doslet] Ignoring core profile {}: {error}",
+            path.display()
+        );
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "shared native adapter is also included by diagnostic examples"
+)]
+pub fn save_core_profile(session: &Session, path: &Path) {
+    if !session.dynamic_core_enabled() {
+        return;
+    }
+    let mut bytes = vec![0; doslet_x86::DYNAMIC_PROFILE_MAX_BYTES];
+    let length = session.write_dynamic_profile(&mut bytes);
+    // Keep useful previous observations when startup has not seen hot code yet.
+    if length <= 6 {
+        return;
+    }
+    if let Err(error) = fs::write(path, &bytes[..length]) {
+        eprintln!(
+            "[WARN doslet] Cannot save core profile {}: {error}",
+            path.display()
+        );
+    }
+}
+
 fn mount_directory(
     root: &Path,
     directory: &Path,

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+[features]
+default = ["dynamic-core"]
+dynamic-core = ["doslet-runtime/dynamic-core"]
 [dependencies]
 doslet-config.workspace = true
 doslet-input.workspace = true

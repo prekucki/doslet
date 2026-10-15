@@ -83,6 +83,24 @@ impl Ram {
         }
         self.bytes.get_mut(range)
     }
+    /// Native stores maintain generations themselves after checking exhaustion.
+    /// Keep both mutable borrows disjoint and do not invalidate untouched pages.
+    pub(crate) fn native_view_mut(
+        &mut self,
+        range: Range<usize>,
+    ) -> Option<doslet_bus::NativeRamMut<'_>> {
+        if self.code_space == 0 {
+            return None;
+        }
+        let linear_base = u32::try_from(range.start).ok()?;
+        Some(doslet_bus::NativeRamMut {
+            linear_base,
+            bytes: self.bytes.get_mut(range)?,
+            page_generations: &mut self.generations,
+            excluded_start: 0,
+            excluded_len: 0,
+        })
+    }
     fn bump(&mut self, page: usize) {
         if let Some(next) = self.generations[page].checked_add(1) {
             self.generations[page] = next;
@@ -143,6 +161,60 @@ impl Ram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_borrow_invalidates_only_pages_explicitly_written() {
+        let mut ram = Ram::default();
+        let range = 3 * PAGE_SIZE - 2..3 * PAGE_SIZE + 2;
+        let untouched = ram.code_check(0..4).unwrap();
+        let before = ram.code_check(range.clone()).unwrap();
+        {
+            let view = ram.native_view_mut(PAGE_SIZE..RAM_SIZE).unwrap();
+            assert_eq!(view.linear_base, PAGE_SIZE as u32);
+            assert_eq!(view.page_generations.len(), RAM_SIZE / PAGE_SIZE);
+            assert!(
+                view.page_generations
+                    .iter()
+                    .all(|&generation| generation == 0)
+            );
+        }
+        assert!(ram.code_valid(&before));
+        {
+            let view = ram.native_view_mut(PAGE_SIZE..RAM_SIZE).unwrap();
+            let offset = range.start - view.linear_base as usize;
+            // Native stores check both generations before changing any state.
+            for &page in &before.pages {
+                assert_ne!(view.page_generations[page as usize], u64::MAX);
+            }
+            view.bytes[offset..offset + 4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+            for page in before.pages {
+                view.page_generations[page as usize] += 1;
+            }
+        }
+        assert_eq!(
+            ram.view(range.clone()).unwrap(),
+            &0x1234_5678u32.to_le_bytes()
+        );
+        assert!(!ram.code_valid(&before));
+        assert!(ram.code_valid(&untouched));
+        assert_eq!(ram.code_check(range).unwrap().generations, [1, 1]);
+    }
+    #[test]
+    fn native_generation_exhaustion_can_fall_back_without_wrapping() {
+        let mut ram = Ram::default();
+        ram.generations[1] = u64::MAX;
+        let before = ram.code_check(PAGE_SIZE..PAGE_SIZE + 4).unwrap();
+        {
+            let view = ram.native_view_mut(PAGE_SIZE..RAM_SIZE).unwrap();
+            assert_eq!(view.page_generations[1], u64::MAX);
+            // No native write is permitted: ordinary stepping owns exhaustion.
+            assert_eq!(&view.bytes[..4], &[0; 4]);
+        }
+        assert!(ram.code_valid(&before));
+        ram.write(PAGE_SIZE as u32, 42).unwrap();
+        assert!(!ram.code_valid(&before));
+        assert!(ram.native_view_mut(PAGE_SIZE..RAM_SIZE).is_none());
+        assert_eq!(ram.generations[1], u64::MAX);
+    }
     #[test]
     fn borrowed_mutation_bumps_both_pages_and_exhaustion_disables_checks() {
         let mut ram = Ram::default();

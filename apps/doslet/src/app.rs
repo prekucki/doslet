@@ -54,6 +54,7 @@ pub struct Doslet {
     pub notice: Option<String>,
     logged_fault: Option<RuntimeError>,
     logged_notice: Option<String>,
+    dynamic_error_reported: bool,
     pub midi_choices: Vec<String>,
     pub midi_choice: String,
     host_midi: Option<crate::native_midi::Output>,
@@ -103,6 +104,7 @@ pub enum Message {
     Reset,
     Tick,
     FocusLost,
+    CloseRequested(iced::window::Id),
     RefreshMidi,
     MidiSelected(String),
     MidiModeSelected(Mode),
@@ -134,6 +136,7 @@ impl Doslet {
             notice: None,
             logged_fault: None,
             logged_notice: None,
+            dynamic_error_reported: false,
             midi_choices: vec!["Rust synth".into()],
             midi_choice: "Rust synth".into(),
             host_midi: None,
@@ -188,6 +191,10 @@ impl Doslet {
         app.configurator.set_active(machine_spec);
         if cli.game.is_none() {
             app.session = Session::demo_configured(app.launch.hardware)?;
+            app.session.set_dynamic_core(!app.launch.no_dynamic_core);
+            if let Some(path) = &app.launch.core_profile {
+                crate::native_input::load_core_profile(&mut app.session, path);
+            }
         }
         app.routing.set_mode(app.midi_mode);
         if let Some(path) = cli.game {
@@ -549,6 +556,7 @@ impl Doslet {
                 if self.configurator.pending {
                     return Task::none();
                 }
+                self.save_core_profile();
                 if self.session.status() == SessionStatus::Running {
                     self.session.pause();
                 } else {
@@ -587,6 +595,10 @@ impl Doslet {
             Message::FocusLost => {
                 let _ = self.session.release_keys();
                 return self.release_mouse();
+            }
+            Message::CloseRequested(id) => {
+                self.save_core_profile();
+                return iced::window::close(id);
             }
             Message::Tick => self.tick(),
         }
@@ -719,6 +731,7 @@ impl Doslet {
                 return Task::none();
             }
         };
+        self.save_core_profile();
         let mut settings = self.launch.clone();
         settings.hardware = plan.hardware;
         settings.machine_spec = Some(spec.clone());
@@ -795,7 +808,13 @@ impl Doslet {
                     Some(path) => crate::native_input::load_game_with_settings(path, &settings)
                         .map_err(|e| e.to_string())?,
                     None => {
-                        Session::demo_configured(settings.hardware).map_err(|e| e.to_string())?
+                        let mut session = Session::demo_configured(settings.hardware)
+                            .map_err(|e| e.to_string())?;
+                        session.set_dynamic_core(!settings.no_dynamic_core);
+                        if let Some(path) = &settings.core_profile {
+                            crate::native_input::load_core_profile(&mut session, path);
+                        }
+                        session
                     }
                 };
                 let mut storage = if let Some(old) = &mut old_storage {
@@ -857,6 +876,7 @@ impl Doslet {
                         let _ = candidate.session.release_keys();
                         candidate.session.start();
                         self.session = candidate.session;
+                        self.dynamic_error_reported = false;
                         self.source = candidate.source;
                         self.launch = candidate.launch;
                         self.storage = Some(storage);
@@ -933,6 +953,7 @@ impl Doslet {
         }
     }
     fn reset(&mut self) {
+        self.save_core_profile();
         self.notice = None;
         if self.session.dirty_overlay()
             && !self.launch.persist
@@ -1010,6 +1031,10 @@ impl Doslet {
             } else {
                 self.session = Session::demo_configured(self.launch.hardware)
                     .expect("validated demo hardware");
+                self.session.set_dynamic_core(!self.launch.no_dynamic_core);
+                if let Some(path) = &self.launch.core_profile {
+                    crate::native_input::load_core_profile(&mut self.session, path);
+                }
             }
         }
         if let Some(generation) = self.pad_generation {
@@ -1024,7 +1049,14 @@ impl Doslet {
         let _ = self.session.release_keys();
         self.clear_presentation();
     }
+    fn save_core_profile(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = &self.launch.core_profile {
+            crate::native_input::save_core_profile(&self.session, path);
+        }
+    }
     fn clear_presentation(&mut self) {
+        self.dynamic_error_reported = false;
         self.notice = None;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(audio) = &self.audio {
@@ -1301,6 +1333,15 @@ impl Doslet {
                 .is_some_and(|audio| audio.available() < 512)
             {
                 break;
+            }
+            self.session.prepare_dynamic(2);
+            if !self.dynamic_error_reported
+                && let Some(error) = self.session.dynamic_error()
+            {
+                self.dynamic_error_reported = true;
+                self.notice = Some(format!(
+                    "JIT preparation stopped: {error}. Interpreter fallback remains active."
+                ));
             }
             let completed = self.session.advance(budget.min(CHUNK));
             budget -= completed;
@@ -1666,6 +1707,7 @@ impl Doslet {
         };
         Subscription::batch([
             tick,
+            iced::window::close_requests().map(Message::CloseRequested),
             DisplaySizing::subscription().map(Message::DisplaySizing),
             iced::event::listen_with(|event, status, _| {
                 if matches!(event, iced::Event::Window(iced::window::Event::Unfocused)) {
@@ -1688,6 +1730,36 @@ impl Doslet {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    #[cfg(all(
+        feature = "dynamic-core",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod native_profile_fixture {
+        include!("../../../tests/fixtures/protected_graphics.rs");
+    }
+    #[cfg(all(
+        feature = "dynamic-core",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn native_window_close_saves_observations_before_returning_the_close_task() {
+        let fixture = crate::profile::tests::Fixture::new("");
+        let path = fixture.root.join("native.core-profile");
+        let mut program = native_profile_fixture::protected_graphics_com();
+        let code = [0x40, 0x41, 0x42, 0xEB, 0xFB];
+        program[0x300..0x300 + code.len()].copy_from_slice(&code);
+        let mut app = Doslet::new();
+        app.session = Session::new(&program).unwrap();
+        app.launch.core_profile = Some(path.clone());
+        app.session.start();
+        assert_eq!(app.session.advance(1000), 1000);
+        let mut expected = vec![0; doslet_x86::DYNAMIC_PROFILE_MAX_BYTES];
+        let length = app.session.write_dynamic_profile(&mut expected);
+        assert!(length > 6, "synthetic loop must record hot code");
+        assert!(!path.exists());
+        let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        assert_eq!(std::fs::read(path).unwrap(), expected[..length]);
+    }
     #[test]
     fn captured_at_typing_is_discarded_and_paused_release_allows_a_fresh_press() {
         use iced::keyboard::{
@@ -1779,8 +1851,11 @@ mod tests {
         let settings = crate::native_input::LaunchSettings {
             hardware: spec.hardware,
             machine_spec: Some(spec.clone()),
+            no_dynamic_core: true,
+            core_profile: Some(std::path::PathBuf::from("unused-disabled-core-profile")),
             ..Default::default()
         };
+        app.dynamic_error_reported = true;
         let candidate = Doslet::prepare_candidate(spec.clone(), settings, None, None);
         assert!(candidate.result.is_ok());
         app.pending_output = Some(Box::new(Doslet::prepare_output(&spec).unwrap()));
@@ -1791,8 +1866,31 @@ mod tests {
         assert_eq!(app.session.hardware_config(), spec.hardware);
         assert_eq!(app.configurator.active, spec);
         assert_eq!(app.launch.hardware.memory_mib, 4);
+        assert!(app.launch.no_dynamic_core);
+        assert!(!app.session.dynamic_core_enabled());
+        assert!(!app.dynamic_error_reported);
+        assert_eq!(
+            app.launch.core_profile.as_deref(),
+            Some(std::path::Path::new("unused-disabled-core-profile"))
+        );
         app.reset();
         assert_eq!(app.session.hardware_config(), spec.hardware);
+        assert!(!app.session.dynamic_core_enabled());
+    }
+    #[test]
+    fn configured_demo_respects_disabled_native_core_on_launch_and_reset() {
+        let mut app = Doslet::from_cli(crate::cli::Cli {
+            no_audio: true,
+            no_dynamic_core: true,
+            memory_mib: Some(4),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(app.session.hardware_config().memory_mib, 4);
+        assert!(!app.session.dynamic_core_enabled());
+        app.reset();
+        assert_eq!(app.session.hardware_config().memory_mib, 4);
+        assert!(!app.session.dynamic_core_enabled());
     }
     include!("../../../tests/fixtures/sb16_pcm.rs");
     #[test]

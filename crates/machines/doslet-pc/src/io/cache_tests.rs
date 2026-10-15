@@ -73,6 +73,13 @@ fn memory(a: &PcMachine, b: &PcMachine) {
     );
 }
 
+#[cfg(all(
+    feature = "dynamic-core",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "dynamic_tests.rs"]
+mod dynamic_tests;
+
 #[test]
 fn decoded_forms_match_reference_with_dynamic_registers_prefixes_and_faults() {
     let mut cached = machine(true);

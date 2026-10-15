@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [features]
+dynamic-core = ["doslet-pc/dynamic-core", "doslet-x86/dynamic-core"]
 profiling = ["doslet-pc/profiling"]
 [dependencies]
 doslet-storage.workspace = true

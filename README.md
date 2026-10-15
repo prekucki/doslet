@@ -384,7 +384,60 @@ version-specific Heroes countdown waits. It is disabled by default; the terminal
 reports the first actual batch. These sites were inactive in the sampled main
 menu, so the flag does not promise a reduction in menu CPU usage.
 
-Selected instructions in default-32-bit code use a fixed single-instruction
+Native x86-64 and AArch64 builds of `doslet` and `doslet-headless` enable the
+`dynamic-core` Cargo feature by default. Cranelift compiles hot blocks of up to
+16 register-only dword instructions in protected 32-bit code. A terminal relative
+Jcc/JMP back to the block's start can repeat inside one native call, keeping
+registers and flags local until the loop exits or its step budget runs out.
+RAM traces can also follow relative branches and internal exits, with at most
+16 decoded instructions in a 240-byte span. They support LEA, dword memory-left
+CMP/TEST, byte MOV/CMP/TEST (including AH), PUSH/POP32, near direct/indirect CALL,
+RET/RET imm16 and dword XCHG with memory. CALL/RET can remain inside the same
+prepared graph; an external target returns to native dispatch. Data segments must be flat and readable;
+stack operations additionally require a full flat SS with a 32-bit stack, and
+CALL/RET require full flat CS. The PC exposes RAM from 500h with A20 enabled,
+excluding the VGA aperture and IVT/BDA. Every complete access is bounds checked.
+Byte/dword MOV stores continue natively in ordinary RAM with writable flat segments.
+Stores update touched page generations and exit before modifying an active code
+page. Segment safety is cached until a used selector or descriptor changes.
+Other stores, I/O, REP, real-mode code and unsupported forms use the interpreter.
+The scheduler combines native blocks and validated ordinary-RAM
+interpreter work in slices of up to 256 steps, checking IRQs and updating clocks
+and counters once per slice. Device access, mode/IF changes and hardware deadlines
+end a slice. Code bytes/generations and CS bounds remain checked. WASM keeps its
+interpreter and does not depend on Cranelift. See the
+[measurement report](docs/compatibility/native-core.md) for workload-specific
+results, warmup comparisons and correctness evidence.
+
+Use `--no-dynamic-core` in either native frontend to select the interpreter with
+its decode cache and ordinary scheduling, or build with `--no-default-features`
+to omit the native JIT.
+Headless `--no-decode-cache` disables both engines' caches for the byte-fetching
+reference. Native CLI output reports actual compiled and executed block counts.
+
+Optionally reuse observed code on subsequent launches:
+
+```sh
+cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE --core-profile target/prince.core-profile
+```
+
+The same `--core-profile FILE` option works with headless runners. Profiles are
+local hints containing bounded guest code bytes, never saved host machine code.
+Keep them outside game directories and do not redistribute profiles of commercial
+games. The desktop saves on pause, reset and normal shutdown; headless saves at
+the end of a run, including budget exhaustion. Every profile block is decoded
+again and checked against current RAM before execution. Relocated or changed
+bytes fall back to interpretation. Automatic LE object/relocation analysis and
+object-relative profile identities remain future work.
+
+Compilation happens in explicit `Session::prepare_dynamic` maintenance calls
+between execution batches, with at most two blocks per ordinary frontend call.
+It may allocate and adds host latency; `Session::advance` remains allocation-free.
+Compiler failure or the 4096-block lifetime compilation limit stops further
+compilation once, preserving interpreter fallback. See
+[the native core contract](docs/architecture.md#native-dynamic-core) for boundaries.
+
+Selected interpreter instructions in default-32-bit code use a fixed single-instruction
 decode cache shared by native and WASM builds. Page write generations, A20 mapping
 and CS context validate entries. Other forms retain the interpreter; REP and IRQ
 boundaries stay unchanged. Append `--no-decode-cache` for a reference run using
@@ -436,8 +489,10 @@ apps/
 └── doslet-headless/     demo, COM/MZ runners, inspector and benchmark
 ```
 
-All emulation and MIDI synthesis libraries compile with `no_std`; components that own buffers
-use `alloc`. CPU execution uses static bus dispatch. Scanout borrows device
+The portable emulation and MIDI synthesis libraries compile with `no_std`;
+components that own buffers use `alloc`. The optional `doslet-x86-jit` native
+compiler adapter uses `std` and executable memory. CPU execution uses static bus
+dispatch. Scanout borrows device
 memory, and RGBA conversion writes into caller-owned storage. A regression test
 checks **zero heap allocations while running the demo and converting its frame
 after setup**, and while executing the relocated MZ fixture with console output.
@@ -457,11 +512,30 @@ cargo test --workspace --locked
 cargo check -p doslet -p doslet-time -p doslet-executable --target wasm32-unknown-unknown --locked
 cargo check -p doslet-web-worker -p doslet-web-audio --target wasm32-unknown-unknown --locked
 cargo run -p doslet-headless --release --locked -- bench --steps 5000000
+cargo run -p doslet-headless --release --locked --example bench_dynamic
 ```
 
 The benchmark reports host execution steps per second, not emulated MHz or a
 game performance claim. REP iterations count as separate execution steps so a
 batch stays bounded.
+
+`bench_dynamic` compares five million synthetic protected-mode register and RAM steps
+against the cached interpreter in three alternating pairs after warmup, verifies
+registers/flags/time and exposed RAM/VRAM, and reports median execution and compilation separately.
+It is not a game benchmark. For the local PRINCE JIT
+comparison, use the ignored test
+`local_prince_dynamic_core_matches_reference_during_execution` in place of the
+decode-cache test above. Set `DOSLET_PRINCE_EXE` when the installation is elsewhere.
+
+To count native exit reasons and addresses separately from timing, run:
+
+```sh
+cargo run -p doslet-headless --release --features profiling --locked --example profile_dynamic_exits -- /path/to/PRINCE.EXE 1000000000
+```
+
+This opt-in diagnostic validates state against the cached interpreter at each
+100-million-step checkpoint and writes metadata CSV. It is not a throughput
+benchmark. See [native exit measurements](docs/compatibility/native-core.md#measured-native-exit-reasons).
 
 After building the web bundle, run the optional real-browser check with Firefox
 and Python's standard library (no Node, Selenium or package installation):

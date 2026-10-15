@@ -113,10 +113,8 @@ impl Cache {
             self.window = r.window(SegmentRegister::Cs, Access::Execute);
         }
     }
-    fn instruction<B: CpuBus>(&mut self, r: &Registers, bus: &B) -> Option<Instruction> {
-        if !self.enabled {
-            return None;
-        }
+    #[inline(always)]
+    pub(super) fn code_context(&mut self, r: &Registers) -> Option<(SegmentWindow, SegmentCache)> {
         // The hidden CS cache changes only with a new version in the same
         // lineage or with PE mode; the selector is public, so it is keyed too.
         // Keep the tuple: a packed [u64; 2] key measured ~5 ns/step slower in
@@ -144,7 +142,13 @@ impl Cache {
         if !self.code32 {
             return None;
         }
-        let window = self.window?;
+        Some((self.window?, self.context?.cs))
+    }
+    fn instruction<B: CpuBus>(&mut self, r: &Registers, bus: &B) -> Option<Instruction> {
+        if !self.enabled {
+            return None;
+        }
+        let (window, _) = self.code_context(r)?;
         let address = window.address(r.ip, 1)?;
         let index = ((address ^ (address >> 9)) as usize) & (CAPACITY - 1);
         if let Some(entry) = self.entries[index]
@@ -331,17 +335,394 @@ enum Operation {
         displacement: i32,
     },
     Call(i32),
+    CallIndirect(Value),
     Return(u16),
     Input,
     Output,
 }
 #[derive(Clone, Copy)]
-struct Instruction {
+pub(super) struct Instruction {
     length: u8,
     /// Position before a faultable data read that precedes immediate fetching.
     read_length: u8,
     dword: bool,
     operation: Operation,
+}
+
+#[cfg(all(
+    feature = "dynamic-core",
+    not(target_arch = "wasm32"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl Instruction {
+    pub(super) fn native_candidate(self) -> bool {
+        match self.operation {
+            Operation::Move {
+                target: Target::Register(_),
+                source,
+            } => {
+                matches!(
+                    source,
+                    Value::Immediate(_)
+                        | Value::Operand(Target::Register(_))
+                        | Value::Operand(Target::Memory {
+                            address32: true,
+                            ..
+                        })
+                )
+            }
+            Operation::Move {
+                target: Target::Memory {
+                    address32: true, ..
+                },
+                source: Value::Immediate(_) | Value::Operand(Target::Register(_)),
+            } => true,
+            Operation::Alu {
+                target,
+                source,
+                operation,
+                store,
+            } => {
+                let readable = |target| {
+                    matches!(
+                        target,
+                        Target::Register(_)
+                            | Target::Memory {
+                                address32: true,
+                                ..
+                            }
+                    )
+                };
+                readable(target)
+                    && match source {
+                        Value::Immediate(_) => true,
+                        Value::Operand(source) => readable(source),
+                    }
+                    && if store {
+                        self.dword && matches!(target, Target::Register(_))
+                    } else {
+                        self.dword || matches!(operation, 4 | 7)
+                    }
+            }
+            Operation::Lea {
+                target: Target::Memory {
+                    address32: true, ..
+                },
+                ..
+            }
+            | Operation::Push(_)
+            | Operation::Pop(_)
+            | Operation::Call(_)
+            | Operation::CallIndirect(_)
+            | Operation::Return(_) => true,
+            Operation::Exchange {
+                target: Target::Memory {
+                    address32: true, ..
+                },
+                ..
+            } => self.dword,
+            Operation::Inc { .. }
+            | Operation::Exchange {
+                target: Target::Register(_),
+                ..
+            }
+            | Operation::Unary {
+                target: Target::Register(_),
+                ..
+            } => self.dword,
+            _ => false,
+        }
+    }
+
+    fn batch_safe<B: CpuBus>(self, cpu: &Cpu, bus: &B) -> bool {
+        let r = &cpu.registers;
+        let length = if self.dword { 4 } else { 1 };
+        let span = |segment, offset, length, access| {
+            r.address(segment, offset, length, access)
+                .ok()
+                .filter(|address| bus.is_plain_ram(*address, length))
+        };
+        let target = |target: Target, length, access| match target.resolve(r) {
+            Operand::Register(_) => true,
+            Operand::Memory { segment, offset } => span(segment, offset, length, access).is_some(),
+        };
+        let source = |value, length| match value {
+            Value::Immediate(_) => true,
+            Value::Operand(operand) => target(operand, length, Access::Read),
+        };
+        let jump = |address| {
+            r.address(SegmentRegister::Cs, address, 1, Access::Execute)
+                .is_ok()
+        };
+        let push = || {
+            let sp = cpu.stack_pointer().wrapping_sub(4);
+            let sp = if r.stack32() {
+                sp
+            } else {
+                u32::from(sp as u16)
+            };
+            span(SegmentRegister::Ss, sp, 4, Access::Write).is_some()
+        };
+        let pop = || span(SegmentRegister::Ss, cpu.stack_pointer(), 4, Access::Read);
+        match self.operation {
+            Operation::Move {
+                target: dst,
+                source: src,
+            } => source(src, length) && target(dst, length, Access::Write),
+            Operation::Alu {
+                target: dst,
+                source: src,
+                store,
+                ..
+            } => {
+                target(dst, length, Access::Read)
+                    && source(src, length)
+                    && (!store || target(dst, length, Access::Write))
+            }
+            Operation::Exchange { target: dst, .. } => {
+                target(dst, length, Access::Read) && target(dst, length, Access::Write)
+            }
+            Operation::Unary { target: dst, .. } => {
+                target(dst, 4, Access::Read) && target(dst, 4, Access::Write)
+            }
+            Operation::Lea { .. } | Operation::Inc { .. } => true,
+            Operation::Push(value) => source(value, 4) && push(),
+            Operation::Pop(_) => pop().is_some(),
+            Operation::Branch {
+                condition,
+                displacement,
+            } => {
+                condition.is_some_and(|condition| !flags::condition(cpu.flags, condition))
+                    || jump(
+                        r.ip.wrapping_add(u32::from(self.length))
+                            .wrapping_add_signed(displacement),
+                    )
+            }
+            Operation::Call(displacement) => {
+                jump(
+                    r.ip.wrapping_add(u32::from(self.length))
+                        .wrapping_add_signed(displacement),
+                ) && push()
+            }
+            Operation::CallIndirect(value) => {
+                let address = match value {
+                    Value::Immediate(value) => Some(value),
+                    Value::Operand(Target::Register(register)) => {
+                        Some(r.get32(Gpr32::decode(register)))
+                    }
+                    Value::Operand(target) => match target.resolve(r) {
+                        Operand::Memory { segment, offset } => {
+                            span(segment, offset, 4, Access::Read)
+                                .and_then(|address| bus.code_bytes(address, 4))
+                                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                                .map(u32::from_le_bytes)
+                        }
+                        Operand::Register(_) => unreachable!(),
+                    },
+                };
+                address.is_some_and(jump) && push()
+            }
+            Operation::Return(_) => pop()
+                .and_then(|address| bus.code_bytes(address, 4))
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .is_some_and(|bytes| jump(u32::from_le_bytes(bytes))),
+            Operation::Input | Operation::Output => false,
+        }
+    }
+}
+
+/// Decode default-32-bit trace operations without resolving data addresses.
+/// Used segment assumptions are validated and cached at native entry.
+#[cfg(all(
+    feature = "dynamic-core",
+    not(target_arch = "wasm32"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(super) fn native_trace_instruction(
+    bytes: &[u8],
+    offset: u8,
+) -> Option<(doslet_x86_jit::TraceInstruction, u8, u8)> {
+    use doslet_x86_jit::{DwordMemoryAddress, TraceInstruction, TraceOperation as Op, TraceSource};
+    let i = Instruction::decode(bytes)?;
+    let mut segments = 0;
+    let mut write_segments = 0;
+    let memory = |target| match target {
+        Target::Memory {
+            segment,
+            base,
+            index,
+            scale,
+            displacement,
+            address32: true,
+        } => Some((
+            segment,
+            DwordMemoryAddress {
+                base: (base != NO_REGISTER).then_some(base),
+                index: (index != NO_REGISTER).then_some(index),
+                scale,
+                displacement,
+            },
+        )),
+        _ => None,
+    };
+    let mut source = |v, byte| match v {
+        Value::Immediate(v) => Some(TraceSource::Immediate(v)),
+        Value::Operand(Target::Register(r)) => Some(if byte {
+            TraceSource::ByteRegister(r)
+        } else {
+            TraceSource::Register(r)
+        }),
+        Value::Operand(target) => {
+            let (segment, address) = memory(target)?;
+            segments |= 1 << segment as u8;
+            Some(if byte {
+                TraceSource::ByteMemory(address)
+            } else {
+                TraceSource::Memory(address)
+            })
+        }
+    };
+    let operation = match i.operation {
+        Operation::Move {
+            target: Target::Register(target),
+            source: value,
+        } => {
+            let source = source(value, !i.dword)?;
+            if i.dword {
+                Op::Move { target, source }
+            } else {
+                Op::MoveByte { target, source }
+            }
+        }
+        Operation::Move {
+            target,
+            source: value @ (Value::Immediate(_) | Value::Operand(Target::Register(_))),
+        } => {
+            let source = source(value, !i.dword)?;
+            let (segment, address) = memory(target)?;
+            write_segments |= 1 << segment as u8;
+            if i.dword {
+                Op::Store { address, source }
+            } else {
+                Op::StoreByte { address, source }
+            }
+        }
+        Operation::Alu {
+            target,
+            source: value,
+            operation,
+            store: false,
+        } if matches!(operation, 4 | 7) => Op::Compare {
+            left: source(Value::Operand(target), !i.dword)?,
+            right: source(value, !i.dword)?,
+            operation,
+            byte: !i.dword,
+        },
+        Operation::Alu {
+            target: Target::Register(target),
+            source: value,
+            operation,
+            store,
+        } if i.dword => Op::Alu {
+            target,
+            source: source(value, false)?,
+            operation,
+            store,
+        },
+        Operation::Lea {
+            register: target,
+            target: address,
+        } => Op::Lea {
+            target,
+            address: memory(address)?.1,
+        },
+        Operation::Inc {
+            register,
+            decrement,
+        } if i.dword => Op::Inc {
+            register,
+            decrement,
+        },
+        Operation::Exchange {
+            target: Target::Register(left),
+            register: right,
+        } if i.dword => Op::Exchange { left, right },
+        Operation::Exchange { target, register } if i.dword => {
+            let (segment, address) = memory(target)?;
+            segments |= 1 << segment as u8;
+            write_segments |= 1 << segment as u8;
+            Op::ExchangeMemory { address, register }
+        }
+        Operation::Unary {
+            target: Target::Register(register),
+            negate,
+        } if i.dword => Op::Unary { register, negate },
+        Operation::Push(value) => {
+            let source = source(value, false)?;
+            write_segments |= 1 << SegmentRegister::Ss as u8;
+            Op::Push { source }
+        }
+        Operation::Pop(register) => {
+            segments |= 1 << SegmentRegister::Ss as u8;
+            Op::Pop { register }
+        }
+        Operation::Call(displacement) => {
+            write_segments |= 1 << SegmentRegister::Ss as u8;
+            Op::Call {
+                target: u32::from(offset)
+                    .wrapping_add(u32::from(i.length))
+                    .wrapping_add_signed(displacement),
+            }
+        }
+        Operation::CallIndirect(value) => {
+            let target = source(value, false)?;
+            write_segments |= 1 << SegmentRegister::Ss as u8;
+            Op::CallIndirect { target }
+        }
+        Operation::Return(release) => {
+            segments |= 1 << SegmentRegister::Ss as u8;
+            Op::Return { release }
+        }
+        Operation::Branch {
+            condition,
+            displacement,
+        } => Op::Branch {
+            condition,
+            target: u32::from(offset)
+                .wrapping_add(u32::from(i.length))
+                .wrapping_add_signed(displacement),
+        },
+        _ => return None,
+    };
+    Some((
+        TraceInstruction {
+            offset,
+            length: i.length,
+            operation,
+        },
+        segments,
+        write_segments,
+    ))
+}
+
+#[cfg(all(
+    feature = "dynamic-core",
+    not(target_arch = "wasm32"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl Cpu {
+    pub(super) fn batch_instruction<B: CpuBus>(&mut self, bus: &B) -> Option<Instruction> {
+        let instruction = self.decode_cache.instruction(&self.registers, bus)?;
+        instruction.batch_safe(self, bus).then_some(instruction)
+    }
+
+    pub(super) fn execute_batched<B: CpuBus>(&mut self, bus: &mut B, instruction: Instruction) {
+        // Complete operand/stack/branch checks precede all effects. The bus's
+        // plain-RAM contract guarantees successful accesses until a mutation;
+        // this instruction cannot change mappings or its own later addresses.
+        self.execute_cached(bus, instruction)
+            .expect("validated batch instruction and plain-RAM bus contract");
+    }
 }
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -578,6 +959,12 @@ impl Instruction {
                 };
                 Operation::Move { target, source }
             }
+            0xA8 | 0xA9 => Operation::Alu {
+                target: Target::Register(0),
+                source: Value::Immediate(r.immediate(dword)?),
+                operation: 4,
+                store: false,
+            },
             0xB0..=0xBF => {
                 dword = opcode >= 0xB8;
                 Operation::Move {
@@ -610,7 +997,16 @@ impl Instruction {
             },
             0xC2 => Operation::Return(r.word()?),
             0xC3 => Operation::Return(0),
-            0xF7 => {
+            0xFF => {
+                let modrm = r.byte()?;
+                let target = r.target(modrm, address32, segment)?;
+                match (modrm >> 3) & 7 {
+                    2 => Operation::CallIndirect(Value::Operand(target)),
+                    6 => Operation::Push(Value::Operand(target)),
+                    _ => return None,
+                }
+            }
+            0xF6 | 0xF7 => {
                 let modrm = r.byte()?;
                 let target = r.target(modrm, address32, segment)?;
                 match (modrm >> 3) & 7 {
@@ -618,12 +1014,12 @@ impl Instruction {
                         read_length = Some(r.position as u8);
                         Operation::Alu {
                             target,
-                            source: Value::Immediate(r.dword()?),
+                            source: Value::Immediate(r.immediate(dword)?),
                             operation: 4,
                             store: false,
                         }
                     }
-                    2 | 3 => Operation::Unary {
+                    2 | 3 if dword => Operation::Unary {
                         target,
                         negate: modrm & 0x38 == 0x18,
                     },
@@ -644,6 +1040,80 @@ impl Instruction {
             operation,
         })
     }
+}
+
+/// Share decoding with the native backend; unsupported or faultable operations
+/// terminate a native block before any guest state changes.
+#[cfg(all(
+    feature = "dynamic-core",
+    not(target_arch = "wasm32"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(super) fn native_instruction(
+    bytes: &[u8],
+    block_offset: u8,
+) -> Option<doslet_x86_jit::Instruction> {
+    use doslet_x86_jit::{Instruction as Native, Operation as Op, Source};
+    let i = Instruction::decode(bytes)?;
+    // Branches have no byte/dword data operand. For short Jcc the decoder's
+    // generic width bit follows opcode bit 0, so both values must be accepted.
+    // The shared decoder has already rejected operand-size override 66h.
+    if !i.dword && !matches!(i.operation, Operation::Branch { .. }) {
+        return None;
+    }
+    let source = |v| match v {
+        Value::Immediate(v) => Some(Source::Immediate(v)),
+        Value::Operand(Target::Register(r)) => Some(Source::Register(r)),
+        _ => None,
+    };
+    let operation = match i.operation {
+        Operation::Move {
+            target: Target::Register(target),
+            source: s,
+        } => Op::Move {
+            target,
+            source: source(s)?,
+        },
+        Operation::Alu {
+            target: Target::Register(target),
+            source: s,
+            operation,
+            store,
+        } => Op::Alu {
+            target,
+            source: source(s)?,
+            operation,
+            store,
+        },
+        Operation::Inc {
+            register,
+            decrement,
+        } => Op::Inc {
+            register,
+            decrement,
+        },
+        Operation::Exchange {
+            target: Target::Register(left),
+            register: right,
+        } => Op::Exchange { left, right },
+        Operation::Unary {
+            target: Target::Register(register),
+            negate,
+        } => Op::Unary { register, negate },
+        Operation::Branch {
+            condition,
+            displacement,
+        } if block_offset != 0
+            && i64::from(block_offset) + i64::from(i.length) + i64::from(displacement) == 0 =>
+        {
+            Op::LoopBranch { condition }
+        }
+        _ => return None,
+    };
+    Some(Native {
+        length: i.length,
+        operation,
+    })
 }
 impl Cpu {
     pub(super) fn cached_step<B: CpuBus>(
@@ -748,6 +1218,13 @@ impl Cpu {
             Operation::Call(displacement) => {
                 self.near_jump(next.wrapping_add_signed(displacement))?;
                 self.push32(bus, next)?;
+            }
+            Operation::CallIndirect(target) => {
+                // FF /2 reads the target before pushing, and validates the
+                // destination after the push, matching the reference's faults.
+                let target = target.read(self, bus, true)?;
+                self.push32(bus, next)?;
+                self.near_jump(target)?;
             }
             Operation::Return(release) => {
                 let target = self.pop32(bus)?;

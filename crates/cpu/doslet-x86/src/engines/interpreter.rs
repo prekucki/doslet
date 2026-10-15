@@ -4,6 +4,13 @@ use crate::{Gpr16, Gpr32, Registers, decode, flags};
 use core::fmt;
 use doslet_bus::{BusError, CpuBus, MemoryBus};
 mod cache;
+#[cfg(all(
+    feature = "dynamic-core",
+    not(target_arch = "wasm32"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "dynamic.rs"]
+mod dynamic;
 mod operand32;
 mod segments;
 mod x87;
@@ -214,6 +221,12 @@ pub struct Cpu {
     halted: bool,
     interrupt_shadow: u8,
     decode_cache: cache::Cache,
+    #[cfg(all(
+        feature = "dynamic-core",
+        not(target_arch = "wasm32"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    dynamic: dynamic::Cache,
 }
 
 impl Default for Cpu {
@@ -226,6 +239,12 @@ impl Default for Cpu {
             halted: false,
             interrupt_shadow: 0,
             decode_cache: cache::Cache::default(),
+            #[cfg(all(
+                feature = "dynamic-core",
+                not(target_arch = "wasm32"),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            dynamic: dynamic::Cache::default(),
         }
     }
 }
@@ -235,6 +254,9 @@ impl Cpu {
     pub fn set_decode_cache(&mut self, enabled: bool) {
         self.decode_cache.clear();
         self.decode_cache.enabled = enabled;
+        if !enabled {
+            self.set_dynamic_core(false);
+        }
     }
     #[cfg(feature = "profiling")]
     pub fn decode_cache_stats(&self) -> DecodeCacheStats {

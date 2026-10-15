@@ -363,6 +363,40 @@ impl Session {
     pub fn set_decode_cache(&mut self, enabled: bool) {
         self.machine.cpu.set_decode_cache(enabled);
     }
+    pub fn set_dynamic_core(&mut self, enabled: bool) {
+        self.machine.cpu.set_dynamic_core(enabled);
+    }
+    pub fn dynamic_core_enabled(&self) -> bool {
+        self.machine.cpu.dynamic_core_enabled()
+    }
+    pub fn dynamic_stats(&self) -> doslet_x86::DynamicStats {
+        self.machine.cpu.dynamic_stats()
+    }
+    /// Opt-in native-exit diagnostics. Configure before compiling native code;
+    /// allocation is confined to this setup call, not guest execution.
+    pub fn set_dynamic_exit_profiling(&mut self, enabled: bool) -> Result<(), &'static str> {
+        self.machine.cpu.set_dynamic_exit_profiling(enabled)
+    }
+    pub fn dynamic_exit_profile(&self) -> &[doslet_x86::DynamicExitRecord] {
+        self.machine.cpu.dynamic_exit_profile()
+    }
+    pub fn dynamic_exit_profile_dropped(&self) -> u64 {
+        self.machine.cpu.dynamic_exit_profile_dropped()
+    }
+    pub fn dynamic_error(&self) -> Option<&str> {
+        self.machine.cpu.dynamic_error()
+    }
+    /// Native compiler maintenance. May allocate; call outside advance() and
+    /// audio callbacks. Unsupported targets/builds return zero.
+    pub fn prepare_dynamic(&mut self, limit: usize) -> usize {
+        self.machine.cpu.prepare_dynamic(limit)
+    }
+    pub fn load_dynamic_profile(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+        self.machine.cpu.load_dynamic_profile(bytes)
+    }
+    pub fn write_dynamic_profile(&self, output: &mut [u8]) -> usize {
+        self.machine.cpu.write_dynamic_profile(output)
+    }
     /// Experimental caller-selected memory polling sites; no guest code patches.
     pub fn set_memory_wait_sites(&mut self, operand: u32, starts: [u32; 3]) {
         self.machine
@@ -503,7 +537,6 @@ impl Session {
             match self.execute_step(budget - completed) {
                 Ok(consumed) => {
                     completed += consumed;
-                    self.steps += u64::from(consumed);
                 }
                 Err(error) => {
                     self.fault = Some(error);
@@ -511,6 +544,7 @@ impl Session {
                 }
             }
         }
+        self.steps += u64::from(completed);
         completed
     }
     /// Whether the most recent `advance` ended on INT 2Fh/1680h. Frontends

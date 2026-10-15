@@ -434,7 +434,14 @@ mod tests {
                     assert!(dispatched < total * 3 / 4);
                     fast.cpu.registers.set_byte(4, 1);
                     reference.cpu.registers.set_byte(4, 1);
-                    assert_eq!(advance(&mut fast, 100), 100);
+                    #[cfg(feature = "profiling")]
+                    let waits_before = fast.execution_stats().vga_wait_steps;
+                    advance(&mut fast, 100);
+                    // Ordinary native/RAM batching may still combine steps;
+                    // AH != 8 must disable only the VGA polling acceleration.
+                    assert!(fast.vga_wait.candidate.is_none());
+                    #[cfg(feature = "profiling")]
+                    assert_eq!(fast.execution_stats().vga_wait_steps, waits_before);
                     advance(&mut reference, 100);
                     compare(&mut fast, &mut reference);
                 }

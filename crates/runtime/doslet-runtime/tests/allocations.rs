@@ -4,6 +4,183 @@ use doslet_runtime::{Session, SessionStatus};
 include!("../../../../tests/fixtures/relocated_mz.rs");
 include!("../../../../tests/fixtures/protected_graphics.rs");
 include!("../../../../tests/fixtures/iso9660.rs");
+
+#[cfg(all(
+    feature = "dynamic-core",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn native_byte_stack_and_call_loop_allocates_nothing_after_preparation() {
+    let mut program = protected_graphics_com();
+    program[0x208..0x210].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x9A, 0xCF, 0]);
+    program[19..23].copy_from_slice(&0x10400_u32.to_le_bytes());
+    program[0x210..0x218].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x92, 0xCF, 0]);
+    let mut code = vec![
+        0xFA, 0xB8, 0x10, 0, 0, 0, 0x8E, 0xD8, 0x8E, 0xC0, 0x8E, 0xD0, // Full flat DS/ES/SS.
+        0xBC, 0, 1, 0x15, 0, // MOV ESP,150100h.
+        0xB0, 2, 0xE6, 0x92, // A20 on.
+        0xBE, 0, 0, 0x12, 0, // MOV ESI,120000h.
+    ];
+    let loop_start = code.len();
+    code.extend_from_slice(&[
+        0x8A, 0x06, 0x88, 0xC4, // MOV AL,[ESI]; MOV AH,AL.
+        0x38, 0x26, 0x8D, 0x5E, 4, // CMP [ESI],AH; LEA EBX,[ESI+4].
+        0x50, 0x87, 0x44, 0x24, 4, // PUSH EAX; XCHG [ESP+4],EAX.
+        0xE8, 0x0D, 0, 0, 0, // CALL callee.
+        0x5A, 0x47, 0xEB, 0xE9, // POP EDX; INC EDI; JMP start.
+    ]);
+    code.resize(loop_start + 32, 0x90);
+    code.extend_from_slice(&[0x84, 0x26, 0x88, 0x66, 1, 0x40, 0xC3]); // TEST; store AH; INC; RET.
+    program[0x300..0x300 + code.len()].copy_from_slice(&code);
+    let mut native = Session::new(&program).unwrap();
+    let mut reference = Session::new(&program).unwrap();
+    reference.set_decode_cache(false);
+    for session in [&mut native, &mut reference] {
+        session.start();
+        assert_eq!(session.advance(1000), 1000);
+    }
+    assert!(
+        native.prepare_dynamic(8) > 0,
+        "{:?}",
+        native.dynamic_error()
+    );
+    let before = native.dynamic_stats();
+    let budgets = [1, 2, 3, 7, 31, 255, 1009, 10000];
+    let measured = allocation_counter::measure(|| {
+        for budget in budgets {
+            assert_eq!(native.advance(budget), budget);
+        }
+    });
+    for budget in budgets {
+        assert_eq!(reference.advance(budget), budget);
+    }
+    assert_eq!(native.status(), SessionStatus::Running);
+    assert_eq!(native.registers(), reference.registers());
+    assert_eq!(native.eflags(), reference.eflags());
+    assert_eq!(native.control_registers(), reference.control_registers());
+    assert_eq!(native.steps(), reference.steps());
+    assert_eq!(native.emulated_nanos(), reference.emulated_nanos());
+    for range in [0..0xA0000, 0xB0000..0x1000000] {
+        assert_eq!(native.ram_view(range.clone()), reference.ram_view(range));
+    }
+    assert_eq!(native.vram_view(), reference.vram_view());
+    let after = native.dynamic_stats();
+    assert!(after.ram_trace_steps - before.ram_trace_steps > 1000);
+    assert_eq!(measured.count_total, 0);
+    assert_eq!(measured.bytes_total, 0);
+}
+
+#[cfg(all(
+    feature = "dynamic-core",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn native_writable_ram_trace_allocates_nothing_after_preparation() {
+    for profile_exits in [false, true] {
+        let mut program = protected_graphics_com();
+        program[0x210..0x218].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x92, 0xCF, 0]);
+        let code = [
+            0xFA, // No IRQ handler is installed by this synthetic workload.
+            0xB8, 0x10, 0, 0, 0, 0x8E, 0xD8, 0x8E, 0xC0, // Full flat DS and ES.
+            0xB0, 2, 0xE6, 0x92, // Enable A20.
+            0xBE, 0, 0, 0x12, 0, // MOV ESI,120000h.
+            0x8B, 0x06, 0x40, 0x89, 0x06, 0xEB, 0xF9, // Read, increment, store, repeat.
+        ];
+        program[0x300..0x300 + code.len()].copy_from_slice(&code);
+        let mut native = Session::new(&program).unwrap();
+        native.set_dynamic_exit_profiling(profile_exits).unwrap();
+        let mut reference = Session::new(&program).unwrap();
+        reference.set_decode_cache(false);
+        for session in [&mut native, &mut reference] {
+            session.start();
+            assert_eq!(session.advance(1000), 1000);
+        }
+        assert!(
+            native.prepare_dynamic(8) > 0,
+            "{:?}",
+            native.dynamic_error()
+        );
+        let before = native.dynamic_stats();
+        let budgets = [1, 2, 3, 7, 31, 1009, 10000];
+        let measured = allocation_counter::measure(|| {
+            for budget in budgets {
+                assert_eq!(native.advance(budget), budget);
+            }
+        });
+        for budget in budgets {
+            assert_eq!(reference.advance(budget), budget);
+        }
+        assert_eq!(native.status(), SessionStatus::Running);
+        assert_eq!(native.status(), reference.status());
+        assert_eq!(native.registers(), reference.registers());
+        assert_eq!(native.eflags(), reference.eflags());
+        assert_eq!(native.control_registers(), reference.control_registers());
+        assert_eq!(native.steps(), reference.steps());
+        assert_eq!(native.emulated_nanos(), reference.emulated_nanos());
+        for range in [0..0xA0000, 0xB0000..0x1000000] {
+            assert_eq!(native.ram_view(range.clone()), reference.ram_view(range));
+        }
+        assert_eq!(native.vram_view(), reference.vram_view());
+        let after = native.dynamic_stats();
+        assert!(after.executed_steps - before.executed_steps > 1000);
+        assert!(after.ram_trace_steps - before.ram_trace_steps > 1000);
+        assert_eq!(measured.count_total, 0);
+        assert_eq!(measured.bytes_total, 0);
+        let reported = native
+            .dynamic_exit_profile()
+            .iter()
+            .map(|record| record.count)
+            .sum::<u64>();
+        assert_eq!(reported > 0, profile_exits);
+        assert_eq!(native.dynamic_exit_profile_dropped(), 0);
+    }
+}
+
+#[cfg(all(
+    feature = "dynamic-core",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn native_block_execution_and_invalidation_allocate_nothing_after_preparation() {
+    let mut program = protected_graphics_com();
+    let code = [
+        0xB8, 0x10, 0, 0, 0, 0x8E, 0xD8, // Flat DS.
+        0x40, 0x41, 0x42, 0x43, // Four register operations.
+        0xA3, 0, 0, 2, 0, // Interpreter store, also invalidates the data page.
+        0xEB, 0xF5, // Back to the register block.
+    ];
+    program[0x300..0x300 + code.len()].copy_from_slice(&code);
+    let mut native = Session::new(&program).unwrap();
+    let mut reference = Session::new(&program).unwrap();
+    reference.set_decode_cache(false);
+    native.start();
+    reference.start();
+    assert_eq!(native.advance(1000), 1000);
+    assert_eq!(reference.advance(1000), 1000);
+    assert!(
+        native.prepare_dynamic(8) > 0,
+        "{:?}",
+        native.dynamic_error()
+    );
+    let measured = allocation_counter::measure(|| {
+        for budget in [1, 2, 7, 31, 1009, 10000] {
+            assert_eq!(native.advance(budget), budget);
+        }
+    });
+    for budget in [1, 2, 7, 31, 1009, 10000] {
+        assert_eq!(reference.advance(budget), budget);
+    }
+    assert_eq!(native.registers(), reference.registers());
+    assert_eq!(native.eflags(), reference.eflags());
+    assert_eq!(native.emulated_nanos(), reference.emulated_nanos());
+    assert_eq!(
+        native.ram_view(0x20000..0x20004),
+        reference.ram_view(0x20000..0x20004)
+    );
+    assert!(native.dynamic_stats().executed_steps > 1000);
+    assert_eq!(measured.count_total, 0);
+    assert_eq!(measured.bytes_total, 0);
+}
 #[test]
 fn cdrom_file_open_seek_read_and_close_allocate_nothing_after_setup() {
     let mut program = vec![0; 0x130];

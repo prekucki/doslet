@@ -2,6 +2,51 @@ use crate::*;
 use doslet_bus::{MemoryBus, PortBus};
 use doslet_config::{HardwareConfig, KeyboardMode};
 use doslet_input::PhysicalKey;
+
+#[test]
+fn native_ram_views_follow_each_configured_capacity_and_page_table() {
+    for memory_mib in [4, 8, 16, 32] {
+        let mut m = PcMachine::from_config(HardwareConfig {
+            memory_mib,
+            ..HardwareConfig::default()
+        })
+        .unwrap();
+        assert!(m.bus.native_ram().is_none());
+        assert!(m.bus.native_ram_mut().is_none());
+        m.bus.set_a20(true);
+        let end = usize::from(memory_mib) * 1024 * 1024;
+        m.bus.write_u32(end as u32 - 4, 0xA1B2C3D4).unwrap();
+        {
+            let view = m
+                .bus
+                .native_ram()
+                .expect("configured RAM must support native reads");
+            assert_eq!(view.linear_base, 0x500);
+            assert_eq!(view.bytes.len(), end - 0x500);
+            assert_eq!(
+                &view.bytes[view.bytes.len() - 4..],
+                &0xA1B2C3D4_u32.to_le_bytes()
+            );
+            assert_eq!(view.excluded_start, 0xA0000);
+            assert_eq!(view.excluded_len, 0x10000);
+        }
+        {
+            let view = m
+                .bus
+                .native_ram_mut()
+                .expect("configured RAM must support native writes");
+            assert_eq!(view.linear_base, 0x500);
+            assert_eq!(view.bytes.len(), end - 0x500);
+            assert_eq!(view.page_generations.len(), end / 4096);
+            assert_eq!(view.excluded_start, 0xA0000);
+            assert_eq!(view.excluded_len, 0x10000);
+        }
+        m.bus.set_a20(false);
+        assert!(m.bus.native_ram().is_none());
+        assert!(m.bus.native_ram_mut().is_none());
+    }
+}
+
 #[test]
 fn every_ram_capacity_matches_cmos_and_last_wide_transaction() {
     for memory_mib in [4, 8, 16, 32] {

@@ -111,6 +111,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!(
             "Doslet headless\n\n  demo [--steps N] [--frame PATH.ppm]\n  run-com PATH [--steps N] [--frame PATH.ppm]\n  run-mz PATH [--steps N] [--frame PATH.ppm]\n  run-stub PATH [--steps N] [--frame PATH.ppm] [--midi-log PATH] [--midi-wave PATH.wav] (experimental game startup)\n  inspect [PATH]  (default: PRINCE/PRINCE.EXE)\n  bench [--steps N]\n\nRunner diagnostics: --trace N, --trace-tail, --peek HEXADDRESS:DECIMALLENGTH (1..128 bytes), --find-ascii PATTERN (1..128 bytes, up to 16 extended-RAM matches), --profile-cpu (requires Cargo feature profiling), --no-vga-waits (disable VGA wait recognition/batching), --no-decode-cache (use the reference interpreter).\nDemo runs an original COM program. PRINCE intro graphics and guest MIDI are observed; interactive sound is confirmed separately in the UI."
         );
+        println!(
+            "Native core: --no-dynamic-core (cached interpreter), --core-profile FILE (load/save observed blocks outside the game directory)."
+        );
         if command != "help" && command != "--help" && command != "-h" {
             return Err(format!("unknown command: {command}").into());
         }
@@ -144,6 +147,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         200_000
     };
     let mut frame_path: Option<PathBuf> = None;
+    let mut core_profile: Option<PathBuf> = None;
     let mut midi_path: Option<PathBuf> = None;
     let mut wave_path: Option<PathBuf> = None;
     let mut trace_remaining: u64 = 0;
@@ -158,6 +162,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         match option.as_str() {
             "--no-vga-waits" => session.set_vga_wait_acceleration(false),
             "--no-decode-cache" => session.set_decode_cache(false),
+            "--no-dynamic-core" => session.set_dynamic_core(false),
+            "--core-profile" => {
+                core_profile = Some(args.next().ok_or("missing core profile path")?.into())
+            }
             "--profile-cpu" => {
                 #[cfg(feature = "profiling")]
                 {
@@ -197,6 +205,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             _ => return Err(format!("unknown option: {option}").into()),
         }
+    }
+    if let Some(path) = &core_profile {
+        native_input::load_core_profile(&mut session, path);
     }
     session.start();
     let mut midi_log = midi_path
@@ -247,6 +258,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         } else {
             remaining.min(u64::from(batch_limit)) as u32
         };
+        session.prepare_dynamic(2);
         #[cfg(feature = "profiling")]
         let cpu_start = Instant::now();
         let completed = session.advance(batch);
@@ -295,6 +307,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     let elapsed = start.elapsed();
+    if let Some(path) = &core_profile {
+        native_input::save_core_profile(&session, path);
+    }
+    if session.dynamic_core_enabled() {
+        println!("Native dynamic core: {:?}", session.dynamic_stats());
+        if let Some(error) = session.dynamic_error() {
+            eprintln!("JIT preparation stopped: {error}; interpreter fallback active");
+        }
+    }
     #[cfg(feature = "profiling")]
     if let Some(profile) = profile {
         profile.print(&session, elapsed);

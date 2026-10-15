@@ -58,6 +58,8 @@ fn main() -> iced::Result {
 
 fn run(boot: impl iced::application::BootFn<app::Doslet, app::Message> + 'static) -> iced::Result {
     let window = iced::window::Settings {
+        #[cfg(not(target_arch = "wasm32"))]
+        exit_on_close_request: false,
         #[cfg(target_os = "linux")]
         platform_specific: iced::window::settings::PlatformSpecific {
             // Match the desktop entry so Wayland and X11 can resolve our icon.

@@ -193,8 +193,8 @@ impl PcMachine {
     pub fn step(&mut self) -> Result<StepOutcome, MachineError> {
         self.step_with_idle_budget(1).map(|(outcome, _)| outcome)
     }
-    /// Normal execution consumes one logical step. HLT and confirmed VGA wait
-    /// iterations may account for bounded hardware-only logical steps.
+    /// Normal execution consumes one logical step. Native/RAM slices, HLT and
+    /// confirmed waits may consume more, within the budget and device deadlines.
     pub fn step_with_idle_budget(
         &mut self,
         budget: u32,
@@ -210,6 +210,31 @@ impl PcMachine {
             && let Some(consumed) = self.advance_vga_wait(budget)?
         {
             return Ok((StepOutcome::Continue, consumed));
+        }
+        if budget > 1
+            && self.cpu.dynamic_core_enabled()
+            && self.vga_wait.candidate.is_none()
+            && self.memory_wait_sites.is_none()
+            && !(self.cpu.accepts_maskable_interrupt() && self.bus.pic.has_interrupt())
+        {
+            // Native/register and ordinary-RAM work cannot observe devices.
+            // Check IRQs once and flush time/counters at the end of the slice,
+            // strictly before PIT/DSP deadlines. I/O and IF changes end a slice.
+            let timing = &self.timing;
+            let consumed = self.cpu.dynamic_batch(&mut self.bus, budget, |bus| {
+                timing
+                    .steps_to_event_nanos(bus, budget.saturating_add(1), 1_000_000)
+                    .saturating_sub(1)
+                    .min(budget)
+            });
+            if consumed != 0 {
+                self.advance_hardware_steps(consumed)?;
+                #[cfg(feature = "profiling")]
+                {
+                    self.bus.stats.cpu_steps += u64::from(consumed);
+                }
+                return Ok((StepOutcome::Continue, consumed));
+            }
         }
         let read_generation = self.bus.vga_status_read_generation;
         let candidate_valid = self.vga_wait.candidate.is_some() && self.validate_vga_wait();

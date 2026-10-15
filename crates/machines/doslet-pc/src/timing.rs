@@ -54,32 +54,40 @@ impl PcMachine {
         self.steps_to_event_nanos(budget, 1_000_000)
     }
     pub(crate) fn steps_to_event_nanos(&self, budget: u32, deadline: u64) -> u32 {
+        self.timing
+            .steps_to_event_nanos(&self.bus, budget, deadline)
+    }
+}
+impl Timing {
+    pub(crate) fn steps_to_event_nanos(
+        &self,
+        bus: &crate::PcBus,
+        budget: u32,
+        deadline: u64,
+    ) -> u32 {
         // Bound hardware-only work to one millisecond of guest time even when
         // no wake source is programmed. This is independent of host refresh.
         let mut nanos = deadline.min(1_000_000);
-        if let Some(ticks) = self
-            .bus
-            .pit
-            .ticks_until_pulse(0)
-            .expect("installed channel")
-        {
+        if let Some(ticks) = bus.pit.ticks_until_pulse(0).expect("installed channel") {
             let deadline =
-                (u64::from(ticks) * 1_000_000_000 - self.timing.pit_fraction).div_ceil(1_193_182);
+                (u64::from(ticks) * 1_000_000_000 - self.pit_fraction).div_ceil(1_193_182);
             nanos = nanos.min(deadline);
         }
-        if self.hardware_config().keyboard == doslet_config::KeyboardMode::At
-            && let Some(deadline) = self.bus.keyboard.next_deadline()
+        if bus.hardware_config().keyboard == doslet_config::KeyboardMode::At
+            && let Some(deadline) = bus.keyboard.next_deadline()
         {
-            nanos = nanos.min(deadline.saturating_sub(self.time().as_nanos()));
+            nanos = nanos.min(deadline.saturating_sub(self.time.as_nanos()));
         }
-        if self.hardware_config().sb16 && self.bus.dsp.playback_format().is_some() {
-            let deadline = (1_000_000_000 - self.timing.pcm_fraction)
-                .div_ceil(u64::from(self.bus.dsp.sample_rate()));
+        if bus.hardware_config().sb16 && bus.dsp.playback_format().is_some() {
+            let deadline =
+                (1_000_000_000 - self.pcm_fraction).div_ceil(u64::from(bus.dsp.sample_rate()));
             nanos = nanos.min(deadline);
         }
-        let steps = self.timing.cpu.steps_until_nanos(nanos);
+        let steps = self.cpu.steps_until_nanos(nanos);
         budget.min(steps.max(1) as u32)
     }
+}
+impl PcMachine {
     #[inline]
     pub(crate) fn advance_hardware_steps(&mut self, steps: u32) -> Result<(), MachineError> {
         let nanos = self.timing.cpu.advance(steps);
