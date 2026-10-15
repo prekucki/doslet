@@ -165,7 +165,10 @@ pub fn translate(event: &Event) -> (u8, Option<(u8, u8)>) {
         },
         Key::Character(base) => {
             let ascii = match modified_key {
-                Key::Character(value) => value.as_bytes().first().copied(),
+                // Option on macOS can produce a non-ASCII character or a dead
+                // key. DOS Alt shortcuts use the base key and no ASCII byte.
+                _ if modifiers.alt() => Some(0),
+                Key::Character(value) if value.len() == 1 => value.as_bytes().first().copied(),
                 _ => None,
             };
             if base.len() != 1 || !base.is_ascii() {
@@ -215,6 +218,27 @@ fn scan(byte: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn alt_shortcuts_ignore_option_characters_and_dead_keys() {
+        use iced::keyboard::{
+            Location,
+            key::{Code, Physical},
+        };
+        for modified_key in [Key::Character("ø".into()), Key::Unidentified] {
+            let press = Event::KeyPressed {
+                key: Key::Character("o".into()),
+                modified_key,
+                physical_key: Physical::Code(Code::KeyO),
+                location: Location::Standard,
+                modifiers: Modifiers::ALT,
+                text: None,
+                repeat: false,
+            };
+            assert_eq!(translate(&press), (8, Some((0x18, 0))));
+            assert_eq!(physical(&press), Some((18, true)));
+        }
+    }
+
     #[test]
     fn hardware_input_uses_position_and_keeps_release_edges() {
         use iced::keyboard::{

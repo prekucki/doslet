@@ -209,10 +209,11 @@ impl Session {
                 _ => ascii,
             };
         }
+        let printable = ascii != 0;
         if alt {
             ascii = 0;
         }
-        if ascii != 0 || matches!(scan,0x3B..=0x44|0x47..=0x53|0x57|0x58) {
+        if printable || matches!(scan,0x3B..=0x44|0x47..=0x53|0x57|0x58) {
             self.push_key(scan, ascii)?;
         }
         Ok(())

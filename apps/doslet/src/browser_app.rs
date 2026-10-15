@@ -92,6 +92,7 @@ pub struct Snapshot {
     waiting_for_io: bool,
     pending_commit: bool,
     dirty: bool,
+    pointer_in_use: bool,
 }
 impl Snapshot {
     pub fn status(&self) -> SessionStatus {
@@ -197,6 +198,7 @@ impl Doslet {
                 waiting_for_io: false,
                 pending_commit: false,
                 dirty: false,
+                pointer_in_use: false,
             },
             display: DisplayFrame::default(),
             name: "Color bars".into(),
@@ -671,6 +673,7 @@ impl Doslet {
             self.session.waiting_for_io = field(&state, "waitingForIo").as_bool().unwrap_or(false);
             self.session.pending_commit = field(&state, "pendingCommit").as_bool().unwrap_or(false);
             self.session.dirty = field(&state, "dirty").as_bool().unwrap_or(false);
+            self.session.pointer_in_use = field(&state, "pointerInUse").as_bool().unwrap_or(false);
         }
         let event = field(&packet, "event");
         match field(&event, "kind").as_string().as_deref() {
@@ -865,6 +868,7 @@ impl Doslet {
     pub fn hide_host_cursor(&self) -> bool {
         self.has_mouse_capture()
             || self.configurator.active.input.hide_cursor
+                && self.session.pointer_in_use
                 && self.session.status() == SessionStatus::Running
                 && !self.configurator.open
                 && self.workspace.panel.is_none()

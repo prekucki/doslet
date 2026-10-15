@@ -90,6 +90,7 @@ function present(force = false) {
         cx: engine.cx(), di: engine.di(), fault: engine.fault(), midiMode: engine.midi_mode(),
         midiUpgraded: engine.midi_upgraded(), midiSysex: engine.midi_sysex(),
         midiBytes: engine.midi_bytes(), midiNotes: engine.midi_notes(),
+        pointerInUse: engine.pointer_in_use(),
         midiUnmapped: engine.midi_unmapped(), midiDisplay: engine.midi_display()};
     self.postMessage(state);
     if (!videoPool.length) return;

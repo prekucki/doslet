@@ -396,6 +396,9 @@ impl WorkerEngine {
     pub fn nanos(&self) -> f64 {
         self.session.emulated_nanos() as f64
     }
+    pub fn pointer_in_use(&self) -> bool {
+        self.session.pointer_in_use()
+    }
     pub fn cs(&self) -> u16 {
         self.session.registers().cs
     }

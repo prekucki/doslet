@@ -1,5 +1,15 @@
 use super::*;
+
 impl Session {
+    /// A visible driver cursor or recent guest input consumption justifies
+    /// hiding the host cursor. Installation probes and host motion do not.
+    pub fn pointer_in_use(&self) -> bool {
+        self.mouse.visible >= 0
+            || self
+                .mouse_last_read
+                .is_some_and(|last| self.emulated_nanos().saturating_sub(last) < 500_000_000)
+    }
+
     pub(super) fn mouse_video_mode_changed(&mut self) {
         self.mouse_fraction = [0.0; 2];
         let (_, height) = self.pointer_dimensions();
@@ -68,6 +78,7 @@ impl Session {
         let r = &self.machine.cpu.registers;
         if r.cs == bios::SHIM_SEGMENT {
             if self.mouse.callback_active && r.ip == 0x408 {
+                self.mouse_last_read = Some(self.emulated_nanos());
                 let event = self.mouse.pending & self.mouse.callback.0;
                 self.mouse.pending = 0;
                 let r = &mut self.machine.cpu.registers;
@@ -94,6 +105,7 @@ impl Session {
         let (bx, cx, dx, es) = (r.get(Gpr16::Bx), r.get(Gpr16::Cx), r.get(Gpr16::Dx), r.es);
         match ax {
             0 | 0x21 => {
+                self.mouse_last_read = None;
                 self.mouse_fraction = [0.0; 2];
                 self.mouse = doslet_dos::mouse::Mouse::default();
                 self.mouse.y_range.1 = self.pointer_dimensions().1 - 1;
@@ -110,6 +122,7 @@ impl Session {
                 self.mouse.revision = self.mouse.revision.wrapping_add(1);
             }
             3 => {
+                self.mouse_last_read = Some(self.emulated_nanos());
                 self.machine
                     .cpu
                     .registers
@@ -122,6 +135,7 @@ impl Session {
                 self.mouse.move_to(cx, dx);
             }
             5 | 6 if bx < 3 => {
+                self.mouse_last_read = Some(self.emulated_nanos());
                 let history = if ax == 5 {
                     &mut self.mouse.presses[usize::from(bx)]
                 } else {
@@ -155,6 +169,7 @@ impl Session {
                 self.mouse.revision = self.mouse.revision.wrapping_add(1);
             }
             0x0B => {
+                self.mouse_last_read = Some(self.emulated_nanos());
                 self.machine
                     .cpu
                     .registers
@@ -267,5 +282,36 @@ impl Session {
             _ => return Err(RuntimeError::UnsupportedService { vector: 0x33, ax }),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointer_usage_requires_guest_reads_or_visible_driver_cursor_and_expires() {
+        let mut session = Session::new(&[0xFB, 0xF4, 0xEB, 0xFD]).unwrap();
+        assert!(!session.pointer_in_use());
+        session.pointer_move(123, 45);
+        session.pointer_button(0, true);
+        session.mouse_service(0).unwrap();
+        session.mouse_service(0x24).unwrap();
+        assert!(!session.pointer_in_use());
+        session.mouse_service(3).unwrap();
+        assert!(session.pointer_in_use());
+        session.start();
+        session.advance(5_000_000);
+        assert_eq!(session.status(), SessionStatus::Running);
+        assert!(session.emulated_nanos() >= 500_000_000);
+        assert!(!session.pointer_in_use());
+        session.mouse_service(1).unwrap();
+        assert!(session.pointer_in_use());
+        session.mouse_service(2).unwrap();
+        assert!(!session.pointer_in_use());
+        session.mouse_service(0x0B).unwrap();
+        assert!(session.pointer_in_use());
+        session.mouse_service(0x21).unwrap();
+        assert!(!session.pointer_in_use());
     }
 }

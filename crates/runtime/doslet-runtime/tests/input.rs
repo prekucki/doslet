@@ -25,6 +25,27 @@ fn hardware_key_reaches_bios_only_through_irq_handler() {
     assert_eq!(session.registers().get(Gpr16::Bx), 0x1E61);
 }
 #[test]
+fn hardware_alt_o_reaches_bios_and_alt_release_clears_modifier() {
+    for alt in [226, 230] {
+        let mut session = Session::new_configured(
+            &[0x31, 0xC0, 0xCD, 0x16, 0xA3, 0, 2, 0xEB, 0xFE],
+            keyboard_config(),
+        )
+        .unwrap();
+        session.key_event(PhysicalKey(alt), true).unwrap();
+        session.key_event(PhysicalKey(18), true).unwrap();
+        session.start();
+        session.advance(10000);
+        assert_eq!(session.status(), SessionStatus::Running);
+        assert_eq!(session.ram_view(0x10200..0x10202).unwrap(), &[0, 0x18]);
+        assert_eq!(session.ram_view(0x417..0x418).unwrap()[0] & 8, 8);
+        session.key_event(PhysicalKey(18), false).unwrap();
+        session.key_event(PhysicalKey(alt), false).unwrap();
+        session.advance(10000);
+        assert_eq!(session.ram_view(0x417..0x418).unwrap()[0] & 8, 0);
+    }
+}
+#[test]
 fn hardware_shift_and_key_release_update_bda_without_duplicate_bios_injection() {
     let mut session = Session::new_configured(&[0xFB, 0xEB, 0xFD], keyboard_config()).unwrap();
     session.key_event(PhysicalKey(225), true).unwrap();

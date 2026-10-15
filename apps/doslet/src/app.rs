@@ -1736,6 +1736,7 @@ impl Doslet {
     pub fn hide_host_cursor(&self) -> bool {
         self.has_mouse_capture()
             || self.configurator.active.input.hide_cursor
+                && self.session.pointer_in_use()
                 && self.session.status() == SessionStatus::Running
                 && !self.configurator.open
                 && self.workspace.panel.is_none()
@@ -1949,11 +1950,15 @@ mod tests {
     #[test]
     fn uncaptured_hidden_cursor_keeps_absolute_motion_and_passes_escape_to_dos() {
         let mut app = Doslet::new();
-        // Read one BIOS key and store AX at DS:0200h.
-        app.session = Session::new(&[0xB4, 0, 0xCD, 0x16, 0xA3, 0, 2, 0xEB, 0xFE]).unwrap();
+        // Read the mouse, then one BIOS key and store AX at DS:0200h.
+        app.session = Session::new(&[
+            0xB8, 3, 0, 0xCD, 0x33, 0xB4, 0, 0xCD, 0x16, 0xA3, 0, 2, 0xEB, 0xFE,
+        ])
+        .unwrap();
         app.configurator.active.input.capture = false;
         app.configurator.active.input.hide_cursor = true;
         app.session.start();
+        assert!(!app.hide_host_cursor());
         app.session.advance(100);
         assert!(app.session.waiting_for_key());
         assert!(app.hide_host_cursor());
