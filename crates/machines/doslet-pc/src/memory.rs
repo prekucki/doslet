@@ -21,6 +21,32 @@ impl A20Gate {
         }
     }
 }
+/// Bytes an idle-loop proof may see written within one pass.
+const WRITE_LOG: usize = 64;
+
+/// The first previous value of each byte written while a proof observes RAM.
+struct WriteLog {
+    entries: [(u32, u8); WRITE_LOG],
+    len: usize,
+    overflow: bool,
+}
+impl WriteLog {
+    fn record(&mut self, address: u32, old: u8) {
+        if self.entries[..self.len]
+            .iter()
+            .any(|(logged, _)| *logged == address)
+        {
+            return;
+        }
+        if self.len == WRITE_LOG {
+            self.overflow = true;
+            return;
+        }
+        self.entries[self.len] = (address, old);
+        self.len += 1;
+    }
+}
+
 pub(crate) struct Ram {
     bytes: Box<[u8]>,
     generations: Box<[u64]>,
@@ -28,6 +54,9 @@ pub(crate) struct Ram {
     /// Owner identity (high 32 bits) and mapping generation (low 32 bits),
     /// precomputed for cache hits; 0 when spans are unavailable.
     code_space: u64,
+    /// Mutations of any page, for idle proofs to detect device and service writes.
+    writes: u64,
+    log: Option<WriteLog>,
 }
 impl Default for Ram {
     fn default() -> Self {
@@ -41,6 +70,8 @@ impl Ram {
             generations: vec![0; size / PAGE_SIZE].into_boxed_slice(),
             identity: CodeOwnerId::fresh(),
             code_space: 0,
+            writes: 0,
+            log: None,
         };
         ram.set_mapping(0);
         ram
@@ -62,10 +93,14 @@ impl Ram {
             .ok_or(BusError::UnmappedMemory(address))
     }
     pub(crate) fn write(&mut self, address: u32, value: u8) -> Result<(), BusError> {
-        *self
+        let byte = self
             .bytes
             .get_mut(address as usize)
-            .ok_or(BusError::UnmappedMemory(address))? = value;
+            .ok_or(BusError::UnmappedMemory(address))?;
+        if let Some(log) = &mut self.log {
+            log.record(address, *byte);
+        }
+        *byte = value;
         self.bump(address as usize / PAGE_SIZE);
         Ok(())
     }
@@ -81,6 +116,16 @@ impl Ram {
                 self.bump(page);
             }
         }
+        if let Some(log) = &mut self.log {
+            // The caller may change any byte of the borrowed range.
+            if range.len() > WRITE_LOG {
+                log.overflow = true;
+            } else {
+                for address in range.clone() {
+                    log.record(address as u32, self.bytes[address]);
+                }
+            }
+        }
         self.bytes.get_mut(range)
     }
     /// Native stores maintain generations themselves after checking exhaustion.
@@ -92,6 +137,10 @@ impl Ram {
         if self.code_space == 0 {
             return None;
         }
+        if let Some(log) = &mut self.log {
+            log.overflow = true;
+        }
+        self.writes = self.writes.wrapping_add(1);
         let linear_base = u32::try_from(range.start).ok()?;
         Some(doslet_bus::NativeRamMut {
             linear_base,
@@ -101,7 +150,28 @@ impl Ram {
             excluded_len: 0,
         })
     }
+    /// Start recording the previous values of written bytes.
+    pub(crate) fn begin_write_log(&mut self) {
+        self.log = Some(WriteLog {
+            entries: [(0, 0); WRITE_LOG],
+            len: 0,
+            overflow: false,
+        });
+    }
+    /// Stop recording; true when every byte written since holds its old value.
+    pub(crate) fn end_write_log(&mut self) -> bool {
+        self.log.take().is_some_and(|log| {
+            !log.overflow
+                && log.entries[..log.len]
+                    .iter()
+                    .all(|(address, old)| self.bytes[*address as usize] == *old)
+        })
+    }
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes
+    }
     fn bump(&mut self, page: usize) {
+        self.writes = self.writes.wrapping_add(1);
         if let Some(next) = self.generations[page].checked_add(1) {
             self.generations[page] = next;
         } else {

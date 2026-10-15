@@ -15,7 +15,9 @@ use doslet_vfs::{HandleTable, MountId, NodeId, OpenFile};
 use doslet_vga::IndexedFrame;
 use doslet_x86::{CpuError, Gpr16, Registers, StepOutcome, linear_address};
 mod cdrom;
+mod idle;
 use cdrom::CdromImage;
+pub use idle::IdleLoopStats;
 mod keyboard;
 mod mouse;
 mod storage;
@@ -134,6 +136,7 @@ pub struct Session {
     input: doslet_input::InputRouter,
     joystick_axes: [i16; 2],
     joystick_buttons: [bool; 2],
+    idle: idle::IdleLoops,
 }
 
 impl Session {
@@ -299,6 +302,7 @@ impl Session {
             input: doslet_input::InputRouter::new(epoch),
             joystick_axes: [0; 2],
             joystick_buttons: [false; 2],
+            idle: idle::IdleLoops::default(),
         })
     }
     /// Transfer a preloaded input drive into the session during setup.
@@ -536,7 +540,13 @@ impl Session {
             && !self.storage_wait
             && !self.timeslice_yielded
         {
-            match self.execute_step(budget - completed) {
+            let now = self.steps + u64::from(completed);
+            let step = match self.idle_advance(now, budget - completed) {
+                Ok(Some(consumed)) => Ok(consumed),
+                Ok(None) => self.execute_step(budget - completed),
+                Err(error) => Err(error),
+            };
+            match step {
                 Ok(consumed) => {
                     completed += consumed;
                 }
@@ -596,6 +606,7 @@ impl Session {
     }
     fn service(&mut self, vector: u8) -> Result<(), RuntimeError> {
         let ax = self.machine.cpu.registers.get(Gpr16::Ax);
+        self.idle_service(vector, ax);
         if vector == 0x10 && ax >> 8 == 0x12 && self.machine.cpu.registers.get(Gpr16::Bx) == 0x80 {
             // Cirrus Logic VGA-type inquiry; no Cirrus extension BIOS is installed.
             return Ok(());
@@ -1643,6 +1654,85 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use doslet_x86::Gpr32;
+
+    /// Run a COM program for `steps` and return a fingerprint of its state.
+    fn run_fingerprint(
+        program: &[u8],
+        steps: u32,
+        idle_loops: bool,
+    ) -> (Vec<u8>, [u32; 9], u64, u64, IdleLoopStats) {
+        let mut session = Session::new(program).unwrap();
+        session.set_idle_loops(idle_loops);
+        session.start();
+        let mut remaining = steps;
+        while remaining != 0 && session.status() == SessionStatus::Running {
+            remaining -= session.advance(remaining.min(10_000));
+        }
+        let r = session.registers();
+        let registers = [
+            r.get32(Gpr32::Eax),
+            r.get32(Gpr32::Ecx),
+            r.get32(Gpr32::Edx),
+            r.get32(Gpr32::Ebx),
+            r.get32(Gpr32::Esp),
+            r.get32(Gpr32::Ebp),
+            r.get32(Gpr32::Esi),
+            r.get32(Gpr32::Edi),
+            r.ip,
+        ];
+        let ram = session.machine.bus.ram_view(0..0xA0000).unwrap().to_vec();
+        (
+            ram,
+            registers,
+            session.steps(),
+            session.emulated_nanos(),
+            session.idle_loop_stats(),
+        )
+    }
+
+    #[test]
+    fn proven_idle_loops_skip_passes_without_changing_guest_state() {
+        // Wait for a counter the timer interrupt never changes, polling the
+        // keyboard through INT 16h/01h on each pass.
+        let program = [
+            0xB4, 0x01, // mov ah,1
+            0xCD, 0x16, // int 16h
+            0xA1, 0x00, 0x02, // mov ax,[0200h]
+            0x85, 0xC0, // test ax,ax
+            0x74, 0xF5, // jz 0100h
+            0xF4, // hlt
+        ];
+        let skipped = run_fingerprint(&program, 3_000_000, true);
+        let reference = run_fingerprint(&program, 3_000_000, false);
+        assert_eq!(skipped.0, reference.0, "guest RAM");
+        assert_eq!(skipped.1, reference.1, "registers");
+        assert_eq!(
+            (skipped.2, skipped.3),
+            (reference.2, reference.3),
+            "steps and time"
+        );
+        assert!(
+            skipped.4.proofs > 0 && skipped.4.skipped_steps > 1_000_000,
+            "{:?}",
+            skipped.4
+        );
+        assert_eq!(reference.4.skipped_steps, 0);
+    }
+
+    #[test]
+    fn idle_proofs_reject_passes_that_change_memory() {
+        // Increment a word on each pass: never a fixed point.
+        let program = [
+            0xFF, 0x06, 0x00, 0x02, // inc word [0200h]
+            0xEB, 0xFA, // jmp 0100h
+        ];
+        let skipped = run_fingerprint(&program, 500_000, true);
+        let reference = run_fingerprint(&program, 500_000, false);
+        assert_eq!(skipped.0, reference.0);
+        assert_eq!(skipped.1, reference.1);
+        assert_eq!(skipped.4.skipped_steps, 0);
+    }
     #[test]
     fn dos_disk_space_uses_overlay_budget_default_drive_and_invalid_drive_sentinel() {
         let mut drive = ReadOnlyDrive::default().with_write_overlay(1024);

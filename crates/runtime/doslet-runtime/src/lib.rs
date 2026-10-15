@@ -4,4 +4,4 @@ extern crate alloc;
 mod bios;
 pub mod demo;
 pub mod session;
-pub use session::{RuntimeError, Session, SessionStatus};
+pub use session::{IdleLoopStats, RuntimeError, Session, SessionStatus};

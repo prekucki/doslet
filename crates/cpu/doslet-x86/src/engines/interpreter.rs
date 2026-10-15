@@ -229,6 +229,59 @@ pub struct Cpu {
     dynamic: dynamic::Cache,
 }
 
+/// Architectural CPU state compared by idle-loop proofs. Two equal snapshots
+/// at the same instruction boundary execute identically on identical memory.
+#[derive(Clone, PartialEq)]
+pub struct CpuSnapshot {
+    general: [u32; 8],
+    ip: u32,
+    selectors: [u16; 6],
+    caches: [crate::SegmentCache; 6],
+    protected: bool,
+    cpl: u8,
+    flags: u32,
+    control: ControlRegisters,
+    fpu: Option<doslet_x87::X87>,
+    halted: bool,
+    interrupt_shadow: u8,
+}
+
+impl Cpu {
+    pub fn snapshot(&self) -> CpuSnapshot {
+        let r = &self.registers;
+        CpuSnapshot {
+            general: core::array::from_fn(|code| r.get32(Gpr32::decode(code as u8))),
+            ip: r.ip,
+            selectors: [r.es, r.cs, r.ss, r.ds, r.fs, r.gs],
+            caches: r.caches,
+            protected: r.protected,
+            cpl: r.cpl,
+            flags: self.flags,
+            control: self.control.clone(),
+            fpu: self.fpu.clone(),
+            halted: self.halted,
+            interrupt_shadow: self.interrupt_shadow,
+        }
+    }
+
+    /// Whether the current state equals `snapshot`, checking IP first.
+    pub fn matches(&self, snapshot: &CpuSnapshot) -> bool {
+        let r = &self.registers;
+        r.ip == snapshot.ip
+            && self.flags == snapshot.flags
+            && (0..8)
+                .all(|code| r.get32(Gpr32::decode(code)) == snapshot.general[usize::from(code)])
+            && [r.es, r.cs, r.ss, r.ds, r.fs, r.gs] == snapshot.selectors
+            && r.caches == snapshot.caches
+            && r.protected == snapshot.protected
+            && r.cpl == snapshot.cpl
+            && self.halted == snapshot.halted
+            && self.interrupt_shadow == snapshot.interrupt_shadow
+            && self.control == snapshot.control
+            && self.fpu == snapshot.fpu
+    }
+}
+
 impl Default for Cpu {
     fn default() -> Self {
         Self {

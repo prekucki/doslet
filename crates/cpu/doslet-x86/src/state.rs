@@ -39,7 +39,7 @@ impl Gpr32 {
 }
 
 /// i386 control-register state. This machine currently has no x87 coprocessor.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlRegisters {
     pub cr0: u32,
     pub cr2: u32,

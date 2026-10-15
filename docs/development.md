@@ -202,9 +202,24 @@ Interrupt-enabled HLT waits can advance together up to the next PIT/DSP deadline
 the remaining step budget, or 1 ms of guest time. Confirmed
 `IN AL,DX; AND AL,08h; JZ/JNZ -5` and `IN AL,DX; TEST AL,AH; JZ/JNZ -5`
 loops (AH=08h for TEST) on the active VGA status port can batch
-whole iterations strictly before the next raster/PIT/DSP event; other polling
-loops execute normally. Append `--no-vga-waits` to disable recognition and
-batching for reference measurements. [The driver report](compatibility/prince-svga.md)
+whole iterations strictly before the next raster/PIT/DSP event. Append
+`--no-vga-waits` to disable recognition and batching for reference measurements.
+Other busy-wait loops are skipped once proven idle. The session single-steps one
+pass from a starting point while RAM records the previous value of every byte
+written. The pass is proven when the CPU returns to an identical architectural
+state (including segment caches, control registers and x87 state), every
+written byte holds its old value, no port or device memory was accessed, no
+interrupt arrived, mouse and keyboard driver state is unchanged and only pure
+query services ran: INT 16h/01h, 02h, 11h, 12h; INT 21h/0Bh and 06h with DL=FFh;
+INT 33h/0003h; INT 1Ah/00h; INT 10h/03h and 0Fh. While the CPU is back at that
+state and no RAM write or device access happened since, whole passes are
+accounted for as steps and time up to strictly before the next hardware event.
+Attempts start after empty keyboard or mouse polls, at the last proven loop
+head, and otherwise at a backoff from 20 thousand to 2 million steps. Append
+`--no-idle-loops` to execute these loops for reference measurements.
+On the local CIV intro (VGA, Roland, keyboard only) 897 million of 990 million
+steps were skipped and host CPU time fell from 55.9 s to 5.1 s, with identical
+final RAM and registers. [The driver report](compatibility/prince-svga.md)
 records the supported scope and differential checks.
 
 For diagnostic inventories of game polling, the optional `inspect_civ` wait

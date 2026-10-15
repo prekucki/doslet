@@ -20,6 +20,9 @@ pub struct PcBus {
     /// CPU-independent notification generation. Only successful active VGA
     /// status reads increment it; the PC compares before/after one CPU step.
     pub(crate) vga_status_read_generation: u32,
+    /// Port and device-memory accesses, for idle proofs to reject passes
+    /// whose results could depend on device state.
+    pub(crate) device_accesses: u64,
     pub(crate) observe_vga_status: bool,
     #[cfg(feature = "profiling")]
     pub(crate) stats: crate::ExecutionStats,
@@ -64,6 +67,7 @@ impl PcBus {
             guest_nanos: 0,
             keyboard_irq_line: false,
             vga_status_read_generation: 0,
+            device_accesses: 0,
             observe_vga_status: true,
             #[cfg(feature = "profiling")]
             stats: crate::ExecutionStats::default(),
@@ -166,6 +170,15 @@ impl PcBus {
         } else {
             ((page & 0xFE) << 16) | (u32::from(offset) << 1)
         })
+    }
+    pub(crate) fn begin_ram_write_log(&mut self) {
+        self.ram.begin_write_log();
+    }
+    pub(crate) fn end_ram_write_log(&mut self) -> bool {
+        self.ram.end_write_log()
+    }
+    pub(crate) fn ram_writes(&self) -> u64 {
+        self.ram.writes()
     }
     /// Borrow only ordinary RAM; a range touching device memory is rejected.
     pub fn ram_view(&self, range: Range<usize>) -> Option<&[u8]> {
@@ -320,7 +333,11 @@ impl MemoryBus for PcBus {
         if (0x46C..0x470).contains(&address) {
             self.stats.bda_tick_reads += 1;
         }
-        match self.memory_routes.endpoint(address) {
+        let endpoint = self.memory_routes.endpoint(address);
+        if !matches!(endpoint, MemoryEndpoint::Ram) {
+            self.device_accesses = self.device_accesses.wrapping_add(1);
+        }
+        match endpoint {
             MemoryEndpoint::Vga => self
                 .vga
                 .read_memory((address - APERTURE_START) as usize)
@@ -331,7 +348,11 @@ impl MemoryBus for PcBus {
     }
     fn write_u8(&mut self, address: u32, value: u8) -> Result<(), BusError> {
         let address = self.a20.address(address);
-        match self.memory_routes.endpoint(address) {
+        let endpoint = self.memory_routes.endpoint(address);
+        if !matches!(endpoint, MemoryEndpoint::Ram) {
+            self.device_accesses = self.device_accesses.wrapping_add(1);
+        }
+        match endpoint {
             MemoryEndpoint::Vga => {
                 if self
                     .vga
@@ -349,6 +370,7 @@ impl MemoryBus for PcBus {
 }
 impl PortBus for PcBus {
     fn read_port_u8(&mut self, port: u16) -> Result<u8, BusError> {
+        self.device_accesses = self.device_accesses.wrapping_add(1);
         #[cfg(feature = "profiling")]
         {
             self.stats.port_reads += 1;
@@ -421,6 +443,7 @@ impl PortBus for PcBus {
         }
     }
     fn write_port_u8(&mut self, port: u16, value: u8) -> Result<(), BusError> {
+        self.device_accesses = self.device_accesses.wrapping_add(1);
         match self.routes.write(port) {
             Endpoint::Absent => return Err(BusError::UnmappedPort(port)),
             Endpoint::Probe => {}

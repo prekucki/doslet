@@ -1,6 +1,6 @@
 //! 387 environment images, selected by operand size and processor mode.
 use crate::{X87, finite::Finite};
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Pointers {
     ip: u32,
     cs: u16,

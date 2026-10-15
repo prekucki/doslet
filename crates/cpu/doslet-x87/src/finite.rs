@@ -2,7 +2,7 @@
 //! preserve x87 precision independently of the host's floating-point unit.
 use crate::ArithmeticError;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Finite {
     pub negative: bool,
     pub exponent: i32,

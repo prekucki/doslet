@@ -10,7 +10,7 @@ mod operations;
 mod transcendental;
 mod wide;
 use finite::{Finite, Rounded};
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct X87 {
     control: u16,
     status: u16,

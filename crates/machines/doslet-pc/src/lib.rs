@@ -2,6 +2,7 @@
 #![no_std]
 extern crate alloc;
 mod audio;
+mod idle_loop;
 pub mod io;
 pub mod memory;
 mod memory_wait;
@@ -13,6 +14,7 @@ pub use memory_wait::MemoryWaitSites;
 use core::fmt;
 use doslet_bus::BusError;
 use doslet_x86::{Cpu, CpuError, StepOutcome};
+pub use idle_loop::IdleProofMark;
 pub use io::PcBus;
 #[cfg(test)]
 mod config_tests;
@@ -44,6 +46,9 @@ pub struct ExecutionStats {
     /// Logical IN/AND/Jcc units accounted for without interpreter dispatch.
     pub vga_wait_steps: u64,
     pub vga_wait_batches: u64,
+    /// Steps of proven idle-loop passes accounted for without execution.
+    pub idle_loop_steps: u64,
+    pub idle_loop_skips: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
