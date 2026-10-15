@@ -649,13 +649,17 @@ remain pending.
 The ROM-free MT-32-to-GM translator library accepts Roland DT1 SysEx (device
 10h and channel-addressed 00h–0Fh, checksum-validated), the all-parameters
 reset, part channel assignment, patch/timbre/rhythm memory, master volume,
-reverb level and display text. Notes follow MT-32 part routing, key shift and
-reversed panning; bender range, including RPN 0, becomes GM RPN 0. Rhythm keys
-35–75 use the GM kit; CM-32L sound-effect keys, aftertouch, partial reserve,
-reverb character, RQ1 requests and per-key rhythm level/pan are not translated.
-GM choices are Doslet's own; an opt-in local CM-32L ROM test compares preset
-order, power-on programs and rhythm layout with its tables without copying ROM
-data. Native and browser applications select translation by game and output dialect.
+reverb mode/time/level and display text. Notes follow MT-32 part routing, key
+shift and reversed panning; bender range, including RPN 0, becomes GM RPN 0.
+Channel volume follows the CM-32L part-level (about 48·log10) and linear
+master-volume curves with 6 dB headroom. Per-preset level trims (−24..+6 dB),
+octave corrections for four presets and the reverb send per mode and time were
+measured against CM-32L v1.02 on the macOS GM bank; other GM synths share them.
+Rhythm keys 35–75 use the GM kit; CM-32L sound-effect keys, aftertouch, partial
+reserve, reverb character, RQ1 requests and per-key rhythm level/pan are not
+translated. GM choices are Doslet's own; an opt-in local CM-32L ROM test
+compares preset order, power-on programs and rhythm layout with its tables
+without copying ROM data. Native and browser applications select translation by game and output dialect.
 
 The `web` Cargo profile uses LLVM opt-level 3, thin LTO and one codegen unit.
 Release Trunk builds additionally run wasm-opt -O3. These are speed-oriented

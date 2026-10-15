@@ -50,6 +50,8 @@ const NOT_HELD: Held = Held {
 struct Part {
     target: Target,
     transpose: i8,
+    /// Level trim in dB for the playing ROM preset; guest timbres use 0.
+    trim: i8,
     /// Timbre-temp bytes describe the playing timbre (guest data, not a ROM preset).
     guest_timbre: bool,
     rpn: [u8; 2],
@@ -58,6 +60,7 @@ struct Part {
 const PART: Part = Part {
     target: Target::Silent,
     transpose: 0,
+    trim: 0,
     guest_timbre: false,
     rpn: [127, 127],
     held: [NOT_HELD; 128],
@@ -187,6 +190,14 @@ impl Translator {
         let Some((channel, note)) = target else {
             self.stats.unmapped_notes += 1;
             return;
+        };
+        // Drum-note presets share the rhythm channel volume; trim by velocity.
+        let velocity = match self.parts[part].target {
+            Target::Drum(_) if part != RHYTHM_PART => {
+                let factor = u32::from(tables::db_factor(self.parts[part].trim));
+                (u32::from(velocity) * factor / 1000).max(1) as u8
+            }
+            _ => velocity,
         };
         emit(&[0x90 | channel, note, velocity]);
         self.parts[part].held[usize::from(key)] = Held { channel, note };
@@ -330,7 +341,10 @@ impl Translator {
                 self.stats.guest_timbre_loads += 1;
             }
         }
-        let mix = 1 << memory::MASTER_VOLUME | 1 << memory::REVERB_MODE | 1 << memory::REVERB_LEVEL;
+        let mix = 1 << memory::MASTER_VOLUME
+            | 1 << memory::REVERB_MODE
+            | 1 << memory::REVERB_TIME
+            | 1 << memory::REVERB_LEVEL;
         if changes.system & mix != 0 {
             refresh = 0x1FF;
         }
@@ -386,21 +400,28 @@ impl Translator {
     fn resolve(&mut self, part: usize) {
         let [group, number] = self.timbre_ref(part);
         let key_shift = self.memory.patch_temp[part][memory::KEY_SHIFT].min(48) as i8 - 24;
-        let (target, transpose) = if self.parts[part].guest_timbre {
-            timbre::melodic(&self.memory.timbre_temp[part])
+        let (target, transpose, trim) = if self.parts[part].guest_timbre {
+            let (target, transpose) = timbre::melodic(&self.memory.timbre_temp[part]);
+            (target, transpose, 0)
         } else if group < 2 {
             let program = group * 64 + number;
+            let trim = tables::PRESET_TRIM_DB[usize::from(program)];
             match tables::preset_drum(program) {
-                Some(note) => (Target::Drum(note), 0),
-                None => (Target::Program(tables::PRESETS[usize::from(program)].1), 0),
+                Some(note) => (Target::Drum(note), 0, trim),
+                None => (
+                    Target::Program(tables::PRESETS[usize::from(program)].1),
+                    tables::preset_transpose(program),
+                    trim,
+                ),
             }
         } else {
             let note = tables::RHYTHM_TIMBRES
                 .get(usize::from(number))
                 .map(|n| n[0]);
-            (note.map_or(Target::Silent, Target::Drum), 0)
+            (note.map_or(Target::Silent, Target::Drum), 0, 0)
         };
         self.parts[part].target = target;
+        self.parts[part].trim = trim;
         self.parts[part].transpose = transpose.saturating_add(key_shift).clamp(-48, 48);
     }
     fn rhythm_note(&self, key: u8) -> Option<u8> {
@@ -441,9 +462,17 @@ impl Translator {
                 }
             }
         }
-        let level = self.memory.system[memory::REVERB_LEVEL].min(7);
+        let system = &self.memory.system;
         let on = part == RHYTHM_PART || patch[memory::REVERB_SWITCH] & 1 != 0;
-        let reverb = if on { level * 16 } else { 0 };
+        let reverb = if on {
+            tables::reverb_send(
+                system[memory::REVERB_MODE],
+                system[memory::REVERB_TIME],
+                system[memory::REVERB_LEVEL],
+            )
+        } else {
+            0
+        };
         if self.changed(out, REVERB, reverb) {
             emit(&[0xB0 | out, 91, reverb]);
         }
@@ -452,9 +481,17 @@ impl Translator {
     fn refresh_mix<F: FnMut(&[u8])>(&mut self, part: usize, emit: &mut F) {
         let out = output_channel(part);
         let patch = self.memory.patch_temp[part];
-        let master = u32::from(self.memory.system[memory::MASTER_VOLUME].min(100));
-        let level = u32::from(patch[memory::OUTPUT_LEVEL].min(100));
-        let volume = (level * master * 127 / 10_000) as u8;
+        let trim = match self.parts[part].target {
+            _ if part == RHYTHM_PART => tables::RHYTHM_TRIM_DB,
+            Target::Program(_) => self.parts[part].trim,
+            // Drum-note presets are trimmed by velocity on the rhythm channel.
+            Target::Drum(_) | Target::Silent => 0,
+        };
+        let volume = tables::part_volume(
+            patch[memory::OUTPUT_LEVEL],
+            self.memory.system[memory::MASTER_VOLUME],
+            trim,
+        );
         if self.changed(out, VOLUME, volume) {
             emit(&[0xB0 | out, 7, volume]);
         }

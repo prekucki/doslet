@@ -23,6 +23,7 @@ pub const RHYTHM_PART: usize = 8;
 
 /// System area offsets.
 pub const REVERB_MODE: usize = 1;
+pub const REVERB_TIME: usize = 2;
 pub const REVERB_LEVEL: usize = 3;
 pub const CHANNEL_ASSIGN: usize = 13;
 pub const MASTER_VOLUME: usize = 22;

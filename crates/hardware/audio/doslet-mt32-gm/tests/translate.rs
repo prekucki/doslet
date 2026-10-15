@@ -68,22 +68,34 @@ fn presets_map_to_gm_and_pan_is_reversed() {
             &[0xB2, 7, 127],
         ],
     );
+    // AcouPiano1 is trimmed +5 dB (Str Sect 1 before it, +4 dB): the program
+    // change refreshes volume, and full output level sits 1 dB below 127.
     assert_eq!(
         out,
         [
             vec![0xC1, 0],
+            vec![0xB1, 7, tables::part_volume(80, 100, 5)],
             vec![0xB1, 10, 127],
             vec![0xB1, 10, 0],
-            vec![0xB1, 7, 127]
+            vec![0xB1, 7, 120]
         ]
     );
     assert_eq!(tables::PRESETS[48], ("Str Sect 1", 48));
-    // Triangle and Cymbal have no GM melodic program; they use drum-kit notes.
+    // Triangle and Cymbal have no GM melodic program; they use drum-kit notes,
+    // trimmed by velocity because the rhythm channel volume is shared.
     let out = translate(
         &mut translator,
         &[&[0xC2, 121], &[0x92, 60, 90], &[0x82, 60, 0]],
     );
-    assert_eq!(out, [vec![0x99, 81, 90], vec![0x89, 81, 0]]);
+    assert_eq!(tables::PRESET_TRIM_DB[121], -13);
+    assert_eq!(
+        out,
+        [
+            vec![0xB1, 7, tables::part_volume(100, 100, 0)],
+            vec![0x99, 81, 42],
+            vec![0x89, 81, 0]
+        ]
+    );
     assert_eq!(translator.part_target(1), Target::Drum(81));
 }
 
@@ -96,7 +108,14 @@ fn guest_timbres_use_names_or_parameters_and_follow_memory_rewrites() {
         &mut translator,
         &[&dt1(0x10, [0x08, 0x00, 0x00], &strings), &patch, &[0xC1, 0]],
     );
-    assert_eq!(out, [vec![0xC0, 48]]);
+    // Guest timbres carry no preset trim.
+    assert_eq!(
+        out,
+        [
+            vec![0xC0, 48],
+            vec![0xB0, 7, tables::part_volume(80, 100, 0)]
+        ]
+    );
     // Rewriting the memory timbre refreshes the part playing it; coarse C3
     // sounds an octave down, so GM notes are transposed.
     let bass = timbre("Bass 1", 24, 0, 80, false);
@@ -221,11 +240,20 @@ fn channel_assignment_moves_parts_and_releases_their_notes() {
 fn master_volume_reverb_and_bend_range_refresh_gm_controls() {
     let mut translator = ready();
     let out = translate(&mut translator, &[&dt1(0x10, [0x10, 0x00, 0x16], &[50])]);
-    // Output level 80 at master volume 50 is 50/127 on every used channel.
+    // Output level 80 at master volume 50 on every used channel, with each
+    // part's preset trim (Slap Bass 1 on part 1) and the rhythm trim.
     assert_eq!(out.len(), 9);
-    assert!(out.contains(&vec![0xB0, 7, 50]) && out.contains(&vec![0xB9, 7, 50]));
+    let slap = tables::PRESET_TRIM_DB[68];
+    assert!(out.contains(&vec![0xB0, 7, tables::part_volume(80, 50, slap)]));
+    assert!(out.contains(&vec![0xB9, 7, tables::part_volume(80, 50, -2)]));
+    // Power-on Room at reverb time 5 sends 16 per level step.
     let out = translate(&mut translator, &[&dt1(0x10, [0x10, 0x00, 0x03], &[7])]);
     assert!(out.contains(&vec![0xB0, 91, 112]) && out.contains(&vec![0xB9, 91, 112]));
+    // A longer reverb time saturates; Tap delay at time 0 stays nearly dry.
+    let out = translate(&mut translator, &[&dt1(0x10, [0x10, 0x00, 0x02], &[7])]);
+    assert!(out.contains(&vec![0xB0, 91, 127]));
+    let out = translate(&mut translator, &[&dt1(0x10, [0x10, 0x00, 0x01], &[3, 0])]);
+    assert!(out.contains(&vec![0xB0, 91, 14]));
     let out = translate(
         &mut translator,
         &[&[0xB1, 101, 0], &[0xB1, 100, 0], &[0xB1, 6, 2]],
@@ -300,4 +328,29 @@ fn translation_after_setup_allocates_nothing() {
     });
     assert_eq!(measured.count_total, 0);
     assert!(bytes > 0);
+}
+
+#[test]
+fn volume_curve_follows_cm32l_level_and_master_attenuation() {
+    // Full scale needs the +6 dB headroom; an untrimmed preset is 6 dB lower.
+    assert_eq!(tables::part_volume(100, 100, 6), 127);
+    assert_eq!(tables::part_volume(100, 100, 0), 90);
+    assert_eq!(tables::part_volume(100, 100, 24), 127);
+    // Part level 50 is about -14.4 dB (48·log10); master 50 is -6 dB.
+    assert_eq!(tables::part_volume(50, 100, 6), 55);
+    assert_eq!(tables::part_volume(100, 50, 6), 90);
+    assert_eq!(tables::part_volume(0, 100, 6), 0);
+    assert_eq!(tables::part_volume(100, 0, 6), 0);
+    assert_eq!(tables::db_factor(0), 1000);
+    assert_eq!(tables::db_factor(-40), tables::db_factor(-30));
+    assert_eq!(tables::reverb_send(0, 5, 3), 48);
+    assert_eq!(tables::reverb_send(9, 15, 9), tables::reverb_send(1, 7, 7));
+}
+
+#[test]
+fn high_presets_play_an_octave_up_on_their_gm_programs() {
+    let mut translator = ready();
+    let out = translate(&mut translator, &[&[0xC1, 22], &[0x91, 60, 100]]);
+    assert_eq!(out.last().unwrap(), &vec![0x90, 72, 100]);
+    assert_eq!(translator.part_target(0), Target::Program(8));
 }
