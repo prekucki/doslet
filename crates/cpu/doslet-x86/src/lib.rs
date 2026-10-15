@@ -1,11 +1,6 @@
 //! Allocation-free, statically dispatched x86 interpreter foundation.
 //! Selected real/protected-mode i386 forms with explicit unsupported diagnostics.
 #![no_std]
-#[cfg(all(
-    feature = "dynamic-core",
-    not(target_arch = "wasm32"),
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
 extern crate alloc;
 
 mod decode;

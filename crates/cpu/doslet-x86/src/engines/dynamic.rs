@@ -792,24 +792,36 @@ impl Cpu {
         let mut completed = 0;
         let mut native_steps = 0;
         let mut native_blocks = 0;
-        while completed < budget {
-            let Some(instruction) = self.batch_lookup(code, bus) else {
+        'blocks: while completed < budget {
+            let Some((index, count, check)) = self.batch_block(code, bus) else {
                 break;
             };
-            let remaining = budget - completed;
-            let steps = if remaining >= 2 && instruction.native_candidate() {
-                self.try_native_block(NativeBus::Write(bus), remaining, || remaining)
-            } else {
-                0
-            };
-            if steps != 0 {
-                completed += steps;
-                native_steps += steps;
-                native_blocks += 1;
-            } else if self.try_batched(bus, &mut windows, code, instruction) {
+            for position in 0..count {
+                let instruction = self.block_instruction(index, position);
+                let remaining = budget - completed;
+                if remaining >= 2 && instruction.native_candidate() {
+                    let steps =
+                        self.try_native_block(NativeBus::Write(bus), remaining, || remaining);
+                    if steps != 0 {
+                        completed += steps;
+                        native_steps += steps;
+                        native_blocks += 1;
+                        continue 'blocks;
+                    }
+                }
+                let next = self
+                    .registers
+                    .ip
+                    .wrapping_add(u32::from(instruction.length()));
+                if !self.try_batched(bus, &mut windows, code, instruction) {
+                    break 'blocks;
+                }
                 completed += 1;
-            } else {
-                break;
+                // As in the interpreter batch: control transfers, repeated
+                // strings, the budget and code stores end the block.
+                if completed == budget || self.registers.ip != next || !bus.code_valid(&check) {
+                    continue 'blocks;
+                }
             }
         }
         self.dynamic.stats.execution_batches += u64::from(completed != 0);

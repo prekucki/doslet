@@ -318,6 +318,16 @@ validates all of its plain-RAM operands, stack slots and branch targets before
 its first effect and then accesses those linear addresses directly; a failed
 check ends the slice before that instruction.
 
+Slices fetch from a separate fixed cache of 1024 basic blocks, each holding up
+to 16 decoded instructions through the first control transfer and stopping
+before port I/O or an unsupported form. A block is validated once per entry
+against the CS window over its whole span and one code check; after each
+instruction the slice continues only while IP reaches the next decoded
+instruction and the check still holds, so taken branches, repeated strings and
+stores into the block's pages return to lookup. A block that cannot start is
+remembered as a rejection. The native core's slices use the same blocks and try
+a native block before each candidate instruction.
+
 The CPU owns hidden segment caches, descriptor-table state and optional x87
 state. Its decoder selects 16/32-bit addressing and validates cache permissions
 before emitting linear bus addresses. The independent `doslet-x87` crate owns

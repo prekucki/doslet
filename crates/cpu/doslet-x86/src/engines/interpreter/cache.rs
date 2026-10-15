@@ -4,9 +4,10 @@ use crate::state::SegmentWindow;
 use crate::{
     Access, Gpr16, Gpr32, Registers, SegmentCache, SegmentRegister, decode::Operand, flags,
 };
+use alloc::boxed::Box;
 use doslet_bus::{CodeCheck, CpuBus};
 
-const CAPACITY: usize = 512;
+const CAPACITY: usize = 4096;
 const NO_REGISTER: u8 = 8;
 
 #[cfg(feature = "profiling")]
@@ -37,6 +38,9 @@ pub struct DecodeCacheStats {
     /// Interpreter batches without the native core, and the steps they ran.
     pub batches: u64,
     pub batched_steps: u64,
+    /// Validated basic-block lookups, and blocks decoded on a miss.
+    pub block_hits: u64,
+    pub block_misses: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,8 +55,42 @@ struct Entry {
     check: CodeCheck,
     instruction: Instruction,
 }
+
+const BLOCK_CAPACITY: usize = 1024;
+const BLOCK_INSTRUCTIONS: usize = 16;
+
+/// Consecutive decoded instructions up to the first control transfer, validated
+/// once per lookup. A block starting with an instruction that cannot be batched
+/// has `count == 0` and remembers that rejection against the same code check.
+#[derive(Clone, Copy)]
+struct Block {
+    /// Linear start address; `u32::MAX`, which is never RAM, marks a free slot.
+    address: u32,
+    /// Bytes covered by `check` and by the CS window test of a hit.
+    length: u8,
+    count: u8,
+    check: CodeCheck,
+    instructions: [Instruction; BLOCK_INSTRUCTIONS],
+}
+impl Block {
+    const EMPTY: Self = Self {
+        address: u32::MAX,
+        length: 0,
+        count: 0,
+        check: CodeCheck {
+            space: 0,
+            pages: [0; 2],
+            generations: [0; 2],
+        },
+        instructions: [Instruction::UNSUPPORTED; BLOCK_INSTRUCTIONS],
+    };
+}
 pub(super) struct Cache {
-    entries: [Option<Entry>; CAPACITY],
+    /// Reserved once at setup; the fixed length lets masked indexing skip
+    /// bounds checks without placing the table on the stack.
+    entries: Box<[Option<Entry>; CAPACITY]>,
+    /// Basic blocks for batched execution, reserved once at setup.
+    blocks: Box<[Block; BLOCK_CAPACITY]>,
     context: Option<Context>,
     /// Registers lineage, CS version, selector and PE mode under which
     /// `code32` and `context` were last resolved.
@@ -67,7 +105,14 @@ pub(super) struct Cache {
 impl Default for Cache {
     fn default() -> Self {
         Self {
-            entries: [None; CAPACITY],
+            entries: alloc::vec![None; CAPACITY]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("the vector has CAPACITY entries")),
+            blocks: alloc::vec![Block::EMPTY; BLOCK_CAPACITY]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("the vector has BLOCK_CAPACITY blocks")),
             context: None,
             key: None,
             code32: false,
@@ -89,6 +134,7 @@ impl core::fmt::Debug for Cache {
 impl Cache {
     pub fn clear(&mut self) {
         self.entries.fill(None);
+        self.blocks.fill(Block::EMPTY);
         self.context = None;
         self.key = None;
         self.code32 = false;
@@ -242,6 +288,89 @@ impl Cache {
             instruction,
         });
         Some(instruction)
+    }
+}
+
+impl Cache {
+    /// Find or decode the block starting at `ip`, validated against the current
+    /// CS window and code generations. None when no batchable block starts there.
+    #[inline]
+    fn block_in<B: CpuBus>(&mut self, window: SegmentWindow, ip: u32, bus: &B) -> Option<usize> {
+        let address = window.address(ip, 1)?;
+        let index = ((address ^ (address >> 10)) as usize) & (BLOCK_CAPACITY - 1);
+        let block = &self.blocks[index];
+        if block.address == address && bus.code_valid(&block.check) {
+            if block.count == 0 {
+                return None;
+            }
+            if window.address(ip, block.length).is_some() {
+                #[cfg(feature = "profiling")]
+                {
+                    self.stats.block_hits += 1;
+                }
+                return Some(index);
+            }
+        }
+        self.build_block(window, ip, address, index, bus)
+    }
+
+    #[cold]
+    fn build_block<B: CpuBus>(
+        &mut self,
+        window: SegmentWindow,
+        ip: u32,
+        address: u32,
+        index: usize,
+        bus: &B,
+    ) -> Option<usize> {
+        #[cfg(feature = "profiling")]
+        {
+            self.stats.block_misses += 1;
+        }
+        let bytes = bus.code_bytes(address, u8::MAX)?;
+        let mut block = Block {
+            address,
+            ..Block::EMPTY
+        };
+        let mut offset = 0;
+        while usize::from(block.count) < BLOCK_INSTRUCTIONS {
+            let Some(instruction) = Instruction::decode(&bytes[offset..]) else {
+                break;
+            };
+            let end = offset + usize::from(instruction.length);
+            if matches!(
+                instruction.operation,
+                Operation::Input | Operation::Output | Operation::Unsupported
+            ) || end > usize::from(u8::MAX)
+                || window
+                    .address(ip.wrapping_add(offset as u32), instruction.length)
+                    .is_none()
+            {
+                break;
+            }
+            block.instructions[usize::from(block.count)] = instruction;
+            block.count += 1;
+            offset = end;
+            if matches!(
+                instruction.operation,
+                Operation::Branch { .. }
+                    | Operation::Call(_)
+                    | Operation::CallIndirect(_)
+                    | Operation::Return(_)
+                    | Operation::Loop { .. }
+            ) {
+                break;
+            }
+        }
+        // A rejection covers the bytes the decoder could have inspected.
+        block.length = if block.count == 0 {
+            bytes.len().min(15)
+        } else {
+            offset
+        } as u8;
+        block.check = bus.code_check(address, block.length)?;
+        self.blocks[index] = block;
+        (block.count != 0).then_some(index)
     }
 }
 
@@ -781,14 +910,26 @@ impl Cpu {
         };
         let budget = budget.min(BATCH_STEPS).min(limit(bus));
         let mut completed = 0;
-        while completed < budget {
-            let Some(instruction) = self.batch_lookup(code, bus) else {
+        'blocks: while completed < budget {
+            let Some((index, count, check)) = self.batch_block(code, bus) else {
                 break;
             };
-            if !self.try_batched(bus, &mut windows, code, instruction) {
-                break;
+            for position in 0..count {
+                let instruction = self.block_instruction(index, position);
+                let next = self
+                    .registers
+                    .ip
+                    .wrapping_add(u32::from(instruction.length));
+                if !self.try_batched(bus, &mut windows, code, instruction) {
+                    break 'blocks;
+                }
+                completed += 1;
+                // A taken branch, a repeated string or the budget ends the run;
+                // a store may have rewritten the rest of the block.
+                if completed == budget || self.registers.ip != next || !bus.code_valid(&check) {
+                    continue 'blocks;
+                }
             }
-            completed += 1;
         }
         #[cfg(feature = "profiling")]
         {
@@ -1110,22 +1251,28 @@ impl Cpu {
         }
     }
 
+    /// The validated block at the current IP: its slot, instruction count and
+    /// code check. Batched instructions cannot change the CS context.
+    #[inline]
+    pub(super) fn batch_block<B: CpuBus>(
+        &mut self,
+        code: SegmentWindow,
+        bus: &B,
+    ) -> Option<(usize, usize, CodeCheck)> {
+        let index = self.decode_cache.block_in(code, self.registers.ip, bus)?;
+        let block = &self.decode_cache.blocks[index];
+        Some((index, usize::from(block.count), block.check))
+    }
+
+    #[inline]
+    pub(super) fn block_instruction(&self, index: usize, position: usize) -> Instruction {
+        self.decode_cache.blocks[index].instructions[position]
+    }
+
     /// The CS execute window and empty data windows for one slice.
     pub(super) fn batch_context(&mut self) -> Option<(SegmentWindow, Windows)> {
         let (code, _) = self.decode_cache.code_context(&self.registers)?;
         Some((code, Windows::default()))
-    }
-
-    /// Look up the current instruction; batched instructions cannot change the
-    /// CS context resolved by `batch_context`.
-    #[inline]
-    pub(super) fn batch_lookup<B: CpuBus>(
-        &mut self,
-        code: SegmentWindow,
-        bus: &B,
-    ) -> Option<Instruction> {
-        self.decode_cache
-            .instruction_in(code, self.registers.ip, bus)
     }
 
     /// The per-step checks of `step` are invariant across a batch: batched
@@ -1246,6 +1393,15 @@ impl Reader<'_> {
     }
 }
 impl Instruction {
+    #[cfg(all(
+        feature = "dynamic-core",
+        not(target_arch = "wasm32"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(super) fn length(self) -> u8 {
+        self.length
+    }
+
     /// One byte of offset range: the reference path reports its own faults.
     const UNSUPPORTED: Self = Self {
         length: 1,
