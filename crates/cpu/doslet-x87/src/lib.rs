@@ -1,6 +1,9 @@
 //! Independent x87 stack/control state and selected finite arithmetic forms.
 #![no_std]
+mod exponential;
 mod finite;
+mod logarithm;
+mod wide;
 use finite::{Finite, Rounded};
 #[derive(Debug)]
 pub struct X87 {
@@ -14,6 +17,18 @@ pub struct X87 {
 pub enum StackError {
     Overflow,
     Empty,
+}
+/// Constants loaded from the x87's internal constant table, rounded to 64
+/// significand bits using RC. PC does not affect constant loads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Constant {
+    One,
+    Log2Ten,
+    Log2E,
+    Pi,
+    Log10Two,
+    LnTwo,
+    Zero,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArithmeticError {
@@ -77,6 +92,35 @@ impl X87 {
     pub fn st0(&self) -> Result<f64, StackError> {
         self.st(0)
     }
+    /// FLD1/FLDL2T/FLDL2E/FLDPI/FLDLG2/FLDLN2/FLDZ. Rounding these constants
+    /// does not raise precision or set C1, including with unmasked precision.
+    pub fn load_constant(&mut self, constant: Constant) -> Result<(), StackError> {
+        let (floor, exponent, nearest_up) = match constant {
+            Constant::One => (0x8000_0000_0000_0000_u64, 0, false),
+            Constant::Log2Ten => (0xD49A_784B_CD1B_8AFE, 1, false),
+            Constant::Log2E => (0xB8AA_3B29_5C17_F0BB, 0, true),
+            Constant::Pi => (0xC90F_DAA2_2168_C234, 1, true),
+            Constant::Log10Two => (0x9A20_9A84_FBCF_F798, -2, true),
+            Constant::LnTwo => (0xB172_17F7_D1CF_79AB, -1, true),
+            Constant::Zero => (0, 0, false),
+        };
+        let inexact = !matches!(constant, Constant::One | Constant::Zero);
+        let up = inexact
+            && match (self.control >> 10) & 3 {
+                0 => nearest_up,
+                2 => true,
+                _ => false, // All constants are nonnegative: down equals truncate.
+            };
+        let value = Finite {
+            negative: false,
+            exponent,
+            mantissa: floor + u64::from(up),
+        };
+        self.push(value.to_f64())?;
+        self.finite[((self.status >> 11) & 7) as usize] = Some(value);
+        self.status &= !0x200;
+        Ok(())
+    }
     /// FILD converts all signed integer bits exactly, independently of PC/RC.
     pub fn push_integer(&mut self, value: i64) -> Result<(), StackError> {
         let finite = Finite::from_i64(value);
@@ -125,6 +169,9 @@ impl X87 {
         let rhs = Finite::from_f64(value).ok_or(ArithmeticError::Unsupported)?;
         self.arithmetic_finite(rhs, operation)
     }
+    pub fn arithmetic_integer(&mut self, value: i64, operation: u8) -> Result<(), ArithmeticError> {
+        self.arithmetic_finite(Finite::from_i64(value), operation)
+    }
     pub fn arithmetic_register(&mut self, index: u8, operation: u8) -> Result<(), ArithmeticError> {
         self.st(index).map_err(ArithmeticError::Stack)?;
         let top = ((self.status >> 11) & 7) as usize;
@@ -155,6 +202,67 @@ impl X87 {
         let slot = ((self.status >> 11) & 7) as usize;
         let value = self.finite[slot].ok_or(ArithmeticError::Unsupported)?;
         self.store_rounded(slot, value.integer_round(self.control), false)
+    }
+    /// FYL2X: ST(1) * log2(ST(0)), followed by one pop on successful completion.
+    /// Normal finite inputs use bounded integer range reduction. Nonfinite
+    /// operands remain explicit until the general special-value model exists.
+    pub fn y_log2_x(&mut self) -> Result<(), ArithmeticError> {
+        self.st0().map_err(ArithmeticError::Stack)?;
+        self.st(1).map_err(ArithmeticError::Stack)?;
+        let top = ((self.status >> 11) & 7) as usize;
+        let slot = (top + 1) & 7;
+        let x = self.finite[top].ok_or(ArithmeticError::Unsupported)?;
+        let y = self.finite[slot].ok_or(ArithmeticError::Unsupported)?;
+        if x.mantissa == 0 || x.negative {
+            let invalid = x.mantissa != 0 || y.mantissa == 0;
+            let value = if invalid {
+                f64::from_bits(0xFFF8_0000_0000_0000)
+            } else {
+                signed(f64::INFINITY, !y.negative)
+            };
+            return self.store_special(slot, value, if invalid { 1 } else { 4 }, true);
+        }
+        let result = logarithm::multiply_log2(x, y, self.control)?;
+        self.store_rounded(slot, result, true)
+    }
+    /// F2XM1: 2^ST(0)-1 on the documented [-1, 1] input domain.
+    pub fn exp2_minus_one(&mut self) -> Result<(), ArithmeticError> {
+        self.st0().map_err(ArithmeticError::Stack)?;
+        let slot = ((self.status >> 11) & 7) as usize;
+        let x = self.finite[slot].ok_or(ArithmeticError::Unsupported)?;
+        let result = exponential::exp2_minus_one(x, self.control)?;
+        self.store_rounded(slot, result, false)
+    }
+    /// FSCALE preserves ST(1) and the full ST(0) significand. The scale is
+    /// truncated toward zero independently of RC; PC does not round the result.
+    pub fn scale(&mut self) -> Result<(), ArithmeticError> {
+        self.st0().map_err(ArithmeticError::Stack)?;
+        self.st(1).map_err(ArithmeticError::Stack)?;
+        let top = ((self.status >> 11) & 7) as usize;
+        let mut value = self.finite[top].ok_or(ArithmeticError::Unsupported)?;
+        let scale = self.finite[(top + 1) & 7].ok_or(ArithmeticError::Unsupported)?;
+        if value.mantissa != 0 && scale.mantissa != 0 && scale.exponent >= 0 {
+            // Such a scale cannot yield a result in the supported exponent
+            // range even for the smallest/largest currently loadable operand.
+            if scale.exponent >= 12 {
+                return Err(ArithmeticError::Unsupported);
+            }
+            let magnitude = (scale.mantissa >> (63 - scale.exponent)) as i32;
+            value.exponent += if scale.negative {
+                -magnitude
+            } else {
+                magnitude
+            };
+        }
+        self.store_rounded(
+            top,
+            Rounded {
+                value,
+                inexact: false,
+                up: false,
+            },
+            false,
+        )
     }
     /// FIST/FISTP returns the encoded signed integer, or masked integer indefinite.
     pub fn store_integer(&mut self, bits: u8) -> Result<u64, ArithmeticError> {
@@ -204,6 +312,7 @@ impl X87 {
         let finite = self.finite[slot];
         self.push(value)?;
         self.finite[((self.status >> 11) & 7) as usize] = finite;
+        self.status &= !0x200;
         Ok(())
     }
     /// FST/FSTP ST(i) copies the full retained value and tag without rounding.
@@ -251,10 +360,67 @@ impl X87 {
         self.status &= !0x200;
         Ok(())
     }
+    pub fn absolute(&mut self) -> Result<(), StackError> {
+        self.st0()?;
+        let slot = ((self.status >> 11) & 7) as usize;
+        self.values[slot] = self.values[slot].abs();
+        if let Some(value) = &mut self.finite[slot] {
+            value.negative = false;
+        }
+        self.status &= !0x200;
+        Ok(())
+    }
+    /// FFREE only changes the tag, including an already empty register.
+    pub fn free(&mut self, index: u8) {
+        let slot = (((self.status >> 11) + u16::from(index & 7)) & 7) as usize;
+        self.tags |= 3 << (slot * 2);
+    }
+    /// FINCSTP/FDECSTP rotate TOP without changing physical values or tags.
+    pub fn rotate_top(&mut self, increment: bool) {
+        let top = (self.status >> 11) & 7;
+        let next = if increment {
+            top.wrapping_add(1)
+        } else {
+            top.wrapping_sub(1)
+        } & 7;
+        self.status = (self.status & !0x3A00) | (next << 11);
+    }
     /// FCOMPP uses IEEE ordering, including the 387's signed infinities.
     pub fn compare_pop_twice(&mut self) -> Result<(), ArithmeticError> {
+        self.compare_register(1, 2)
+    }
+    /// FTST compares ST(0) with positive zero, preserving every stack value.
+    /// As with FCOM, either kind of NaN raises invalid operation.
+    pub fn test_zero(&mut self) -> Result<(), ArithmeticError> {
+        let value = self.st0().map_err(ArithmeticError::Stack)?;
+        let condition = if value.is_nan() {
+            self.status |= 1;
+            if self.control & 1 == 0 {
+                self.status |= 0x8080;
+                return Err(ArithmeticError::UnmaskedException(1));
+            }
+            0x4500
+        } else {
+            let top = ((self.status >> 11) & 7) as usize;
+            let order = match self.finite[top] {
+                Some(value) => value.compare(Finite::from_i64(0)),
+                None => value.partial_cmp(&0.0).unwrap(), // Signed infinity.
+            };
+            if order.is_lt() {
+                0x100
+            } else if order.is_eq() {
+                0x4000
+            } else {
+                0
+            }
+        };
+        self.status = (self.status & !0x4700) | condition;
+        Ok(())
+    }
+    /// Ordered FCOM/FCOMP/FCOMPP, retaining exact finite integer comparisons.
+    pub fn compare_register(&mut self, index: u8, pops: u8) -> Result<(), ArithmeticError> {
         let lhs = self.st0().map_err(ArithmeticError::Stack)?;
-        let rhs = self.st(1).map_err(ArithmeticError::Stack)?;
+        let rhs = self.st(index).map_err(ArithmeticError::Stack)?;
         let condition = if lhs.is_nan() || rhs.is_nan() {
             self.status |= 1;
             if self.control & 1 == 0 {
@@ -262,16 +428,18 @@ impl X87 {
                 return Err(ArithmeticError::UnmaskedException(1));
             }
             0x4500
-        } else if self.order(0, 1).is_lt() {
+        } else if self.order(0, index).is_lt() {
             0x100
-        } else if self.order(0, 1).is_eq() {
+        } else if self.order(0, index).is_eq() {
             0x4000
         } else {
             0
         };
         self.status = (self.status & !0x4700) | condition;
-        self.pop().map_err(ArithmeticError::Stack)?;
-        self.pop().map_err(ArithmeticError::Stack)
+        for _ in 0..pops {
+            self.pop().map_err(ArithmeticError::Stack)?;
+        }
+        Ok(())
     }
     fn order(&self, left: u8, right: u8) -> core::cmp::Ordering {
         let top = ((self.status >> 11) & 7) as usize;
@@ -289,6 +457,9 @@ impl X87 {
     /// FDIV/FDIVR ST(0), ST(i), with the same exponent limits as FDIVP.
     pub fn divide(&mut self, index: u8, reverse: bool) -> Result<(), ArithmeticError> {
         self.divide_registers(0, index, reverse, false)
+    }
+    pub fn divide_destination(&mut self, index: u8, reverse: bool) -> Result<(), ArithmeticError> {
+        self.divide_registers(index, 0, reverse, false)
     }
     fn divide_registers(
         &mut self,
@@ -337,12 +508,20 @@ impl X87 {
         } else {
             return Err(ArithmeticError::Unsupported);
         };
+        self.store_special(destination_slot, value, exception, pop)
+    }
+    fn store_special(
+        &mut self,
+        slot: usize,
+        value: f64,
+        exception: u16,
+        pop: bool,
+    ) -> Result<(), ArithmeticError> {
         self.status = (self.status & !0x200) | exception; // C1=0, sticky exceptions.
         if exception & !self.control != 0 {
             self.status |= 0x8080; // ES/B, without changing the stack or destination.
             return Err(ArithmeticError::UnmaskedException(exception));
         }
-        let slot = (((self.status >> 11) + u16::from(destination_index)) & 7) as usize;
         let tag = if value == 0.0 {
             1
         } else if value.is_finite() {
@@ -364,6 +543,11 @@ impl X87 {
         result: Rounded,
         pop: bool,
     ) -> Result<(), ArithmeticError> {
+        if result.value.mantissa != 0 && !(-1022..=1022).contains(&result.value.exponent) {
+            // FRNDINT can return a loaded value unchanged, bypassing finite
+            // arithmetic's range check. Never panic in diagnostic conversion.
+            return Err(ArithmeticError::Unsupported);
+        }
         let exception = if result.inexact { 0x20 } else { 0 };
         self.status = (self.status & !0x200) | exception | if result.up { 0x200 } else { 0 };
         if exception & !self.control != 0 {
@@ -381,6 +565,13 @@ impl X87 {
     }
     /// FADDP ST(i), ST(0), retaining extended integer precision.
     pub fn add_pop(&mut self, index: u8) -> Result<(), ArithmeticError> {
+        self.add_destination(index, true)
+    }
+    /// FADD ST(i), ST(0), retaining TOP and the source register.
+    pub fn add_register(&mut self, index: u8) -> Result<(), ArithmeticError> {
+        self.add_destination(index, false)
+    }
+    fn add_destination(&mut self, index: u8, pop: bool) -> Result<(), ArithmeticError> {
         self.st0().map_err(ArithmeticError::Stack)?;
         self.st(index).map_err(ArithmeticError::Stack)?;
         let top = ((self.status >> 11) & 7) as usize;
@@ -388,7 +579,7 @@ impl X87 {
         let mut source = self.finite[top].ok_or(ArithmeticError::Unsupported)?;
         let destination = self.finite[slot].ok_or(ArithmeticError::Unsupported)?;
         source.negative = !source.negative;
-        self.store_rounded(slot, destination.subtract(source, self.control)?, true)
+        self.store_rounded(slot, destination.subtract(source, self.control)?, pop)
     }
     /// FMULP or FSUBP/FSUBRP ST(i), ST(0), for finite normal results.
     pub fn arithmetic_pop(
@@ -396,6 +587,16 @@ impl X87 {
         index: u8,
         multiply: bool,
         reverse: bool,
+    ) -> Result<(), ArithmeticError> {
+        self.arithmetic_destination(index, multiply, reverse, true)
+    }
+    /// Finite FMUL/FSUB/FSUBR with ST(i) destination, optionally popping ST(0).
+    pub fn arithmetic_destination(
+        &mut self,
+        index: u8,
+        multiply: bool,
+        reverse: bool,
+        pop: bool,
     ) -> Result<(), ArithmeticError> {
         self.st0().map_err(ArithmeticError::Stack)?;
         self.st(index).map_err(ArithmeticError::Stack)?;
@@ -410,18 +611,26 @@ impl X87 {
         } else {
             destination.subtract(source, self.control)?
         };
-        self.store_rounded(slot, result, true)
+        self.store_rounded(slot, result, pop)
     }
     /// FCOMP with a binary32/64 memory operand.
     pub fn compare_memory_pop(&mut self, rhs: f64) -> Result<(), ArithmeticError> {
+        self.compare_memory(rhs, true)
+    }
+    pub fn compare_memory(&mut self, rhs: f64, pop: bool) -> Result<(), ArithmeticError> {
+        let rhs = Finite::from_f64(rhs).ok_or(ArithmeticError::Unsupported)?;
+        self.compare_finite(rhs, pop)
+    }
+    pub fn compare_integer(&mut self, rhs: i64, pop: bool) -> Result<(), ArithmeticError> {
+        self.compare_finite(Finite::from_i64(rhs), pop)
+    }
+    fn compare_finite(&mut self, rhs: Finite, pop: bool) -> Result<(), ArithmeticError> {
         let lhs = self.st0().map_err(ArithmeticError::Stack)?;
-        if !lhs.is_finite() || !rhs.is_finite() {
+        if !lhs.is_finite() {
             return Err(ArithmeticError::Unsupported);
         }
         let top = ((self.status >> 11) & 7) as usize;
-        let order = self.finite[top]
-            .unwrap()
-            .compare(Finite::from_f64(rhs).unwrap());
+        let order = self.finite[top].unwrap().compare(rhs);
         let condition = if order.is_lt() {
             0x100
         } else if order.is_eq() {
@@ -430,7 +639,10 @@ impl X87 {
             0
         };
         self.status = (self.status & !0x4700) | condition;
-        self.pop().map_err(ArithmeticError::Stack)
+        if pop {
+            self.pop().map_err(ArithmeticError::Stack)?;
+        }
+        Ok(())
     }
     pub fn pop(&mut self) -> Result<(), StackError> {
         self.st0()?;
@@ -447,6 +659,303 @@ fn signed(value: f64, negative: bool) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fscale_matches_native_retained_bits_and_truncates_independently_of_pc_rc() {
+        let mut cases = 0;
+        for line in include_str!("native_scales.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let mut fields = line
+                .split_whitespace()
+                .map(|field| u64::from_str_radix(field, 16).unwrap());
+            let control = fields.next().unwrap() as u16;
+            let x_mantissa = fields.next().unwrap();
+            let x_sign_exponent = fields.next().unwrap();
+            let y = f64::from_bits(fields.next().unwrap());
+            let mantissa = fields.next().unwrap();
+            let sign_exponent = fields.next().unwrap();
+            let status = fields.next().unwrap() as u16;
+            let x = Finite {
+                negative: x_sign_exponent & 0x8000 != 0,
+                exponent: (x_sign_exponent & 0x7FFF) as i32 - 16383,
+                mantissa: x_mantissa,
+            };
+            let mut fpu = X87::new();
+            fpu.load_control(control);
+            fpu.push(y).unwrap();
+            fpu.push(if x.mantissa == 0 {
+                signed(0., x.negative)
+            } else {
+                x.to_f64()
+            })
+            .unwrap();
+            fpu.finite[6] = Some(x);
+            fpu.scale().unwrap();
+            let actual = fpu.finite[6].unwrap();
+            assert_eq!(actual.mantissa, mantissa, "{line}");
+            assert_eq!(actual.negative, sign_exponent & 0x8000 != 0);
+            if mantissa != 0 {
+                assert_eq!(actual.exponent, (sign_exponent & 0x7FFF) as i32 - 16383);
+            }
+            assert_eq!(fpu.status(), status);
+            assert_eq!(fpu.st(1), Ok(y));
+            cases += 1;
+        }
+        assert_eq!(cases, 300);
+    }
+    #[test]
+    fn fscale_rejects_unsupported_result_ranges_without_mutation() {
+        for scale in [-1e20, 1e20, -1023., 1023.] {
+            let mut fpu = X87::new();
+            fpu.push(scale).unwrap();
+            fpu.push(1.).unwrap();
+            let status = fpu.status();
+            let tags = fpu.tags();
+            assert_eq!(fpu.scale(), Err(ArithmeticError::Unsupported));
+            assert_eq!(fpu.st0(), Ok(1.));
+            assert_eq!(fpu.st(1), Ok(scale));
+            assert_eq!(fpu.status(), status);
+            assert_eq!(fpu.tags(), tags);
+        }
+        let mut fpu = X87::new();
+        fpu.push(1e20).unwrap();
+        fpu.push(-0.).unwrap();
+        fpu.scale().unwrap();
+        assert_eq!(fpu.st0().unwrap().to_bits(), (-0.0_f64).to_bits());
+    }
+    #[test]
+    fn f2xm1_matches_native_values_including_tiny_inputs_without_cancellation() {
+        let mut cases = 0;
+        for line in include_str!("native_exponentials.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let mut fields = line
+                .split_whitespace()
+                .map(|field| u64::from_str_radix(field, 16).unwrap());
+            let control = fields.next().unwrap() as u16;
+            let x = f64::from_bits(fields.next().unwrap());
+            let mantissa = fields.next().unwrap();
+            let sign_exponent = fields.next().unwrap();
+            let status = fields.next().unwrap() as u16;
+            let mut fpu = X87::new();
+            fpu.load_control(control);
+            fpu.push(x).unwrap();
+            fpu.exp2_minus_one().unwrap();
+            let actual = fpu.finite[7].unwrap();
+            assert_eq!(actual.negative, sign_exponent & 0x8000 != 0);
+            if mantissa == 0 {
+                assert_eq!(actual.mantissa, 0);
+            } else {
+                let rank = |exponent: u64, significand: u64| {
+                    (u128::from(exponent) << 63) + u128::from(significand & !(1 << 63))
+                };
+                assert!(
+                    rank((actual.exponent + 16383) as u64, actual.mantissa)
+                        .abs_diff(rank(sign_exponent & 0x7FFF, mantissa))
+                        <= 2,
+                    "{line}: {:016X}",
+                    actual.mantissa
+                );
+            }
+            assert_eq!(fpu.status() & 0x3820, status & 0x3820);
+            cases += 1;
+        }
+        assert_eq!(cases, 144);
+    }
+    #[test]
+    fn f2xm1_rejects_out_of_domain_and_unmasked_precision_without_changing_the_stack() {
+        for value in [-2., 2., f64::INFINITY, f64::NAN] {
+            let mut fpu = X87::new();
+            fpu.push(value).unwrap();
+            let status = fpu.status();
+            assert_eq!(fpu.exp2_minus_one(), Err(ArithmeticError::Unsupported));
+            assert_eq!(fpu.st0().unwrap().to_bits(), value.to_bits());
+            assert_eq!(fpu.status(), status);
+        }
+        let mut fpu = X87::new();
+        fpu.push(0.5).unwrap();
+        fpu.load_control(0x035F);
+        assert_eq!(
+            fpu.exp2_minus_one(),
+            Err(ArithmeticError::UnmaskedException(0x20))
+        );
+        assert_eq!(fpu.st0(), Ok(0.5));
+        assert_eq!(fpu.status() & 0x3800, 0x3800);
+    }
+    #[test]
+    fn audit_frndint_upper_binade_reports_unsupported_without_panicking_or_popping() {
+        let mut fpu = X87::new();
+        fpu.push(f64::MAX).unwrap();
+        let status = fpu.status();
+        let tags = fpu.tags();
+        assert_eq!(fpu.round_integer(), Err(ArithmeticError::Unsupported));
+        assert_eq!(fpu.st0(), Ok(f64::MAX));
+        assert_eq!(fpu.status(), status);
+        assert_eq!(fpu.tags(), tags);
+    }
+    #[test]
+    fn audit_fld_register_clears_c1_but_preserves_precision_status() {
+        let mut fpu = X87::new();
+        fpu.push(1.75).unwrap();
+        assert_eq!(fpu.store_integer(16), Ok(2));
+        assert_eq!(fpu.status(), 0x3A20);
+        fpu.duplicate(0).unwrap();
+        assert_eq!(fpu.status(), 0x3020); // Captured native FLD ST(0).
+        assert_eq!(fpu.st0(), Ok(1.75));
+        assert_eq!(fpu.st(1), Ok(1.75));
+    }
+    #[test]
+    fn fyl2x_matches_native_values_within_two_extended_ulps() {
+        let mut cases = 0;
+        for line in include_str!("native_logarithms.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let mut fields = line
+                .split_whitespace()
+                .map(|field| u64::from_str_radix(field, 16).unwrap());
+            let control = fields.next().unwrap() as u16;
+            let x = f64::from_bits(fields.next().unwrap());
+            let y_mantissa = fields.next().unwrap();
+            let y_sign_exponent = fields.next().unwrap();
+            let expected_mantissa = fields.next().unwrap();
+            let expected_sign_exponent = fields.next().unwrap();
+            let expected_status = fields.next().unwrap() as u16;
+            let y = Finite {
+                negative: y_sign_exponent & 0x8000 != 0,
+                exponent: (y_sign_exponent & 0x7FFF) as i32 - 16383,
+                mantissa: y_mantissa,
+            };
+            let mut fpu = X87::new();
+            fpu.load_control(control);
+            fpu.push(y.to_f64()).unwrap();
+            fpu.finite[7] = Some(y);
+            fpu.push(x).unwrap();
+            fpu.y_log2_x().unwrap();
+            let actual = fpu.finite[7].unwrap();
+            assert_eq!(
+                actual.negative,
+                expected_sign_exponent & 0x8000 != 0,
+                "{line}"
+            );
+            if expected_mantissa != 0 {
+                let rank = |exponent: u64, mantissa: u64| {
+                    (u128::from(exponent) << 63) + u128::from(mantissa & !(1 << 63))
+                };
+                let expected_rank = rank(expected_sign_exponent & 0x7FFF, expected_mantissa);
+                let actual_rank = rank((actual.exponent + 16383) as u64, actual.mantissa);
+                assert!(
+                    actual_rank.abs_diff(expected_rank) <= 2,
+                    "{line}: {:016X} exp={}",
+                    actual.mantissa,
+                    actual.exponent
+                );
+            } else {
+                assert_eq!(actual.mantissa, 0);
+            }
+            assert_eq!(fpu.status() & 0x3820, expected_status & 0x3820, "{line}");
+            assert_eq!(
+                fpu.tags(),
+                if expected_mantissa == 0 {
+                    0x7FFF
+                } else {
+                    0x3FFF
+                }
+            );
+            cases += 1;
+        }
+        assert_eq!(cases, 540);
+    }
+    #[test]
+    fn fyl2x_preserves_inputs_on_unmasked_exceptions_and_handles_zero_and_negative_domain() {
+        for (x, y, exception) in [(3., 1., 0x20), (0., 1., 4), (-1., 1., 1), (0., 0., 1)] {
+            let mut fpu = X87::new();
+            fpu.push(y).unwrap();
+            fpu.push(x).unwrap();
+            fpu.load_control(0x037F & !exception);
+            let tags = fpu.tags();
+            let values = fpu.values;
+            assert_eq!(
+                fpu.y_log2_x(),
+                Err(ArithmeticError::UnmaskedException(exception))
+            );
+            assert_eq!(fpu.status() & 0x3800, 0x3000);
+            assert_eq!(fpu.tags(), tags);
+            assert_eq!(fpu.values, values);
+        }
+        for (x, y, negative, invalid) in [
+            (0., 1., true, false),
+            (-0., -1., false, false),
+            (-1., 1., true, true),
+            (0., 0., true, true),
+        ] {
+            let mut fpu = X87::new();
+            fpu.push(y).unwrap();
+            fpu.push(x).unwrap();
+            fpu.y_log2_x().unwrap();
+            assert_eq!(fpu.status() & 0x3800, 0x3800);
+            assert_eq!(fpu.st0().unwrap().is_nan(), invalid);
+            assert_eq!(fpu.st0().unwrap().is_sign_negative(), negative);
+            assert_eq!(fpu.status() & 5, if invalid { 1 } else { 4 });
+        }
+    }
+    #[test]
+    fn constants_match_native_x87_at_every_rounding_and_precision_setting() {
+        use Constant::*;
+        for line in include_str!("native_constants.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let mut fields = line
+                .split_whitespace()
+                .map(|field| u64::from_str_radix(field, 16).unwrap());
+            let control = fields.next().unwrap() as u16;
+            let opcode = fields.next().unwrap() as usize;
+            let mantissa = fields.next().unwrap();
+            let exponent = fields.next().unwrap() as i32;
+            let status = fields.next().unwrap() as u16;
+            for precision in [0, 0x100, 0x200, 0x300] {
+                for precision_masked in [false, true] {
+                    let mut fpu = X87::new();
+                    let control =
+                        (control & !0x320) | precision | if precision_masked { 0x20 } else { 0 };
+                    fpu.load_control(control);
+                    fpu.load_constant(
+                        [One, Log2Ten, Log2E, Pi, Log10Two, LnTwo, Zero][opcode - 0xE8],
+                    )
+                    .unwrap();
+                    let retained = fpu.finite[7].unwrap();
+                    assert_eq!(retained.mantissa, mantissa, "{line}; CW={control:04X}");
+                    if mantissa != 0 {
+                        assert_eq!(retained.exponent + 16383, exponent);
+                    }
+                    assert!(!retained.negative);
+                    assert_eq!(fpu.status(), status);
+                    assert_eq!(fpu.tags(), if mantissa == 0 { 0x7FFF } else { 0x3FFF });
+                    assert_eq!(fpu.control(), control);
+                }
+            }
+        }
+    }
+    #[test]
+    fn constants_clear_c1_preserve_other_conditions_and_do_not_overwrite_full_stack() {
+        let mut fpu = X87::new();
+        fpu.status = 0x4720;
+        fpu.load_constant(Constant::LnTwo).unwrap();
+        assert_eq!(fpu.status(), 0x7D20); // TOP=7, C1 cleared; C0/C2/C3/PE retained.
+        for _ in 0..7 {
+            fpu.push_integer(17).unwrap();
+        }
+        let tags = fpu.tags();
+        let top = fpu.status() & 0x3800;
+        let values = fpu.values;
+        assert_eq!(fpu.load_constant(Constant::Pi), Err(StackError::Overflow));
+        assert_eq!(fpu.tags(), tags);
+        assert_eq!(fpu.status() & 0x3800, top);
+        assert_eq!(fpu.values, values);
+    }
     #[test]
     fn register_stores_copy_tags_wrap_top_and_do_not_write_on_empty_source() {
         for (value, tag) in [(0.0, 1), (-0.0, 1), (2.5, 0), (f64::INFINITY, 2)] {

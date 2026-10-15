@@ -7,6 +7,395 @@ struct TestBus {
     ports: [u8; 256],
 }
 #[test]
+fn fscale_decodes_without_popping_and_ignores_rounding_control_for_scale_truncation() {
+    for rounding in 0..4 {
+        let mut cpu = Cpu::default().with_x87();
+        let fpu = cpu.fpu.as_mut().unwrap();
+        fpu.load_control(0x007F | (rounding << 10));
+        fpu.push(-1.75).unwrap();
+        fpu.push(3.0).unwrap();
+        let flags = cpu.flags;
+        let mut bus = TestBus::new(&[0xD9, 0xFD]);
+        cpu.step(&mut bus).unwrap();
+        let fpu = cpu.fpu.as_ref().unwrap();
+        assert_eq!(fpu.st0(), Ok(1.5));
+        assert_eq!(fpu.st(1), Ok(-1.75));
+        assert_eq!(fpu.status(), 0x3000);
+        assert_eq!(cpu.registers.ip, 2);
+        assert_eq!(cpu.flags, flags);
+        assert_eq!(bus.writes, 0);
+    }
+}
+#[test]
+fn f2xm1_decodes_without_popping_or_changing_other_stack_registers() {
+    let mut cpu = Cpu::default().with_x87();
+    cpu.fpu.as_mut().unwrap().push(17.0).unwrap();
+    cpu.fpu.as_mut().unwrap().push(0.5).unwrap();
+    let flags = cpu.flags;
+    let mut bus = TestBus::new(&[0xD9, 0xF0]);
+    cpu.step(&mut bus).unwrap();
+    let fpu = cpu.fpu.as_ref().unwrap();
+    assert!((fpu.st0().unwrap() - (core::f64::consts::SQRT_2 - 1.0)).abs() < 1e-15);
+    assert_eq!(fpu.st(1), Ok(17.0));
+    assert_eq!(fpu.status() & 0x3800, 0x3000);
+    assert_eq!(cpu.registers.ip, 2);
+    assert_eq!(cpu.flags, flags);
+    assert_eq!(bus.writes, 0);
+}
+#[test]
+fn fyl2x_executes_the_heroes_log_sequence_and_pops_only_one_register() {
+    let mut cpu = Cpu::default().with_x87();
+    cpu.fpu.as_mut().unwrap().push(17.0).unwrap(); // Sentinel below y.
+    let mut bus = TestBus::new(&[
+        0xD9, 0xED, // FLDLN2.
+        0xD9, 6, 0, 2, // FLD m32real [0200h].
+        0xD9, 0xF1, // FYL2X: natural log of 8.
+    ]);
+    bus.ram[0x200..0x204].copy_from_slice(&8.0_f32.to_bits().to_le_bytes());
+    let flags = cpu.flags;
+    for _ in 0..3 {
+        cpu.step(&mut bus).unwrap();
+    }
+    assert_eq!(cpu.registers.ip, 8);
+    assert_eq!(cpu.flags, flags);
+    assert_eq!(bus.writes, 0);
+    let fpu = cpu.fpu.as_ref().unwrap();
+    assert_eq!(fpu.st(1), Ok(17.0));
+    assert!((fpu.st0().unwrap() - core::f64::consts::LN_2 * 3.0).abs() < 1e-15);
+    assert_eq!(fpu.status() & 0x3800, 0x3000);
+    assert_eq!(fpu.tags() & 0xC00, 0xC00); // Former ST(0), slot 5, is empty.
+}
+#[test]
+fn all_seven_x87_constant_opcodes_push_without_precision_exceptions() {
+    for opcode in 0xE8..=0xEE {
+        for rounding in 0..4 {
+            for precision in [0, 0x100, 0x200, 0x300] {
+                let mut cpu = Cpu::default().with_x87();
+                cpu.fpu
+                    .as_mut()
+                    .unwrap()
+                    .load_control(0x005F | precision | (rounding << 10));
+                let flags = cpu.flags;
+                let mut bus = TestBus::new(&[0xD9, opcode]);
+                cpu.step(&mut bus).unwrap();
+                assert_eq!(cpu.registers.ip, 2);
+                assert_eq!(cpu.flags, flags);
+                assert_eq!(bus.writes, 0);
+                let fpu = cpu.fpu.as_ref().unwrap();
+                let expected = [
+                    1.0,
+                    core::f64::consts::LOG2_10,
+                    core::f64::consts::LOG2_E,
+                    core::f64::consts::PI,
+                    core::f64::consts::LOG10_2,
+                    core::f64::consts::LN_2,
+                    0.0,
+                ];
+                assert_eq!(fpu.st0(), Ok(expected[usize::from(opcode - 0xE8)]));
+                assert_eq!(fpu.status(), 0x3800);
+                if (0xE9..=0xED).contains(&opcode) {
+                    assert_eq!(
+                        fpu.store_value(),
+                        Err(doslet_x87::ArithmeticError::Unsupported)
+                    );
+                }
+            }
+        }
+    }
+}
+#[test]
+fn ftst_compares_zero_without_popping_or_changing_integer_flags() {
+    for (value, condition) in [
+        (-1.0, 0x100),
+        (-0.0, 0x4000),
+        (0.0, 0x4000),
+        (1.0, 0),
+        (f64::NEG_INFINITY, 0x100),
+        (f64::INFINITY, 0),
+        (f64::from_bits(1), 0),
+        (-f64::from_bits(1), 0x100),
+        (f64::NAN, 0x4500),
+    ] {
+        let mut bus = TestBus::new(&[0xD9, 0xE4]);
+        let mut cpu = Cpu::default().with_x87();
+        cpu.flags |= flags::CARRY | flags::ZERO | flags::PARITY;
+        let flags = cpu.flags;
+        let fpu = cpu.fpu.as_mut().unwrap();
+        fpu.push(value).unwrap();
+        let tags = fpu.tags();
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.flags, flags);
+        assert_eq!(cpu.registers.ip, 2);
+        assert_eq!(bus.writes, 0);
+        let fpu = cpu.fpu.as_ref().unwrap();
+        assert_eq!(fpu.status() & 0x4700, condition);
+        assert_eq!(fpu.status() & 0x3800, 0x3800);
+        assert_eq!(fpu.status() & 1, u16::from(value.is_nan()));
+        assert_eq!(fpu.tags(), tags);
+        assert_eq!(fpu.st0().unwrap().to_bits(), value.to_bits());
+    }
+    let mut bus = TestBus::new(&[0xD9, 0xE4]);
+    let mut cpu = Cpu::default().with_x87();
+    cpu.fpu.as_mut().unwrap().push(f64::NAN).unwrap();
+    cpu.fpu.as_mut().unwrap().load_control(0x037E);
+    assert!(matches!(
+        cpu.step(&mut bus),
+        Err(doslet_x86::CpuError::X87Arithmetic {
+            reason: doslet_x87::ArithmeticError::UnmaskedException(1),
+            ..
+        })
+    ));
+    assert!(cpu.fpu.as_ref().unwrap().st0().unwrap().is_nan());
+    assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x4500, 0);
+    assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x8081, 0x8081);
+    let mut cpu = Cpu::default().with_x87();
+    assert!(matches!(
+        cpu.step(&mut TestBus::new(&[0xD9, 0xE4])),
+        Err(doslet_x86::CpuError::X87Arithmetic {
+            reason: doslet_x87::ArithmeticError::Stack(doslet_x87::StackError::Empty),
+            ..
+        })
+    ));
+}
+#[test]
+fn every_x87_encoding_routes_to_the_declared_handler_or_explicit_diagnostic() {
+    use doslet_x86::{
+        CpuError,
+        x87_decode::{self, Encoding},
+    };
+    for opcode in 0xD8..=0xDF {
+        for modrm in 0..=255 {
+            let mut bus = TestBus::new(&[opcode, modrm, 0, 0, 0, 0, 0, 0]);
+            let mut cpu = Cpu::default().with_x87();
+            for reg in [Gpr16::Bx, Gpr16::Bp, Gpr16::Si, Gpr16::Di] {
+                cpu.registers.set(reg, 0x1000);
+            }
+            for _ in 0..8 {
+                cpu.fpu.as_mut().unwrap().push(2.0).unwrap();
+            }
+            let encoding = x87_decode::decode(opcode, modrm);
+            let result = cpu.step(&mut bus);
+            match encoding {
+                Encoding::I387(instruction) if instruction.implemented() => assert!(
+                    matches!(
+                        result,
+                        Ok(_) | Err(CpuError::X87Arithmetic { .. } | CpuError::X87Stack { .. })
+                    ),
+                    "{opcode:02X} {modrm:02X}: {result:?}"
+                ),
+                Encoding::I387(instruction) | Encoding::LaterIsa(instruction) => {
+                    assert!(
+                        matches!(result, Err(CpuError::X87Unsupported { instruction: actual, .. }) if actual == instruction)
+                    );
+                    assert_eq!(cpu.registers.ip, 2); // No displacement or data accesses.
+                    assert_eq!(bus.writes, 0);
+                    assert_eq!(cpu.fpu.as_ref().unwrap().st0(), Ok(2.0));
+                    assert_eq!(cpu.fpu.as_ref().unwrap().tags(), 0);
+                }
+                Encoding::Reserved => assert!(matches!(result, Err(CpuError::X87Reserved { .. }))),
+                Encoding::NotX87 => unreachable!(),
+            }
+        }
+    }
+}
+
+#[test]
+fn all_register_arithmetic_directions_destinations_and_pop_forms_execute() {
+    for opcode in [0xD8, 0xDC, 0xDE] {
+        for group in [0, 1, 4, 5, 6, 7] {
+            for index in 0..8 {
+                let mut bus = TestBus::new(&[opcode, 0xC0 | (group << 3) | index]);
+                let mut cpu = Cpu::default().with_x87();
+                for _ in 0..7 {
+                    cpu.fpu.as_mut().unwrap().push(2.0).unwrap();
+                }
+                cpu.fpu.as_mut().unwrap().push(8.0).unwrap();
+                let flags = cpu.flags;
+                let top = cpu.fpu.as_ref().unwrap().status() & 0x3800;
+                let (lhs, rhs) = if opcode == 0xD8 {
+                    (8.0, if index == 0 { 8.0 } else { 2.0 })
+                } else {
+                    (if index == 0 { 8.0 } else { 2.0 }, 8.0)
+                };
+                let reverse = opcode != 0xD8;
+                let expected = match group {
+                    0 => lhs + rhs,
+                    1 => lhs * rhs,
+                    4 if reverse => rhs - lhs,
+                    4 => lhs - rhs,
+                    5 if reverse => lhs - rhs,
+                    5 => rhs - lhs,
+                    6 if reverse => rhs / lhs,
+                    6 => lhs / rhs,
+                    7 if reverse => lhs / rhs,
+                    _ => rhs / lhs,
+                };
+                cpu.step(&mut bus).unwrap();
+                assert_eq!(cpu.flags, flags);
+                assert_eq!(bus.writes, 0);
+                let fpu = cpu.fpu.as_ref().unwrap();
+                if opcode == 0xDE {
+                    assert_eq!(fpu.status() & 0x3800, (top + 0x800) & 0x3800);
+                    if index != 0 {
+                        assert_eq!(fpu.st(index - 1), Ok(expected));
+                    }
+                    assert!(fpu.st(7).is_err());
+                } else {
+                    assert_eq!(fpu.status() & 0x3800, top);
+                    assert_eq!(fpu.st(if opcode == 0xD8 { 0 } else { index }), Ok(expected));
+                    if index != 0 {
+                        assert_eq!(
+                            fpu.st(if opcode == 0xD8 { index } else { 0 }),
+                            Ok(if opcode == 0xD8 { 2.0 } else { 8.0 })
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn integer_memory_arithmetic_has_fixed_data_width_and_respects_address_overrides() {
+    for opcode in [0xDA, 0xDE] {
+        for address_32 in [false, true] {
+            for operand_32 in [false, true] {
+                for group in 0..8 {
+                    let mut code = Vec::new();
+                    if address_32 {
+                        code.push(0x67);
+                    }
+                    if operand_32 {
+                        code.push(0x66);
+                    }
+                    code.extend_from_slice(&[
+                        opcode,
+                        (group << 3) | if address_32 { 5 } else { 6 },
+                        0,
+                        2,
+                    ]);
+                    if address_32 {
+                        code.extend_from_slice(&[0, 0]);
+                    }
+                    let mut bus = TestBus::new(&code);
+                    bus.ram[0x200..0x204].copy_from_slice(&(-3_i32).to_le_bytes());
+                    let mut cpu = Cpu::default().with_x87();
+                    cpu.fpu.as_mut().unwrap().push(12.0).unwrap();
+                    let flags = cpu.flags;
+                    cpu.step(&mut bus).unwrap();
+                    assert_eq!(cpu.registers.ip as usize, code.len());
+                    assert_eq!(cpu.flags, flags);
+                    assert_eq!(bus.writes, 0);
+                    let fpu = cpu.fpu.as_ref().unwrap();
+                    if group == 3 {
+                        assert!(fpu.st0().is_err());
+                    } else if group == 2 {
+                        assert_eq!(fpu.st0(), Ok(12.0));
+                        assert_eq!(fpu.status() & 0x4500, 0); // 12 > -3.
+                    } else {
+                        assert_eq!(
+                            fpu.st0(),
+                            Ok([9.0, -36.0, 0.0, 0.0, 15.0, -15.0, -4.0, -0.25][group as usize])
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_register_comparisons_preserve_retained_precision_and_only_pop_when_requested() {
+    for pop in [false, true] {
+        for (lhs, rhs, condition) in [(0, 1, 0x100), (1, 1, 0x4000), (2, 1, 0)] {
+            let mut bus = TestBus::new(&[0xD8, if pop { 0xD9 } else { 0xD1 }]);
+            let mut cpu = Cpu::default().with_x87();
+            let base = 1_i64 << 60;
+            let fpu = cpu.fpu.as_mut().unwrap();
+            fpu.push_integer(base + rhs).unwrap();
+            fpu.push_integer(base + lhs).unwrap();
+            cpu.step(&mut bus).unwrap();
+            let fpu = cpu.fpu.as_ref().unwrap();
+            assert_eq!(fpu.status() & 0x4700, condition);
+            assert_eq!(fpu.status() & 0x3800, if pop { 0x3800 } else { 0x3000 });
+        }
+    }
+}
+
+#[test]
+fn stack_tag_operations_and_absolute_value_do_not_round_registers() {
+    let mut bus = TestBus::new(&[0xD9, 0xE1, 0xDD, 0xC0, 0xD9, 0xF6, 0xD9, 0xF7]);
+    let mut cpu = Cpu::default().with_x87();
+    let exact = (1_i64 << 60) + 1;
+    cpu.fpu.as_mut().unwrap().push_integer(-exact).unwrap();
+    cpu.fpu.as_mut().unwrap().load_control(0x007F);
+    cpu.step(&mut bus).unwrap(); // FABS.
+    assert_eq!(
+        cpu.fpu.as_mut().unwrap().store_integer(64),
+        Ok(exact as u64)
+    );
+    cpu.step(&mut bus).unwrap(); // FFREE ST(0): empty but TOP unchanged.
+    assert_eq!(cpu.fpu.as_ref().unwrap().tags(), 0xFFFF);
+    assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x3800, 0x3800);
+    cpu.step(&mut bus).unwrap(); // FDECSTP.
+    assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x3800, 0x3000);
+    cpu.step(&mut bus).unwrap(); // FINCSTP.
+    assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x3800, 0x3800);
+    assert_eq!(cpu.fpu.as_ref().unwrap().tags(), 0xFFFF);
+}
+
+#[test]
+fn memory_comparisons_decode_both_float_widths_and_optional_pop() {
+    for opcode in [0xD8, 0xDC] {
+        for pop in [false, true] {
+            for (lhs, rhs, condition) in [(1.0, 2.0, 0x100), (2.0, 2.0, 0x4000), (3.0, 2.0, 0)] {
+                let mut bus = TestBus::new(&[opcode, if pop { 0x1E } else { 0x16 }, 0, 2]);
+                if opcode == 0xD8 {
+                    bus.ram[0x200..0x204].copy_from_slice(&(rhs as f32).to_bits().to_le_bytes());
+                } else {
+                    bus.ram[0x200..0x208].copy_from_slice(&f64::to_bits(rhs).to_le_bytes());
+                }
+                let mut cpu = Cpu::default().with_x87();
+                cpu.fpu.as_mut().unwrap().push(lhs).unwrap();
+                cpu.step(&mut bus).unwrap();
+                let fpu = cpu.fpu.as_ref().unwrap();
+                assert_eq!(fpu.status() & 0x4700, condition);
+                assert_eq!(fpu.status() & 0x3800, if pop { 0 } else { 0x3800 });
+                assert_eq!(fpu.st0().is_err(), pop);
+            }
+        }
+    }
+}
+
+#[test]
+fn new_sti_arithmetic_forms_preserve_both_operands_on_unmasked_precision() {
+    for modrm in [0xC9, 0xE1, 0xE9, 0xF1, 0xF9] {
+        let mut bus = TestBus::new(&[0xDC, modrm]);
+        let mut cpu = Cpu::default().with_x87();
+        let fpu = cpu.fpu.as_mut().unwrap();
+        fpu.push(1.0).unwrap();
+        fpu.push(1.0 / 3.0).unwrap();
+        fpu.load_control(0x005F); // PC=24, unmasked precision exception.
+        let tags = fpu.tags();
+        assert!(
+            matches!(
+                cpu.step(&mut bus),
+                Err(doslet_x86::CpuError::X87Arithmetic {
+                    reason: doslet_x87::ArithmeticError::UnmaskedException(0x20),
+                    ..
+                })
+            ),
+            "DC {modrm:02X}"
+        );
+        let fpu = cpu.fpu.as_ref().unwrap();
+        assert_eq!(fpu.st0(), Ok(1.0 / 3.0));
+        assert_eq!(fpu.st(1), Ok(1.0));
+        assert_eq!(fpu.status() & 0x3800, 0x3000);
+        assert_eq!(fpu.tags(), tags);
+        assert_eq!(bus.writes, 0);
+    }
+}
+#[test]
 fn x87_fst_and_fstp_decode_all_registers_and_preserve_retained_precision() {
     for pop in [false, true] {
         for index in 0..8 {
@@ -73,6 +462,47 @@ fn x87_faddp_updates_the_destination_and_pops_only_after_success() {
     assert!(cpu.step(&mut bus).is_err());
     assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x3800, 0x3000);
     assert_eq!(cpu.fpu.as_ref().unwrap().st(1), Ok(1.0));
+}
+
+#[test]
+fn x87_fadd_sti_keeps_top_source_and_retained_precision() {
+    for index in 0..8 {
+        let mut bus = TestBus::new(&[0xDC, 0xC0 + index]);
+        let mut cpu = Cpu::default().with_x87();
+        let exact = (1_i64 << 60) + 1;
+        let fpu = cpu.fpu.as_mut().unwrap();
+        for _ in 0..8 {
+            fpu.push_integer(exact).unwrap();
+        }
+        let top = fpu.status() & 0x3800;
+        let tags = fpu.tags();
+        let flags = cpu.flags;
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.flags, flags);
+        assert_eq!(bus.writes, 0);
+        assert_eq!(cpu.registers.ip, 2);
+        let fpu = cpu.fpu.as_mut().unwrap();
+        assert_eq!(fpu.status() & 0x3800, top);
+        assert_eq!(fpu.tags(), tags);
+        for unchanged in 0..8 {
+            if unchanged != index {
+                assert_eq!(fpu.st(unchanged), Ok(exact as f64));
+            }
+        }
+        fpu.exchange(index).unwrap();
+        assert_eq!(fpu.store_integer(64), Ok(2 * exact as u64));
+    }
+    let mut bus = TestBus::new(&[0xDC, 0xC1]);
+    let mut cpu = Cpu::default().with_x87();
+    let fpu = cpu.fpu.as_mut().unwrap();
+    fpu.push(1.0).unwrap();
+    fpu.push(1.0 / 3.0).unwrap();
+    fpu.load_control(0x005F); // Single precision, unmasked precision exception.
+    assert!(cpu.step(&mut bus).is_err());
+    let fpu = cpu.fpu.as_ref().unwrap();
+    assert_eq!(fpu.status() & 0x3800, 0x3000);
+    assert_eq!(fpu.st0(), Ok(1.0 / 3.0));
+    assert_eq!(fpu.st(1), Ok(1.0));
 }
 
 #[test]

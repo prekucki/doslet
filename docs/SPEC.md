@@ -127,13 +127,41 @@ explicitly rather than delivering INT 0.
 `Cpu::default()` has no x87 and starts with CR0.EM/ET set. `with_x87()` installs
 an independent fixed-stack `doslet-x87` unit and clears EM. The default PC uses
 that unit and reports it through CMOS equipment bits. Supported x87 forms are
-control/status initialization and transfer, FLD1/FLDZ, register duplication and
-sign change, FXCH ST(i), FST/FSTP ST(i), selected m32/m64 loads/stores, FCOMPP, finite-memory
-FCOMP, register FDIV/FDIVR/FDIVP/FDIVRP, finite FADD/FMUL/FSUB/FSUBR
-with ST(0) destinations and finite FADDP/FMULP/FSUBP/FSUBRP.
+control/status initialization and transfer, all seven FLD constant instructions, register duplication,
+FCHS/FABS, FXCH ST(i), FFREE, FINCSTP/FDECSTP, FST/FSTP ST(i), selected m32/m64
+loads/stores, FCOM/FCOMP/FCOMPP, FTST, finite-memory FCOM/FCOMP,
+register FDIV/FDIVR/FDIVP/FDIVRP, finite FADD/FMUL/FSUB/FSUBR with ST(0) or
+ST(i) destinations, and finite FADDP/FMULP/FSUBP/FSUBRP. FYL2X supports positive
+finite inputs using bounded integer range reduction with extended result
+precision independent of PC, and selected zero/negative finite domain errors.
+Nonfinite FYL2X operands and full extended exponent results remain unsupported.
+540 native reference cases agree within two adjacent extended-precision values;
+this is sampled evidence, not a global accuracy or exact-C1 guarantee.
+F2XM1 supports finite inputs in [−1, 1] with extended significand precision
+independent of PC. A fixed Q2.254 series factors out the input to retain tiny
+nonzero values; at most 96 terms are evaluated. Its 144 native cases use the
+same sampled two-adjacent-value tolerance. Nonfinite/out-of-domain inputs,
+unsupported result exponents and general exception delivery remain explicit.
+Finite FSCALE changes only the exponent, using ST(1) truncated toward zero
+independently of RC and ignoring PC. It preserves ST(1) and the retained
+significand. 300 native cases match exactly; unsupported result exponents and
+nonfinite inputs still stop explicitly.
+FIADD/FIMUL/FICOM/FICOMP/FISUB/FISUBR/FIDIV/FIDIVR use signed m16/m32 integers.
+The allocation-free public decoder classifies all 2048 D8–DF/ModR/M pairs and
+records mnemonic, operand format/direction and pop count. Recognized missing
+forms and later P6/SSE3 instructions report named unsupported errors; reserved
+encodings report a separate error. Undocumented aliases remain excluded. The
+complete map and implemented/unimplemented status are in
+[x87 encoding coverage](compatibility/x87.md).
+The [x87 implementation audit](compatibility/x87-audit.md) distinguishes opcode
+support from numerical and exception completeness, including the current
+nonarchitectural rollback policy for unmasked precision exceptions.
 FILD accepts signed 16/32/64-bit memory integers without rounding away any
-integer bits, independently of precision/rounding control. Selected normal
-finite memory arithmetic supports FADD/FMUL/FSUB/FSUBR/FDIV/FDIVR with m32/m64
+integer bits, independently of precision/rounding control. FLD constants retain
+64 significand bits, honor RC independently of PC, and do not raise precision
+or set C1 for constant rounding. Captured native x87 vectors cover every constant
+and all four rounding modes.
+Selected normal finite memory arithmetic supports FADD/FMUL/FSUB/FSUBR/FDIV/FDIVR with m32/m64
 operands. Register FST/FSTP copies retained precision and tags without rounding,
 including empty destinations and FSTP ST(0) as a single pop. Empty sources remain
 explicit stack errors under the current stack-exception model.

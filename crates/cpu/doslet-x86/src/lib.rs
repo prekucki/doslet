@@ -6,6 +6,7 @@ mod decode;
 pub mod engines;
 pub mod flags;
 pub mod state;
+pub mod x87_decode;
 
 #[cfg(feature = "profiling")]
 pub use engines::interpreter::DecodeCacheStats;

@@ -253,7 +253,7 @@ impl Finite {
     }
 }
 
-fn round(
+pub(super) fn round(
     mantissa: u64,
     mut exponent: i32,
     negative: bool,

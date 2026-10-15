@@ -247,6 +247,18 @@ eight fixed values with retained 64-bit finite significands, tags, control/statu
 and selected operations; it depends on
 neither a PC device nor the frontend. The PC chooses whether to install it and
 sets the corresponding CMOS equipment bit.
+`doslet-x86::x87_decode` classifies all D8–DF/ModR/M pairs without accessing
+guest state or memory. It records the documented 387 instruction and operand
+shape, separates later P6/SSE3 encodings and rejects reserved/undocumented forms.
+The interpreter uses this map before operand access so unsupported instructions
+produce named diagnostics. Numeric operations remain in `doslet-x87`; the
+[coverage map](compatibility/x87.md) distinguishes decoding from execution.
+Finite FYL2X uses fixed 256-bit integer range reduction and a bounded 192-bit
+fraction extraction before multiplying the retained operand. It introduces no
+host math dependency or execution allocation. The [x87 audit](compatibility/x87-audit.md)
+records the remaining representation, environment and exception-model work.
+F2XM1 shares fixed-width multiplication/rounding helpers and evaluates a bounded
+Q2.254 series on [−1, 1], factoring out the input to avoid cancellation.
 
 VGA owns configuration register banks and the color/mono CRTC decode. The PC
 routes their ports; VGA tests cover readback and write protection independently

@@ -19,6 +19,20 @@ pub enum StepOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CpuError {
+    X87Unsupported {
+        cs: u16,
+        ip: u32,
+        opcode: u8,
+        modrm: u8,
+        instruction: crate::x87_decode::Instruction,
+        later_isa: bool,
+    },
+    X87Reserved {
+        cs: u16,
+        ip: u32,
+        opcode: u8,
+        modrm: u8,
+    },
     X87Arithmetic {
         cs: u16,
         ip: u32,
@@ -96,6 +110,35 @@ impl From<BusError> for CpuError {
 impl fmt::Display for CpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::X87Unsupported {
+                cs,
+                ip,
+                opcode,
+                modrm,
+                instruction,
+                later_isa,
+            } => {
+                write!(
+                    f,
+                    "unsupported x87 {:?} {:?} ({opcode:02X} {modrm:02X}) at {cs:04X}:{ip:08X}",
+                    instruction.mnemonic, instruction.operands
+                )?;
+                if *later_isa {
+                    write!(f, " (requires an ISA newer than 80387)")?;
+                }
+                Ok(())
+            }
+            Self::X87Reserved {
+                cs,
+                ip,
+                opcode,
+                modrm,
+            } => {
+                write!(
+                    f,
+                    "reserved x87 encoding {opcode:02X} {modrm:02X} at {cs:04X}:{ip:08X}"
+                )
+            }
             Self::X87Arithmetic { cs, ip, reason } => {
                 write!(f, "x87 arithmetic {reason:?} at {cs:04X}:{ip:08X}")
             }
