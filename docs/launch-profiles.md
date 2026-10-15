@@ -102,12 +102,16 @@ The game mode should match the sound option chosen in game setup. Roland MT-32
 SysEx still upgrades the effective game mode automatically. Rust output in
 MT-32 mode is labelled “MT-32 → GM (approximation)”.
 
-`midi.output` accepts `rust`, `moont`, or a host MIDI port name/index. Port names
+`midi.output` accepts `rust`, `apple` (native macOS), `moont`, or a host MIDI port name/index. Port names
 are preferable to indices across host restarts. `moont` requires
 `midi.rom_directory`, containing the user's `CM32L_CONTROL.ROM` and
 `CM32L_PCM.ROM`. With a ROM directory and no explicit output, moont is selected;
 otherwise the existing Rust synth default applies. ROMs remain user-owned and
 are never embedded in profiles or the build.
+
+`apple` uses the macOS system General MIDI bank and needs no ROM directory.
+It always receives GM, using MT-32 → GM translation for MT-32 games;
+`midi.host_mode` only selects the dialect of an external MIDI port.
 
 `audio.enabled` defaults to true. False prevents opening an audio device and
 clears the selected MIDI output and ROM directory for this launch.

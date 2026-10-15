@@ -54,11 +54,13 @@ BIOS/DOS keyboard input is available. DOS mouse input includes position, buttons
 Click the guest display to capture the mouse and use relative movement. **Esc**
 releases capture; a subsequent Esc reaches the game. Focus loss, pause, reset
 and game termination also release capture. The system cursor stays visible
-until capture succeeds. Browser capture uses Pointer Lock.
+until capture succeeds, unless **Hide cursor over the game** is enabled in
+Settings → Input. Turn off **Capture mouse on click** to use absolute movement
+and pass Esc directly to the game. Browser capture uses Pointer Lock.
 
-MIDI from the guest is rendered by a basic procedural synthesizer and sent to the
-default audio device. This is not a sample-based GM or Roland MT-32 synthesizer;
-Sound Blaster PCM mixing remains pending. If no audio device
+By default, MIDI from the guest is rendered by a basic procedural synthesizer
+and mixed with Sound Blaster PCM on the default audio device. The default synth
+is not a sample-based GM or Roland MT-32 synthesizer. If no audio device
 can be opened, a message appears and graphics continue. To disable audio:
 
 ```sh
@@ -67,6 +69,12 @@ cargo run -p doslet --release --locked -- --help
 ```
 
 ### Workspace controls and display
+
+The small **MPU** lamp in the bottom bar lights green for new MIDI notes and
+amber for other MIDI traffic. Hover over it for byte/note counts and the time
+since the last note. It tracks game output, independently of the selected
+synthesizer; a dark lamp does not mean that a sustained note has stopped sounding.
+The lamp stays dim while paused and adds no separate refresh timer.
 
 Press **Run** to execute the built-in demo, **Pause** to suspend execution, **Step** to
 advance one execution step, or **Reset** to create a fresh session. Linux builds
@@ -121,6 +129,25 @@ target/release/doslet --config games/HoMnM.toml
 [HEROES startup evidence](compatibility/heroes.md) records the x87 fixes
 and remaining CPU requirements.
 
+### Apple General MIDI on macOS
+
+Select **Apple DLS synth** under **MIDI OUTPUT**, or use:
+
+```sh
+cargo run -p doslet --release --locked -- --game path/to/GAME.EXE --midi-output apple
+```
+
+This uses macOS's DLSMusicDevice and system sound bank; no ROMs, separate MIDI
+application or downloaded SoundFont are required. Its PCM is mixed with Sound
+Blaster effects through the existing audio output. Pause preserves synth state;
+Reset creates a fresh synth. Output changes restore channel settings and active
+notes, restarting their envelopes and effects.
+
+Version-2 profiles use `[output] midi_output = "apple"`; version-1 profiles use
+`[midi] output = "apple"`. Apple output always receives General MIDI, including
+the existing MT-32 → GM approximation when needed. It is available only in the
+native macOS app; other platforms and the browser report an unsupported output.
+
 ### External MIDI synthesizers
 
 To use an external or system MIDI synthesizer, click **Find MIDI outputs** in
@@ -133,8 +160,9 @@ cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE --midi-output
 ```
 
 Replace `0` with the index or exact name of your synthesizer's output port.
-`--midi-output` skips CPAL and internal sample generation; it conflicts with
-`--no-audio`. A MIDI forwarding port alone does not generate sound. Linux host
+Selecting a port skips internal MIDI sample generation; Sound Blaster PCM still
+uses CPAL. `--midi-output` conflicts with `--no-audio`. A MIDI forwarding port
+alone does not generate sound. Linux host
 MIDI requires an available ALSA sequencer device. A dedicated native MIDI thread
 sends complete messages at deadlines derived from guest time. Execution runs up
 to 80 ms ahead to buffer short UI stalls; message timestamps retain bounded
@@ -160,8 +188,8 @@ F1–F10. Keyboard events captured by application controls stay with those contr
 **GAME MIDI** chooses the game's MIDI dialect; **MIDI OUTPUT** chooses the
 renderer or host port. The default game mode is GM. Roland MT-32 SysEx
 automatically upgrades it to MT-32 and shows that change under **Info**.
-Rust synth and GM host ports use **MT-32 → GM (approximation)** translation in
-MT-32 mode. This approximation needs no ROMs and does not reproduce LA synthesis.
+Rust synth, Apple DLS synth and GM host ports use **MT-32 → GM (approximation)**
+translation in MT-32 mode. This approximation needs no ROMs and does not reproduce LA synthesis.
 **Info** also shows SysEx counts, unmapped notes and the module's LCD text.
 For example, ROM-free CIV audio uses:
 
@@ -172,9 +200,9 @@ cargo run -p doslet --release --locked -- --game games/CIV.EXE --midi-mode mt32 
 Mark a real MT-32 or Munt port using **HOST PORT DIALECT → MT-32**, or the CLI
 `--midi-mode mt32 --midi-output PORT --midi-output-mode mt32`. These outputs
 receive the original SysEx. GM input to an MT-32 host port is unsupported.
-With a ROM directory, the default native output is moont; `--midi-output rust`
-or a port explicitly selects another output. The ROM path remains available
-when switching back to moont. In GM mode, moont uses GmDevice: CM-32L instruments
+With a ROM directory, the default native output is moont; `--midi-output rust`,
+`--midi-output apple` or a port explicitly selects another output. The ROM path
+remains available when switching back to moont. In GM mode, moont uses GmDevice: CM-32L instruments
 and eight melodic parts, rather than a complete General MIDI sound bank.
 
 The ROM directory must contain `CM32L_CONTROL.ROM` (v1.02) and

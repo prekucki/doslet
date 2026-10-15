@@ -924,6 +924,9 @@ mod tests {
                         Err(error) => panic!("fixture request missing: {error}"),
                     }
                 };
+                // Accepted sockets inherit O_NONBLOCK on macOS. The fixture
+                // reads synchronously with a timeout after polling accept().
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                     .unwrap();

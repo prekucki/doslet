@@ -471,6 +471,12 @@ impl WorkerEngine {
     pub fn midi_sysex(&self) -> f64 {
         self.routing.translator().stats().sysex as f64
     }
+    pub fn midi_bytes(&self) -> f64 {
+        self.session.midi_stats().1 as f64
+    }
+    pub fn midi_notes(&self) -> f64 {
+        self.routing.input_note_events() as f64
+    }
     pub fn midi_unmapped(&self) -> f64 {
         self.routing.translator().stats().unmapped_notes as f64
     }
@@ -655,6 +661,8 @@ mod tests {
         assert_eq!(engine.midi_mode(), "mt32");
         assert!(engine.midi_upgraded());
         assert_eq!(engine.midi_sysex(), 1.0);
+        assert_eq!(engine.midi_bytes(), message.len() as f64);
+        assert_eq!(engine.midi_notes(), 1.0);
         assert!(!engine.midi[..count].contains(&0xF0));
         assert!(
             engine.midi[..count]
@@ -663,6 +671,7 @@ mod tests {
         );
         engine.set_output_mode("mt32").unwrap();
         let count = engine.snapshot_midi();
+        assert_eq!(engine.midi_notes(), 1.0);
         assert!(
             engine.replay[..count]
                 .windows(11)

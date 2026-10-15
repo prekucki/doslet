@@ -158,7 +158,7 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         bottom = bottom.push(space::horizontal().width(12)).push(
             text(if let Some(progress) = progress {
                 progress
-            } else if app.hide_host_cursor() {
+            } else if app.has_mouse_capture() {
                 "Esc to release mouse"
             } else {
                 ""
@@ -167,7 +167,7 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
             .color(MUTED),
         );
     }
-    bottom = bottom.push(space::horizontal());
+    bottom = bottom.push(space::horizontal()).push(mpu_indicator(app));
     if let Some(iced::widget::image::Handle::Rgba { width, height, .. }) = &app.display.image {
         bottom = bottom.push(text(format!("{width} × {height}")).size(12).color(MUTED));
     }
@@ -613,6 +613,59 @@ pub(crate) fn panel(_: &Theme) -> container::Style {
         },
         ..Default::default()
     }
+}
+
+fn mpu_indicator(app: &Doslet) -> Element<'_, Message> {
+    use crate::midi_activity::Lamp;
+    let lamp = app
+        .midi_activity
+        .lamp(app.session.status() == SessionStatus::Running);
+    let color = match lamp {
+        Lamp::Note => ACCENT,
+        Lamp::Data => Color::from_rgb8(228, 193, 133),
+        Lamp::Idle => Color::from_rgb8(79, 85, 94),
+    };
+    let light = container(space::horizontal().width(6))
+        .height(6)
+        .style(move |_| container::Style {
+            background: Some(color.into()),
+            border: Border {
+                radius: 3.0.into(),
+                ..Default::default()
+            },
+            shadow: iced::Shadow {
+                color: Color {
+                    a: if lamp == Lamp::Idle { 0.0 } else { 0.3 },
+                    ..color
+                },
+                blur_radius: 5.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    let badge = container(
+        row![light, text("MPU").size(10).color(MUTED)]
+            .spacing(6)
+            .align_y(iced::Center),
+    )
+    .padding([4, 8])
+    .style(|_| container::Style {
+        background: Some(PANEL.into()),
+        border: Border {
+            color: EDGE,
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        ..Default::default()
+    });
+    tooltip(
+        badge,
+        container(text(app.midi_activity.description()).size(12))
+            .padding(10)
+            .style(panel),
+        tooltip::Position::Top,
+    )
+    .into()
 }
 
 pub(crate) fn primary(_: &Theme, status: button::Status) -> button::Style {

@@ -136,6 +136,7 @@ pub struct Doslet {
     pub midi_choice: String,
     pub midi_mode: Mode,
     pub midi_output_mode: Mode,
+    pub midi_activity: crate::midi_activity::MidiActivity,
     midi_summary: String,
     bridge: Option<Browser>,
     audio_state: String,
@@ -207,6 +208,7 @@ impl Doslet {
             midi_choice: "Rust synth".into(),
             midi_mode: Mode::Gm,
             midi_output_mode: Mode::Gm,
+            midi_activity: crate::midi_activity::MidiActivity::default(),
             midi_summary: String::new(),
             bridge,
             audio_state: "inactive".into(),
@@ -649,6 +651,11 @@ impl Doslet {
                 code => SessionStatus::Exited((code - 256) as u8),
             };
             self.session.steps = number(&state, "steps") as u64;
+            self.midi_activity.observe(
+                number(&state, "nanos") as u64,
+                number(&state, "midiBytes") as u64,
+                number(&state, "midiNotes") as u64,
+            );
             self.session.registers.cs = number(&state, "cs") as u16;
             self.session.registers.ip = number(&state, "ip") as u32;
             self.session
@@ -852,8 +859,16 @@ impl Doslet {
             },
         )
     }
-    pub fn hide_host_cursor(&self) -> bool {
+    pub fn has_mouse_capture(&self) -> bool {
         self.mouse_captured
+    }
+    pub fn hide_host_cursor(&self) -> bool {
+        self.has_mouse_capture()
+            || self.configurator.active.input.hide_cursor
+                && self.session.status() == SessionStatus::Running
+                && !self.configurator.open
+                && self.workspace.panel.is_none()
+                && !self.configurator.pending
     }
     pub fn subscription(&self) -> Subscription<Message> {
         // Poll bounded presentation snapshots even while paused/importing. The

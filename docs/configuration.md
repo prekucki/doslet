@@ -28,6 +28,10 @@ Browser preparation runs through the emulation Worker and host adapters.
 | Resources | Resolved I/O ownership and sound resources; invalid assignments identify their configuration field |
 | Output | Host audio, MIDI renderer/port and game/host MIDI dialects, independently of installed guest sound hardware |
 
+`output.midi_output` accepts `rust`, `apple` (native macOS system GM synth),
+`moont` (requires CM-32L ROMs) or a MIDI port name/index. Apple output uses the
+system sound bank and mixes with Sound Blaster PCM; it always receives GM.
+
 Only the current CPU, timing and video implementations are selectable. The
 interpreter and x87 implement documented subsets, rather than complete historical
 processors. See [the specification](SPEC.md) for their implemented instructions.
@@ -36,6 +40,12 @@ AT keyboard mode uses physical key locations and release events. BIOS mode
 retains scan-code/ASCII injection. Text entered in application controls stays
 out of the guest. Pause, focus/capture loss and disconnect release guest input;
 held controls require a physical release before they can act again.
+
+Mouse capture and cursor visibility are independent. Set `input.capture = false`
+and `input.hide_cursor = true` to use absolute pointer movement, hide the host
+cursor over the running game and pass Esc through to DOS. The cursor remains
+visible in application panels and while paused. With capture enabled, Esc still
+releases capture. `hide_cursor` defaults to false.
 
 Native controllers use gilrs; browser controllers use the Gamepad API. The Input
 page lists available controller identities. A stable ID is optional; leave it
@@ -135,6 +145,7 @@ dma16 = 5
 keyboard = "bios"
 gameport = false
 capture = true
+hide_cursor = false
 pad_index = 0
 deadzone_percent = 12
 axis_x = 0

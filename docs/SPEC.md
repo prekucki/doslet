@@ -453,7 +453,11 @@ Only arrival at an unchanged installed IRET shim invokes the host service.
 An installed IRQ0 shim updates BDA ticks/daily rollover and decrements the BIOS
 floppy-motor timeout (also used by CIV for delays), invokes the current
 INT 1Ch user hook and sends PIC EOI through guest instructions while preserving
-AX. Modified shims execute as guest code. INT 10h/AH=0Fh
+AX. Modified shims execute as guest code. INT 1Ah/AH=02h reads hours, minutes,
+seconds and the daylight-saving flag from the installed CMOS registers, returning
+CF set while its update-in-progress bit is set. The initial clock uses BCD and
+24-hour format; RTC ticking and format conversion remain pending.
+INT 10h/AH=0Fh
 reports the default text or mode-13h configuration.
 INT 10h/AX=0003h restores the selected 80x25 text configuration, initializes
 mode/geometry/page/cursor fields in the BDA and clears eight B800h text pages
@@ -593,8 +597,10 @@ Native pointer capture uses a local iced runtime/winit patch: Locked with
 Confined fallback, relative device motion and captured button events. A bounded
 128-event stream releases capture on overflow/disconnection. Esc is consumed
 to release capture; focus loss, pause, reset and termination release it too.
-Capture generations reject delayed events from a previous session. Browser
-capture uses DOM Pointer Lock from a display click and sends relative movement
+Capture generations reject delayed events from a previous session. Native and
+browser profiles independently support `input.hide_cursor` over the running
+game image; disabling capture preserves absolute movement and passes Esc to DOS.
+Browser capture uses DOM Pointer Lock from a display click and sends relative movement
 directly to the machine Worker. Raw INT 33h/000Bh motion counters continue at
 guest cursor bounds; only logical cursor coordinates are clamped. Fractional
 host movement is retained without allocating or retaining offscreen movement
@@ -616,6 +622,15 @@ a suspended context, with Mute/Unmute available once running. A suspended contex
 does not block guest execution. Epochs invalidate stale audio on game/output
 changes. Pause preserves queued synth state; Reset clears it. The user confirmed
 Rust synth sound and graphics in Firefox and Chrome.
+
+Native macOS additionally supports `apple` output through the system
+DLSMusicDevice General MIDI bank. The host-only adapter receives routed GM
+messages and renders bounded blocks into the existing Sound Blaster/CPAL mixer.
+Pause preserves synthesis state; Reset recreates the unit. Output-switch replay
+restores channel settings and notes, without preserving envelopes/effect tails.
+The Apple FFI stays outside portable emulation crates. Apple output is explicitly
+unsupported on other platforms and in the browser. Synthetic tests verify system
+bank PCM, guest timing and replay; they do not establish game playback quality.
 
 Optional host MIDI bypasses internal synthesis: native midir ports and browser
 Web MIDI outputs. Discovery/permission is explicit. The default stays Rust synth.
@@ -658,7 +673,8 @@ measured against CM-32L v1.02 on the macOS GM bank; other GM synths share them.
 Rhythm keys 35–75 use the GM kit; CM-32L sound-effect keys, aftertouch, partial
 reserve, reverb character, RQ1 requests and per-key rhythm level/pan are not
 translated. GM choices are Doslet's own; an opt-in local CM-32L ROM test
-compares preset order, power-on programs and rhythm layout with its tables
+compares preset order, power-on programs and rhythm layout with its tables, and
+`mt32_calibration` in `doslet-apple-midi` reports the calibration measurements,
 without copying ROM data. Native and browser applications select translation by game and output dialect.
 
 The `web` Cargo profile uses LLVM opt-level 3, thin LTO and one codegen unit.

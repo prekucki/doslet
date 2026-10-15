@@ -1,6 +1,6 @@
+use crate::native_synth::{APPLE_LABEL, Timeline};
 use crate::presentation::{DisplayFrame, DisplaySizing, SizingMessage};
 use doslet_midi_routing::{Mode, Routing, SNAPSHOT_CAPACITY};
-use doslet_midi_synth::Timeline;
 use doslet_runtime::{RuntimeError, Session, SessionStatus};
 use iced::{Element, Subscription, Task, Theme};
 use std::time::{Duration, Instant};
@@ -61,6 +61,7 @@ pub struct Doslet {
     routing: Routing,
     pub midi_mode: Mode,
     pub midi_output_mode: Mode,
+    pub midi_activity: crate::midi_activity::MidiActivity,
     #[cfg(test)]
     pub archive: Option<crate::archive::GameArchive>,
     #[cfg(test)]
@@ -103,6 +104,7 @@ pub enum Message {
     Step,
     Reset,
     Tick,
+    GamepadsReady,
     FocusLost,
     CloseRequested(iced::window::Id),
     RefreshMidi,
@@ -137,12 +139,13 @@ impl Doslet {
             logged_fault: None,
             logged_notice: None,
             dynamic_error_reported: false,
-            midi_choices: vec!["Rust synth".into()],
+            midi_choices: crate::native_synth::choices(),
             midi_choice: "Rust synth".into(),
             host_midi: None,
             routing: Routing::new(Mode::Gm),
             midi_mode: Mode::Gm,
             midi_output_mode: Mode::Gm,
+            midi_activity: crate::midi_activity::MidiActivity::default(),
             #[cfg(test)]
             archive: None,
             #[cfg(test)]
@@ -227,6 +230,7 @@ impl Doslet {
         if let Some(selection) = cli.midi_output {
             let selection = match selection.as_str() {
                 "rust" => "Rust synth",
+                "apple" => APPLE_LABEL,
                 "moont" => "CM-32L / MT-32",
                 other => other,
             };
@@ -486,7 +490,7 @@ impl Doslet {
             }
             Message::RefreshMidi => match crate::native_midi::ports() {
                 Ok(ports) => {
-                    self.midi_choices = vec!["Rust synth".into()];
+                    self.midi_choices = crate::native_synth::choices();
                     if self.mt32_rom_dir.is_some() {
                         self.midi_choices.push("CM-32L / MT-32".into());
                     }
@@ -601,6 +605,7 @@ impl Doslet {
                 return iced::window::close(id);
             }
             Message::Tick => self.tick(),
+            Message::GamepadsReady => self.poll_gamepads(),
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(audio) = &self.audio {
@@ -629,6 +634,11 @@ impl Doslet {
             }
         }
         self.log_errors();
+        self.midi_activity.observe(
+            self.session.emulated_nanos(),
+            self.session.midi_stats().1,
+            self.routing.input_note_events(),
+        );
         self.display.refresh(&self.session);
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -660,6 +670,7 @@ impl Doslet {
         if spec.output.audio {
             let selection = match spec.output.midi_output.as_str() {
                 "rust" => "Rust synth",
+                "apple" => APPLE_LABEL,
                 "moont" => "CM-32L / MT-32",
                 other => other,
             };
@@ -890,6 +901,7 @@ impl Doslet {
                         self.midi_choice = output.choice;
                         self.midi_choices = output.choices;
                         self.routing = output.routing;
+                        self.midi_activity = crate::midi_activity::MidiActivity::default();
                         self.pcm_mixer = output.mixer;
                         self.display = DisplayFrame::default();
                         self.anchor = None;
@@ -1067,7 +1079,18 @@ impl Doslet {
             .audio
             .as_ref()
             .map_or(self.midi.sample_rate(), |audio| audio.rate);
-        self.midi = Timeline::new(rate).unwrap();
+        let synth = if self.midi_choice == APPLE_LABEL {
+            Timeline::apple(rate)
+        } else {
+            Timeline::new(rate)
+        };
+        match synth {
+            Ok(engine) => self.midi = engine,
+            Err(error) => {
+                self.notice = Some(format!("MIDI reset: {error}"));
+                self.session.pause();
+            }
+        }
         self.pcm_mixer.reset(self.midi.sample_rate(), 0).unwrap();
         if self.midi_choice == "CM-32L / MT-32"
             && let Some(directory) = &self.mt32_rom_dir
@@ -1085,6 +1108,7 @@ impl Doslet {
             }
         }
         self.routing = Routing::new(self.midi_mode);
+        self.midi_activity = crate::midi_activity::MidiActivity::default();
         if let Some(output) = &mut self.host_midi
             && let Err(error) = output.clear()
         {
@@ -1163,6 +1187,7 @@ impl Doslet {
         let Some(gamepads) = &mut self.gamepads else {
             return;
         };
+        gamepads.acknowledge();
         for _ in 0..256 {
             let Some(update) = gamepads.poll() else {
                 break;
@@ -1491,7 +1516,8 @@ impl Doslet {
                 );
             }
             return format!(
-                "Audio · {} Hz · {} MIDI notes · peak {:.2} · {} played frames · SB {} nonzero frames",
+                "{} · {} Hz · {} MIDI notes · peak {:.2} · {} played frames · SB {} nonzero frames",
+                self.midi_choice,
                 audio.rate,
                 self.midi.note_events(),
                 peak,
@@ -1551,7 +1577,10 @@ impl Doslet {
         Ok(engine)
     }
     fn reselect_midi(&mut self, selection: &str) -> Result<(), String> {
-        if selection == "CM-32L / MT-32" || selection == "Rust synth" {
+        if selection == APPLE_LABEL && !cfg!(target_os = "macos") {
+            return Err("Apple MIDI output is available only on native macOS".into());
+        }
+        if matches!(selection, "CM-32L / MT-32" | "Rust synth" | APPLE_LABEL) {
             // A MIDI dialect/synth change does not require reopening CPAL.
             // Keep the current stream until the replacement synth is ready.
             let new_audio = if self.audio.is_none() {
@@ -1560,33 +1589,17 @@ impl Doslet {
                 None
             };
             let rate = self.audio.as_ref().or(new_audio.as_ref()).unwrap().rate;
-            let mut replay_error = None;
-            if selection == "CM-32L / MT-32" {
-                self.mt32 = Some(self.restored_mt32(rate)?);
+            let (mt32, midi) = if selection == "CM-32L / MT-32" {
+                (Some(self.restored_mt32(rate)?), None)
             } else {
-                let mut engine = Timeline::new(rate).map_err(|e| e.to_string())?;
-                engine
-                    .skip_until(self.session.emulated_nanos())
-                    .map_err(|e| e.to_string())?;
-                self.routing.replay(Mode::Gm, &mut |message| {
-                    if replay_error.is_some() {
-                        return;
-                    }
-                    for &byte in message {
-                        if let Err(error) = engine.push_byte(byte) {
-                            replay_error = Some(error.to_string());
-                            break;
-                        }
-                    }
-                });
-                if let Some(error) = replay_error {
-                    return Err(error);
-                }
-                self.midi = engine;
-                self.mt32 = None;
-            }
+                (None, Some(self.restored_synth(rate, selection)?))
+            };
             if let Some(output) = &mut self.host_midi {
                 output.clear()?;
+            }
+            self.mt32 = mt32;
+            if let Some(engine) = midi {
+                self.midi = engine;
             }
             self.host_midi = None;
             self.pcm_mixer
@@ -1603,7 +1616,7 @@ impl Doslet {
                 return Err("GM to an MT-32 host port is unsupported; select MT-32 game mode. GM on moont uses GmDevice.".into());
             }
             let ports = crate::native_midi::ports()?;
-            self.midi_choices = vec!["Rust synth".into()];
+            self.midi_choices = crate::native_synth::choices();
             if self.mt32_rom_dir.is_some() {
                 self.midi_choices.push("CM-32L / MT-32".into());
             }
@@ -1654,14 +1667,38 @@ impl Doslet {
     }
     fn select_midi(&mut self, selection: &str) -> Result<(), String> {
         let ready = match selection {
-            "Rust synth" => self.audio.is_some() && self.mt32.is_none(),
+            "Rust synth" | APPLE_LABEL => self.audio.is_some() && self.mt32.is_none(),
             "CM-32L / MT-32" => self.audio.is_some() && self.mt32.is_some(),
             _ => self.host_midi.as_ref().is_some_and(|o| o.check().is_ok()),
         };
-        if selection == self.midi_choice && ready {
+        if selection == self.midi_choice && ready && self.notice.is_none() {
             return Ok(());
         }
         self.reselect_midi(selection)
+    }
+    fn restored_synth(&self, rate: u32, selection: &str) -> Result<Timeline, String> {
+        let mut engine = if selection == APPLE_LABEL {
+            Timeline::apple(rate)?
+        } else {
+            Timeline::new(rate)?
+        };
+        engine.skip_until(self.session.emulated_nanos())?;
+        let mut replay_error = None;
+        self.routing.replay(Mode::Gm, &mut |message| {
+            if replay_error.is_some() {
+                return;
+            }
+            for &byte in message {
+                if let Err(error) = engine.restore_byte(byte) {
+                    replay_error = Some(error);
+                    break;
+                }
+            }
+        });
+        if let Some(error) = replay_error {
+            return Err(error);
+        }
+        Ok(engine)
     }
     pub fn midi_mode_label(&self) -> String {
         let route = if self.midi_mode == Mode::Mt32 && self.output_dialect() == Mode::Gm {
@@ -1693,20 +1730,36 @@ impl Doslet {
     pub fn pointer_dimensions(&self) -> (u16, u16) {
         self.session.pointer_dimensions()
     }
-    pub fn hide_host_cursor(&self) -> bool {
+    pub fn has_mouse_capture(&self) -> bool {
         self.mouse_capture.is_some() && !self.mouse_capture_pending
     }
+    pub fn hide_host_cursor(&self) -> bool {
+        self.has_mouse_capture()
+            || self.configurator.active.input.hide_cursor
+                && self.session.status() == SessionStatus::Running
+                && !self.configurator.open
+                && self.workspace.panel.is_none()
+                && !self.configurator.pending
+    }
     pub fn subscription(&self) -> Subscription<Message> {
-        let tick = if self.session.status() == SessionStatus::Running
-            || self.session.storage_waiting()
-            || self.gamepads.is_some()
-        {
+        let ticking =
+            self.session.status() == SessionStatus::Running || self.session.storage_waiting();
+        let tick = if ticking {
             iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
         } else {
             Subscription::none()
         };
         Subscription::batch([
             tick,
+            if ticking {
+                Subscription::none()
+            } else {
+                self.gamepads
+                    .as_ref()
+                    .map_or_else(Subscription::none, |pads| {
+                        pads.subscription().map(|()| Message::GamepadsReady)
+                    })
+            },
             iced::window::close_requests().map(Message::CloseRequested),
             DisplaySizing::subscription().map(Message::DisplaySizing),
             iced::event::listen_with(|event, status, _| {
@@ -1893,6 +1946,43 @@ mod tests {
         assert!(!app.session.dynamic_core_enabled());
     }
     include!("../../../tests/fixtures/sb16_pcm.rs");
+    #[test]
+    fn uncaptured_hidden_cursor_keeps_absolute_motion_and_passes_escape_to_dos() {
+        let mut app = Doslet::new();
+        // Read one BIOS key and store AX at DS:0200h.
+        app.session = Session::new(&[0xB4, 0, 0xCD, 0x16, 0xA3, 0, 2, 0xEB, 0xFE]).unwrap();
+        app.configurator.active.input.capture = false;
+        app.configurator.active.input.hide_cursor = true;
+        app.session.start();
+        app.session.advance(100);
+        assert!(app.session.waiting_for_key());
+        assert!(app.hide_host_cursor());
+        let _ = app.update(Message::PointerMoved(123, 45));
+        let _ = app.update(Message::PointerButton(0, true));
+        assert_eq!(app.session.pointer_position(), (123, 45));
+        assert!(app.mouse_capture.is_none());
+        assert!(!app.mouse_capture_pending);
+        let escape = iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape);
+        let _ = app.update(Message::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: escape.clone(),
+            modified_key: escape,
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Escape),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }));
+        // The BIOS keyboard wait resumes at the next guest timer interrupt.
+        app.session.advance(1_000_000);
+        assert_eq!(app.session.ram_view(0x10200..0x10202).unwrap(), &[0x1B, 1]);
+        assert!(app.hide_host_cursor());
+        app.workspace.panel = Some(crate::ui::Panel::Audio);
+        assert!(!app.hide_host_cursor());
+        app.workspace.panel = None;
+        app.session.pause();
+        assert!(!app.hide_host_cursor());
+    }
+
     #[test]
     fn mouse_capture_uses_relative_motion_releases_on_escape_and_ignores_stale_events() {
         use iced::window::MouseCaptureEvent;
@@ -2258,6 +2348,69 @@ enabled = false
         assert_eq!(app.midi.note_events(), 1);
         assert!(app.midi_mode_label().contains("approximation"));
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apple_output_routes_mt32_replays_notes_and_survives_pause_and_reset() {
+        let mut app = Doslet::new();
+        app.midi_choice = APPLE_LABEL.into();
+        app.midi = Timeline::apple(48000).unwrap();
+        app.midi_output_mode = Mode::Mt32; // Applies only to external ports.
+        let mut program = vec![0xBA, 0x31, 3, 0xB0, 0x3F, 0xEE, 0xBA, 0x30, 3];
+        for byte in [
+            0xF0, 0x41, 0x10, 0x16, 0x12, 0x20, 0, 0, b'A', 0x1F, 0xF7, 0x91, 60, 100,
+        ] {
+            program.extend_from_slice(&[0xB0, byte, 0xEE]);
+        }
+        program.extend_from_slice(&[0xEB, 0xFE]);
+        app.session = Session::new(&program).unwrap();
+        app.session.start();
+        app.session.advance(1000);
+        app.process_audio().unwrap();
+        assert_eq!(app.midi_mode, Mode::Mt32);
+        assert_eq!(app.output_dialect(), Mode::Gm);
+        assert_eq!(app.midi.note_events(), 1);
+        let now = app.session.emulated_nanos();
+        let mut restored = app.restored_synth(48000, APPLE_LABEL).unwrap();
+        assert_eq!(restored.note_events(), 1);
+        assert_eq!(restored.render_until(now, &mut app.samples).unwrap(), 0);
+        let mut peak = 0.0_f32;
+        loop {
+            let count = restored
+                .render_until(now + 100_000_000, &mut app.samples)
+                .unwrap();
+            if count == 0 {
+                break;
+            }
+            peak = app.samples[..count]
+                .iter()
+                .flatten()
+                .fold(peak, |p, s| p.max(s.abs()));
+        }
+        assert!(peak > 0.0001, "restored translated note must produce PCM");
+        let _ = app.update(Message::RunPause);
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.session.emulated_nanos(), now);
+        assert_eq!(app.midi.note_events(), 1);
+        let _ = app.update(Message::RunPause);
+        assert_eq!(app.midi.note_events(), 1);
+        let _ = app.update(Message::Reset);
+        assert_eq!(app.midi_choice, APPLE_LABEL);
+        assert!(matches!(app.midi, Timeline::Apple(_)));
+        assert_eq!(app.midi.note_events(), 0);
+        assert_eq!(app.session.emulated_nanos(), 0);
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn apple_output_is_rejected_without_changing_the_current_output() {
+        let mut app = Doslet::new();
+        let error = app.select_midi(APPLE_LABEL).unwrap_err();
+        assert!(error.contains("only on native macOS"));
+        assert_eq!(app.midi_choice, "Rust synth");
+        assert!(!app.midi_choices.iter().any(|v| v == APPLE_LABEL));
+    }
+
     #[test]
     fn host_midi_lookahead_is_bounded_and_rebases_after_pause_and_reset() {
         let mut app = Doslet::new();
@@ -2341,6 +2494,59 @@ enabled = false
         assert!(app.notice.is_none());
         let _ = app.update(Message::ArchiveLoaded(Ok(None)));
         assert!(app.archive.is_some());
+    }
+
+    #[test]
+    fn controller_notifications_update_a_paused_session_without_advancing_it() {
+        use crate::native_gamepad::{GamepadUpdate, NativeGamepads, PadState, uuid_string};
+        let mut app = Doslet::new();
+        app.session.start();
+        app.session.advance(25);
+        app.session.pause();
+        let steps = app.session.steps();
+        let nanos = app.session.emulated_nanos();
+        let (pads, send) = NativeGamepads::test_pair();
+        app.gamepads = Some(pads);
+        let uuid = [0xAB; 16];
+        send(GamepadUpdate::Connected {
+            id: 0,
+            name: "Test controller".into(),
+            uuid: uuid_string(uuid),
+            generation: 1,
+        });
+        send(GamepadUpdate::State(PadState {
+            id: 0,
+            uuid,
+            generation: 1,
+            sequence: 1,
+            resync: true,
+            ambiguous: false,
+            axes: [32767, -32767, 0, 0, 0, 0, 0, 0],
+            buttons: 1,
+        }));
+        let _ = app.update(Message::GamepadsReady);
+        assert!(
+            app.configurator
+                .controllers
+                .iter()
+                .any(|v| v.contains("Test controller"))
+        );
+        assert_eq!(app.pad_generation, Some(1));
+        assert_eq!(app.pad_axes, [32767, -32767]);
+        assert_eq!(app.pad_buttons, [true, false]);
+        send(GamepadUpdate::Disconnected {
+            id: 0,
+            uuid: uuid_string(uuid),
+            generation: 1,
+            sequence: 5,
+        });
+        let _ = app.update(Message::GamepadsReady);
+        assert_eq!(app.pad_axes, [0; 2]);
+        assert_eq!(app.pad_buttons, [false; 2]);
+        assert_eq!(app.session.status(), SessionStatus::Paused);
+        assert_eq!(app.session.steps(), steps);
+        assert_eq!(app.session.emulated_nanos(), nanos);
+        assert!(app.notice.is_none(), "{:?}", app.notice);
     }
 
     #[test]

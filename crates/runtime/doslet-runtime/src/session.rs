@@ -639,6 +639,26 @@ impl Session {
                 self.machine.cpu.registers.set_byte(0, rollover);
                 self.machine.bus.write_u8(0x470, 0)?;
             }
+            (0x1A, 2) => {
+                // Read the installed CMOS clock, including its update-in-progress
+                // flag. This BIOS service does not introduce a host wall clock.
+                let cmos = &mut self.machine.bus.cmos;
+                let selected = cmos.selected();
+                cmos.select(0x0A);
+                let updating = cmos.read() & 0x80 != 0;
+                if !updating {
+                    let mut time = [0; 4];
+                    for (value, register) in time.iter_mut().zip([4, 2, 0, 0x0B]) {
+                        cmos.select(register);
+                        *value = cmos.read();
+                    }
+                    let r = &mut self.machine.cpu.registers;
+                    r.set(Gpr16::Cx, u16::from_be_bytes([time[0], time[1]]));
+                    r.set(Gpr16::Dx, u16::from_be_bytes([time[2], time[3] & 1]));
+                }
+                cmos.select(selected);
+                self.set_carry(updating)?;
+            }
             (0x10, 0x08..=0x0A | 0x0E | 0x06 | 0x07 | 0x01 | 0x05) => self.text_service(ax)?,
             (0x10, 2 | 3) if self.machine.cpu.registers.get_byte(7) < 8 => {
                 let page = self.machine.cpu.registers.get_byte(7);
@@ -1800,6 +1820,42 @@ mod tests {
         assert!(frame.pixels[..2560].contains(&12));
         assert_eq!(session.machine.bus.read_u16(0x450).unwrap(), 0);
     }
+    #[test]
+    fn bios_rtc_time_reads_cmos_and_reports_updates_through_returned_carry() {
+        for updating in [false, true] {
+            let program = [
+                0xB9, 0xAA, 0xAA, 0xBA, 0xBB, 0xBB, // Sentinels in CX/DX.
+                0xF9, 0xB8, 0, 2, 0xCD, 0x1A, // STC; BIOS read RTC time.
+                0x9C, 0x5B, // Save returned FLAGS in BX.
+                0xB8, 0, 0x4C, 0xCD, 0x21,
+            ];
+            let mut session = Session::new(&program).unwrap();
+            let cmos = &mut session.machine.bus.cmos;
+            for (register, value) in [(4, 0x23), (2, 0x58), (0, 0x59), (0x0B, 3)] {
+                cmos.select(register);
+                cmos.write(value);
+            }
+            if updating {
+                cmos.select(0x0A);
+                cmos.write(0xA6);
+            }
+            cmos.select(0x97);
+            session.start();
+            session.advance(100);
+            assert_eq!(session.status(), SessionStatus::Exited(0));
+            assert_eq!(session.registers().get(Gpr16::Bx) & 1, u16::from(updating));
+            assert_eq!(
+                session.registers().get(Gpr16::Cx),
+                if updating { 0xAAAA } else { 0x2358 }
+            );
+            assert_eq!(
+                session.registers().get(Gpr16::Dx),
+                if updating { 0xBBBB } else { 0x5901 }
+            );
+            assert_eq!(session.machine.bus.cmos.selected(), 0x97);
+        }
+    }
+
     #[test]
     fn bios_timer_decrements_civs_floppy_timeout_delay() {
         let mut session = Session::new(&[0x90]).unwrap();

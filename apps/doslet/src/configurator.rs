@@ -56,6 +56,7 @@ pub enum Edit {
     Keyboard(bool),
     Gameport(bool),
     Capture(bool),
+    HideCursor(bool),
     PadId(String),
     Number(&'static str, String),
     Name(String),
@@ -161,6 +162,7 @@ impl ConfiguratorState {
             }
             Edit::Gameport(v) => self.draft.hardware.gameport = *v,
             Edit::Capture(v) => self.draft.input.capture = *v,
+            Edit::HideCursor(v) => self.draft.input.hide_cursor = *v,
             Edit::PadId(v) => self.draft.input.pad_id = (!v.is_empty()).then(|| v.clone()),
             Edit::Number(k, v) => match v.parse::<u8>() {
                 Ok(v) => match *k {
@@ -400,6 +402,13 @@ impl ConfiguratorState {
                         narrow,
                     ))
                     .push(
+                        checkbox(s.input.hide_cursor)
+                            .label("Hide cursor over the game")
+                            .size(16)
+                            .text_size(14)
+                            .on_toggle(Edit::HideCursor),
+                    )
+                    .push(
                         text("Turn off AT keyboard to use BIOS compatibility mode.")
                             .size(12)
                             .color(MUTED),
@@ -608,11 +617,18 @@ impl ConfiguratorState {
                     )
                     .push(field(
                         "MIDI output",
-                        text_input("rust, or output port name", &s.output.midi_output)
-                            .on_input(Edit::Output)
-                            .size(14)
-                            .padding(8)
-                            .into(),
+                        text_input(
+                            if cfg!(target_os = "macos") {
+                                "rust, apple, moont, or port name"
+                            } else {
+                                "rust, moont, or port name"
+                            },
+                            &s.output.midi_output,
+                        )
+                        .on_input(Edit::Output)
+                        .size(14)
+                        .padding(8)
+                        .into(),
                     ))
                     .push(pair(
                         field(

@@ -37,6 +37,7 @@ pub struct Routing {
     gm: State,
     translator: Box<Translator>,
     upgraded: bool,
+    input_note_events: u64,
 }
 impl Routing {
     pub fn new(mode: Mode) -> Self {
@@ -47,6 +48,7 @@ impl Routing {
             gm: State::new(),
             translator: Box::new(Translator::new()),
             upgraded: false,
+            input_note_events: 0,
         }
     }
     pub fn mode(&self) -> Mode {
@@ -54,6 +56,11 @@ impl Routing {
     }
     pub fn upgraded(&self) -> bool {
         self.upgraded
+    }
+    /// Complete guest Note On messages with nonzero velocity, before translation.
+    /// Host replay and output changes do not increment this counter.
+    pub fn input_note_events(&self) -> u64 {
+        self.input_note_events
     }
     pub fn translator(&self) -> &Translator {
         &self.translator
@@ -73,6 +80,9 @@ impl Routing {
         let Some(message) = self.decoder.push(byte)? else {
             return Ok(());
         };
+        if message.len() == 3 && message[0] & 0xF0 == 0x90 && message[2] != 0 {
+            self.input_note_events = self.input_note_events.saturating_add(1);
+        }
         if self.mode == Mode::Gm
             && message.len() >= 5
             && message[0] == 0xF0

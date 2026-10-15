@@ -1060,6 +1060,7 @@ dependencies = [
  "clap",
  "console_error_panic_hook",
  "cpal",
+ "doslet-apple-midi",
  "doslet-config",
  "doslet-dos",
  "doslet-input",
@@ -1082,6 +1083,18 @@ dependencies = [
  "web-sys",
  "web-time",
  "zip",
+]
+
+[[package]]
+name = "doslet-apple-midi"
+version = "0.1.0"
+dependencies = [
+ "coreaudio-sys",
+ "doslet-midi-routing",
+ "doslet-midi-synth",
+ "doslet-mt32",
+ "doslet-mt32-gm",
+ "moont",
 ]
 
 [[package]]

@@ -146,8 +146,8 @@ pub const fn preset_drum(program: u8) -> Option<u8> {
 /// Level trim in dB per preset, so the GM mix keeps the CM-32L balance between
 /// instruments. Measured K-weighted at velocity 100 on keys 48/60/72 against
 /// CM-32L v1.02 with the macOS GM bank, relative to the median preset, then
-/// limited to -24..=+6 dB by an opt-in local calibration; no ROM data is
-/// embedded.
+/// limited to -24..=+6 dB. `mt32_calibration` in `doslet-apple-midi` reports
+/// the measurements; no ROM data is embedded.
 pub const PRESET_TRIM_DB: [i8; 128] = [
     5, 5, 2, 0, 2, 1, 6, 5, 0, 3, 0, 2, 6, 3, 2, -3, // 0..
     5, 2, 2, 1, 1, 0, 1, -1, 4, 5, 6, 5, -2, -12, 1, -6, // 16..

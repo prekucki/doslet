@@ -19,6 +19,12 @@ The benchmark reports host execution steps per second, not emulated MHz or a
 game performance claim. REP iterations count as separate execution steps so a
 batch stays bounded.
 
+On macOS, `cargo test -p doslet-apple-midi --locked` renders synthetic MIDI through
+the system DLSMusicDevice into memory, without opening an audio output device.
+These tests need access to macOS Audio Unit services (a restricted sandbox may
+hide the component). They verify nonzero PCM, timing and snapshot replay, not
+audible game compatibility.
+
 `bench_dynamic` compares five million synthetic protected-mode register and RAM steps
 against the cached interpreter in three alternating pairs after warmup, verifies
 registers/flags/time and exposed RAM/VRAM, and reports median execution and compilation separately.

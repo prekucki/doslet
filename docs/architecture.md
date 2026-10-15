@@ -46,6 +46,12 @@ AT keyboard crate implements scan sets 1/2 and guest-time typematic. Its IRQ1
 shim updates the BIOS key ring only when executed through the guest IVT.
 The gameport implements guest-time charge deadlines at port 201h.
 
+The native UI uses its 16-ms timer only while execution is running or storage
+is pending. Otherwise, the controller worker wakes it through coalesced event
+notifications. During execution, the existing timer drains controller events.
+A paused session with no pending work does not request periodic UI updates.
+Guest VGA timing remains independent of this host timer.
+
 ## Dependency graph
 
 Arrows mean "depends on".
@@ -59,6 +65,7 @@ graph TD
   Routing --> Translator[doslet-mt32-gm]
   Routing --> Synth
   UI --> Moont[doslet-mt32]
+  UI -. macOS .-> Apple[doslet-apple-midi / DLSMusicDevice]
   CLI[headless application] --> Runtime
   CLI --> Synth
   CLI --> Executable[doslet-executable]
@@ -170,6 +177,19 @@ fallback accommodates wasm-bindgen error strings in the worklet global scope.
 The Trunk Rust post-build hook builds both extra WASM modules and bindings,
 including wasm-opt -O3 in release builds. There is no JS build system.
 
+Native macOS can select `apple`, backed by `doslet-apple-midi`. This host adapter
+owns one DLSMusicDevice Audio Unit and renders at most 512 stereo frames per call.
+It uses the system GM bank, receives the existing GM/MT-32 routing output and
+shares the guest-timed PCM mixer and CPAL queue with the Rust synth. Fixed planar
+scratch buffers are interleaved into caller storage; no machine state is shared.
+Apple API allocation behavior is outside the emulator's allocation guarantee.
+Snapshot replay services the Audio Unit between messages and discards setup PCM
+without advancing guest time. Pause preserves the unit and sends silence to the
+audio device; Reset replaces the unit. The private FFI module owns creation,
+configuration, render and disposal;
+the crate denies unsafe code elsewhere. No Audio Unit enters the portable core
+or WASM dependency graph.
+
 Host MIDI is an explicit alternate adapter: midir natively, Web MIDI in browsers.
 The no_std wire decoder reconstructs complete messages and keeps basic replay
 state outside sample synthesis. Native port output bypasses sample generation.
@@ -214,6 +234,11 @@ translation according to the game/output dialects. Roland model-16h SysEx
 upgrades GM game mode to MT-32 before a GM output receives it. Other unsupported
 SysEx retains the output's explicit error behavior. The procedural synth honors
 RPN 0; replay restores its semitone/cents range and current RPN selector.
+An MT-32 device reset also sends GM All Sound Off and Reset All Controllers on
+the translated channels, clearing sustained voices and restoring expression
+before the fresh instrument setup. PCM regression tests cover a muted channel
+and a note released under sustain; the native Apple adapter has a separate
+expression-reset rendering check.
 Written-byte masks in the MT-32 model track DT1 and program/controller side
 effects. Raw replay sends a device reset followed by bounded DT1 packets only
 for known written ranges, then pitch, expression, sustain and active notes.
@@ -380,7 +405,8 @@ no PC, DOS or filesystem dependency and never owns guest RAM. Its small unsafe b
 converts finalized compiler output to private function pointers, invokes them
 with borrowed general registers, EFLAGS and EIP, optionally borrowing a bounded
 RAM span for a trace, and frees executable storage on drop. The rest
-of the workspace retains `unsafe_code = forbid`.
+of the emulation workspace retains `unsafe_code = forbid`; the macOS Audio Unit
+host adapter has its own private FFI boundary described above.
 
 There are two distinct representations. Address-independent prepared blocks
 contain decoded register IR or a bounded RAM/control-flow trace and at most 240

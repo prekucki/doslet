@@ -17,6 +17,7 @@ mod configurator;
 mod keyboard;
 #[path = "../../common/machine_profile.rs"]
 mod machine_profile;
+mod midi_activity;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_gamepad;
 #[cfg(not(target_arch = "wasm32"))]
@@ -27,6 +28,8 @@ mod native_midi;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "../../common/native_storage.rs"]
 mod native_storage;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_synth;
 mod presentation;
 #[cfg(not(target_arch = "wasm32"))]
 mod profile;
@@ -37,6 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use clap::Parser;
     let cli = cli::Cli::parse();
     if cli.list_midi_outputs {
+        println!("rust: Rust synth");
+        #[cfg(target_os = "macos")]
+        println!("apple: {}", native_synth::APPLE_LABEL);
+        println!("moont: CM-32L / MT-32 (requires ROMs)");
         for name in native_midi::ports()?.names {
             println!("{name}");
         }

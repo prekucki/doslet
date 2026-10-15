@@ -400,6 +400,9 @@ impl Cli {
             self.midi_output = None;
             self.mt32_rom_dir = None;
         }
+        if self.midi_output.as_deref() == Some("apple") && !cfg!(target_os = "macos") {
+            return Err("Apple MIDI output is available only on native macOS".into());
+        }
         if let Some(game) = &self.game {
             if !game.is_file() {
                 return Err(format!("game.executable is not a file: {}", game.display()).into());
@@ -609,6 +612,8 @@ pub(crate) mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(root.join("profiles")).unwrap();
+            // macOS temp paths may use /var, while resolved profiles use /private/var.
+            let root = root.canonicalize().unwrap();
             std::fs::write(root.join("TINY.EXE"), relocated_mz()).unwrap();
             let config = root.join("profiles/game.toml");
             std::fs::write(&config, profile).unwrap();
@@ -627,6 +632,46 @@ pub(crate) mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn cursor_visibility_and_capture_survive_native_profile_resolution() {
+        let fixture = Fixture::new(
+            "version=2\n[game]\nexecutable='../TINY.EXE'\n[input]\ncapture=false\nhide_cursor=true\n",
+        );
+        let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
+        let spec = cli.launch.machine_spec.unwrap();
+        assert!(!spec.input.capture);
+        assert!(spec.input.hide_cursor);
+    }
+
+    #[test]
+    fn apple_profile_output_obeys_platform_and_cli_overrides() {
+        for profile in [
+            "version=1\n[game]\nexecutable='../TINY.EXE'\n[midi]\noutput='apple'\ngame_mode='mt32'\n",
+            "version=2\n[game]\nexecutable='../TINY.EXE'\n[output]\nmidi_output='apple'\ngame_midi='mt32'\n",
+        ] {
+            let fixture = Fixture::new(profile);
+            let resolved = fixture.cli(&[]).resolve();
+            if cfg!(target_os = "macos") {
+                let cli = resolved.unwrap();
+                assert_eq!(cli.midi_output.as_deref(), Some("apple"));
+                assert_eq!(cli.midi_mode, Some(MidiMode::Mt32));
+                assert_eq!(cli.launch.machine_spec.unwrap().output.midi_output, "apple");
+            } else {
+                assert!(
+                    resolved
+                        .unwrap_err()
+                        .to_string()
+                        .contains("only on native macOS")
+                );
+            }
+            let cli = fixture.cli(&["--midi-output", "rust"]).resolve().unwrap();
+            assert_eq!(cli.midi_output.as_deref(), Some("rust"));
+            let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
+            assert!(cli.no_audio);
+            assert!(cli.midi_output.is_none());
         }
     }
 

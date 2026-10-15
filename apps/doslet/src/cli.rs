@@ -67,7 +67,7 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub core_profile: Option<PathBuf>,
 
-    /// MIDI port index/name, rust, or moont
+    /// MIDI port index/name, rust, apple (macOS), or moont
     #[arg(long, value_name = "PORT")]
     pub midi_output: Option<String>,
 
@@ -83,7 +83,7 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", conflicts_with = "no_audio")]
     pub mt32_rom_dir: Option<PathBuf>,
 
-    /// List host MIDI output ports and exit before opening a window
+    /// List built-in outputs and host MIDI ports, then exit without a window
     #[arg(long)]
     pub list_midi_outputs: bool,
 

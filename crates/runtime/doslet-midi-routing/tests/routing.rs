@@ -25,6 +25,75 @@ fn push(router: &mut Routing, bytes: &[u8], output: Mode) -> Vec<Vec<u8>> {
     }
     messages
 }
+
+fn feed_gm(router: &mut Routing, synth: &mut doslet_midi_synth::Synth, bytes: &[u8]) {
+    for message in push(router, bytes, Mode::Gm) {
+        for byte in message {
+            synth.push_byte(byte).unwrap();
+        }
+    }
+}
+
+#[test]
+fn translated_reset_restores_a_channel_muted_by_expression() {
+    let mut router = Routing::new(Mode::Mt32);
+    let mut synth = doslet_midi_synth::Synth::new(48000).unwrap();
+    feed_gm(
+        &mut router,
+        &mut synth,
+        &[0xB1, 11, 0, 0xC1, 0, 0x91, 60, 100],
+    );
+    let mut samples = [[0.0; 2]; 1024];
+    synth.render(&mut samples);
+    assert!(samples.iter().flatten().all(|&sample| sample == 0.0));
+    feed_gm(&mut router, &mut synth, &dt1(0x7F << 14, &[0]));
+    feed_gm(&mut router, &mut synth, &[0x91, 64, 100]);
+    synth.render(&mut samples);
+    assert!(
+        samples.iter().flatten().any(|sample| sample.abs() > 0.0001),
+        "MT-32 reset must make subsequent GM notes audible again"
+    );
+}
+
+#[test]
+fn translated_reset_stops_notes_already_released_under_sustain() {
+    let mut router = Routing::new(Mode::Mt32);
+    let mut synth = doslet_midi_synth::Synth::new(48000).unwrap();
+    feed_gm(
+        &mut router,
+        &mut synth,
+        &[0xC1, 48, 0xB1, 64, 127, 0x91, 60, 100, 0x81, 60, 0],
+    );
+    let mut samples = [[0.0; 2]; 1024];
+    synth.render(&mut samples);
+    assert!(samples.iter().flatten().any(|sample| sample.abs() > 0.0001));
+    feed_gm(&mut router, &mut synth, &dt1(0x7F << 14, &[0]));
+    synth.render(&mut samples);
+    assert!(
+        samples.iter().flatten().all(|&sample| sample == 0.0),
+        "MT-32 reset must also silence notes retained by the GM sustain pedal"
+    );
+}
+
+#[test]
+fn activity_counts_guest_notes_with_running_status_but_not_replay_or_note_off() {
+    let mut router = Routing::new(Mode::Gm);
+    push(&mut router, &[0x90, 60], Mode::Gm);
+    assert_eq!(router.input_note_events(), 0);
+    push(
+        &mut router,
+        &[100, 62, 0xF8, 90, 60, 0, 0x80, 62, 64],
+        Mode::Gm,
+    );
+    assert_eq!(router.input_note_events(), 2);
+    router.replay(Mode::Gm, &mut |_| {});
+    router.set_mode(Mode::Mt32);
+    router.replay(Mode::Mt32, &mut |_| {});
+    assert_eq!(router.input_note_events(), 2);
+    push(&mut router, &[0x91, 65, 100], Mode::Gm);
+    assert_eq!(router.input_note_events(), 3);
+}
+
 #[test]
 fn gm_passes_through_but_roland_upgrades_before_a_gm_sink_sees_sysex() {
     let mut router = Routing::new(Mode::Gm);

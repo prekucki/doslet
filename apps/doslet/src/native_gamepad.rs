@@ -1,5 +1,6 @@
 //! Native controller snapshots carry stable IDs and connection ordering.
 use gilrs::{Axis, Button, EventType, GilrsBuilder};
+mod wakeup;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -62,28 +63,52 @@ pub struct NativeGamepads {
     overflow: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    wakeup: wakeup::Signal,
 }
 fn send(
     sender: &SyncSender<GamepadUpdate>,
     overflow: &AtomicBool,
+    wakeup: &wakeup::Signal,
     event: GamepadUpdate,
 ) -> Result<bool, ()> {
     match sender.try_send(event) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            wakeup.notify();
+            Ok(true)
+        }
         Err(TrySendError::Full(_)) => {
             overflow.store(true, Ordering::Release);
+            wakeup.notify();
             Ok(false)
         }
         Err(TrySendError::Disconnected(_)) => Err(()),
     }
 }
 impl NativeGamepads {
+    #[cfg(test)]
+    pub fn test_pair() -> (Self, impl Fn(GamepadUpdate)) {
+        let (sender, receiver) = mpsc::sync_channel(256);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let wakeup = wakeup::Signal::default();
+        let pads = Self {
+            receiver,
+            overflow: overflow.clone(),
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            wakeup: wakeup.clone(),
+        };
+        (pads, move |update| {
+            assert!(send(&sender, &overflow, &wakeup, update).unwrap());
+        })
+    }
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::sync_channel(256);
         let overflow = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_overflow = Arc::clone(&overflow);
         let worker_stop = Arc::clone(&stop);
+        let wakeup = wakeup::Signal::default();
+        let worker_wakeup = wakeup.clone();
         let worker = thread::spawn(move || {
             let mut gilrs = match GilrsBuilder::new()
                 .with_default_filters(false)
@@ -95,6 +120,7 @@ impl NativeGamepads {
                     let _ = send(
                         &sender,
                         &worker_overflow,
+                        &worker_wakeup,
                         GamepadUpdate::Error(error.to_string()),
                     );
                     return;
@@ -119,6 +145,7 @@ impl NativeGamepads {
                 if send(
                     &sender,
                     &worker_overflow,
+                    &worker_wakeup,
                     GamepadUpdate::Connected {
                         id,
                         name: pad.name().into(),
@@ -147,6 +174,7 @@ impl NativeGamepads {
                             let _ = send(
                                 &sender,
                                 &worker_overflow,
+                                &worker_wakeup,
                                 GamepadUpdate::Error(
                                     "Controller connection generation exhausted".into(),
                                 ),
@@ -202,6 +230,7 @@ impl NativeGamepads {
                             let _ = send(
                                 &sender,
                                 &worker_overflow,
+                                &worker_wakeup,
                                 GamepadUpdate::Error("Controller event sequence exhausted".into()),
                             );
                             return;
@@ -270,7 +299,7 @@ impl NativeGamepads {
                     continue;
                 };
                 let was_state = matches!(update, GamepadUpdate::State(_));
-                match send(&sender, &worker_overflow, update) {
+                match send(&sender, &worker_overflow, &worker_wakeup, update) {
                     Ok(true) => {
                         if was_state
                             && !worker_overflow.load(Ordering::Acquire)
@@ -293,7 +322,15 @@ impl NativeGamepads {
             overflow,
             stop,
             worker: Some(worker),
+            wakeup,
         }
+    }
+    pub fn subscription(&self) -> iced::Subscription<()> {
+        iced::Subscription::run_with(self.wakeup.clone(), wakeup::Signal::stream)
+    }
+    /// Clear before draining: a producer racing with the drain can wake us again.
+    pub fn acknowledge(&self) {
+        self.wakeup.clear();
     }
     pub fn poll(&mut self) -> Option<GamepadUpdate> {
         if self.overflow.load(Ordering::Acquire) {
@@ -328,19 +365,42 @@ mod tests {
     }
     #[test]
     fn overflow_release_is_reserved_and_bounded() {
+        use iced::futures::Stream;
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
         let (sender, receiver) = mpsc::sync_channel(256);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let wakeup = wakeup::Signal::default();
+        let mut notifications = wakeup.stream();
+        let waker = iced::futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
         for _ in 0..256 {
-            sender.try_send(GamepadUpdate::ReleaseAll).unwrap();
+            assert!(send(&sender, &overflow, &wakeup, GamepadUpdate::ReleaseAll).unwrap());
         }
-        let overflow = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            Pin::new(&mut notifications).poll_next(&mut cx),
+            Poll::Ready(Some(()))
+        );
+        assert!(Pin::new(&mut notifications).poll_next(&mut cx).is_pending());
+        // Even a dropped event must wake an idle UI so it releases held input.
+        assert!(!send(&sender, &overflow, &wakeup, GamepadUpdate::ReleaseAll).unwrap());
+        assert_eq!(
+            Pin::new(&mut notifications).poll_next(&mut cx),
+            Poll::Ready(Some(()))
+        );
         let mut pads = NativeGamepads {
             receiver,
             overflow: overflow.clone(),
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
+            wakeup,
         };
+        pads.acknowledge();
         assert!(matches!(pads.poll(), Some(GamepadUpdate::ReleaseAll)));
         assert!(!overflow.load(Ordering::Acquire));
         assert!(pads.poll().is_none());
+        assert!(Pin::new(&mut notifications).poll_next(&mut cx).is_pending());
     }
 }

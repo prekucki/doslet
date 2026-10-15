@@ -131,6 +131,7 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
                 "keyboard",
                 "gameport",
                 "capture",
+                "hide_cursor",
                 "pad_index",
                 "pad_id",
                 "deadzone_percent",
@@ -154,6 +155,9 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
         spec.input.pad_id = string(i, "pad_id")?.filter(|s| !s.is_empty());
         if let Some(v) = boolean(i, "capture")? {
             spec.input.capture = v;
+        }
+        if let Some(v) = boolean(i, "hide_cursor")? {
+            spec.input.hide_cursor = v;
         }
         for (key, target) in [
             ("pad_index", &mut spec.input.pad_index),
@@ -442,6 +446,7 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
     });
     d["input"]["gameport"] = value(spec.hardware.gameport);
     d["input"]["capture"] = value(spec.input.capture);
+    d["input"]["hide_cursor"] = value(spec.input.hide_cursor);
     if let Some(id) = &spec.input.pad_id {
         d["input"]["pad_id"] = value(id);
     }
@@ -557,6 +562,8 @@ mod tests {
         };
         s.hardware.keyboard = KeyboardMode::At;
         s.input.deadzone_percent = 20;
+        s.input.capture = false;
+        s.input.hide_cursor = true;
         assert_eq!(
             parse_machine_profile(&export_machine_profile(&s)).unwrap(),
             s

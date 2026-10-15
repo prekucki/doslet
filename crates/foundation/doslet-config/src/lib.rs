@@ -51,6 +51,7 @@ pub struct HostBindingManifest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputSettings {
     pub capture: bool,
+    pub hide_cursor: bool,
     pub pad_index: u8,
     pub pad_id: Option<String>,
     pub deadzone_percent: u8,
@@ -63,6 +64,7 @@ impl Default for InputSettings {
     fn default() -> Self {
         Self {
             capture: true,
+            hide_cursor: false,
             pad_index: 0,
             pad_id: None,
             deadzone_percent: 12,

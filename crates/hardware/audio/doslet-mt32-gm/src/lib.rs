@@ -361,6 +361,12 @@ impl Translator {
     fn reset<F: FnMut(&[u8])>(&mut self, emit: &mut F) {
         for part in 0..PARTS {
             self.release_all(part, emit);
+            let out = output_channel(part);
+            // Note Off cannot stop voices retained by the GM sustain pedal.
+            // The MT-32 reset also restores expression, modulation and bend;
+            // refreshing patch/mixer parameters alone leaves those controls stale.
+            emit(&[0xB0 | out, 120, 0]);
+            emit(&[0xB0 | out, 121, 0]);
         }
         let stats = self.stats;
         *self = Self::new();

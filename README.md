@@ -55,7 +55,8 @@ The browser version needs no installation and no server.
   executed protected-mode code. Differential tests check both against a
   reference interpreter. Loops that only wait for the VGA retrace are skipped
   ahead instead of being executed step by step.
-- **Flexible MIDI.** Play music through the built-in Rust synthesizer, a MIDI
+- **Flexible MIDI.** Play music through the built-in Rust synthesizer, Apple's
+  system General MIDI synth on macOS, a MIDI
   port on your computer (TiMidity, Munt or a hardware synth), Web MIDI in the
   browser, or CM-32L emulation that uses your own ROMs. Doslet recognizes MT-32
   music automatically and can translate it for General MIDI devices.

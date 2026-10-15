@@ -191,6 +191,7 @@ export class Browser {
     async prepareOutput(output) {
         if(!output.audio) return {disabled:true};
         const selection=output.midi_output;
+        if(selection==='apple') throw new Error('Apple MIDI output is available only on native macOS; choose rust or an exposed MIDI port in the browser');
         if(selection==='moont') throw new Error('CM-32L ROM synthesis is available on desktop; choose rust or an exposed MIDI port in the browser');
         if(selection==='rust') {await this.startRustAudio();return {selection:'Rust synth',output};}
         const id=this.midiLabels.get(selection);
