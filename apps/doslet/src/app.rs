@@ -1665,7 +1665,7 @@ impl Doslet {
     }
     pub fn midi_mode_label(&self) -> String {
         let route = if self.midi_mode == Mode::Mt32 && self.output_dialect() == Mode::Gm {
-            "MT-32 → GM (przybliżenie)"
+            "MT-32 → GM (approximation)"
         } else if self.mt32.is_some() && self.midi_mode == Mode::Gm {
             "GM → CM-32L (approximation, 8 melodic parts)"
         } else {
@@ -2256,7 +2256,7 @@ enabled = false
         assert_eq!(app.midi_mode, Mode::Mt32);
         assert_eq!(app.routing.translator().stats().sysex, 1);
         assert_eq!(app.midi.note_events(), 1);
-        assert!(app.midi_mode_label().contains("przybliżenie"));
+        assert!(app.midi_mode_label().contains("approximation"));
     }
     #[test]
     fn host_midi_lookahead_is_bounded_and_rebases_after_pause_and_reset() {

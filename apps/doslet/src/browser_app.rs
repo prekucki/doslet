@@ -759,7 +759,7 @@ impl Doslet {
             if self.midi_mode == Mode::Mt32
                 && (self.midi_choice == "Rust synth" || self.midi_output_mode == Mode::Gm)
             {
-                "MT-32 → GM (przybliżenie)"
+                "MT-32 → GM (approximation)"
             } else {
                 ""
             },
