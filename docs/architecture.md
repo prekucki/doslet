@@ -318,8 +318,8 @@ validates all of its plain-RAM operands, stack slots and branch targets before
 its first effect and then accesses those linear addresses directly; a failed
 check ends the slice before that instruction.
 
-Slices fetch from a separate fixed cache of 1024 basic blocks, each holding up
-to 16 decoded instructions through the first control transfer and stopping
+Slices fetch from a separate fixed cache of 4096 basic blocks, each holding up
+to 8 decoded instructions through the first control transfer and stopping
 before port I/O or an unsupported form. A block is validated once per entry
 against the CS window over its whole span and one code check; after each
 instruction the slice continues only while IP reaches the next decoded

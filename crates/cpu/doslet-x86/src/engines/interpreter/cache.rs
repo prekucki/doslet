@@ -41,6 +41,13 @@ pub struct DecodeCacheStats {
     /// Validated basic-block lookups, and blocks decoded on a miss.
     pub block_hits: u64,
     pub block_misses: u64,
+    /// Block misses whose slot held another address, or the same address with
+    /// changed code generations.
+    pub block_conflicts: u64,
+    pub block_stale: u64,
+    /// Lookups in code whose CS is not default-32-bit; real, V86 and 16-bit
+    /// protected-mode code always use the original interpreter.
+    pub code16_lookups: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,8 +63,8 @@ struct Entry {
     instruction: Instruction,
 }
 
-const BLOCK_CAPACITY: usize = 1024;
-const BLOCK_INSTRUCTIONS: usize = 16;
+const BLOCK_CAPACITY: usize = 4096;
+const BLOCK_INSTRUCTIONS: usize = 8;
 
 /// Consecutive decoded instructions up to the first control transfer, validated
 /// once per lookup. A block starting with an instruction that cannot be batched
@@ -196,7 +203,13 @@ impl Cache {
         if !self.enabled {
             return None;
         }
-        let (window, _) = self.code_context(r)?;
+        let Some((window, _)) = self.code_context(r) else {
+            #[cfg(feature = "profiling")]
+            {
+                self.stats.code16_lookups += u64::from(!self.code32);
+            }
+            return None;
+        };
         self.instruction_in(window, r.ip, bus)
     }
     /// Look up `ip` in an already resolved 32-bit code context.
@@ -325,7 +338,12 @@ impl Cache {
     ) -> Option<usize> {
         #[cfg(feature = "profiling")]
         {
+            let slot = &self.blocks[index];
             self.stats.block_misses += 1;
+            self.stats.block_conflicts +=
+                u64::from(slot.address != address && slot.address != u32::MAX);
+            self.stats.block_stale +=
+                u64::from(slot.address == address && !bus.code_valid(&slot.check));
         }
         let bytes = bus.code_bytes(address, u8::MAX)?;
         let mut block = Block {
