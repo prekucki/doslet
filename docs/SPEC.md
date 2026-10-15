@@ -232,16 +232,22 @@ default-32-bit code. It caches prefix decisions, operations, immediates and
 16/32-bit address expressions; effective addresses and segment permissions are
 resolved against current registers. Implemented cached forms include byte/dword
 MOV and ALU/CMP/TEST, dword INC/DEC, LEA, XCHG, NEG/NOT, selected dword stack
-operations, short/near relative jumps and conditional jumps, near CALL/RET and
-byte IN/OUT through DX. Word operand overrides, REP strings, other instructions
-and buses without the optional code contract use the original interpreter.
+operations, short/near relative jumps and conditional jumps, LOOP/LOOPE/LOOPNE/JECXZ,
+near CALL/RET, byte IN/OUT through DX, byte/dword MUL/IMUL/DIV/IDIV of the
+accumulator, CWDE/CDQ, MOVZX/MOVSX into dword registers and byte/word/dword
+MOVS/STOS/LODS with or without REP. A repeated string still performs one
+iteration per step. Other word operand overrides, other instructions and buses
+without the optional code contract use the original interpreter. A decoder
+rejection is remembered against the same code check, so the original interpreter
+runs without another decode attempt until those bytes change.
 Both paths consume one scheduling step and preserve the existing IRQ boundaries.
 
 PC RAM tracks checked write generations for 4-KiB pages, including mutations
 through wide write views. A code span checks both page generations, its RAM
 owner identity and A20 mapping generation; its physical pages are resolved at
-decode time and hits do not translate the address again. CS-cache/context
-changes clear the instruction cache. Offset-independent CS checks are resolved
+decode time and hits do not translate the address again. Entries are keyed by
+linear address and decoded only for default-32-bit code, so they remain valid
+across CS-cache/context changes. Offset-independent CS checks are resolved
 once per context, detected through a registers lineage and CS reload version;
 hits still check the instruction's complete offset range.
 Counter exhaustion disables caching rather than wrapping.
@@ -292,6 +298,15 @@ work for at most 256 steps. MMIO, I/O, faults, mode/IF changes and unsupported
 instructions remain boundaries. Hardware clocks and execution counters advance
 once per slice; RAM writes still invalidate code immediately. The bus must opt
 into the ordinary-RAM batching contract, which defaults to disabled.
+
+Without the native core, including WASM and `--no-dynamic-core`, the machine
+uses the same slice boundaries for cached interpreter instructions. Data-segment
+and CS windows are resolved once per slice, because batched instructions cannot
+load segment registers. Each instruction validates every operand, stack slot and
+branch target as plain RAM or a valid CS offset before its first effect, then
+performs the accesses at those linear addresses; a failed check ends the slice
+before that instruction and the original interpreter handles it. A divide error
+leaves only IP changed, which the slice restores before handing over.
 
 Discovery and native execution allocate nothing. Explicit host preparation between
 batches may allocate and request executable memory through `doslet-x86-jit`, the

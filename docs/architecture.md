@@ -296,16 +296,27 @@ interpretation. A20 changes advance the mapping generation in the token.
 
 Cache entries contain operations, immediates and addressing expressions rather
 than resolved data addresses. Register-dependent addresses and segment checks
-remain execution work. CS context changes clear entries and resolve the selector,
-hidden-cache, PE-mode and execute checks once; hits validate the entire code span's
-offset range and its generation token. Each `Registers` value carries a setup-time
+remain execution work. Entries are keyed by linear address and hold only
+default-32-bit decodes, so they survive CS context changes; a change resolves the
+selector, hidden-cache, PE-mode and execute checks once, and hits validate the
+entire code span's offset range and its generation token. Decoder rejections are
+cached against the same check so the original interpreter runs without repeated
+decode attempts. Each `Registers` value carries a setup-time
 lineage and a CS reload version that are not guest state; a step whose lineage,
 version, selector and PE mode match the last resolution skips the full context
 comparison, and exhausted counters restore it. Short/noncontiguous code views and unsupported
 forms use the original byte-fetching interpreter, preserving partial fault IP
-progress. One cached instruction still consumes exactly one bounded step; REP
-and IRQ delivery retain their existing paths. The optional native core below
-uses a separate block cache.
+progress. One cached instruction still consumes exactly one bounded step; a
+cached REP string performs one iteration per step, and IRQ delivery retains its
+existing path. The optional native core below uses a separate block cache.
+
+`Cpu::interpret_batch` runs cached instructions without the native core between
+the machine's IRQ check and its next hardware deadline, at most 256 steps, so
+the PC advances clocks and counters once per slice instead of once per
+instruction. Segment windows are resolved once per slice. Each instruction
+validates all of its plain-RAM operands, stack slots and branch targets before
+its first effect and then accesses those linear addresses directly; a failed
+check ends the slice before that instruction.
 
 The CPU owns hidden segment caches, descriptor-table state and optional x87
 state. Its decoder selects 16/32-bit addressing and validates cache permissions

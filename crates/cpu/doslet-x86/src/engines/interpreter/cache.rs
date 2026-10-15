@@ -1,7 +1,9 @@
 //! Single-instruction cache. Unsupported forms use the original interpreter.
 use super::{Cpu, CpuError, StepOutcome};
 use crate::state::SegmentWindow;
-use crate::{Access, Gpr32, Registers, SegmentCache, SegmentRegister, decode::Operand, flags};
+use crate::{
+    Access, Gpr16, Gpr32, Registers, SegmentCache, SegmentRegister, decode::Operand, flags,
+};
 use doslet_bus::{CodeCheck, CpuBus};
 
 const CAPACITY: usize = 512;
@@ -32,6 +34,9 @@ pub struct DecodeCacheStats {
     pub decode_attempts: u64,
     pub failed_decodes: u64,
     pub fallback_hits: u64,
+    /// Interpreter batches without the native core, and the steps they ran.
+    pub batches: u64,
+    pub batched_steps: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,7 +94,9 @@ impl Cache {
         self.code32 = false;
         self.window = None;
     }
-    /// Full context check; entries survive only an unchanged 32-bit context.
+    /// Full context check. Entries are keyed by linear address and decoded only
+    /// for default-32-bit code, so they remain valid in every 32-bit context;
+    /// each hit still checks its offset range against the current window.
     #[inline(always)]
     fn resolve_context(&mut self, r: &Registers) {
         let context = Context {
@@ -102,12 +109,7 @@ impl Cache {
             #[cfg(feature = "profiling")]
             {
                 self.stats.context_switches += u64::from(self.context.is_some());
-                let removed = self.entries.iter().filter(|e| e.is_some()).count() as u64;
-                self.stats.context_invalidations += removed;
-                self.stats.invalidations += removed;
             }
-            self.clear();
-            self.code32 = true;
             self.context = Some(context);
             // The context fixes every CS check except the instruction's offset range.
             self.window = r.window(SegmentRegister::Cs, Access::Execute);
@@ -149,13 +151,30 @@ impl Cache {
             return None;
         }
         let (window, _) = self.code_context(r)?;
-        let address = window.address(r.ip, 1)?;
+        self.instruction_in(window, r.ip, bus)
+    }
+    /// Look up `ip` in an already resolved 32-bit code context.
+    #[inline]
+    fn instruction_in<B: CpuBus>(
+        &mut self,
+        window: SegmentWindow,
+        ip: u32,
+        bus: &B,
+    ) -> Option<Instruction> {
+        let address = window.address(ip, 1)?;
         let index = ((address ^ (address >> 9)) as usize) & (CAPACITY - 1);
         if let Some(entry) = self.entries[index]
             && entry.address == address
         {
-            let segment_valid = window.address(r.ip, entry.instruction.length).is_some();
+            let segment_valid = window.address(ip, entry.instruction.length).is_some();
             if segment_valid && bus.code_valid(&entry.check) {
+                if matches!(entry.instruction.operation, Operation::Unsupported) {
+                    #[cfg(feature = "profiling")]
+                    {
+                        self.stats.fallback_hits += 1;
+                    }
+                    return None;
+                }
                 #[cfg(feature = "profiling")]
                 {
                     self.stats.hits += 1;
@@ -197,11 +216,21 @@ impl Cache {
             {
                 self.stats.failed_decodes += 1;
             }
+            // Remember the rejection while the bytes the decoder saw stay
+            // unchanged, so the reference path runs without another attempt.
+            let length = bytes.len() as u8;
+            if let Some(check) = bus.code_check(address, length) {
+                self.entries[index] = Some(Entry {
+                    address,
+                    check,
+                    instruction: Instruction::UNSUPPORTED,
+                });
+            }
             return None;
         };
         // Failed probes leave registers/bus untouched. Let byte fetching report
         // the original fault and partial IP progress at a code-segment boundary.
-        window.address(r.ip, instruction.length)?;
+        window.address(ip, instruction.length)?;
         let check = bus.code_check(address, instruction.length)?;
         #[cfg(feature = "profiling")]
         {
@@ -300,6 +329,29 @@ fn write<B: CpuBus>(
         target.write(&mut cpu.registers, bus, false, value as u16)
     }
 }
+fn read_width<B: CpuBus>(
+    target: Operand,
+    cpu: &Cpu,
+    bus: &mut B,
+    width: u8,
+) -> Result<u32, CpuError> {
+    match width {
+        4 => target.read32(&cpu.registers, bus),
+        _ => target.read(&cpu.registers, bus, width == 2).map(u32::from),
+    }
+}
+fn write_width<B: CpuBus>(
+    target: Operand,
+    cpu: &mut Cpu,
+    bus: &mut B,
+    width: u8,
+    value: u32,
+) -> Result<(), CpuError> {
+    match width {
+        4 => target.write32(&mut cpu.registers, bus, value),
+        _ => target.write(&mut cpu.registers, bus, width == 2, value as u16),
+    }
+}
 #[derive(Clone, Copy)]
 enum Operation {
     Move {
@@ -339,6 +391,38 @@ enum Operation {
     Return(u16),
     Input,
     Output,
+    /// LOOPNE/LOOPE/LOOP (E0-E2) and JECXZ (E3), selected by `kind`.
+    Loop {
+        kind: u8,
+        displacement: i32,
+        address32: bool,
+    },
+    /// MOVS (A4), STOS (AA) or LODS (AC); one iteration per step under REP.
+    String {
+        kind: u8,
+        width: u8,
+        segment: SegmentRegister,
+        address32: bool,
+        repeat: bool,
+    },
+    /// MUL, IMUL, DIV or IDIV of the accumulator (F6/F7 /4-/7).
+    MulDiv {
+        target: Target,
+        operation: u8,
+    },
+    /// CWDE (98) or CDQ (99).
+    Extend {
+        cdq: bool,
+    },
+    /// MOVZX/MOVSX (0F B6/B7/BE/BF) into a dword register.
+    MoveExtend {
+        register: u8,
+        source: Target,
+        word: bool,
+        signed: bool,
+    },
+    /// A remembered decoder rejection; never executed from the cache.
+    Unsupported,
 }
 #[derive(Clone, Copy)]
 pub(super) struct Instruction {
@@ -433,7 +517,14 @@ impl Instruction {
             _ => false,
         }
     }
+}
 
+#[cfg(all(
+    feature = "dynamic-core",
+    not(target_arch = "wasm32"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl Instruction {
     fn batch_safe<B: CpuBus>(self, cpu: &Cpu, bus: &B) -> bool {
         let r = &cpu.registers;
         let length = if self.dword { 4 } else { 1 };
@@ -526,7 +617,14 @@ impl Instruction {
                 .and_then(|address| bus.code_bytes(address, 4))
                 .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
                 .is_some_and(|bytes| jump(u32::from_le_bytes(bytes))),
-            Operation::Input | Operation::Output => false,
+            Operation::Input
+            | Operation::Output
+            | Operation::Loop { .. }
+            | Operation::String { .. }
+            | Operation::MulDiv { .. }
+            | Operation::Extend { .. }
+            | Operation::MoveExtend { .. }
+            | Operation::Unsupported => false,
         }
     }
 }
@@ -705,6 +803,438 @@ pub(super) fn native_trace_instruction(
     ))
 }
 
+/// Upper bound of one batch; the machine's event deadline usually ends it first.
+pub(super) const BATCH_STEPS: u32 = 256;
+const PLAIN_RAM: &str = "validated batch access and plain-RAM bus contract";
+
+/// A validated operand: a register or a plain-RAM linear address.
+#[derive(Clone, Copy)]
+enum Place {
+    Register(u8),
+    Ram(u32),
+}
+#[derive(Clone, Copy)]
+enum Source {
+    Immediate(u32),
+    Place(Place),
+}
+
+/// Data-segment windows resolved once per batch. Batched instructions cannot
+/// load segment registers, so the hidden caches stay unchanged throughout.
+#[derive(Default)]
+struct Windows([[Option<Option<SegmentWindow>>; 2]; 6]);
+impl Windows {
+    #[inline]
+    fn linear<B: CpuBus>(
+        &mut self,
+        r: &Registers,
+        bus: &B,
+        segment: SegmentRegister,
+        offset: u32,
+        length: u8,
+        access: Access,
+    ) -> Option<u32> {
+        let slot = &mut self.0[segment as usize][usize::from(access == Access::Write)];
+        let window = *slot.get_or_insert_with(|| r.window(segment, access));
+        let address = window?.address(offset, length)?;
+        bus.is_plain_ram(address, length).then_some(address)
+    }
+    #[inline]
+    fn place<B: CpuBus>(
+        &mut self,
+        r: &Registers,
+        bus: &B,
+        target: Target,
+        length: u8,
+        access: Access,
+    ) -> Option<Place> {
+        match target.resolve(r) {
+            Operand::Register(code) => Some(Place::Register(code)),
+            Operand::Memory { segment, offset } => self
+                .linear(r, bus, segment, offset, length, access)
+                .map(Place::Ram),
+        }
+    }
+    #[inline]
+    fn source<B: CpuBus>(
+        &mut self,
+        r: &Registers,
+        bus: &B,
+        value: Value,
+        length: u8,
+    ) -> Option<Source> {
+        match value {
+            Value::Immediate(value) => Some(Source::Immediate(value)),
+            Value::Operand(target) => self
+                .place(r, bus, target, length, Access::Read)
+                .map(Source::Place),
+        }
+    }
+}
+
+impl Cpu {
+    /// Execute a bounded run of decoded ordinary-RAM instructions without the
+    /// native core. The machine checks pending IRQs first and supplies the next
+    /// hardware deadline. I/O, MMIO, faultable operands and mode/IF changes stop
+    /// before execution, so hardware and scheduling counters can advance once.
+    pub fn interpret_batch<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+    ) -> u32 {
+        if budget < 2 || !self.batch_ready() || !self.decode_cache.enabled {
+            return 0;
+        }
+        let Some((code, _)) = self.decode_cache.code_context(&self.registers) else {
+            return 0;
+        };
+        let budget = budget.min(BATCH_STEPS).min(limit(bus));
+        let mut windows = Windows::default();
+        let mut completed = 0;
+        while completed < budget {
+            // Batched instructions cannot change the CS context resolved above.
+            let ip = self.registers.ip;
+            let Some(instruction) = self.decode_cache.instruction_in(code, ip, bus) else {
+                break;
+            };
+            if !self.try_batched(bus, &mut windows, code, instruction) {
+                break;
+            }
+            completed += 1;
+        }
+        #[cfg(feature = "profiling")]
+        {
+            self.decode_cache.stats.batches += u64::from(completed != 0);
+            self.decode_cache.stats.batched_steps += u64::from(completed);
+        }
+        completed
+    }
+
+    /// Validate every address an instruction uses, then perform it on those
+    /// linear addresses. Returns false, with no effect, when any check fails:
+    /// the reference step then reports faults and touches devices itself.
+    /// Effects follow `execute_cached` in order and in flag computation.
+    fn try_batched<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        windows: &mut Windows,
+        code: SegmentWindow,
+        i: Instruction,
+    ) -> bool {
+        let r = &self.registers;
+        let length = if i.dword { 4 } else { 1 };
+        let next = r.ip.wrapping_add(u32::from(i.length));
+        let jump = |displacement: i32| {
+            let target = next.wrapping_add_signed(displacement);
+            code.address(target, 1).map(|_| target)
+        };
+        let push_address = |windows: &mut Windows, bus: &B| {
+            let sp = self.stack_pointer().wrapping_sub(4);
+            let sp = if r.stack32() {
+                sp
+            } else {
+                u32::from(sp as u16)
+            };
+            windows
+                .linear(r, bus, SegmentRegister::Ss, sp, 4, Access::Write)
+                .map(|address| (sp, address))
+        };
+        match i.operation {
+            Operation::Move { target, source } => {
+                let Some(source) = windows.source(r, bus, source, length) else {
+                    return false;
+                };
+                let Some(target) = windows.place(r, bus, target, length, Access::Write) else {
+                    return false;
+                };
+                let value = self.load_source(bus, source, i.dword);
+                self.store(bus, target, i.dword, value);
+            }
+            Operation::Lea { register, target } => {
+                let Operand::Memory { offset, .. } = target.resolve(r) else {
+                    unreachable!()
+                };
+                self.registers.set32(Gpr32::decode(register), offset);
+            }
+            Operation::Alu {
+                target,
+                source,
+                operation,
+                store,
+            } => {
+                let Some(place) = windows.place(r, bus, target, length, Access::Read) else {
+                    return false;
+                };
+                if store
+                    && windows
+                        .place(r, bus, target, length, Access::Write)
+                        .is_none()
+                {
+                    return false;
+                }
+                let Some(source) = windows.source(r, bus, source, length) else {
+                    return false;
+                };
+                let left = self.load(bus, place, i.dword);
+                let right = self.load_source(bus, source, i.dword);
+                let (value, new_flags) = if i.dword {
+                    flags::alu32(self.flags, left, right, operation)
+                } else {
+                    let (value, flags) =
+                        flags::alu(self.flags, left as u16, right as u16, operation, false);
+                    (u32::from(value), flags)
+                };
+                self.flags = new_flags;
+                if store {
+                    self.store(bus, place, i.dword, value);
+                }
+            }
+            Operation::Exchange { target, register } => {
+                let Some(place) = windows.place(r, bus, target, length, Access::Read) else {
+                    return false;
+                };
+                if windows
+                    .place(r, bus, target, length, Access::Write)
+                    .is_none()
+                {
+                    return false;
+                }
+                let other = Place::Register(register);
+                let left = self.load(bus, place, i.dword);
+                let right = self.load(bus, other, i.dword);
+                self.store(bus, place, i.dword, right);
+                self.store(bus, other, i.dword, left);
+            }
+            Operation::Inc {
+                register,
+                decrement,
+            } => {
+                let register = Gpr32::decode(register);
+                let (value, next_flags) = flags::alu32(
+                    self.flags,
+                    self.registers.get32(register),
+                    1,
+                    if decrement { 5 } else { 0 },
+                );
+                self.flags = (next_flags & !flags::CARRY) | (self.flags & flags::CARRY);
+                self.registers.set32(register, value);
+            }
+            Operation::Unary { target, negate } => {
+                let Some(place) = windows.place(r, bus, target, 4, Access::Read) else {
+                    return false;
+                };
+                if windows.place(r, bus, target, 4, Access::Write).is_none() {
+                    return false;
+                }
+                let value = self.load(bus, place, true);
+                let value = if negate {
+                    let (value, new_flags) = flags::alu32(self.flags, 0, value, 5);
+                    self.flags = new_flags;
+                    value
+                } else {
+                    !value
+                };
+                self.store(bus, place, true, value);
+            }
+            Operation::Push(value) => {
+                let Some(source) = windows.source(r, bus, value, 4) else {
+                    return false;
+                };
+                let Some((sp, address)) = push_address(windows, bus) else {
+                    return false;
+                };
+                let value = self.load_source(bus, source, true);
+                self.store(bus, Place::Ram(address), true, value);
+                self.set_stack_pointer(sp);
+            }
+            Operation::Pop(register) => {
+                let sp = self.stack_pointer();
+                let Some(address) =
+                    windows.linear(r, bus, SegmentRegister::Ss, sp, 4, Access::Read)
+                else {
+                    return false;
+                };
+                let value = self.load(bus, Place::Ram(address), true);
+                self.adjust_stack(4);
+                self.registers.set32(Gpr32::decode(register), value);
+            }
+            Operation::Branch {
+                condition,
+                displacement,
+            } => {
+                if condition.is_none_or(|condition| flags::condition(self.flags, condition)) {
+                    let Some(target) = jump(displacement) else {
+                        return false;
+                    };
+                    self.registers.ip = target;
+                    return true;
+                }
+            }
+            Operation::Call(displacement) => {
+                let Some(target) = jump(displacement) else {
+                    return false;
+                };
+                let Some((sp, address)) = push_address(windows, bus) else {
+                    return false;
+                };
+                self.store(bus, Place::Ram(address), true, next);
+                self.set_stack_pointer(sp);
+                self.registers.ip = target;
+                return true;
+            }
+            Operation::CallIndirect(value) => {
+                let Some(source) = windows.source(r, bus, value, 4) else {
+                    return false;
+                };
+                let Some((sp, address)) = push_address(windows, bus) else {
+                    return false;
+                };
+                let target = self.load_source(bus, source, true);
+                if code.address(target, 1).is_none() {
+                    return false;
+                }
+                self.store(bus, Place::Ram(address), true, next);
+                self.set_stack_pointer(sp);
+                self.registers.ip = target;
+                return true;
+            }
+            Operation::Return(release) => {
+                let sp = self.stack_pointer();
+                let Some(address) =
+                    windows.linear(r, bus, SegmentRegister::Ss, sp, 4, Access::Read)
+                else {
+                    return false;
+                };
+                let target = self.load(bus, Place::Ram(address), true);
+                if code.address(target, 1).is_none() {
+                    return false;
+                }
+                self.adjust_stack(4);
+                self.registers.ip = target;
+                self.adjust_stack(u32::from(release));
+                return true;
+            }
+            Operation::Loop {
+                kind,
+                displacement,
+                address32,
+            } => {
+                let count = self.address_register(Gpr16::Cx, address32);
+                let take = if kind == 3 {
+                    count == 0
+                } else {
+                    let count = if address32 {
+                        count.wrapping_sub(1)
+                    } else {
+                        u32::from((count as u16).wrapping_sub(1))
+                    };
+                    count != 0 && (kind == 2 || (self.flags & flags::ZERO != 0) == (kind == 1))
+                };
+                if take && jump(displacement).is_none() {
+                    return false;
+                }
+                return self.delegate_batched(bus, i);
+            }
+            Operation::String {
+                kind,
+                width,
+                segment,
+                address32,
+                repeat,
+            } => {
+                if !repeat || self.address_register(Gpr16::Cx, address32) != 0 {
+                    let si = self.address_register(Gpr16::Si, address32);
+                    let di = self.address_register(Gpr16::Di, address32);
+                    if kind != 0xAA
+                        && windows
+                            .linear(r, bus, segment, si, width, Access::Read)
+                            .is_none()
+                    {
+                        return false;
+                    }
+                    if kind != 0xAC
+                        && windows
+                            .linear(r, bus, SegmentRegister::Es, di, width, Access::Write)
+                            .is_none()
+                    {
+                        return false;
+                    }
+                }
+                return self.delegate_batched(bus, i);
+            }
+            Operation::MulDiv { target, .. } => {
+                if windows
+                    .place(r, bus, target, length, Access::Read)
+                    .is_none()
+                {
+                    return false;
+                }
+                return self.delegate_batched(bus, i);
+            }
+            Operation::Extend { .. } => return self.delegate_batched(bus, i),
+            Operation::MoveExtend { source, word, .. } => {
+                let width = if word { 2 } else { 1 };
+                if windows.place(r, bus, source, width, Access::Read).is_none() {
+                    return false;
+                }
+                return self.delegate_batched(bus, i);
+            }
+            Operation::Input | Operation::Output | Operation::Unsupported => return false,
+        }
+        self.registers.ip = next;
+        true
+    }
+
+    /// Execute a validated instruction through the reference-equivalent cached
+    /// path. Only a divide error remains possible; it has no effect except IP,
+    /// which is restored so the reference step reports it.
+    fn delegate_batched<B: CpuBus>(&mut self, bus: &mut B, i: Instruction) -> bool {
+        let ip = self.registers.ip;
+        if self.execute_cached(bus, i).is_err() {
+            self.registers.ip = ip;
+            return false;
+        }
+        true
+    }
+
+    fn load<B: CpuBus>(&self, bus: &mut B, place: Place, dword: bool) -> u32 {
+        match place {
+            Place::Register(code) if dword => self.registers.get32(Gpr32::decode(code)),
+            Place::Register(code) => u32::from(self.registers.get_byte(code)),
+            Place::Ram(address) if dword => bus.read_u32(address).expect(PLAIN_RAM),
+            Place::Ram(address) => u32::from(bus.read_u8(address).expect(PLAIN_RAM)),
+        }
+    }
+
+    fn load_source<B: CpuBus>(&self, bus: &mut B, source: Source, dword: bool) -> u32 {
+        match source {
+            Source::Immediate(value) => value,
+            Source::Place(place) => self.load(bus, place, dword),
+        }
+    }
+
+    fn store<B: CpuBus>(&mut self, bus: &mut B, place: Place, dword: bool, value: u32) {
+        match place {
+            Place::Register(code) if dword => self.registers.set32(Gpr32::decode(code), value),
+            Place::Register(code) => self.registers.set_byte(code, value as u8),
+            Place::Ram(address) if dword => bus.write_u32(address, value).expect(PLAIN_RAM),
+            Place::Ram(address) => bus.write_u8(address, value as u8).expect(PLAIN_RAM),
+        }
+    }
+
+    /// The per-step checks of `step` are invariant across a batch: batched
+    /// instructions cannot set TF, change CR0, load segments or open a shadow.
+    fn batch_ready(&self) -> bool {
+        !self.halted
+            && self.interrupt_shadow == 0
+            && self.flags & (flags::TRAP | flags::RESUME | flags::VIRTUAL) == 0
+            && self.control.cr0 & 0x8000_0000 == 0
+            && self.registers.protected
+            && self.protected_mode()
+    }
+}
+
 #[cfg(all(
     feature = "dynamic-core",
     not(target_arch = "wasm32"),
@@ -830,16 +1360,25 @@ impl Reader<'_> {
     }
 }
 impl Instruction {
+    /// One byte of offset range: the reference path reports its own faults.
+    const UNSUPPORTED: Self = Self {
+        length: 1,
+        read_length: 1,
+        dword: false,
+        operation: Operation::Unsupported,
+    };
+
     fn decode(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader { bytes, position: 0 };
         let mut operand32 = true;
         let mut address32 = true;
         let mut segment = None;
+        let mut repeat = false;
         let opcode = loop {
             match r.byte()? {
                 0x66 => operand32 = false,
                 0x67 => address32 = false,
-                0xF2 | 0xF3 => {}
+                0xF2 | 0xF3 => repeat = true,
                 byte @ (0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) => {
                     segment = Some(match byte {
                         0x26 => SegmentRegister::Es,
@@ -853,7 +1392,32 @@ impl Instruction {
                 byte => break byte,
             }
         };
-        // Word operands retain the reference path in this initial experiment.
+        if matches!(opcode, 0xA4 | 0xA5 | 0xAA | 0xAB | 0xAC | 0xAD) {
+            // REPNE repeats MOVS/STOS/LODS exactly like REP.
+            let width = if opcode & 1 == 0 {
+                1
+            } else if operand32 {
+                4
+            } else {
+                2
+            };
+            if r.position > 15 {
+                return None;
+            }
+            return Some(Self {
+                length: r.position as u8,
+                read_length: r.position as u8,
+                dword: width == 4,
+                operation: Operation::String {
+                    kind: opcode & 0xFE,
+                    width,
+                    segment: segment.unwrap_or(SegmentRegister::Ds),
+                    address32,
+                    repeat,
+                },
+            });
+        }
+        // Other word operands retain the reference path.
         if !operand32 {
             return None;
         }
@@ -982,12 +1546,33 @@ impl Instruction {
             },
             0x0F => {
                 let second = r.byte()?;
-                if !(0x80..=0x8F).contains(&second) {
+                if matches!(second, 0xB6 | 0xB7 | 0xBE | 0xBF) {
+                    let modrm = r.byte()?;
+                    dword = true;
+                    Operation::MoveExtend {
+                        register: (modrm >> 3) & 7,
+                        source: r.target(modrm, address32, segment)?,
+                        word: second & 1 != 0,
+                        signed: second & 8 != 0,
+                    }
+                } else if (0x80..=0x8F).contains(&second) {
+                    Operation::Branch {
+                        condition: Some(second & 15),
+                        displacement: r.dword()? as i32,
+                    }
+                } else {
                     return None;
                 }
-                Operation::Branch {
-                    condition: Some(second & 15),
-                    displacement: r.dword()? as i32,
+            }
+            0xE0..=0xE3 => Operation::Loop {
+                kind: opcode & 3,
+                displacement: i32::from(r.byte()? as i8),
+                address32,
+            },
+            0x98 | 0x99 => {
+                dword = true;
+                Operation::Extend {
+                    cdq: opcode == 0x99,
                 }
             }
             0xE8 => Operation::Call(r.dword()? as i32),
@@ -1023,6 +1608,7 @@ impl Instruction {
                         target,
                         negate: modrm & 0x38 == 0x18,
                     },
+                    operation @ 4..=7 => Operation::MulDiv { target, operation },
                     _ => return None,
                 }
             }
@@ -1239,8 +1825,210 @@ impl Cpu {
                 self.registers.get32(Gpr32::Edx) as u16,
                 self.registers.get_byte(0),
             )?,
+            Operation::Loop {
+                kind,
+                displacement,
+                address32,
+            } => {
+                self.registers.ip = next;
+                let take = if kind == 3 {
+                    self.address_register(Gpr16::Cx, address32) == 0
+                } else {
+                    let count = self.address_register(Gpr16::Cx, address32).wrapping_sub(1);
+                    self.set_address_register(Gpr16::Cx, count, address32);
+                    let count = self.address_register(Gpr16::Cx, address32);
+                    count != 0 && (kind == 2 || (self.flags & flags::ZERO != 0) == (kind == 1))
+                };
+                if take {
+                    self.near_jump(next.wrapping_add_signed(displacement))?;
+                }
+            }
+            Operation::String {
+                kind,
+                width,
+                segment,
+                address32,
+                repeat,
+            } => {
+                self.registers.ip = next;
+                let count = self.address_register(Gpr16::Cx, address32);
+                if repeat && count == 0 {
+                    return Ok(StepOutcome::Continue);
+                }
+                let si = self.address_register(Gpr16::Si, address32);
+                let di = self.address_register(Gpr16::Di, address32);
+                let source = Operand::Memory {
+                    segment,
+                    offset: si,
+                };
+                let target = Operand::Memory {
+                    segment: SegmentRegister::Es,
+                    offset: di,
+                };
+                match kind {
+                    0xA4 => {
+                        let value = read_width(source, self, bus, width)?;
+                        write_width(target, self, bus, width, value)?;
+                    }
+                    0xAA => {
+                        let value = read_width(Operand::Register(0), self, bus, width)?;
+                        write_width(target, self, bus, width, value)?;
+                    }
+                    _ => {
+                        let value = read_width(source, self, bus, width)?;
+                        write_width(Operand::Register(0), self, bus, width, value)?;
+                    }
+                }
+                let amount = i32::from(width);
+                let delta = if self.flags & flags::DIRECTION == 0 {
+                    amount
+                } else {
+                    -amount
+                };
+                if kind != 0xAA {
+                    self.set_address_register(Gpr16::Si, si.wrapping_add_signed(delta), address32);
+                }
+                if kind != 0xAC {
+                    self.set_address_register(Gpr16::Di, di.wrapping_add_signed(delta), address32);
+                }
+                if repeat {
+                    self.set_address_register(Gpr16::Cx, count - 1, address32);
+                    if count > 1 {
+                        self.registers.ip = ip;
+                    }
+                }
+            }
+            Operation::MulDiv { target, operation } => {
+                self.registers.ip = next;
+                let value = read(target.resolve(&self.registers), self, bus, dword)?;
+                self.multiply_divide(operation, value, dword, ip)?;
+            }
+            Operation::Extend { cdq } => {
+                self.registers.ip = next;
+                if cdq {
+                    let sign = self.registers.get32(Gpr32::Eax) & 0x8000_0000 != 0;
+                    self.registers
+                        .set32(Gpr32::Edx, if sign { u32::MAX } else { 0 });
+                } else {
+                    let value = self.registers.get(Gpr16::Ax) as i16 as i32 as u32;
+                    self.registers.set32(Gpr32::Eax, value);
+                }
+            }
+            Operation::MoveExtend {
+                register,
+                source,
+                word,
+                signed,
+            } => {
+                self.registers.ip = next;
+                let value = source
+                    .resolve(&self.registers)
+                    .read(&self.registers, bus, word)?;
+                let value = match (signed, word) {
+                    (true, true) => value as i16 as i32 as u32,
+                    (true, false) => value as u8 as i8 as i32 as u32,
+                    _ => u32::from(value),
+                };
+                self.registers.set32(Gpr32::decode(register), value);
+            }
+            Operation::Unsupported => unreachable!("lookups return None for rejections"),
         }
         Ok(StepOutcome::Continue)
+    }
+
+    /// F6/F7 /4-/7 on AL/AX or EAX, as the byte and dword reference paths.
+    fn multiply_divide(
+        &mut self,
+        operation: u8,
+        value: u32,
+        dword: bool,
+        ip: u32,
+    ) -> Result<(), CpuError> {
+        let divide_error = CpuError::DivideError {
+            cs: self.registers.cs,
+            ip,
+        };
+        if dword {
+            if operation < 6 {
+                let accumulator = self.registers.get32(Gpr32::Eax);
+                let (product, overflow) = if operation == 4 {
+                    let product = u64::from(accumulator) * u64::from(value);
+                    (product, product >> 32 != 0)
+                } else {
+                    let product = i64::from(accumulator as i32) * i64::from(value as i32);
+                    (product as u64, product != i64::from(product as i32))
+                };
+                self.registers.set32(Gpr32::Eax, product as u32);
+                self.registers.set32(Gpr32::Edx, (product >> 32) as u32);
+                self.set_multiply_overflow(overflow);
+                return Ok(());
+            }
+            let dividend = (u64::from(self.registers.get32(Gpr32::Edx)) << 32)
+                | u64::from(self.registers.get32(Gpr32::Eax));
+            let result = if operation == 6 {
+                dividend
+                    .checked_div(u64::from(value))
+                    .filter(|quotient| *quotient <= u64::from(u32::MAX))
+                    .map(|quotient| (quotient as u32, (dividend % u64::from(value)) as u32))
+            } else {
+                (dividend as i64)
+                    .checked_div(i64::from(value as i32))
+                    .filter(|quotient| i32::try_from(*quotient).is_ok())
+                    .map(|quotient| {
+                        (
+                            quotient as u32,
+                            ((dividend as i64) % i64::from(value as i32)) as u32,
+                        )
+                    })
+            };
+            let (quotient, remainder) = result.ok_or(divide_error)?;
+            self.registers.set32(Gpr32::Eax, quotient);
+            self.registers.set32(Gpr32::Edx, remainder);
+            return Ok(());
+        }
+        let ax = self.registers.get(Gpr16::Ax);
+        let value = value as u8;
+        if operation < 6 {
+            let product = if operation == 4 {
+                u32::from(ax as u8) * u32::from(value)
+            } else {
+                (i32::from(ax as u8 as i8) * i32::from(value as i8)) as u32
+            };
+            let overflow = if operation == 4 {
+                product > 0xFF
+            } else {
+                product as i32 != i32::from(product as i8)
+            };
+            self.registers.set(Gpr16::Ax, product as u16);
+            self.set_multiply_overflow(overflow);
+            return Ok(());
+        }
+        let (dividend, divisor) = if operation == 7 {
+            (i64::from(ax as i16), i64::from(value as i8))
+        } else {
+            (i64::from(ax), i64::from(value))
+        };
+        if divisor == 0 {
+            return Err(divide_error);
+        }
+        let quotient = dividend / divisor;
+        let remainder = dividend % divisor;
+        let range = if operation == 7 { -128..=127 } else { 0..=255 };
+        if !range.contains(&quotient) {
+            return Err(divide_error);
+        }
+        self.registers.set_byte(0, quotient as u8);
+        self.registers.set_byte(4, remainder as u8);
+        Ok(())
+    }
+
+    fn set_multiply_overflow(&mut self, overflow: bool) {
+        self.flags = (self.flags & !(flags::CARRY | flags::OVERFLOW))
+            | if overflow {
+                flags::CARRY | flags::OVERFLOW
+            } else {
+                0
+            };
     }
 }
 

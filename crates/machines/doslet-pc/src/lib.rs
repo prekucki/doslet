@@ -212,7 +212,6 @@ impl PcMachine {
             return Ok((StepOutcome::Continue, consumed));
         }
         if budget > 1
-            && self.cpu.dynamic_core_enabled()
             && self.vga_wait.candidate.is_none()
             && self.memory_wait_sites.is_none()
             && !(self.cpu.accepts_maskable_interrupt() && self.bus.pic.has_interrupt())
@@ -221,12 +220,17 @@ impl PcMachine {
             // Check IRQs once and flush time/counters at the end of the slice,
             // strictly before PIT/DSP deadlines. I/O and IF changes end a slice.
             let timing = &self.timing;
-            let consumed = self.cpu.dynamic_batch(&mut self.bus, budget, |bus| {
+            let limit = |bus: &io::PcBus| {
                 timing
                     .steps_to_event_nanos(bus, budget.saturating_add(1), 1_000_000)
                     .saturating_sub(1)
                     .min(budget)
-            });
+            };
+            let consumed = if self.cpu.dynamic_core_enabled() {
+                self.cpu.dynamic_batch(&mut self.bus, budget, limit)
+            } else {
+                self.cpu.interpret_batch(&mut self.bus, budget, limit)
+            };
             if consumed != 0 {
                 self.advance_hardware_steps(consumed)?;
                 #[cfg(feature = "profiling")]
