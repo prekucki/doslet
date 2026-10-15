@@ -30,14 +30,6 @@ run = ["cargo build -p doslet --release --locked", "python3 tools/install_deskto
 description = "Run the guest COM demo without a window"
 run = "cargo run -p doslet-headless --locked -- demo"
 
-[tasks.inspect-prince]
-description = "Inspect the locally supplied PRINCE executable"
-run = "cargo run -p doslet-headless --locked -- inspect PRINCE/PRINCE.EXE"
-
-[tasks.package-prince]
-description = "Create ignored target/prince-game.zip and validate game startup from it"
-run = "cargo test -p doslet --release --locked --offline local_prince_zip_round_trip -- --ignored --nocapture"
-
 [tasks.web]
 description = "Serve the iced WebAssembly application"
 dir = "web"

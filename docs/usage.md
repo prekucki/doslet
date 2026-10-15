@@ -298,9 +298,13 @@ machine. Switching replays channel state, RPN 0 and held/sustained notes. Raw MT
 outputs additionally receive guest-written configuration through bounded DT1
 packets. Voice envelopes and reverb tails are restarted.
 
-For the local acceptance installation, `mise run package-prince` generates
-ignored `target/prince-game.zip` and validates startup from that ZIP. This task
-requires your own `PRINCE/` directory and never includes game data in a build.
+For a local acceptance installation in `PRINCE/`, the opt-in test below
+generates ignored `target/prince-game.zip` and validates startup from that ZIP.
+It requires your own `PRINCE/` directory and never includes game data in a build:
+
+```sh
+cargo test -p doslet --release --locked local_prince_zip_round_trip -- --ignored --nocapture
+```
 
 If your shell exports `NO_COLOR=1`, Trunk 0.21.13 rejects that value. Use
 `NO_COLOR=true trunk serve` or `NO_COLOR=true trunk build`; the mise web tasks

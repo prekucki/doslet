@@ -46,8 +46,8 @@ python3 tests/browser_smoke.py --prince
 python3 tests/browser_components.py
 ```
 
-The second command needs the local `target/prince-game.zip` created by
-`mise run package-prince`. The isolated headless browser mutes its audio sink;
+The second command needs the local `target/prince-game.zip` created by the
+`local_prince_zip_round_trip` test (see [using Doslet](usage.md#browser)). The isolated headless browser mutes its audio sink;
 it checks nonzero rendered samples, ZIP execution, transfer channels,
 pause/resume/reset, output recovery, and continued audio/CPU progress during an
 800-ms window-thread stall. Web MIDI uses a mock device, including a port without
@@ -69,8 +69,9 @@ cargo run -p doslet-headless --locked -- demo --frame /tmp/doslet-demo.ppm
 ```
 
 [`mise.toml`](../mise.toml) provides the same workflows as `mise run test`,
-`mise run check`, `mise run demo`, `mise run run`, `mise run web` and
-`mise run inspect-prince`. `mise run run` uses the optimized release profile;
+`mise run check`, `mise run demo`, `mise run run` and `mise run web`.
+Tasks that use your own game files belong in an untracked `mise.local.toml`.
+`mise run run` uses the optimized release profile;
 `mise run run-debug` retains the debug profile for development.
 
 ## Implementation status
