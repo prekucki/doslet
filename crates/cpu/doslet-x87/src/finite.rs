@@ -1,4 +1,4 @@
-//! Normal finite arithmetic with a 64-bit significand. Integer intermediates
+//! Extended-range finite arithmetic with a 64-bit significand. Integer intermediates
 //! preserve x87 precision independently of the host's floating-point unit.
 use crate::ArithmeticError;
 
@@ -14,6 +14,7 @@ pub(crate) struct Rounded {
     pub value: Finite,
     pub inexact: bool,
     pub up: bool,
+    pub exceptions: u16,
 }
 
 impl Finite {
@@ -76,27 +77,43 @@ impl Finite {
         if self.mantissa == 0 {
             return f64::from_bits(u64::from(self.negative) << 63);
         }
-        // Arithmetic below currently accepts normal binary64 exponent range.
-        let rounded = round(self.mantissa, self.exponent, self.negative, 0, 1, 0x027F)
-            .expect("finite arithmetic result is within the supported exponent range")
-            .value;
-        let bits = (u64::from(rounded.negative) << 63)
-            | (((rounded.exponent + 1023) as u64) << 52)
-            | ((rounded.mantissa >> 11) & 0xF_FFFF_FFFF_FFFF);
-        f64::from_bits(bits)
-    }
-    pub fn memory_round(self, single: bool, control: u16) -> Result<Rounded, ArithmeticError> {
-        let result = round(
+        let rounded = round_format(
             self.mantissa,
             self.exponent,
             self.negative,
             0,
             1,
-            (control & !0x300) | if single { 0 } else { 0x200 },
-        )?;
-        if single && result.value.mantissa != 0 && !(-126..=127).contains(&result.value.exponent) {
-            return Err(ArithmeticError::Unsupported);
-        }
+            0x027F,
+            53,
+            -1022,
+            1023,
+        )
+        .value;
+        let sign = u64::from(rounded.negative) << 63;
+        let bits = if rounded.mantissa == 0 {
+            sign
+        } else if rounded.exponent > 1023 {
+            sign | 0x7FF0_0000_0000_0000
+        } else if rounded.exponent < -1022 {
+            sign | (rounded.mantissa >> (-1022 - rounded.exponent + 11))
+        } else {
+            sign | (((rounded.exponent + 1023) as u64) << 52)
+                | ((rounded.mantissa >> 11) & 0xF_FFFF_FFFF_FFFF)
+        };
+        f64::from_bits(bits)
+    }
+    pub fn memory_round(self, single: bool, control: u16) -> Result<Rounded, ArithmeticError> {
+        let result = round_format(
+            self.mantissa,
+            self.exponent,
+            self.negative,
+            0,
+            1,
+            control,
+            if single { 24 } else { 53 },
+            if single { -126 } else { -1022 },
+            if single { 127 } else { 1023 },
+        );
         Ok(result)
     }
     pub fn integer_round(self, control: u16) -> Rounded {
@@ -105,6 +122,7 @@ impl Finite {
                 value: self,
                 inexact: false,
                 up: false,
+                exceptions: 0,
             };
         }
         let (kept, inexact, halfway) = if self.exponent < 0 {
@@ -147,6 +165,7 @@ impl Finite {
             },
             inexact,
             up,
+            exceptions: 0,
         }
     }
 
@@ -255,7 +274,7 @@ impl Finite {
 
 pub(super) fn round(
     mantissa: u64,
-    mut exponent: i32,
+    exponent: i32,
     negative: bool,
     remainder: u128,
     denominator: u128,
@@ -267,17 +286,74 @@ pub(super) fn round(
         3 => 64,
         _ => return Err(ArithmeticError::Unsupported),
     };
-    let discard = 64 - precision;
-    let low = mantissa & ((1u64 << discard) - 1);
-    let inexact = low != 0 || remainder != 0;
-    let halfway = if discard == 0 {
-        (remainder * 2).cmp(&denominator)
+    Ok(round_format(
+        mantissa,
+        exponent,
+        negative,
+        remainder,
+        denominator,
+        control,
+        precision,
+        -16382,
+        16383,
+    ))
+}
+
+// Normalized significand plus an exact fractional remainder. Keeping the
+// exponent independent of the host format is essential for extended values.
+#[allow(clippy::too_many_arguments)]
+fn round_format(
+    mantissa: u64,
+    mut exponent: i32,
+    negative: bool,
+    remainder: u128,
+    denominator: u128,
+    control: u16,
+    precision: u32,
+    minimum: i32,
+    maximum: i32,
+) -> Rounded {
+    // x87 detects tininess after rounding to the selected significand width,
+    // before the additional rounding needed for a subnormal exponent. This
+    // differs from simply testing the final (possibly normal) destination.
+    let tiny = exponent < minimum
+        && round_format(
+            mantissa,
+            exponent,
+            negative,
+            remainder,
+            denominator,
+            control,
+            precision,
+            i32::MIN,
+            i32::MAX,
+        )
+        .value
+        .exponent
+            < minimum;
+    let discard = (64 - precision) + minimum.saturating_sub(exponent).max(0) as u32;
+    let (kept, low, halfway) = if discard == 0 {
+        // Compare 2*r with d without overflowing a 128-bit intermediate.
+        (mantissa, 0, remainder.cmp(&(denominator - remainder)))
+    } else if discard < 64 {
+        let low = mantissa & ((1_u64 << discard) - 1);
+        (
+            mantissa >> discard,
+            low,
+            low.cmp(&(1_u64 << (discard - 1)))
+                .then_with(|| remainder.cmp(&0)),
+        )
+    } else if discard == 64 {
+        (
+            0,
+            mantissa,
+            mantissa.cmp(&(1_u64 << 63)).then_with(|| remainder.cmp(&0)),
+        )
     } else {
-        low.cmp(&(1 << (discard - 1)))
-            .then_with(|| remainder.cmp(&0))
+        (0, mantissa, core::cmp::Ordering::Less)
     };
-    let kept = mantissa >> discard;
-    let up = inexact
+    let inexact = low != 0 || remainder != 0;
+    let mut up = inexact
         && match (control >> 10) & 3 {
             0 => halfway.is_gt() || (halfway.is_eq() && kept & 1 != 0),
             1 => negative,
@@ -285,18 +361,41 @@ pub(super) fn round(
             _ => false,
         };
     let rounded = u128::from(kept) + u128::from(up);
-    let mantissa = if rounded >= (1u128 << precision) {
-        exponent += 1;
-        1 << 63
+    let (mantissa, new_exponent) = if rounded == 0 {
+        (0, 0)
     } else {
-        (rounded as u64) << discard
+        let highest = 127 - rounded.leading_zeros();
+        (
+            (if highest > 63 {
+                rounded >> (highest - 63)
+            } else {
+                rounded << (63 - highest)
+            }) as u64,
+            exponent + discard as i32 + highest as i32 - 63,
+        )
     };
-    if mantissa != 0 && !(-1022..=1022).contains(&exponent) {
-        // Extended exponent range, subnormal results and overflow remain explicit.
-        // Reserve the upper binary64 binade to keep diagnostic conversion finite.
-        return Err(ArithmeticError::Unsupported);
+    exponent = new_exponent;
+    let mut exceptions = if tiny && inexact { 0x10 } else { 0 };
+    let mut mantissa = mantissa;
+    let mut inexact = inexact;
+    if mantissa != 0 && exponent > maximum {
+        exceptions |= 8;
+        inexact = true;
+        let infinity = match (control >> 10) & 3 {
+            0 => true,
+            1 => negative,
+            2 => !negative,
+            _ => false,
+        };
+        up = infinity;
+        exponent = maximum + i32::from(infinity);
+        mantissa = if infinity {
+            1 << 63
+        } else {
+            u64::MAX << (64 - precision)
+        };
     }
-    Ok(Rounded {
+    Rounded {
         value: Finite {
             negative,
             exponent,
@@ -304,7 +403,8 @@ pub(super) fn round(
         },
         inexact,
         up,
-    })
+        exceptions,
+    }
 }
 
 #[cfg(test)]

@@ -260,7 +260,7 @@ already set the compatible value.
 | Component | Implemented | Still needed |
 | --- | --- | --- |
 | x86 CPU | Selected real/protected-mode 386 operations, cached GDT/LDT segments, EIP32, 16/32-bit ModR/M/SIB, same-privilege gates, bounded REP | Full instruction/privilege coverage, paging, precise faults, timing |
-| x87 | Independent control/status/stack, exact signed integer loads, selected finite arithmetic and rounded normal memory stores, constants and infinity comparison | Full extended exponent range, subnormal arithmetic/stores and exception delivery |
+| x87 | All documented 387 opcode handlers, raw real80/context transfers, extended-range arithmetic, BCD, root/remainders and bounded transcendental kernels | Full exception delivery, masked stack faults, some nonfinite transcendental operands; see the [audit](docs/compatibility/x87-audit.md) |
 | i8042 / CMOS | Controller/A20, keyboard command/ACK protocol, CMOS register bank and memory-size fields | Raw keyboard/mouse protocols and IRQs, RTC clock/IRQ behavior and persistence |
 | PIC | Master CPU interrupt delivery; independent slave register bank at A0h/A1h; masks, fixed priority and EOI | Cascading and remaining operating modes |
 | DMA | Independent 8237 state, PC page registers, bounded byte/word RAM transfers and auto-init | Full arbitration/cascade timing, MMIO and memory-to-memory |

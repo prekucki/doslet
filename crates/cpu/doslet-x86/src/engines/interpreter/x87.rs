@@ -7,6 +7,7 @@ impl Cpu {
         bus: &mut B,
         opcode: u8,
         context: Context,
+        operand_32: bool,
     ) -> Result<StepOutcome, CpuError> {
         if self.fpu.is_none() || self.control.cr0 & 12 != 0 {
             return Err(CpuError::X87Unavailable {
@@ -52,8 +53,89 @@ impl Cpu {
             ip: context.ip,
             reason,
         };
+        let protected = self.control.cr0 & 1 != 0;
+        let tracks_pointer = !matches!(
+            instruction.mnemonic,
+            crate::x87_decode::Mnemonic::Fldenv
+                | crate::x87_decode::Mnemonic::Fnstenv
+                | crate::x87_decode::Mnemonic::Frstor
+                | crate::x87_decode::Mnemonic::Fnsave
+                | crate::x87_decode::Mnemonic::Fldcw
+                | crate::x87_decode::Mnemonic::Fnstcw
+                | crate::x87_decode::Mnemonic::Fnstsw
+                | crate::x87_decode::Mnemonic::Fnclex
+                | crate::x87_decode::Mnemonic::Fninit
+                | crate::x87_decode::Mnemonic::Fneni
+                | crate::x87_decode::Mnemonic::Fndisi
+                | crate::x87_decode::Mnemonic::Fnsetpm
+        );
+        if tracks_pointer {
+            self.fpu.as_mut().unwrap().record_instruction(
+                if protected {
+                    context.ip
+                } else {
+                    (u32::from(context.cs) << 4).wrapping_add(context.ip)
+                },
+                context.cs,
+                (u16::from(opcode & 7) << 8) | u16::from(modrm),
+            );
+        }
         if modrm >> 6 == 3 {
             match (opcode, modrm) {
+                (0xD9, 0xF2 | 0xFB | 0xFE | 0xFF) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .trigonometric(match modrm {
+                        0xFE => 0,
+                        0xFF => 1,
+                        0xFB => 2,
+                        _ => 3,
+                    })
+                    .map_err(arithmetic_error)?,
+                (0xD9, 0xF3) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .arctangent_pop()
+                    .map_err(arithmetic_error)?,
+                (0xD9, 0xF9) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .y_log2_x_plus_one()
+                    .map_err(arithmetic_error)?,
+                (0xD9, 0xE5) => self.fpu.as_mut().unwrap().examine(),
+                (0xD9, 0xFA) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .square_root()
+                    .map_err(arithmetic_error)?,
+                (0xD9, 0xF4) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .extract()
+                    .map_err(arithmetic_error)?,
+                (0xD9, 0xF5 | 0xF8) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .remainder(modrm == 0xF5)
+                    .map_err(arithmetic_error)?,
+                (0xDD, 0xE0..=0xEF) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .unordered_compare(modrm & 7, u8::from(modrm & 8 != 0))
+                    .map_err(arithmetic_error)?,
+                (0xDA, 0xE9) => self
+                    .fpu
+                    .as_mut()
+                    .unwrap()
+                    .unordered_compare(1, 2)
+                    .map_err(arithmetic_error)?,
                 (0xDC, 0xC0..=0xC7) => self
                     .fpu
                     .as_mut()
@@ -208,7 +290,84 @@ impl Cpu {
                 context.segment_override,
                 context.address_32,
             )?;
+            if tracks_pointer && let decode::Operand::Memory { segment, offset } = operand {
+                self.fpu.as_mut().unwrap().record_operand(
+                    if protected {
+                        offset
+                    } else {
+                        self.registers.address(segment, offset, 1, Access::Read)?
+                    },
+                    self.registers.selector(segment),
+                );
+            }
             match (opcode, (modrm >> 3) & 7) {
+                (0xD9 | 0xDD, operation @ (4 | 6)) => {
+                    let registers = opcode == 0xDD;
+                    let store = operation == 6;
+                    let width = if operand_32 { 28 } else { 14 } + if registers { 80 } else { 0 };
+                    let address = operand.address(
+                        &self.registers,
+                        width,
+                        if store { Access::Write } else { Access::Read },
+                    )?;
+                    if store {
+                        let bytes = self
+                            .fpu
+                            .as_ref()
+                            .unwrap()
+                            .save_environment(operand_32, protected, registers);
+                        for offset in 0..width {
+                            bus.write_u8(address + u32::from(offset), bytes[usize::from(offset)])?;
+                        }
+                        if registers {
+                            self.fpu.as_mut().unwrap().initialize();
+                        } else {
+                            let control = self.fpu.as_ref().unwrap().control();
+                            self.fpu.as_mut().unwrap().load_control(control | 0x3F);
+                        }
+                    } else {
+                        let mut bytes = [0; 108];
+                        for offset in 0..width {
+                            bytes[usize::from(offset)] =
+                                bus.read_u8(address + u32::from(offset))?;
+                        }
+                        self.fpu
+                            .as_mut()
+                            .unwrap()
+                            .restore_environment(&bytes, operand_32, protected, registers);
+                    }
+                }
+                (0xDB, operation @ (5 | 7)) | (0xDF, operation @ (4 | 6)) => {
+                    let store = operation == 7 || operation == 6;
+                    let address = operand.address(
+                        &self.registers,
+                        10,
+                        if store { Access::Write } else { Access::Read },
+                    )?;
+                    if store {
+                        let bytes = if opcode == 0xDB {
+                            self.fpu.as_ref().unwrap().store_extended()
+                        } else {
+                            self.fpu.as_mut().unwrap().store_bcd()
+                        }
+                        .map_err(arithmetic_error)?;
+                        for (offset, byte) in bytes.into_iter().enumerate() {
+                            bus.write_u8(address + offset as u32, byte)?;
+                        }
+                        self.fpu.as_mut().unwrap().pop().map_err(stack_error)?;
+                    } else {
+                        let mut bytes = [0; 10];
+                        for (offset, byte) in bytes.iter_mut().enumerate() {
+                            *byte = bus.read_u8(address + offset as u32)?;
+                        }
+                        if opcode == 0xDB {
+                            self.fpu.as_mut().unwrap().load_extended(bytes)
+                        } else {
+                            self.fpu.as_mut().unwrap().load_bcd(bytes)
+                        }
+                        .map_err(arithmetic_error)?;
+                    }
+                }
                 (0xDA | 0xDE, operation) => {
                     let width = if opcode == 0xDA { 4 } else { 2 };
                     let address = operand.address(&self.registers, width, Access::Read)?;
@@ -286,18 +445,18 @@ impl Cpu {
                         Access::Read,
                     )?;
                     let low = decode::read_dword(bus, address)?;
-                    let value = if opcode == 0xD8 {
-                        f64::from(f32::from_bits(low))
+                    let bits = if opcode == 0xD8 {
+                        u64::from(low)
                     } else {
                         let high = decode::read_dword(bus, address + 4)?;
-                        f64::from_bits(u64::from(low) | (u64::from(high) << 32))
+                        u64::from(low) | (u64::from(high) << 32)
                     };
                     let fpu = self.fpu.as_mut().unwrap();
                     if operation == 2 || operation == 3 {
-                        fpu.compare_memory(value, operation == 3)
+                        fpu.compare_real(bits, opcode == 0xD8, operation == 3)
                             .map_err(arithmetic_error)?;
                     } else {
-                        fpu.arithmetic_memory(value, operation)
+                        fpu.arithmetic_real(bits, opcode == 0xD8, operation)
                             .map_err(arithmetic_error)?;
                     }
                 }
@@ -308,20 +467,17 @@ impl Cpu {
                         Access::Read,
                     )?;
                     let low = decode::read_dword(bus, address)?;
-                    let value = if opcode == 0xD9 {
-                        f64::from(f32::from_bits(low))
+                    let bits = if opcode == 0xD9 {
+                        u64::from(low)
                     } else {
                         let high = decode::read_dword(bus, address + 4)?;
-                        f64::from_bits(u64::from(low) | (u64::from(high) << 32))
+                        u64::from(low) | (u64::from(high) << 32)
                     };
-                    if !value.is_finite() {
-                        return Err(arithmetic_error(doslet_x87::ArithmeticError::Unsupported));
-                    }
                     self.fpu
                         .as_mut()
                         .unwrap()
-                        .push(value)
-                        .map_err(stack_error)?;
+                        .load_real(bits, opcode == 0xD9)
+                        .map_err(arithmetic_error)?;
                 }
                 (0xD9 | 0xDD, operation @ (2 | 3)) => {
                     let address = operand.address(
@@ -335,7 +491,7 @@ impl Cpu {
                         .unwrap()
                         .store_float(opcode == 0xD9)
                         .map_err(arithmetic_error)?;
-                    if opcode == 0xD9 && f64::from(value as f32) != value {
+                    if opcode == 0xD9 && !value.is_nan() && f64::from(value as f32) != value {
                         return Err(arithmetic_error(doslet_x87::ArithmeticError::Unsupported));
                     }
                     if opcode == 0xD9 {

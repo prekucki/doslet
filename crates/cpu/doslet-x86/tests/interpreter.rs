@@ -7,6 +7,128 @@ struct TestBus {
     ports: [u8; 256],
 }
 #[test]
+fn all_documented_387_encodings_have_execution_handlers() {
+    for opcode in 0xD8..=0xDF {
+        for modrm in 0..=255 {
+            if let doslet_x86::x87_decode::Encoding::I387(instruction) =
+                doslet_x86::x87_decode::decode(opcode, modrm)
+            {
+                assert!(
+                    instruction.implemented(),
+                    "{opcode:02X} {modrm:02X}: {instruction:?}"
+                );
+            }
+        }
+    }
+}
+#[test]
+fn environment_size_overrides_and_save_restore_preserve_extended_state() {
+    for wide in [false, true] {
+        let mut code = vec![0xD9, 0xED]; // FLDLN2, including retained low bits.
+        for (opcode, modrm, address) in [
+            (0xD9, 0x36, 0x200_u16),
+            (0xDD, 0x36, 0x300),
+            (0xDD, 0x26, 0x300),
+            (0xDB, 0x3E, 0x400),
+        ] {
+            if wide && opcode != 0xDB {
+                code.push(0x66);
+            }
+            code.extend_from_slice(&[opcode, modrm]);
+            code.extend_from_slice(&address.to_le_bytes());
+        }
+        let mut bus = TestBus::new(&[]);
+        bus.ram[0x100..0x100 + code.len()].copy_from_slice(&code);
+        bus.ram[0x200..0x400].fill(0xAA);
+        let mut cpu = Cpu::default().with_x87();
+        cpu.registers.ip = 0x100;
+        cpu.fpu.as_mut().unwrap().load_control(0x35F); // Precision unmasked: constant load is exact.
+        cpu.step(&mut bus).unwrap();
+        let raw = cpu.fpu.as_ref().unwrap().store_extended().unwrap();
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bus.ram[0x200..0x202].try_into().unwrap()),
+            0x35F
+        );
+        let width = if wide { 28 } else { 14 };
+        assert_eq!(bus.ram[0x200 + width], 0xAA);
+        assert_eq!(cpu.fpu.as_ref().unwrap().control(), 0x37F);
+        let ip_offset = if wide { 12 } else { 6 };
+        assert_eq!(
+            u16::from_le_bytes(
+                bus.ram[0x200 + ip_offset..0x202 + ip_offset]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x100
+        );
+        cpu.step(&mut bus).unwrap(); // FNSAVE only resets after successful writes.
+        assert_eq!(cpu.fpu.as_ref().unwrap().tags(), 0xFFFF);
+        assert_eq!(cpu.fpu.as_ref().unwrap().status(), 0);
+        assert_eq!(bus.ram[0x300 + width + 80], 0xAA);
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.as_ref().unwrap().store_extended().unwrap(), raw);
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(&bus.ram[0x400..0x40A], &raw);
+        assert_eq!(cpu.fpu.as_ref().unwrap().tags(), 0xFFFF);
+    }
+}
+#[test]
+fn failed_environment_transfers_do_not_reset_mask_or_restore_the_fpu() {
+    struct FaultBus {
+        inner: TestBus,
+        store: bool,
+    }
+    impl MemoryBus for FaultBus {
+        fn read_u8(&mut self, a: u32) -> Result<u8, BusError> {
+            if !self.store && a == 0x205 {
+                Err(BusError::UnmappedMemory(a))
+            } else {
+                self.inner.read_u8(a)
+            }
+        }
+        fn write_u8(&mut self, a: u32, v: u8) -> Result<(), BusError> {
+            if self.store && a == 0x205 {
+                Err(BusError::UnmappedMemory(a))
+            } else {
+                self.inner.write_u8(a, v)
+            }
+        }
+    }
+    impl PortBus for FaultBus {
+        fn read_port_u8(&mut self, p: u16) -> Result<u8, BusError> {
+            self.inner.read_port_u8(p)
+        }
+        fn write_port_u8(&mut self, p: u16, v: u8) -> Result<(), BusError> {
+            self.inner.write_port_u8(p, v)
+        }
+    }
+    for opcode in [0xD9, 0xDD] {
+        for store in [false, true] {
+            let mut bus = FaultBus {
+                inner: TestBus::new(&[opcode, if store { 0x36 } else { 0x26 }, 0, 2]),
+                store,
+            };
+            let mut cpu = Cpu::default().with_x87();
+            let fpu = cpu.fpu.as_mut().unwrap();
+            fpu.push_integer(i64::MAX).unwrap();
+            fpu.load_control(0x35F);
+            let state = fpu.save_environment(false, false, true);
+            assert!(matches!(
+                cpu.step(&mut bus),
+                Err(doslet_x86::CpuError::Bus(BusError::UnmappedMemory(0x205)))
+            ));
+            assert_eq!(
+                cpu.fpu
+                    .as_ref()
+                    .unwrap()
+                    .save_environment(false, false, true),
+                state
+            );
+        }
+    }
+}
+#[test]
 fn fscale_decodes_without_popping_and_ignores_rounding_control_for_scale_truncation() {
     for rounding in 0..4 {
         let mut cpu = Cpu::default().with_x87();
@@ -368,7 +490,7 @@ fn memory_comparisons_decode_both_float_widths_and_optional_pop() {
 }
 
 #[test]
-fn new_sti_arithmetic_forms_preserve_both_operands_on_unmasked_precision() {
+fn new_sti_arithmetic_forms_complete_the_destination_on_unmasked_precision() {
     for modrm in [0xC9, 0xE1, 0xE9, 0xF1, 0xF9] {
         let mut bus = TestBus::new(&[0xDC, modrm]);
         let mut cpu = Cpu::default().with_x87();
@@ -389,7 +511,14 @@ fn new_sti_arithmetic_forms_preserve_both_operands_on_unmasked_precision() {
         );
         let fpu = cpu.fpu.as_ref().unwrap();
         assert_eq!(fpu.st0(), Ok(1.0 / 3.0));
-        assert_eq!(fpu.st(1), Ok(1.0));
+        let expected = match modrm {
+            0xC9 => 1.0_f32 / 3.0,
+            0xE1 => -2.0_f32 / 3.0,
+            0xE9 => 2.0_f32 / 3.0,
+            0xF1 => 1.0_f32 / 3.0,
+            _ => 3.0_f32,
+        };
+        assert_eq!(fpu.st(1), Ok(f64::from(expected)));
         assert_eq!(fpu.status() & 0x3800, 0x3000);
         assert_eq!(fpu.tags(), tags);
         assert_eq!(bus.writes, 0);
@@ -460,8 +589,11 @@ fn x87_faddp_updates_the_destination_and_pops_only_after_success() {
     fpu.push(1.0 / 3.0).unwrap();
     fpu.load_control(0x005F); // Single precision, unmasked precision exception.
     assert!(cpu.step(&mut bus).is_err());
-    assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x3800, 0x3000);
-    assert_eq!(cpu.fpu.as_ref().unwrap().st(1), Ok(1.0));
+    assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x3800, 0x3800);
+    assert_eq!(
+        cpu.fpu.as_ref().unwrap().st0(),
+        Ok(f64::from(4.0_f32 / 3.0))
+    );
 }
 
 #[test]
@@ -502,7 +634,7 @@ fn x87_fadd_sti_keeps_top_source_and_retained_precision() {
     let fpu = cpu.fpu.as_ref().unwrap();
     assert_eq!(fpu.status() & 0x3800, 0x3000);
     assert_eq!(fpu.st0(), Ok(1.0 / 3.0));
-    assert_eq!(fpu.st(1), Ok(1.0));
+    assert_eq!(fpu.st(1), Ok(f64::from(4.0_f32 / 3.0)));
 }
 
 #[test]

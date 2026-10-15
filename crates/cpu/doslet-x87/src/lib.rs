@@ -1,8 +1,13 @@
-//! Independent x87 stack/control state and selected finite arithmetic forms.
+//! Independent 387 stack/control state and bounded portable numerical kernels.
 #![no_std]
+mod binary;
+mod environment;
 mod exponential;
+mod extended;
 mod finite;
 mod logarithm;
+mod operations;
+mod transcendental;
 mod wide;
 use finite::{Finite, Rounded};
 #[derive(Debug)]
@@ -12,6 +17,8 @@ pub struct X87 {
     tags: u16,
     values: [f64; 8],
     finite: [Option<Finite>; 8],
+    encodings: [u128; 8],
+    pointers: environment::Pointers,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StackError {
@@ -34,7 +41,7 @@ pub enum Constant {
 pub enum ArithmeticError {
     Stack(StackError),
     UnmaskedException(u16),
-    /// Unsupported exponent range, special operand or conversion.
+    /// Unsupported numeric domain, special operand or exception completion.
     Unsupported,
 }
 impl Default for X87 {
@@ -50,10 +57,17 @@ impl X87 {
             tags: 0xFFFF,
             values: [0.0; 8],
             finite: [None; 8],
+            encodings: [0; 8],
+            pointers: environment::Pointers::new(),
         }
     }
     pub fn initialize(&mut self) {
-        *self = Self::new();
+        // FINIT empties the stack by changing tags; it does not erase the
+        // physical data registers. FNSAVE uses the same initialization.
+        self.control = 0x037F;
+        self.status = 0;
+        self.tags = 0xFFFF;
+        self.pointers = environment::Pointers::new();
     }
     pub fn control(&self) -> u16 {
         self.control
@@ -87,6 +101,7 @@ impl X87 {
         self.tags = (self.tags & !(3 << (top * 2))) | (tag << (top * 2));
         self.values[top] = value;
         self.finite[top] = Finite::from_f64(value);
+        self.encodings[top] = extended::from_f64(value);
         Ok(())
     }
     pub fn st0(&self) -> Result<f64, StackError> {
@@ -118,6 +133,7 @@ impl X87 {
         };
         self.push(value.to_f64())?;
         self.finite[((self.status >> 11) & 7) as usize] = Some(value);
+        self.encodings[((self.status >> 11) & 7) as usize] = extended::encode(value);
         self.status &= !0x200;
         Ok(())
     }
@@ -126,6 +142,7 @@ impl X87 {
         let finite = Finite::from_i64(value);
         self.push(finite.to_f64())?;
         self.finite[((self.status >> 11) & 7) as usize] = Some(finite);
+        self.encodings[((self.status >> 11) & 7) as usize] = extended::encode(finite);
         self.status &= !0x200;
         Ok(())
     }
@@ -141,66 +158,87 @@ impl X87 {
         let value = self.st0().map_err(ArithmeticError::Stack)?;
         let top = ((self.status >> 11) & 7) as usize;
         if let Some(finite) = self.finite[top]
-            && !finite.compare(Finite::from_f64(value).unwrap()).is_eq()
+            && !Finite::from_f64(value).is_some_and(|v| finite.compare(v).is_eq())
         {
             return Err(ArithmeticError::Unsupported);
         }
         Ok(value)
     }
-    /// FST/FSTP rounds a finite normal result to its memory format using RC.
+    /// FST/FSTP rounds to its memory format using RC, including range limits.
     /// PC does not select the precision of a memory store.
     pub fn store_float(&mut self, single: bool) -> Result<f64, ArithmeticError> {
         self.st0().map_err(ArithmeticError::Stack)?;
         let slot = ((self.status >> 11) & 7) as usize;
         let Some(value) = self.finite[slot] else {
-            return self.store_value();
+            return self.special_memory(slot);
         };
         let result = value.memory_round(single, self.control)?;
-        let exception = if result.inexact { 0x20 } else { 0 };
+        let exception = result.exceptions | if result.inexact { 0x20 } else { 0 };
         self.status = (self.status & !0x200) | exception | if result.up { 0x200 } else { 0 };
         if exception & !self.control != 0 {
             self.status |= 0x8080;
             return Err(ArithmeticError::UnmaskedException(exception));
         }
-        Ok(result.value.to_f64())
+        Ok(
+            if result.value.mantissa != 0 && result.value.exponent > if single { 127 } else { 1023 }
+            {
+                signed(f64::INFINITY, result.value.negative)
+            } else {
+                result.value.to_f64()
+            },
+        )
     }
-    /// Selected finite arithmetic with a binary32/64 memory source.
+    /// Basic arithmetic with a binary64 memory source.
     pub fn arithmetic_memory(&mut self, value: f64, operation: u8) -> Result<(), ArithmeticError> {
-        let rhs = Finite::from_f64(value).ok_or(ArithmeticError::Unsupported)?;
-        self.arithmetic_finite(rhs, operation)
+        self.st0().map_err(ArithmeticError::Stack)?;
+        let top = ((self.status >> 11) & 7) as usize;
+        self.binary(
+            top,
+            self.number(top),
+            binary::Number::from_f64(value),
+            operation,
+            false,
+        )
     }
     pub fn arithmetic_integer(&mut self, value: i64, operation: u8) -> Result<(), ArithmeticError> {
         self.arithmetic_finite(Finite::from_i64(value), operation)
     }
     pub fn arithmetic_register(&mut self, index: u8, operation: u8) -> Result<(), ArithmeticError> {
+        self.st0().map_err(ArithmeticError::Stack)?;
         self.st(index).map_err(ArithmeticError::Stack)?;
         let top = ((self.status >> 11) & 7) as usize;
-        let rhs =
-            self.finite[(top + usize::from(index)) & 7].ok_or(ArithmeticError::Unsupported)?;
-        self.arithmetic_finite(rhs, operation)
+        self.binary(
+            top,
+            self.number(top),
+            self.number((top + usize::from(index)) & 7),
+            operation,
+            false,
+        )
     }
-    fn arithmetic_finite(&mut self, mut rhs: Finite, operation: u8) -> Result<(), ArithmeticError> {
+    fn arithmetic_finite(&mut self, rhs: Finite, operation: u8) -> Result<(), ArithmeticError> {
         self.st0().map_err(ArithmeticError::Stack)?;
-        let slot = ((self.status >> 11) & 7) as usize;
-        let lhs = self.finite[slot].ok_or(ArithmeticError::Unsupported)?;
-        let result = match operation {
-            0 => {
-                rhs.negative = !rhs.negative;
-                lhs.subtract(rhs, self.control)?
-            }
-            1 => lhs.multiply(rhs, self.control)?,
-            4 => lhs.subtract(rhs, self.control)?,
-            5 => rhs.subtract(lhs, self.control)?,
-            6 => lhs.divide(rhs, self.control)?,
-            7 => rhs.divide(lhs, self.control)?,
-            _ => return Err(ArithmeticError::Unsupported),
-        };
-        self.store_rounded(slot, result, false)
+        let top = ((self.status >> 11) & 7) as usize;
+        self.binary(
+            top,
+            self.number(top),
+            binary::Number::from_finite(rhs),
+            operation,
+            false,
+        )
     }
     pub fn round_integer(&mut self) -> Result<(), ArithmeticError> {
         self.st0().map_err(ArithmeticError::Stack)?;
         let slot = ((self.status >> 11) & 7) as usize;
-        let value = self.finite[slot].ok_or(ArithmeticError::Unsupported)?;
+        let Some(value) = self.finite[slot] else {
+            let number = self.number(slot);
+            return self.binary(
+                slot,
+                number,
+                binary::Number::from_finite(Finite::from_i64(0)),
+                0,
+                false,
+            );
+        };
         self.store_rounded(slot, value.integer_round(self.control), false)
     }
     /// FYL2X: ST(1) * log2(ST(0)), followed by one pop on successful completion.
@@ -241,28 +279,28 @@ impl X87 {
         let top = ((self.status >> 11) & 7) as usize;
         let mut value = self.finite[top].ok_or(ArithmeticError::Unsupported)?;
         let scale = self.finite[(top + 1) & 7].ok_or(ArithmeticError::Unsupported)?;
+        self.check_denormals(&[top, (top + 1) & 7])?;
         if value.mantissa != 0 && scale.mantissa != 0 && scale.exponent >= 0 {
-            // Such a scale cannot yield a result in the supported exponent
-            // range even for the smallest/largest currently loadable operand.
-            if scale.exponent >= 12 {
-                return Err(ArithmeticError::Unsupported);
-            }
-            let magnitude = (scale.mantissa >> (63 - scale.exponent)) as i32;
+            let magnitude = if scale.exponent >= 16 {
+                65536
+            } else {
+                (scale.mantissa >> (63 - scale.exponent)) as i32
+            };
             value.exponent += if scale.negative {
                 -magnitude
             } else {
                 magnitude
             };
         }
-        self.store_rounded(
-            top,
-            Rounded {
-                value,
-                inexact: false,
-                up: false,
-            },
-            false,
-        )
+        let rounded = finite::round(
+            value.mantissa,
+            value.exponent,
+            value.negative,
+            0,
+            1,
+            self.control | 0x300,
+        )?;
+        self.store_rounded(top, rounded, false)
     }
     /// FIST/FISTP returns the encoded signed integer, or masked integer indefinite.
     pub fn store_integer(&mut self, bits: u8) -> Result<u64, ArithmeticError> {
@@ -310,7 +348,9 @@ impl X87 {
         let value = self.st(index)?;
         let slot = (((self.status >> 11) + u16::from(index)) & 7) as usize;
         let finite = self.finite[slot];
+        let special = self.encodings[slot];
         self.push(value)?;
+        self.encodings[((self.status >> 11) & 7) as usize] = special;
         self.finite[((self.status >> 11) & 7) as usize] = finite;
         self.status &= !0x200;
         Ok(())
@@ -327,6 +367,7 @@ impl X87 {
         let tag = (self.tags >> (top * 2)) & 3;
         self.values[destination] = value;
         self.finite[destination] = self.finite[top];
+        self.encodings[destination] = self.encodings[top];
         self.tags = (self.tags & !(3 << (destination * 2))) | (tag << (destination * 2));
         self.status &= !0x200; // C1: no format conversion or rounding.
         if pop {
@@ -344,6 +385,7 @@ impl X87 {
         let slot_tag = (self.tags >> (slot * 2)) & 3;
         self.values.swap(top, slot);
         self.finite.swap(top, slot);
+        self.encodings.swap(top, slot);
         self.tags = (self.tags & !((3 << (top * 2)) | (3 << (slot * 2))))
             | (slot_tag << (top * 2))
             | (top_tag << (slot * 2));
@@ -354,6 +396,7 @@ impl X87 {
         self.st0()?;
         let slot = ((self.status >> 11) & 7) as usize;
         self.values[slot] = -self.values[slot];
+        self.encodings[slot] ^= 1_u128 << 79;
         if let Some(value) = &mut self.finite[slot] {
             value.negative = !value.negative;
         }
@@ -364,6 +407,7 @@ impl X87 {
         self.st0()?;
         let slot = ((self.status >> 11) & 7) as usize;
         self.values[slot] = self.values[slot].abs();
+        self.encodings[slot] &= !(1_u128 << 79);
         if let Some(value) = &mut self.finite[slot] {
             value.negative = false;
         }
@@ -392,69 +436,30 @@ impl X87 {
     /// FTST compares ST(0) with positive zero, preserving every stack value.
     /// As with FCOM, either kind of NaN raises invalid operation.
     pub fn test_zero(&mut self) -> Result<(), ArithmeticError> {
-        let value = self.st0().map_err(ArithmeticError::Stack)?;
-        let condition = if value.is_nan() {
-            self.status |= 1;
-            if self.control & 1 == 0 {
-                self.status |= 0x8080;
-                return Err(ArithmeticError::UnmaskedException(1));
-            }
-            0x4500
-        } else {
-            let top = ((self.status >> 11) & 7) as usize;
-            let order = match self.finite[top] {
-                Some(value) => value.compare(Finite::from_i64(0)),
-                None => value.partial_cmp(&0.0).unwrap(), // Signed infinity.
-            };
-            if order.is_lt() {
-                0x100
-            } else if order.is_eq() {
-                0x4000
-            } else {
-                0
-            }
-        };
-        self.status = (self.status & !0x4700) | condition;
-        Ok(())
+        self.st0().map_err(ArithmeticError::Stack)?;
+        let top = ((self.status >> 11) & 7) as usize;
+        self.compare_number(
+            self.number(top),
+            binary::Number::from_finite(Finite::from_i64(0)),
+            0,
+        )
     }
     /// Ordered FCOM/FCOMP/FCOMPP, retaining exact finite integer comparisons.
     pub fn compare_register(&mut self, index: u8, pops: u8) -> Result<(), ArithmeticError> {
-        let lhs = self.st0().map_err(ArithmeticError::Stack)?;
-        let rhs = self.st(index).map_err(ArithmeticError::Stack)?;
-        let condition = if lhs.is_nan() || rhs.is_nan() {
-            self.status |= 1;
-            if self.control & 1 == 0 {
-                self.status |= 0x8080;
-                return Err(ArithmeticError::UnmaskedException(1));
-            }
-            0x4500
-        } else if self.order(0, index).is_lt() {
-            0x100
-        } else if self.order(0, index).is_eq() {
-            0x4000
-        } else {
-            0
-        };
-        self.status = (self.status & !0x4700) | condition;
-        for _ in 0..pops {
-            self.pop().map_err(ArithmeticError::Stack)?;
-        }
-        Ok(())
-    }
-    fn order(&self, left: u8, right: u8) -> core::cmp::Ordering {
+        self.st0().map_err(ArithmeticError::Stack)?;
+        self.st(index).map_err(ArithmeticError::Stack)?;
         let top = ((self.status >> 11) & 7) as usize;
-        let lhs = (top + usize::from(left)) & 7;
-        let rhs = (top + usize::from(right)) & 7;
-        match (self.finite[lhs], self.finite[rhs]) {
-            (Some(a), Some(b)) => a.compare(b),
-            _ => self.values[lhs].partial_cmp(&self.values[rhs]).unwrap(),
-        }
+        self.compare_number(
+            self.number(top),
+            self.number((top + usize::from(index)) & 7),
+            pops,
+        )
     }
     /// FDIVP ST(i), ST(0), with guest precision and rounding control.
     pub fn divide_pop(&mut self, index: u8, reverse: bool) -> Result<(), ArithmeticError> {
         self.divide_registers(index, 0, reverse, true)
     }
-    /// FDIV/FDIVR ST(0), ST(i), with the same exponent limits as FDIVP.
+    /// FDIV/FDIVR ST(0), ST(i), using retained extended operands.
     pub fn divide(&mut self, index: u8, reverse: bool) -> Result<(), ArithmeticError> {
         self.divide_registers(0, index, reverse, false)
     }
@@ -468,47 +473,17 @@ impl X87 {
         reverse: bool,
         pop: bool,
     ) -> Result<(), ArithmeticError> {
-        let source = self.st(source_index).map_err(ArithmeticError::Stack)?;
-        let destination = self.st(destination_index).map_err(ArithmeticError::Stack)?;
-        let (numerator, denominator) = if reverse {
-            (source, destination)
-        } else {
-            (destination, source)
-        };
-        if numerator.is_nan() || denominator.is_nan() {
-            return Err(ArithmeticError::Unsupported);
-        }
-        let negative = numerator.is_sign_negative() ^ denominator.is_sign_negative();
-        let destination_slot = (((self.status >> 11) + u16::from(destination_index)) & 7) as usize;
-        let source_slot = (((self.status >> 11) + u16::from(source_index)) & 7) as usize;
-        if numerator != 0.0
-            && denominator != 0.0
-            && numerator.is_finite()
-            && denominator.is_finite()
-        {
-            let destination = self.finite[destination_slot].unwrap();
-            let source = self.finite[source_slot].unwrap();
-            let result = if reverse {
-                source.divide(destination, self.control)?
-            } else {
-                destination.divide(source, self.control)?
-            };
-            return self.store_rounded(destination_slot, result, pop);
-        }
-        let (value, exception) = if (numerator == 0.0 && denominator == 0.0)
-            || (numerator.is_infinite() && denominator.is_infinite())
-        {
-            (f64::from_bits(0xFFF8_0000_0000_0000), 1)
-        } else if denominator == 0.0 && numerator.is_finite() {
-            (signed(f64::INFINITY, negative), 4)
-        } else if numerator.is_infinite() {
-            (signed(f64::INFINITY, negative), 0)
-        } else if denominator.is_infinite() || numerator == 0.0 {
-            (signed(0.0, negative), 0)
-        } else {
-            return Err(ArithmeticError::Unsupported);
-        };
-        self.store_special(destination_slot, value, exception, pop)
+        self.st(source_index).map_err(ArithmeticError::Stack)?;
+        self.st(destination_index).map_err(ArithmeticError::Stack)?;
+        let top = ((self.status >> 11) & 7) as usize;
+        let destination = (top + usize::from(destination_index)) & 7;
+        self.binary(
+            destination,
+            self.number(destination),
+            self.number((top + usize::from(source_index)) & 7),
+            if reverse { 7 } else { 6 },
+            pop,
+        )
     }
     fn store_special(
         &mut self,
@@ -531,6 +506,7 @@ impl X87 {
         };
         self.values[slot] = value;
         self.finite[slot] = Finite::from_f64(value);
+        self.encodings[slot] = extended::from_f64(value);
         self.tags = (self.tags & !(3 << (slot * 2))) | (tag << (slot * 2));
         if pop {
             self.pop().map_err(ArithmeticError::Stack)?;
@@ -543,25 +519,43 @@ impl X87 {
         result: Rounded,
         pop: bool,
     ) -> Result<(), ArithmeticError> {
-        if result.value.mantissa != 0 && !(-1022..=1022).contains(&result.value.exponent) {
-            // FRNDINT can return a loaded value unchanged, bypassing finite
-            // arithmetic's range check. Never panic in diagnostic conversion.
-            return Err(ArithmeticError::Unsupported);
-        }
-        let exception = if result.inexact { 0x20 } else { 0 };
+        let exception = result.exceptions | if result.inexact { 0x20 } else { 0 };
         self.status = (self.status & !0x200) | exception | if result.up { 0x200 } else { 0 };
-        if exception & !self.control != 0 {
+        let pending = exception & !self.control;
+        if pending != 0 {
             self.status |= 0x8080;
+        }
+        // Precision is a post-completion exception for a register destination.
+        // Range traps still stop explicitly until wrapped-result delivery exists.
+        if pending & !0x20 != 0 {
             return Err(ArithmeticError::UnmaskedException(exception));
         }
-        self.values[slot] = result.value.to_f64();
-        self.finite[slot] = Some(result.value);
-        let tag = u16::from(result.value.mantissa == 0);
+        let infinity = result.value.mantissa != 0 && result.value.exponent > 16383;
+        self.values[slot] = if infinity {
+            signed(f64::INFINITY, result.value.negative)
+        } else {
+            result.value.to_f64()
+        };
+        self.finite[slot] = if infinity { None } else { Some(result.value) };
+        self.encodings[slot] = if infinity {
+            extended::from_f64(self.values[slot])
+        } else {
+            extended::encode(result.value)
+        };
+        let tag = if infinity || (result.value.mantissa != 0 && result.value.exponent < -16382) {
+            2
+        } else {
+            u16::from(result.value.mantissa == 0)
+        };
         self.tags = (self.tags & !(3 << (slot * 2))) | (tag << (slot * 2));
         if pop {
             self.pop().map_err(ArithmeticError::Stack)?;
         }
-        Ok(())
+        if pending != 0 {
+            Err(ArithmeticError::UnmaskedException(exception))
+        } else {
+            Ok(())
+        }
     }
     /// FADDP ST(i), ST(0), retaining extended integer precision.
     pub fn add_pop(&mut self, index: u8) -> Result<(), ArithmeticError> {
@@ -576,12 +570,9 @@ impl X87 {
         self.st(index).map_err(ArithmeticError::Stack)?;
         let top = ((self.status >> 11) & 7) as usize;
         let slot = (top + usize::from(index)) & 7;
-        let mut source = self.finite[top].ok_or(ArithmeticError::Unsupported)?;
-        let destination = self.finite[slot].ok_or(ArithmeticError::Unsupported)?;
-        source.negative = !source.negative;
-        self.store_rounded(slot, destination.subtract(source, self.control)?, pop)
+        self.binary(slot, self.number(slot), self.number(top), 0, pop)
     }
-    /// FMULP or FSUBP/FSUBRP ST(i), ST(0), for finite normal results.
+    /// FMULP or FSUBP/FSUBRP ST(i), ST(0).
     pub fn arithmetic_pop(
         &mut self,
         index: u8,
@@ -590,7 +581,7 @@ impl X87 {
     ) -> Result<(), ArithmeticError> {
         self.arithmetic_destination(index, multiply, reverse, true)
     }
-    /// Finite FMUL/FSUB/FSUBR with ST(i) destination, optionally popping ST(0).
+    /// FMUL/FSUB/FSUBR with ST(i) destination, optionally popping ST(0).
     pub fn arithmetic_destination(
         &mut self,
         index: u8,
@@ -602,47 +593,44 @@ impl X87 {
         self.st(index).map_err(ArithmeticError::Stack)?;
         let top = ((self.status >> 11) & 7) as usize;
         let slot = (top + usize::from(index)) & 7;
-        let source = self.finite[top].ok_or(ArithmeticError::Unsupported)?;
-        let destination = self.finite[slot].ok_or(ArithmeticError::Unsupported)?;
-        let result = if multiply {
-            destination.multiply(source, self.control)?
-        } else if reverse {
-            source.subtract(destination, self.control)?
-        } else {
-            destination.subtract(source, self.control)?
-        };
-        self.store_rounded(slot, result, pop)
+        self.binary(
+            slot,
+            self.number(slot),
+            self.number(top),
+            if multiply {
+                1
+            } else if reverse {
+                5
+            } else {
+                4
+            },
+            pop,
+        )
     }
     /// FCOMP with a binary32/64 memory operand.
     pub fn compare_memory_pop(&mut self, rhs: f64) -> Result<(), ArithmeticError> {
         self.compare_memory(rhs, true)
     }
     pub fn compare_memory(&mut self, rhs: f64, pop: bool) -> Result<(), ArithmeticError> {
-        let rhs = Finite::from_f64(rhs).ok_or(ArithmeticError::Unsupported)?;
-        self.compare_finite(rhs, pop)
+        self.st0().map_err(ArithmeticError::Stack)?;
+        let top = ((self.status >> 11) & 7) as usize;
+        self.compare_number(
+            self.number(top),
+            binary::Number::from_f64(rhs),
+            u8::from(pop),
+        )
     }
     pub fn compare_integer(&mut self, rhs: i64, pop: bool) -> Result<(), ArithmeticError> {
         self.compare_finite(Finite::from_i64(rhs), pop)
     }
     fn compare_finite(&mut self, rhs: Finite, pop: bool) -> Result<(), ArithmeticError> {
-        let lhs = self.st0().map_err(ArithmeticError::Stack)?;
-        if !lhs.is_finite() {
-            return Err(ArithmeticError::Unsupported);
-        }
+        self.st0().map_err(ArithmeticError::Stack)?;
         let top = ((self.status >> 11) & 7) as usize;
-        let order = self.finite[top].unwrap().compare(rhs);
-        let condition = if order.is_lt() {
-            0x100
-        } else if order.is_eq() {
-            0x4000
-        } else {
-            0
-        };
-        self.status = (self.status & !0x4700) | condition;
-        if pop {
-            self.pop().map_err(ArithmeticError::Stack)?;
-        }
-        Ok(())
+        self.compare_number(
+            self.number(top),
+            binary::Number::from_finite(rhs),
+            u8::from(pop),
+        )
     }
     pub fn pop(&mut self) -> Result<(), StackError> {
         self.st0()?;
@@ -705,18 +693,14 @@ mod tests {
         assert_eq!(cases, 300);
     }
     #[test]
-    fn fscale_rejects_unsupported_result_ranges_without_mutation() {
-        for scale in [-1e20, 1e20, -1023., 1023.] {
+    fn fscale_handles_overflow_underflow_and_preserves_signed_zero() {
+        for scale in [-1e20, 1e20] {
             let mut fpu = X87::new();
             fpu.push(scale).unwrap();
             fpu.push(1.).unwrap();
-            let status = fpu.status();
-            let tags = fpu.tags();
-            assert_eq!(fpu.scale(), Err(ArithmeticError::Unsupported));
-            assert_eq!(fpu.st0(), Ok(1.));
+            fpu.scale().unwrap();
             assert_eq!(fpu.st(1), Ok(scale));
-            assert_eq!(fpu.status(), status);
-            assert_eq!(fpu.tags(), tags);
+            assert_eq!(fpu.status() & 0x38, if scale < 0. { 0x30 } else { 0x28 });
         }
         let mut fpu = X87::new();
         fpu.push(1e20).unwrap();
@@ -765,7 +749,7 @@ mod tests {
         assert_eq!(cases, 144);
     }
     #[test]
-    fn f2xm1_rejects_out_of_domain_and_unmasked_precision_without_changing_the_stack() {
+    fn f2xm1_rejects_out_of_domain_and_completes_unmasked_precision() {
         for value in [-2., 2., f64::INFINITY, f64::NAN] {
             let mut fpu = X87::new();
             fpu.push(value).unwrap();
@@ -781,16 +765,16 @@ mod tests {
             fpu.exp2_minus_one(),
             Err(ArithmeticError::UnmaskedException(0x20))
         );
-        assert_eq!(fpu.st0(), Ok(0.5));
+        assert!((fpu.st0().unwrap() - (core::f64::consts::SQRT_2 - 1.)).abs() < 1e-15);
         assert_eq!(fpu.status() & 0x3800, 0x3800);
     }
     #[test]
-    fn audit_frndint_upper_binade_reports_unsupported_without_panicking_or_popping() {
+    fn audit_frndint_upper_binade_preserves_the_exact_value() {
         let mut fpu = X87::new();
         fpu.push(f64::MAX).unwrap();
         let status = fpu.status();
         let tags = fpu.tags();
-        assert_eq!(fpu.round_integer(), Err(ArithmeticError::Unsupported));
+        assert_eq!(fpu.round_integer(), Ok(()));
         assert_eq!(fpu.st0(), Ok(f64::MAX));
         assert_eq!(fpu.status(), status);
         assert_eq!(fpu.tags(), tags);
@@ -870,7 +854,7 @@ mod tests {
     }
     #[test]
     fn fyl2x_preserves_inputs_on_unmasked_exceptions_and_handles_zero_and_negative_domain() {
-        for (x, y, exception) in [(3., 1., 0x20), (0., 1., 4), (-1., 1., 1), (0., 0., 1)] {
+        for (x, y, exception) in [(0., 1., 4), (-1., 1., 1), (0., 0., 1)] {
             let mut fpu = X87::new();
             fpu.push(y).unwrap();
             fpu.push(x).unwrap();
@@ -1069,7 +1053,7 @@ mod tests {
             fpu.round_integer(),
             Err(ArithmeticError::UnmaskedException(0x20))
         );
-        assert_eq!(fpu.st0(), Ok(0.25));
+        assert_eq!(fpu.st0(), Ok(0.));
     }
     #[test]
     fn memory_stores_use_format_precision_and_guest_rounding_without_changing_st0() {
@@ -1230,7 +1214,7 @@ mod tests {
         assert_eq!(fpu.st0(), Err(StackError::Empty));
     }
     #[test]
-    fn division_exceptions_and_inexact_results_preserve_the_operand_stack() {
+    fn division_precompletion_and_postcompletion_exceptions_have_distinct_stack_effects() {
         let mut fpu = X87::new();
         fpu.load_control(0x037B); // Unmask division by zero.
         fpu.push(-1.0).unwrap();
@@ -1251,8 +1235,8 @@ mod tests {
             fpu.divide_pop(1, false),
             Err(ArithmeticError::UnmaskedException(0x20))
         );
-        assert_eq!(fpu.st0(), Ok(3.0));
-        assert_eq!(fpu.st(1), Ok(1.0));
+        assert_eq!(fpu.st0(), Ok(1.0 / 3.0));
+        assert_eq!(fpu.st(1), Err(StackError::Empty));
         fpu.initialize();
         fpu.push(0.0).unwrap();
         fpu.push(0.0).unwrap();

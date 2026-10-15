@@ -243,22 +243,27 @@ and IRQ delivery retain their existing paths. No decoded blocks or JIT exist.
 The CPU owns hidden segment caches, descriptor-table state and optional x87
 state. Its decoder selects 16/32-bit addressing and validates cache permissions
 before emitting linear bus addresses. The independent `doslet-x87` crate owns
-eight fixed values with retained 64-bit finite significands, tags, control/status
-and selected operations; it depends on
-neither a PC device nor the frontend. The PC chooses whether to install it and
-sets the corresponding CMOS equipment bit.
+eight raw extended register encodings, retained 64-bit finite significands,
+physical tags, TOP, control/status and instruction/data pointers. It depends on
+neither a PC device nor the frontend. The 80387 state is enabled by the PC model.
+
 `doslet-x86::x87_decode` classifies all D8–DF/ModR/M pairs without accessing
-guest state or memory. It records the documented 387 instruction and operand
-shape, separates later P6/SSE3 encodings and rejects reserved/undocumented forms.
-The interpreter uses this map before operand access so unsupported instructions
-produce named diagnostics. Numeric operations remain in `doslet-x87`; the
-[coverage map](compatibility/x87.md) distinguishes decoding from execution.
-Finite FYL2X uses fixed 256-bit integer range reduction and a bounded 192-bit
-fraction extraction before multiplying the retained operand. It introduces no
-host math dependency or execution allocation. The [x87 audit](compatibility/x87-audit.md)
-records the remaining representation, environment and exception-model work.
-F2XM1 shares fixed-width multiplication/rounding helpers and evaluates a bounded
-Q2.254 series on [−1, 1], factoring out the input to avoid cancellation.
+guest state or memory. Every documented 387 encoding selects an interpreter
+handler; P6/SSE3 and reserved encodings remain separate diagnostics. The adapter
+supplies addressing/mode/operand size and performs bus transfers. All numerical
+operations and environment encoding remain in `doslet-x87`.
+
+The FPU uses fixed-width integer arithmetic across the extended exponent range.
+Raw real80 transfers and context images preserve guest encodings; binary64 is a
+diagnostic/output view. Shared arithmetic rules handle memory/register specials.
+Root, remainder, logarithm, exponential and trigonometric kernels have bounded
+loops and fixed local arrays, without a host math dependency or execution
+allocation. FPREM partial reductions return C2 to the guest; trig range failures
+also preserve the guest operand and set C2. FNSTENV/FNSAVE side effects occur
+after the CPU adapter completes memory writes.
+The [coverage map](compatibility/x87.md) separates opcode support from numerical
+conformance. The [audit](compatibility/x87-audit.md) records reference fixtures
+and the remaining stack/exception-delivery and nonfinite-transcendental limits.
 
 VGA owns configuration register banks and the color/mono CRTC decode. The PC
 routes their ports; VGA tests cover readback and write protection independently

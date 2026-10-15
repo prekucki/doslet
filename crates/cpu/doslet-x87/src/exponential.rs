@@ -31,6 +31,7 @@ pub(super) fn exp2_minus_one(x: Finite, control: u16) -> Result<Rounded, Arithme
             value: x,
             inexact: false,
             up: false,
+            exceptions: 0,
         });
     }
     let mut absolute = x;
@@ -42,6 +43,7 @@ pub(super) fn exp2_minus_one(x: Finite, control: u16) -> Result<Rounded, Arithme
                 value: Finite::from_f64(if x.negative { -0.5 } else { 1.0 }).unwrap(),
                 inexact: true,
                 up: false,
+                exceptions: 0,
             });
         }
         _ => {}

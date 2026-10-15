@@ -169,27 +169,7 @@ impl Instruction {
         use Mnemonic::*;
         !matches!(
             self.mnemonic,
-            Fldenv
-                | Fnstenv
-                | Frstor
-                | Fnsave
-                | Fbld
-                | Fbstp
-                | Fxam
-                | Fptan
-                | Fpatan
-                | Fxtract
-                | Fprem1
-                | Fprem
-                | Fyl2xp1
-                | Fsqrt
-                | Fsincos
-                | Fsin
-                | Fcos
-                | Fucom
-                | Fucomp
-                | Fucompp
-                | Fcmovb
+            Fcmovb
                 | Fcmove
                 | Fcmovbe
                 | Fcmovu
@@ -202,7 +182,7 @@ impl Instruction {
                 | Fucomip
                 | Fcomip
                 | Fisttp
-        ) && !matches!(self.operands, Operands::Memory(MemoryFormat::Real80))
+        )
     }
 }
 

@@ -466,7 +466,7 @@ impl Cpu {
                 )?;
                 self.registers.set_byte(0, value as u8);
             }
-            0xD8..=0xDF => return self.x87_step(bus, opcode, context),
+            0xD8..=0xDF => return self.x87_step(bus, opcode, context, operand_32),
             0x9B => {
                 if self.fpu.is_none() || self.control.cr0 & 0x0A == 0x0A {
                     return Err(CpuError::X87Unavailable { cs, ip });

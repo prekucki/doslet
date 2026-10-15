@@ -126,63 +126,64 @@ explicitly rather than delivering INT 0.
 
 `Cpu::default()` has no x87 and starts with CR0.EM/ET set. `with_x87()` installs
 an independent fixed-stack `doslet-x87` unit and clears EM. The default PC uses
-that unit and reports it through CMOS equipment bits. Supported x87 forms are
-control/status initialization and transfer, all seven FLD constant instructions, register duplication,
-FCHS/FABS, FXCH ST(i), FFREE, FINCSTP/FDECSTP, FST/FSTP ST(i), selected m32/m64
-loads/stores, FCOM/FCOMP/FCOMPP, FTST, finite-memory FCOM/FCOMP,
-register FDIV/FDIVR/FDIVP/FDIVRP, finite FADD/FMUL/FSUB/FSUBR with ST(0) or
-ST(i) destinations, and finite FADDP/FMULP/FSUBP/FSUBRP. FYL2X supports positive
-finite inputs using bounded integer range reduction with extended result
-precision independent of PC, and selected zero/negative finite domain errors.
-Nonfinite FYL2X operands and full extended exponent results remain unsupported.
-540 native reference cases agree within two adjacent extended-precision values;
-this is sampled evidence, not a global accuracy or exact-C1 guarantee.
-F2XM1 supports finite inputs in [−1, 1] with extended significand precision
-independent of PC. A fixed Q2.254 series factors out the input to retain tiny
-nonzero values; at most 96 terms are evaluated. Its 144 native cases use the
-same sampled two-adjacent-value tolerance. Nonfinite/out-of-domain inputs,
-unsupported result exponents and general exception delivery remain explicit.
-Finite FSCALE changes only the exponent, using ST(1) truncated toward zero
-independently of RC and ignoring PC. It preserves ST(1) and the retained
-significand. 300 native cases match exactly; unsupported result exponents and
-nonfinite inputs still stop explicitly.
-FIADD/FIMUL/FICOM/FICOMP/FISUB/FISUBR/FIDIV/FIDIVR use signed m16/m32 integers.
-The allocation-free public decoder classifies all 2048 D8–DF/ModR/M pairs and
-records mnemonic, operand format/direction and pop count. Recognized missing
-forms and later P6/SSE3 instructions report named unsupported errors; reserved
-encodings report a separate error. Undocumented aliases remain excluded. The
-complete map and implemented/unimplemented status are in
-[x87 encoding coverage](compatibility/x87.md).
-The [x87 implementation audit](compatibility/x87-audit.md) distinguishes opcode
-support from numerical and exception completeness, including the current
-nonarchitectural rollback policy for unmasked precision exceptions.
-FILD accepts signed 16/32/64-bit memory integers without rounding away any
-integer bits, independently of precision/rounding control. FLD constants retain
-64 significand bits, honor RC independently of PC, and do not raise precision
-or set C1 for constant rounding. Captured native x87 vectors cover every constant
-and all four rounding modes.
-Selected normal finite memory arithmetic supports FADD/FMUL/FSUB/FSUBR/FDIV/FDIVR with m32/m64
-operands. Register FST/FSTP copies retained precision and tags without rounding,
-including empty destinations and FSTP ST(0) as a single pop. Empty sources remain
-explicit stack errors under the current stack-exception model.
-Memory FST/FSTP rounds normal finite values to the destination's binary32/64
-precision using RC, sets precision/C1 status and retains ST(0) until a successful
-store/pop; PC does not select memory-store precision.
-FRNDINT and FIST/FISTP m16/m32/m64int use RC without losing retained integer
-bits. Integer stores check signed bounds and return integer indefinite with
-masked invalid status for out-of-range/nonfinite inputs; unmasked exceptions
-stop before storing or popping. Dword ENTER builds bounded nested stack frames
-and BSF/BSR support both operand widths, including their defined zero flag.
-Finite arithmetic retains a normalized 64-bit significand using integer
-intermediates, applies the control word's 24/53/64-bit precision and four rounding
-modes, and reports precision exceptions and C1. Register division also supports masked
-zero/invalid results. Normal arithmetic results currently support exponents
-from -1022 through 1022; extended exponent range, subnormal arithmetic results,
-subnormal/overflow memory stores, nonfinite memory loads, unmasked exceptions and other
-forms stop explicitly. The binary64 register view is diagnostic; it does not
-replace the retained arithmetic significand. Full 80-bit formats and exception
-delivery remain pending. Captured native x87 reference vectors cover 360
-division/multiplication/subtraction cases, including the Pentium FDIV probe.
+that unit and reports it through CMOS equipment bits. The allocation-free public
+decoder classifies all 2048 D8–DF/ModR/M pairs: every documented 387 form selects
+an execution handler; later P6/SSE3 and reserved encodings remain explicit errors.
+The [coverage map](compatibility/x87.md) records formats, directions and pops.
+Opcode coverage does not promise complete numerical or exception conformance.
+
+The FPU retains raw 80-bit register encodings alongside normalized finite
+64-bit significands. Basic arithmetic supports the extended exponent range,
+masked overflow/underflow and subnormal results; binary64 is only a diagnostic
+view. PC selects 24/53/64 significand bits for basic arithmetic and FSQRT. RC
+selects rounding for arithmetic and memory conversions. Reserved PC=01 remains
+an explicit unsupported arithmetic configuration. Register FST/FLD/FXCH preserve
+encodings and tags; real80 memory transfers preserve special payloads and
+unsupported encodings without interpreting them as arithmetic.
+
+Real32/64 transfers and basic arithmetic share zero/infinity/NaN rules. Memory
+source denormals and signaling NaNs raise their respective status flags before
+conversion. Ordered and unordered comparisons distinguish quiet/signaling NaNs;
+FXAM classifies registers, including empty and unsupported encodings. FILD and
+FIST/FISTP preserve signed integer precision and bounds. FBLD/FBSTP implement
+18-digit packed BCD, negative zero, rounding and masked BCD indefinite. Invalid
+BCD digits remain explicit errors because their architectural result is undefined.
+
+FLDENV/FNSTENV and FRSTOR/FNSAVE use operand-size-selected 14/28-byte
+environments or 94/108-byte states, independently of address size. They support
+real/protected pointer layouts, opcode and all eight logical ST(i) encodings.
+Control instructions do not replace the saved last arithmetic instruction/data
+pointers. FNSTENV masks exceptions and FNSAVE initializes only after successful
+memory writes; reads finish before state restoration. Multi-byte guest writes
+are not promised atomic if the bus faults partway through them.
+
+All seven constants retain 64 significand bits and honor RC independently of
+PC without raising precision. FRNDINT, FSCALE, FXTRACT, FSQRT, FPREM/FPREM1,
+FYL2X, FYL2XP1, F2XM1, FPATAN, FSIN/FCOS/FSINCOS and FPTAN have bounded portable
+integer algorithms. Transcendentals ignore PC and honor RC. FPREM/FPREM1 set C2
+for partial reduction and quotient bits upon completion. Trigonometric inputs
+with magnitude at least 2^63 leave the operand/TOP unchanged and set C2.
+F2XM1 requires finite inputs in [-1,1]. Some nonfinite transcendental/scaling
+operands remain explicit unsupported numeric domains.
+
+Masked exceptional results, sticky flags and selected pre/post-completion
+rules are implemented. An unmasked register precision exception commits its
+rounded destination and stack pop before returning the diagnostic error;
+invalid/zero-divide faults preserve the destination. Pending IRQ13/FWAIT
+signaling, wrapped register results for unmasked range traps, masked stack
+fault completion and complete memory-store exception/restart behavior remain
+pending. The frontend still stops on reported unmasked exceptions.
+
+Captured native x86-64 x87 fixtures test arithmetic, constants, logarithms,
+roots, remainders, trigonometry and format boundaries. Finite transcendental
+samples permit small result differences; they establish neither a universal
+error bound nor bit-identical historical-387/C1 behavior. Large-angle reduction
+uses a 192-bit pi/2 constant rather than the physical x87 approximation.
+The [implementation audit](compatibility/x87-audit.md) records exact counts,
+remaining limits and reproducible native-reference commands. These checks do
+not establish game compatibility.
+Dword ENTER builds bounded nested stack frames and BSF/BSR support both operand
+widths, including their defined zero flag.
 
 CPU segment translation produces an unmasked linear address; machine A20 wiring
 controls address bit 20. The default PC has 16 MiB of RAM, with A20 initially
