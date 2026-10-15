@@ -30,6 +30,7 @@ pub struct PcBus {
     pub keyboard: Controller,
     pub cmos: Cmos,
     system_control: u8,
+    pub(crate) awe_writes: u64,
 }
 impl Default for PcBus {
     fn default() -> Self {
@@ -37,6 +38,7 @@ impl Default for PcBus {
         pit.write_control(0x36).unwrap();
         pit.write_counter(0, 0).unwrap();
         pit.write_counter(0, 0).unwrap();
+        pit.set_gate(2, false).unwrap();
         let mut slave_pic = Pic::new(0x70);
         slave_pic.write_data(0xFF);
         Self {
@@ -59,6 +61,7 @@ impl Default for PcBus {
             a20: A20Gate::default(),
             cmos: Cmos::new(640, ((crate::memory::RAM_SIZE - 0x100000) / 1024) as u16),
             system_control: 0,
+            awe_writes: 0,
         }
     }
 }
@@ -268,7 +271,7 @@ impl MemoryBus for PcBus {
 impl PortBus for PcBus {
     fn read_port_u8(&mut self, port: u16) -> Result<u8, BusError> {
         if port == 0x61 {
-            return Ok(self.system_control);
+            return Ok(self.system_control | (u8::from(self.pit.output(2).unwrap()) << 5));
         }
         #[cfg(feature = "profiling")]
         {
@@ -278,6 +281,7 @@ impl PortBus for PcBus {
         }
         match port {
             0x3C6..=0x3C8 => Ok(self.vga.read_port(port).unwrap()),
+            0x3CD => Ok(0xFF), // No Tseng ET3000/ET4000 segment-select register.
             0x3C9 => Ok(self.vga.read_dac()),
             0..=0x0F => self.dma[0]
                 .read_register(port as u8)
@@ -304,6 +308,17 @@ impl PortBus for PcBus {
                 self.dsp.acknowledge_irq(true);
                 Ok(0xFF)
             }
+            // The emulated DSP is fixed at 220h. DOS setup programs probe
+            // common legacy Sound Blaster bases; unclaimed ISA reads float high.
+            0x210..=0x21F
+            | 0x230..=0x23F
+            | 0x240..=0x24F
+            | 0x250..=0x25F
+            | 0x260..=0x26F
+            | 0x280..=0x28F => Ok(0xFF),
+            // No OPTi/CS4231-compatible WSS codec is installed. These are
+            // documented codec decode windows used by DOS setup probes.
+            0x530..=0x537 | 0x608..=0x60B | 0xE84..=0xE87 | 0xF44..=0xF47 => Ok(0xFF),
             // No AWE/EMU8000 is installed. Its probe ranges float high on
             // this ISA machine; they must not identify a nonexistent synth.
             0x600..=0x6FF | 0xA00..=0xAFF | 0xE00..=0xEFF => Ok(0xFF),
@@ -327,6 +342,7 @@ impl PortBus for PcBus {
             0x92 => Ok(if self.a20.enabled { 2 } else { 0 }),
             0x330 => Ok(self.mpu.read_data()),
             0x331 => Ok(self.mpu.status()),
+            0x320..=0x321 => Ok(0xFF), // No device at the probed 320h base.
             0xA0 => Ok(self.slave_pic.read_command()),
             0xA1 => Ok(self.slave_pic.read_data()),
             0x20 => Ok(self.pic.read_command()),
@@ -340,10 +356,12 @@ impl PortBus for PcBus {
     }
     fn write_port_u8(&mut self, port: u16, value: u8) -> Result<(), BusError> {
         if port == 0x61 {
+            self.pit.set_gate(2, value & 1 != 0).unwrap();
             self.system_control = value & 0x0F;
             return Ok(());
         }
         match port {
+            0x3CD => {} // No Tseng vendor bank register on the generic VBE adapter.
             0x3C6 => {
                 self.vga.write_port(port, value);
             }
@@ -367,7 +385,17 @@ impl PortBus for PcBus {
                 .dsp
                 .write_command(value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
-            0x600..=0x6FF | 0xA00..=0xAFF | 0xE00..=0xEFF => {} // Absent AWE probe banks.
+            0x210..=0x21F
+            | 0x230..=0x23F
+            | 0x240..=0x24F
+            | 0x250..=0x25F
+            | 0x260..=0x26F
+            | 0x280..=0x28F => {} // No DSP at these candidate bases.
+            0x320..=0x321 => {} // No device at the probed 320h base.
+            0x530..=0x537 | 0x608..=0x60B | 0xE84..=0xE87 | 0xF44..=0xF47 => {} // No WSS codec is installed.
+            0x600..=0x6FF | 0xA00..=0xAFF | 0xE00..=0xEFF => {
+                self.awe_writes += 1;
+            } // Absent AWE probe banks.
             0x3B4 | 0x3B5 | 0x3D4 | 0x3D5 | 0x3C0 | 0x3C2 | 0x3C4 | 0x3C5 | 0x3CE | 0x3CF => {
                 if !self.vga.write_port(port, value) {
                     return Err(BusError::UnmappedPort(port));
@@ -430,6 +458,32 @@ mod cache_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn absent_tseng_bank_register_does_not_echo_probe_patterns_or_change_vbe_bank() {
+        let mut bus = PcBus::default();
+        for pattern in [0x55, 0xAA, 0xFF] {
+            bus.write_port_u8(0x3CD, pattern).unwrap();
+            assert_eq!(bus.read_port_u8(0x3CD), Ok(0xFF));
+        }
+    }
+    #[test]
+    fn channel_two_mode_zero_counts_guest_ticks_with_port_61_gate_and_output() {
+        let mut machine = crate::PcMachine::default();
+        machine.bus.write_port_u8(0x43, 0xB0).unwrap();
+        machine.bus.write_port_u8(0x42, 3).unwrap();
+        machine.bus.write_port_u8(0x42, 0).unwrap();
+        machine.advance_pit_ticks(100);
+        assert_eq!(machine.bus.read_port_u8(0x61), Ok(0));
+        machine.bus.write_port_u8(0x61, 3).unwrap();
+        machine.advance_pit_ticks(2);
+        assert_eq!(machine.bus.read_port_u8(0x61), Ok(3));
+        machine.bus.write_port_u8(0x43, 0x80).unwrap();
+        machine.advance_pit_ticks(1);
+        assert_eq!(machine.bus.read_port_u8(0x42), Ok(1)); // Latched before terminal count.
+        assert_eq!(machine.bus.read_port_u8(0x42), Ok(0));
+        assert_eq!(machine.bus.read_port_u8(0x61), Ok(0x23));
+        assert!(!machine.bus.pic.has_interrupt()); // Channel 2 is not IRQ0.
+    }
     #[test]
     fn slave_pic_ports_keep_masks_and_initialization_independent_of_master() {
         let mut bus = PcBus::default();

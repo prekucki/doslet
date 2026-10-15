@@ -30,6 +30,8 @@ extern "C" {
         button: i8,
         pressed: bool,
     ) -> Result<(), JsValue>;
+    #[wasm_bindgen(method, catch, js_name = captureMouse)]
+    fn capture_mouse(this: &Browser) -> Result<(), JsValue>;
     #[wasm_bindgen(method, catch, js_name = importZip)]
     fn import_zip(this: &Browser, bytes: &[u8]) -> Result<(), JsValue>;
     #[wasm_bindgen(method)]
@@ -102,6 +104,8 @@ pub struct Doslet {
     underruns: u64,
     peak: f64,
     host_messages: u64,
+    pcm_frames: u64,
+    mouse_captured: bool,
 }
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -160,6 +164,8 @@ impl Doslet {
             underruns: 0,
             peak: 0.0,
             host_messages: 0,
+            pcm_frames: 0,
+            mouse_captured: false,
         }
     }
     fn command(&mut self, kind: &str, program: &str) {
@@ -191,6 +197,17 @@ impl Doslet {
                 }
             }
             Message::PointerButton(button, pressed) => {
+                if pressed
+                    && !self.mouse_captured
+                    && self.session.status() == SessionStatus::Running
+                {
+                    if let Some(bridge) = &self.bridge
+                        && let Err(error) = bridge.capture_mouse()
+                    {
+                        self.notice = Some(format!("Mouse capture: {error:?}"));
+                    }
+                    return Task::none();
+                }
                 if let Some(bridge) = &self.bridge
                     && let Err(error) = bridge.pointer_event(0, 0, button as i8, pressed)
                 {
@@ -371,6 +388,7 @@ impl Doslet {
             return;
         };
         let packet = bridge.poll();
+        self.mouse_captured = field(&packet, "mouseCaptured").as_bool().unwrap_or(false);
         let state = field(&packet, "state");
         if !state.is_null() && !state.is_undefined() {
             self.session.status = match number(&state, "status") as u32 {
@@ -464,6 +482,7 @@ impl Doslet {
         self.notes = number(&audio, "notes") as u64;
         self.frames = number(&audio, "frames") as u64;
         self.peak = number(&audio, "peak");
+        self.pcm_frames = number(&audio, "pcmNonzero") as u64;
         self.underruns = number(&audio, "underruns") as u64;
         self.host_messages = number(&audio, "messages") as u64;
     }
@@ -473,18 +492,19 @@ impl Doslet {
     pub fn audio_label(&self) -> String {
         if self.midi_choice != "Rust synth" {
             return format!(
-                "Host MIDI · {} · {} sent messages",
-                self.midi_choice, self.host_messages
+                "Host MIDI · {} · {} sent messages · SB {} frames · peak {:.2}",
+                self.midi_choice, self.host_messages, self.pcm_frames, self.peak
             );
         }
         format!(
-            "Web Audio · {}{} · {} notes · peak {:.2} · {} rendered frames · {} underruns",
+            "Web Audio · {}{} · {} notes · peak {:.2} · {} rendered frames · {} underruns · SB {} frames",
             self.audio_state,
             if self.muted { " · muted" } else { "" },
             self.notes,
             self.peak,
             self.frames,
-            self.underruns
+            self.underruns,
+            self.pcm_frames
         )
     }
     pub fn audio_button_label(&self) -> &'static str {
@@ -516,6 +536,9 @@ impl Doslet {
                 200
             },
         )
+    }
+    pub fn hide_host_cursor(&self) -> bool {
+        self.mouse_captured
     }
     pub fn subscription(&self) -> Subscription<Message> {
         // Poll bounded presentation snapshots even while paused/importing. The

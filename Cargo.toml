@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["apps/common"]
+exclude = ["apps/common", "vendor/iced_runtime", "vendor/iced_winit"]
 members = [
     "crates/foundation/*",
     "crates/cpu/*",
@@ -35,8 +35,10 @@ doslet-vga = { path = "crates/hardware/video/doslet-vga" }
 doslet-mpu401 = { path = "crates/hardware/audio/doslet-mpu401" }
 doslet-sb-dsp = { path = "crates/hardware/audio/doslet-sb-dsp" }
 doslet-sb-mixer = { path = "crates/hardware/audio/doslet-sb-mixer" }
+doslet-pcm = { path = "crates/hardware/audio/doslet-pcm" }
 doslet-pc = { path = "crates/machines/doslet-pc" }
 doslet-executable = { path = "crates/system/doslet-executable" }
+doslet-iso9660 = { path = "crates/system/doslet-iso9660" }
 doslet-dos = { path = "crates/system/doslet-dos" }
 doslet-runtime = { path = "crates/runtime/doslet-runtime" }
 doslet-midi-routing = { path = "crates/runtime/doslet-midi-routing" }
@@ -55,3 +57,7 @@ strip = "debuginfo"
 [profile.web]
 inherits = "release"
 opt-level = 3
+
+[patch.crates-io]
+iced_runtime = { path = "vendor/iced_runtime" }
+iced_winit = { path = "vendor/iced_winit" }

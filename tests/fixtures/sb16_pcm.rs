@@ -1,0 +1,12 @@
+// Original COM fixture: continuously play unsigned 8-bit mono DMA1 at 16 kHz.
+pub fn sb16_pcm_program() -> Vec<u8> {
+    let mut code = vec![0xB0, 0xFF, 0xE6, 0x21]; // Mask IRQs; inspect PCM without guest IRQ handlers.
+    code.extend_from_slice(&[0xB8, 0, 0x20, 0x8E, 0xC0, 0x31, 0xFF, 0xB8, 0x40, 0xC0, 0xB9, 0x80, 0, 0xF3, 0xAB]);
+    for (port, value) in [(0x0A, 5), (0x0C, 0), (2, 0), (2, 0), (3, 0xFF), (3, 0), (0x83, 2), (0x0B, 0x59), (0x0A, 1)] {
+        code.extend_from_slice(&[0xB0, value, 0xE6, port]);
+    }
+    code.extend_from_slice(&[0xBA, 0x2C, 2]);
+    for value in [0xD1, 0x41, 0x3E, 0x80, 0xC6, 0, 0xFF, 0] { code.extend_from_slice(&[0xB0, value, 0xEE]); }
+    code.extend_from_slice(&[0xEB, 0xFE]);
+    code
+}

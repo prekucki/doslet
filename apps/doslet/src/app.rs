@@ -1,4 +1,4 @@
-use crate::presentation::DisplayFrame;
+use crate::presentation::{DisplayFrame, DisplaySizing, SizingMessage};
 use doslet_midi_routing::{Mode, Routing, SNAPSHOT_CAPACITY};
 use doslet_midi_synth::Timeline;
 use doslet_runtime::{RuntimeError, Session, SessionStatus};
@@ -10,6 +10,7 @@ const CHUNK: u32 = 10_000;
 pub struct Doslet {
     pub session: Session,
     pub display: DisplayFrame,
+    pub display_sizing: DisplaySizing,
     pub name: String,
     pub notice: Option<String>,
     logged_fault: Option<RuntimeError>,
@@ -33,7 +34,11 @@ pub struct Doslet {
     mt32_rom_dir: Option<std::path::PathBuf>,
     samples: [[f32; 2]; 512],
     midi_bytes: [u8; 1024],
-    pcm: [[i16; 2]; 128],
+    pcm: [doslet_pcm::Frame; 128],
+    pcm_mixer: doslet_pcm::Mixer,
+    mouse_capture: Option<iced::window::Id>,
+    mouse_capture_pending: bool,
+    mouse_capture_generation: u64,
     #[cfg(not(target_arch = "wasm32"))]
     source: Option<std::path::PathBuf>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -43,9 +48,12 @@ pub struct Doslet {
 }
 #[derive(Clone, Debug)]
 pub enum Message {
+    DisplaySizing(SizingMessage),
     PointerMoved(u16, u16),
     PointerButton(u8, bool),
     PointerLeft,
+    CaptureWindow(iced::window::Id, u64),
+    MouseCapture(iced::window::Id, u64, iced::window::MouseCaptureEvent),
     Keyboard(iced::keyboard::Event),
     RunPause,
     Step,
@@ -67,6 +75,7 @@ impl Doslet {
         Self {
             session: Session::demo(),
             display: DisplayFrame::default(),
+            display_sizing: DisplaySizing::default(),
             name: "Color bars".into(),
             notice: None,
             logged_fault: None,
@@ -90,7 +99,11 @@ impl Doslet {
             mt32_rom_dir: None,
             samples: [[0.0; 2]; 512],
             midi_bytes: [0; 1024],
-            pcm: [[0; 2]; 128],
+            pcm: [doslet_pcm::EMPTY; 128],
+            pcm_mixer: doslet_pcm::Mixer::new(48000).unwrap(),
+            mouse_capture: None,
+            mouse_capture_pending: false,
+            mouse_capture_generation: 0,
             #[cfg(not(target_arch = "wasm32"))]
             source: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -120,6 +133,7 @@ impl Doslet {
                 match crate::audio::Output::new() {
                     Ok(audio) => {
                         app.midi = Timeline::new(audio.rate).unwrap();
+                        app.pcm_mixer.reset(audio.rate, 0).unwrap();
                         app.audio = Some(audio);
                     }
                     Err(error) => app.notice = Some(format!("Audio unavailable: {error}")),
@@ -158,19 +172,111 @@ impl Doslet {
         )?)
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let mouse_task = if matches!(message, Message::Reset) {
+            self.release_mouse()
+        } else {
+            Task::none()
+        };
         match message {
+            Message::DisplaySizing(message) => {
+                return self
+                    .display_sizing
+                    .update(message, &self.display)
+                    .map(Message::DisplaySizing);
+            }
             Message::PointerMoved(x, y) => {
-                if self.session.status() == SessionStatus::Running {
+                if self.mouse_capture.is_none()
+                    && !self.mouse_capture_pending
+                    && self.session.status() == SessionStatus::Running
+                {
                     self.session.pointer_move(x, y);
                 }
             }
             Message::PointerButton(button, pressed) => {
+                if pressed
+                    && self.session.status() == SessionStatus::Running
+                    && self.mouse_capture.is_none()
+                    && !self.mouse_capture_pending
+                {
+                    self.mouse_capture_pending = true;
+                    self.mouse_capture_generation = self.mouse_capture_generation.wrapping_add(1);
+                    let generation = self.mouse_capture_generation;
+                    return iced::window::latest()
+                        .and_then(move |id| Task::done(Message::CaptureWindow(id, generation)));
+                }
+                if self.mouse_capture_pending {
+                    return Task::none();
+                }
                 if self.session.status() == SessionStatus::Running || !pressed {
                     self.session.pointer_button(button, pressed);
                 }
             }
-            Message::PointerLeft => self.session.release_pointer_buttons(),
+            Message::PointerLeft => {
+                if self.mouse_capture.is_none() && !self.mouse_capture_pending {
+                    self.session.release_pointer_buttons();
+                }
+            }
+            Message::CaptureWindow(id, generation) => {
+                if generation == self.mouse_capture_generation
+                    && self.mouse_capture_pending
+                    && self.session.status() == SessionStatus::Running
+                {
+                    self.mouse_capture = Some(id);
+                    return iced::window::capture_mouse(id)
+                        .map(move |event| Message::MouseCapture(id, generation, event));
+                }
+            }
+            Message::MouseCapture(id, generation, event) => {
+                if generation != self.mouse_capture_generation {
+                    return Task::none();
+                }
+                use iced::window::MouseCaptureEvent;
+                match event {
+                    MouseCaptureEvent::Acquired => {
+                        if !self.mouse_capture_pending
+                            || self.session.status() != SessionStatus::Running
+                        {
+                            return iced::window::release_mouse(id).map(|()| Message::PointerLeft);
+                        }
+                        self.mouse_capture_pending = false;
+                        self.mouse_capture = Some(id);
+                    }
+                    MouseCaptureEvent::Motion { dx, dy } => {
+                        if self.mouse_capture == Some(id)
+                            && self.session.status() == SessionStatus::Running
+                        {
+                            self.session.pointer_relative(dx, dy);
+                        }
+                    }
+                    MouseCaptureEvent::Button { button, pressed } => {
+                        if self.mouse_capture == Some(id) {
+                            self.session.pointer_button(button, pressed);
+                        }
+                    }
+                    MouseCaptureEvent::Released => {
+                        if self.mouse_capture == Some(id) || self.mouse_capture_pending {
+                            self.mouse_capture = None;
+                            self.mouse_capture_pending = false;
+                            self.session.release_pointer_buttons();
+                        }
+                    }
+                    MouseCaptureEvent::Failed(error) => {
+                        self.notice = Some(format!("Mouse capture unavailable: {error}"));
+                    }
+                }
+            }
             Message::Keyboard(event) => {
+                if (self.mouse_capture.is_some() || self.mouse_capture_pending)
+                    && matches!(
+                        &event,
+                        iced::keyboard::Event::KeyPressed {
+                            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                            ..
+                        }
+                    )
+                {
+                    return self.release_mouse();
+                }
                 if self.session.status() == SessionStatus::Running {
                     let (modifiers, key) = crate::keyboard::translate(&event);
                     if let Err(error) = self.session.set_key_modifiers(modifiers).and_then(|()| {
@@ -303,8 +409,22 @@ impl Doslet {
         self.display.refresh(&self.session);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            Task::none()
+            if self.session.status() != SessionStatus::Running {
+                Task::batch([mouse_task, self.release_mouse()])
+            } else {
+                mouse_task
+            }
         }
+    }
+    fn release_mouse(&mut self) -> Task<Message> {
+        if self.mouse_capture.is_some() || self.mouse_capture_pending {
+            self.mouse_capture_generation = self.mouse_capture_generation.wrapping_add(1);
+        }
+        self.mouse_capture_pending = false;
+        self.session.release_pointer_buttons();
+        self.mouse_capture.take().map_or_else(Task::none, |id| {
+            iced::window::release_mouse(id).map(|()| Message::PointerLeft)
+        })
     }
     fn log_errors(&mut self) {
         let fault = self.session.fault();
@@ -362,7 +482,12 @@ impl Doslet {
             audio.clear();
             audio.set_active(self.session.status() == SessionStatus::Running);
         }
-        self.midi = Timeline::new(self.midi.sample_rate()).unwrap();
+        let rate = self
+            .audio
+            .as_ref()
+            .map_or(self.midi.sample_rate(), |audio| audio.rate);
+        self.midi = Timeline::new(rate).unwrap();
+        self.pcm_mixer.reset(self.midi.sample_rate(), 0).unwrap();
         if self.midi_choice == "CM-32L / MT-32"
             && let Some(directory) = &self.mt32_rom_dir
         {
@@ -411,6 +536,7 @@ impl Doslet {
             target = target.saturating_add(crate::native_midi::LOOKAHEAD.as_nanos() as u64);
         }
         let mut budget = MAX_STEPS_PER_TICK;
+        let previous_memory_wait_steps = self.session.memory_wait_steps();
         while budget != 0
             && self.session.status() == SessionStatus::Running
             && self.session.emulated_nanos() < target
@@ -434,11 +560,44 @@ impl Doslet {
                 break;
             }
         }
+        if previous_memory_wait_steps == 0 && self.session.memory_wait_steps() != 0 {
+            eprintln!(
+                "[INFO doslet] {}: experimental timer waits active; batched {} logical steps",
+                self.name,
+                self.session.memory_wait_steps()
+            );
+        }
     }
     fn process_audio(&mut self) -> Result<(), String> {
+        loop {
+            let count = self.session.drain_pcm_timed(&mut self.pcm);
+            if count == 0 {
+                break;
+            }
+            self.pcm_mixer
+                .receive(&self.pcm[..count])
+                .map_err(|e| e.to_string())?;
+        }
         if let Some(mt32) = &mut self.mt32 {
             loop {
                 let count = mt32
+                    .render_until(self.session.emulated_nanos(), &mut self.samples)
+                    .map_err(|e| e.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                self.pcm_mixer.mix(&mut self.samples[..count]);
+                if let Some(audio) = &self.audio {
+                    audio.push(&self.samples[..count])?;
+                }
+            }
+        } else if self.host_midi.is_some() {
+            self.midi
+                .skip_until(self.session.emulated_nanos())
+                .map_err(|e| e.to_string())?;
+            loop {
+                let count = self
+                    .pcm_mixer
                     .render_until(self.session.emulated_nanos(), &mut self.samples)
                     .map_err(|e| e.to_string())?;
                 if count == 0 {
@@ -448,10 +607,6 @@ impl Doslet {
                     audio.push(&self.samples[..count])?;
                 }
             }
-        } else if self.host_midi.is_some() {
-            self.midi
-                .skip_until(self.session.emulated_nanos())
-                .map_err(|e| e.to_string())?;
         } else {
             loop {
                 let count = self
@@ -461,6 +616,7 @@ impl Doslet {
                 if count == 0 {
                     break;
                 }
+                self.pcm_mixer.mix(&mut self.samples[..count]);
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(audio) = &self.audio {
                     audio.push(&self.samples[..count])?;
@@ -506,31 +662,40 @@ impl Doslet {
                 self.midi.push_byte(byte).map_err(|e| e.to_string())?;
             }
         }
-        while self.session.drain_pcm(&mut self.pcm) != 0 {}
+        if let Some(source) = &self.source {
+            crate::native_input::flush_writes(&mut self.session, source, &self.launch)
+                .map_err(|error| format!("C: RW writeback failed: {error}"))?;
+        }
         Ok(())
     }
     pub fn audio_label(&self) -> String {
         if let Some(output) = &self.host_midi {
-            return output.label();
+            return format!(
+                "{} · SB {} nonzero frames",
+                output.label(),
+                self.pcm_mixer.nonzero()
+            );
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(audio) = &self.audio {
             let (frames, _, peak) = audio.stats();
             if let Some(mt32) = &self.mt32 {
                 return format!(
-                    "CM-32L · {} notes · {} SysEx · peak {:.2} · {} frames",
+                    "CM-32L · {} notes · {} SysEx · peak {:.2} · {} frames · SB {} nonzero frames",
                     mt32.note_events(),
                     mt32.sysex_messages(),
                     peak,
-                    frames
+                    frames,
+                    self.pcm_mixer.nonzero()
                 );
             }
             return format!(
-                "MIDI · {} Hz · {} notes · peak {:.2} · {} played frames",
+                "Audio · {} Hz · {} MIDI notes · peak {:.2} · {} played frames · SB {} nonzero frames",
                 audio.rate,
                 self.midi.note_events(),
                 peak,
-                frames
+                frames,
+                self.pcm_mixer.nonzero()
             );
         }
         "Audio output inactive".into()
@@ -590,6 +755,9 @@ impl Doslet {
                 output.clear()?;
             }
             self.host_midi = None;
+            self.pcm_mixer
+                .reset(audio.rate, self.session.emulated_nanos())
+                .map_err(|e| e.to_string())?;
             self.audio = Some(audio);
         } else {
             if self.midi_mode == Mode::Gm && self.midi_output_mode == Mode::Mt32 {
@@ -611,10 +779,29 @@ impl Doslet {
                 replay.extend_from_slice(message)
             });
             output.push(self.session.emulated_nanos(), &replay)?;
-            if let Some(audio) = &self.audio {
-                audio.set_active(false);
+            if self.audio.is_none() {
+                match crate::audio::Output::new() {
+                    Ok(audio) => self.audio = Some(audio),
+                    Err(error) => {
+                        eprintln!("[WARN doslet] Sound Blaster output unavailable: {error}")
+                    }
+                }
             }
-            self.audio = None;
+            let rate = self
+                .audio
+                .as_ref()
+                .map_or(self.midi.sample_rate(), |audio| audio.rate);
+            self.midi = Timeline::new(rate).map_err(|e| e.to_string())?;
+            self.midi
+                .skip_until(self.session.emulated_nanos())
+                .map_err(|e| e.to_string())?;
+            self.pcm_mixer
+                .reset(rate, self.session.emulated_nanos())
+                .map_err(|e| e.to_string())?;
+            if let Some(audio) = &self.audio {
+                audio.clear();
+                audio.set_active(self.session.status() == SessionStatus::Running);
+            }
             self.mt32 = None;
             self.host_midi = Some(output);
         }
@@ -627,9 +814,12 @@ impl Doslet {
         Ok(())
     }
     fn select_midi(&mut self, selection: &str) -> Result<(), String> {
-        if selection == self.midi_choice
-            && self.host_midi.as_ref().is_none_or(|o| o.check().is_ok())
-        {
+        let ready = match selection {
+            "Rust synth" => self.audio.is_some() && self.mt32.is_none(),
+            "CM-32L / MT-32" => self.audio.is_some() && self.mt32.is_some(),
+            _ => self.host_midi.as_ref().is_some_and(|o| o.check().is_ok()),
+        };
+        if selection == self.midi_choice && ready {
             return Ok(());
         }
         self.reselect_midi(selection)
@@ -664,6 +854,9 @@ impl Doslet {
     pub fn pointer_dimensions(&self) -> (u16, u16) {
         self.session.pointer_dimensions()
     }
+    pub fn hide_host_cursor(&self) -> bool {
+        self.mouse_capture.is_some() && !self.mouse_capture_pending
+    }
     pub fn subscription(&self) -> Subscription<Message> {
         let tick = if self.session.status() == SessionStatus::Running {
             iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
@@ -672,6 +865,7 @@ impl Doslet {
         };
         Subscription::batch([
             tick,
+            DisplaySizing::subscription().map(Message::DisplaySizing),
             iced::event::listen_with(|event, status, _| {
                 if status == iced::event::Status::Ignored
                     && let iced::Event::Keyboard(event) = event
@@ -688,6 +882,260 @@ impl Doslet {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    include!("../../../tests/fixtures/sb16_pcm.rs");
+    #[test]
+    fn mouse_capture_uses_relative_motion_releases_on_escape_and_ignores_stale_events() {
+        use iced::window::MouseCaptureEvent;
+        let mut app = Doslet::new();
+        app.session = Session::new(&[0xEB, 0xFE]).unwrap();
+        app.session.start();
+        let id = iced::window::Id::unique();
+        let _ = app.update(Message::PointerButton(0, true));
+        let generation = app.mouse_capture_generation;
+        let _ = app.update(Message::CaptureWindow(id, generation));
+        assert!(!app.hide_host_cursor());
+        let _ = app.update(Message::MouseCapture(
+            id,
+            generation,
+            MouseCaptureEvent::Acquired,
+        ));
+        assert!(app.hide_host_cursor());
+        let before = app.session.pointer_position();
+        let _ = app.update(Message::PointerMoved(0, 0));
+        assert_eq!(app.session.pointer_position(), before);
+        let _ = app.update(Message::MouseCapture(
+            id,
+            generation,
+            MouseCaptureEvent::Motion {
+                dx: 20.0,
+                dy: -15.0,
+            },
+        ));
+        assert_eq!(
+            app.session.pointer_position(),
+            (before.0 + 20, before.1 - 15)
+        );
+        let escape = iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape);
+        let _ = app.update(Message::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: escape.clone(),
+            modified_key: escape,
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Escape),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }));
+        assert!(!app.hide_host_cursor());
+        let _ = app.update(Message::PointerButton(0, true));
+        let next = app.mouse_capture_generation;
+        let _ = app.update(Message::MouseCapture(
+            id,
+            generation,
+            MouseCaptureEvent::Released,
+        ));
+        assert!(app.mouse_capture_pending);
+        let _ = app.update(Message::CaptureWindow(id, next));
+        let _ = app.update(Message::MouseCapture(id, next, MouseCaptureEvent::Acquired));
+        let _ = app.update(Message::RunPause);
+        assert!(!app.hide_host_cursor());
+        assert_eq!(app.session.status(), SessionStatus::Paused);
+        let _ = app.update(Message::MouseCapture(
+            id,
+            next,
+            MouseCaptureEvent::Motion { dx: 10.0, dy: 10.0 },
+        ));
+        assert_eq!(
+            app.session.pointer_position(),
+            (before.0 + 20, before.1 - 15)
+        );
+    }
+    #[test]
+    fn rw_writeback_persists_closed_files_and_overlay_keeps_host_unchanged() {
+        use doslet_dos::files::ReadOnlyDrive;
+        let root = std::env::temp_dir().join(format!("doslet-rw-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("Heroes.cfg");
+        std::fs::write(&target, b"original").unwrap();
+        let mut drive = ReadOnlyDrive::new();
+        drive.mount(b"HEROES.CFG", b"original".to_vec()).unwrap();
+        let mut drive = drive.with_write_overlay(1024);
+        let handle = drive.create(b"HEROES.CFG", 0).unwrap();
+        drive
+            .write_buffer(handle, 3)
+            .unwrap()
+            .copy_from_slice(b"new");
+        let mut session = Session::new(&[0x90]).unwrap().with_drive(drive);
+        let settings = crate::native_input::LaunchSettings {
+            persist: true,
+            ..Default::default()
+        };
+        let executable = root.join("GAME.EXE");
+        assert_eq!(
+            crate::native_input::flush_writes(&mut session, &executable, &settings).unwrap(),
+            0
+        );
+        let mut drive = ReadOnlyDrive::new();
+        drive.mount(b"HEROES.CFG", b"original".to_vec()).unwrap();
+        let mut drive = drive.with_write_overlay(1024);
+        let handle = drive.create(b"HEROES.CFG", 0).unwrap();
+        drive
+            .write_buffer(handle, 3)
+            .unwrap()
+            .copy_from_slice(b"new");
+        drive.close(handle).unwrap();
+        let mut session = Session::new(&[0x90]).unwrap().with_drive(drive);
+        let overlay = crate::native_input::LaunchSettings::default();
+        assert_eq!(
+            crate::native_input::flush_writes(&mut session, &executable, &overlay).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(
+            crate::native_input::flush_writes(&mut session, &executable, &settings).unwrap(),
+            1
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(
+            crate::native_input::flush_writes(&mut session, &executable, &settings).unwrap(),
+            0
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn sb16_pcm_flows_through_native_mixer_without_host_device() {
+        let mut app = Doslet::new();
+        app.session = Session::new(&sb16_pcm_program()).unwrap();
+        app.session.start();
+        for _ in 0..100 {
+            app.session.advance(10000);
+            app.process_audio().unwrap();
+        }
+        assert_eq!(
+            app.session.status(),
+            SessionStatus::Running,
+            "{:?}",
+            app.session.fault()
+        );
+        assert!(app.pcm_mixer.nonzero() > 1000);
+        assert!(
+            app.samples
+                .iter()
+                .flatten()
+                .any(|sample| sample.abs() > 0.1)
+        );
+    }
+    #[test]
+    #[ignore = "opens the user's audio device and plays a short synthetic SB16 tone"]
+    fn local_sb16_pcm_reaches_host_output() {
+        use clap::Parser;
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cli = crate::cli::Cli::parse_from([
+            std::ffi::OsString::from("doslet"),
+            "--config".into(),
+            repo.join("games/HoMnM.toml").into_os_string(),
+            "--midi-output".into(),
+            "rust".into(),
+        ]);
+        let mut app = Doslet::from_cli(cli).unwrap();
+        assert!(app.audio.is_some());
+        app.session = Session::new(&sb16_pcm_program()).unwrap();
+        app.session.start();
+        for _ in 0..100 {
+            app.session.advance(10000);
+            app.process_audio().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let (played, underruns, peak) = app.audio.as_ref().unwrap().stats();
+        println!(
+            "SB16 host output: source={} nonzero={} played={played} underruns={underruns} peak={peak}",
+            app.pcm_mixer.received(),
+            app.pcm_mixer.nonzero()
+        );
+        assert!(played > 1000);
+        assert!(peak > 0.1);
+    }
+
+    #[test]
+    #[ignore = "requires the user's HoMnM installation and ISO; runs the real setup without window/audio"]
+    fn local_heroes_setup_profile_reaches_menus_and_exits_without_saving() {
+        use clap::Parser;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cli = crate::cli::Cli::parse_from([
+            std::ffi::OsString::from("doslet"),
+            "--config".into(),
+            root.join("games/HoMnM.toml").into_os_string(),
+            "--game".into(),
+            root.join("games/HoMnM/SETUP.EXE").into_os_string(),
+            "--no-audio".into(),
+        ]);
+        let mut app = Doslet::from_cli(cli).unwrap();
+        let text = |session: &Session| -> String {
+            session
+                .ram_view(0xB8000..0xB8000 + 4000)
+                .unwrap()
+                .chunks_exact(2)
+                .map(|cell| char::from(cell[0]))
+                .collect()
+        };
+        app.session.advance(90_000_000);
+        assert_eq!(
+            app.session.status(),
+            SessionStatus::Running,
+            "{:?}",
+            app.session.fault()
+        );
+        assert!(text(&app.session).contains("Main Menu"));
+        assert!(text(&app.session).contains("VESA Compatible"));
+        app.session.push_key(0x02, b'1').unwrap();
+        app.session.advance(20_000_000);
+        assert!(text(&app.session).contains("Select a New Sound Card"));
+        app.session.push_key(0x01, 0x1B).unwrap();
+        app.session.advance(20_000_000);
+        assert!(text(&app.session).contains("Main Menu"));
+        app.session.push_key(0x01, 0x1B).unwrap();
+        app.session.advance(20_000_000);
+        assert_eq!(
+            app.session.status(),
+            SessionStatus::Exited(0),
+            "{:?}",
+            app.session.fault()
+        );
+        println!(
+            "SETUP profile: menus and exit verified at {} steps",
+            app.session.steps()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the user's HEROES installation and homm1.gog ISO"]
+    fn local_heroes_profile_passes_the_cd_check() {
+        use clap::Parser;
+        let config =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../games/HoMnM.toml");
+        let cli = crate::cli::Cli::parse_from([
+            std::ffi::OsString::from("doslet"),
+            "--config".into(),
+            config.into_os_string(),
+            "--no-audio".into(),
+        ]);
+        let mut app = Doslet::from_cli(cli).unwrap();
+        app.session.advance(30_000_000);
+        assert_eq!(
+            app.session.status(),
+            SessionStatus::Running,
+            "{:?}",
+            app.session.fault()
+        );
+        let console = String::from_utf8_lossy(app.session.console());
+        assert!(!console.contains("Unable to access CD Drive"));
+        assert!(!console.contains("must have the Heroes CD"));
+        println!(
+            "HEROES profile: {:?}, steps={}, mode={:?}",
+            app.session.status(),
+            app.session.steps(),
+            app.session.video_mode()
+        );
+    }
 
     #[test]
     #[ignore = "requires the user's local games and TOML profiles; runs without a window or audio device"]

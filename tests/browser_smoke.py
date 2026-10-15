@@ -64,7 +64,7 @@ class Marionette:
         raise AssertionError(f"Timed out: {expression}; state: {self.script('return window.result || null;')}")
 
 
-def game_zip(mt32=False):
+def game_zip(mt32=False, pcm=False):
     # Original fixture: draw color 42, transmit a note, busy-loop indefinitely.
     program = bytes.fromhex("b81300cd10b800a08ec031ffb900fab02af3aa ba3103 b03fee ba3003 ec b090ee b045ee b064ee ebfe")
     if mt32:
@@ -72,6 +72,15 @@ def game_zip(mt32=False):
         message += [(-sum(message[5:])) & 127,0xf7,0x91,69,100]
         program = bytes.fromhex("b81300cd10b800a08ec031ffb900fab02af3aa ba3103 b03fee ba3003 ec")
         program += b"".join(bytes([0xb0,byte,0xee]) for byte in message) + bytes.fromhex("ebfe")
+    if pcm:
+        # Original SB16 fixture; keep DAC on without legacy D1 (real SB16 behavior).
+        program = bytes.fromhex("b0ff e621 b80020 8ec0 31ff b840c0 b98000 f3ab")
+        for port, value in [(0x0a,5),(0x0c,0),(2,0),(2,0),(3,255),(3,0),(0x83,2),(0x0b,0x59),(0x0a,1)]:
+            program += bytes([0xb0,value,0xe6,port])
+        program += bytes.fromhex("ba2c02")
+        for value in [0x41,0x3e,0x80,0xc6,0,0xff,0]:
+            program += bytes([0xb0,value,0xee])
+        program += bytes.fromhex("ebfe")
     data = io.BytesIO()
     with zipfile.ZipFile(data, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("GAME/TEST.COM", program)
@@ -87,9 +96,11 @@ def main():
     args = parser.parse_args()
     bridge_path = next(DIST.glob("snippets/*/src/browser/bridge.js")).relative_to(DIST)
     page = f"""<!doctype html><html><head><base href="/"></head><body>
+    <canvas width="640" height="480"></canvas><button id="capture">Capture mouse</button>
     <script type="module">
     import {{Browser}} from '/{bridge_path}';
     window.bridge = new Browser(); window.result = {{events: []}};
+    document.getElementById('capture').onclick = () => bridge.captureMouse();
     setInterval(() => {{
         const packet = bridge.poll();
         if (packet.event) result.events.push(packet.event);
@@ -102,6 +113,8 @@ def main():
         }}
     }}, 16);
     window.mtZip = new Uint8Array({game_zip(True)});
+    window.pcmZip = new Uint8Array({game_zip(pcm=True)});
+    window.originalZip = new Uint8Array({game_zip()});
     window.startTest = () => {{
         bridge.resumeAudio().then(() => result.resumed = true).catch(e => result.error = String(e));
         bridge.importZip(new Uint8Array({game_zip()}));
@@ -194,6 +207,27 @@ def main():
                 driver.wait("result.state.status === 1 && result.audio.notes === 1 && result.state.steps < 2000000")
                 assert not driver.script("return result.events.some(e => ['error', 'audio-error'].includes(e.kind));"), driver.script("return result.events;")
                 print("pause/resume/reset and bounded channels: OK", flush=True)
+                element = driver.call("WebDriver:FindElement", {"using":"css selector","value":"#capture"})["value"]
+                element_id = element["element-6066-11e4-a52e-4f735466cecf"]
+                driver.call("WebDriver:ElementClick", {"id":element_id})
+                driver.wait("bridge.mouseCaptured()")
+                driver.script("document.dispatchEvent(new MouseEvent('mousemove',{movementX:30,movementY:-20,bubbles:true})); return true;")
+                driver.script("bridge.command('pause',''); return true;")
+                driver.wait("!bridge.mouseCaptured() && result.state.status === 2")
+                driver.script("bridge.command('run',''); return true;")
+                driver.wait("result.state.status === 1")
+                assert not driver.script("return result.events.some(e => ['error','audio-error'].includes(e.kind));"), driver.script("return result.events;")
+                print("browser pointer lock from trusted click, relative input and pause release: OK", flush=True)
+                driver.script("result.events = []; bridge.importZip(pcmZip); return true;")
+                driver.wait("result.events.some(e => e.kind === 'imported')")
+                driver.script("bridge.command('start-game','GAME/TEST.COM'); return true;")
+                driver.wait("result.audio.pcmNonzero > 1000 && result.audio.peak > 0.1 && result.audio.notes === 0")
+                assert not driver.script("return result.events.some(e => ['error','audio-error'].includes(e.kind));"), driver.script("return result.events;")
+                print("guest SB16 DMA -> timestamped PCM -> Rust/WASM worklet without MIDI: OK", flush=True)
+                driver.script("result.events = []; bridge.importZip(originalZip); return true;")
+                driver.wait("result.events.some(e => e.kind === 'imported')")
+                driver.script("bridge.command('start-game','GAME/TEST.COM'); return true;")
+                driver.wait("result.audio.notes === 1 && result.audio.peak > 0.01")
                 # Mock only the external device boundary. This tests real browser
                 # framing, scheduling and switching without opening hardware MIDI.
                 driver.script("""

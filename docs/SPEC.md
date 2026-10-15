@@ -46,11 +46,15 @@ TOML file; CLI paths retain shell-relative semantics. Validate unknown fields,
 types, version, source files and audio requirements before loading the session.
 The supported profile scope is game name/executable, printable ASCII arguments
 (126-byte PSP command tail), absolute DOS working directory on C:, audio/MIDI,
-and an optional single directory mounted as C: with a sparse-write policy.
+and C: plus an optional immutable CD-ROM image mounted under D:–Z:.
 Launch setup and Reset preserve the same resolved settings. TOML is a native
 frontend dependency; runtime setup receives byte slices and no host paths.
-Multiple drives, CD-ROM mounts/MSCDEX, browser profile selection and persistent
-host saves remain pending. See [launch-profiles.md](launch-profiles.md).
+ISO file open/read/seek/close and attributes are read-only; CD default-drive
+selection, directory enumeration and browser profile selection remain pending.
+Native C: profiles support ro, overlay (default) and explicit rw modes. RW
+persists closed modified files with bounded streaming and atomic replacement
+in the native adapter; the core retains its sparse RAM write budget. See
+[launch-profiles.md](launch-profiles.md).
 
 ## Memory and performance requirements
 
@@ -95,6 +99,12 @@ width and bounded REP/REPE/REPNE, yielding after one element. General registers
 have 32-bit backing, with byte/word aliases preserving untouched high bits.
 In 16-bit code, operand-size override 66h supports selected dword moves, ALU,
 shifts/rotates, stack operations, near calls/returns and bounded string operations.
+SHLD/SHRD support word/dword register or memory destinations, immediate or CL
+counts masked to five bits, operand/address/segment overrides and defined result
+flags. A zero count preserves the destination and flags; OF is updated only for
+a one-bit shift. AF and multi-bit OF are undefined and retained deterministically.
+Word counts from 17 through 31 have undefined architectural results and stop
+explicitly in the current interpreter.
 FS/GS moves/overrides, PUSHA(D)/POPA(D), 16-bit ENTER/LEAVE, selected bit-immediate
 and MOVSX/MOVZX instructions, descriptor-table loads/stores, SMSW/LMSW and CR
 register moves support the observed DOS4GW startup path.
@@ -118,14 +128,29 @@ explicitly rather than delivering INT 0.
 an independent fixed-stack `doslet-x87` unit and clears EM. The default PC uses
 that unit and reports it through CMOS equipment bits. Supported x87 forms are
 control/status initialization and transfer, FLD1/FLDZ, register duplication and
-sign change, FXCH ST(i), selected m32/m64 loads/stores, FCOMPP, finite-memory
-FCOMP, register FDIV/FDIVR/FDIVP/FDIVRP and finite FMULP/FSUBP/FSUBRP.
+sign change, FXCH ST(i), FST/FSTP ST(i), selected m32/m64 loads/stores, FCOMPP, finite-memory
+FCOMP, register FDIV/FDIVR/FDIVP/FDIVRP, finite FADD/FMUL/FSUB/FSUBR
+with ST(0) destinations and finite FADDP/FMULP/FSUBP/FSUBRP.
+FILD accepts signed 16/32/64-bit memory integers without rounding away any
+integer bits, independently of precision/rounding control. Selected normal
+finite memory arithmetic supports FADD/FMUL/FSUB/FSUBR/FDIV/FDIVR with m32/m64
+operands. Register FST/FSTP copies retained precision and tags without rounding,
+including empty destinations and FSTP ST(0) as a single pop. Empty sources remain
+explicit stack errors under the current stack-exception model.
+Memory FST/FSTP rounds normal finite values to the destination's binary32/64
+precision using RC, sets precision/C1 status and retains ST(0) until a successful
+store/pop; PC does not select memory-store precision.
+FRNDINT and FIST/FISTP m16/m32/m64int use RC without losing retained integer
+bits. Integer stores check signed bounds and return integer indefinite with
+masked invalid status for out-of-range/nonfinite inputs; unmasked exceptions
+stop before storing or popping. Dword ENTER builds bounded nested stack frames
+and BSF/BSR support both operand widths, including their defined zero flag.
 Finite arithmetic retains a normalized 64-bit significand using integer
 intermediates, applies the control word's 24/53/64-bit precision and four rounding
-modes, and reports precision exceptions and C1. Division also supports masked
+modes, and reports precision exceptions and C1. Register division also supports masked
 zero/invalid results. Normal arithmetic results currently support exponents
 from -1022 through 1022; extended exponent range, subnormal arithmetic results,
-inexact memory stores, nonfinite memory loads, unmasked exceptions and other
+subnormal/overflow memory stores, nonfinite memory loads, unmasked exceptions and other
 forms stop explicitly. The binary64 register view is diagnostic; it does not
 replace the retained arithmetic significand. Full 80-bit formats and exception
 delivery remain pending. Captured native x87 reference vectors cover 360
@@ -144,13 +169,22 @@ inhibit one following instruction. Interrupt-enabled HLT idles until delivery;
 the machine can combine idle scheduling units up to the earliest PIT/DSP event,
 remaining batch budget or 1-ms guest-time limit. Pending eligible IRQs and
 IF-disabled HLT do not fast-forward. The PC also recognizes the exact unprefixed
-`IN AL,DX; AND AL,08h; JZ/JNZ -5` pattern on the active VGA input-status port.
+`IN AL,DX; AND AL,08h; JZ/JNZ -5` pattern and the corresponding
+`TEST AL,AH` form with AH=08h on the active VGA input-status port.
 After discovery and a complete confirming iteration, whole taken iterations can
 advance together strictly before a VGA retrace/PIT/DSP event, remaining budget
 or 1-ms bound. AL, flags and instruction phase remain equivalent to ordinary
-stepping. IF-disabled waits retain pending PIC state; pending eligible IRQs,
+stepping. For TEST, the final complete iteration executes normally to preserve
+unmasked AL bits that can change with display-enable status between retraces.
+Changing AH disables that candidate. IF-disabled waits retain pending PIC state; pending eligible IRQs,
 interrupt shadows, TF/RF/VM, paging, changed code/CS/DX and inactive ports fall
-back. Ordinary one-step/debug execution cannot batch. Architectural exception delivery and
+back. Ordinary one-step/debug execution cannot batch. An experimental native
+Heroes flag enables caller-selected memory waits: exact CMP-dword/JNE loops at
+three known sites, a positive ordinary-RAM counter and matching arithmetic flags.
+Whole iterations stop before PIT/DSP deadlines, with a 1-ms bound; IRQ eligibility,
+shadow/debug state, paging and changed code force ordinary execution. The counter
+is changed by guest code, never by the optimizer. This feature is off by default.
+Architectural exception delivery and
 complete historical CPU-model behavior are not implemented. Unsupported opcodes,
 operands, ports and services stop the session with a diagnostic; a faulted
 instruction is not guaranteed to have rolled back its earlier side effects.
@@ -259,6 +293,12 @@ Default-drive, break-check flag, InDOS/critical-error flag pointers, DTA, vector
 get/set, DOS-version, US country information with an
 ASCII far-call uppercase callback, deterministic date/time, handle timestamp
 queries and device-info services implement selected observed startup calls.
+AH=36h reports sectors/cluster, available clusters, bytes/sector and total
+clusters for C:, its default-drive alias and a mounted CD. Invalid drives return
+AX=FFFFh without repurposing carry. C: free space is the remaining bounded RAM
+overlay budget, including native RW launches; the service never queries host
+storage. Read-only C: and CD report no write space. Sector counts are rounded
+into representable power-of-two clusters; file/extent limits remain independent.
 Handle-based directory enumeration, a full DOS ABI and non-ASCII name/code-page
 handling remain pending.
 
@@ -267,8 +307,21 @@ services reflect the actual gate. Other unavailable INT 15h functions return
 AH=86h/CF=1. DPMI, XMS and VCPI installation probes report absence through their
 defined status registers; no external host is installed. Their explicit IVT
 shims prevent startup from running uninitialized RAM through a null vector.
-The MSCDEX installation probe (INT 2Fh/AX=1500h) returns BX=CX=0: no CD-ROM
-drives are installed. CD-ROM mounting and remaining MSCDEX services are pending.
+The runtime accepts one immutable ISO 9660 image through `Session::with_cdrom_image`
+and implements MSCDEX INT 2Fh services 1500h, 1502h–1508h, 150Ah–150Eh
+for drive discovery, primary-volume metadata and sector reads. Invalid image
+layouts are rejected during setup; out-of-range reads return DOS/MSCDEX errors.
+Without a configured image, the installation probe reports BX=CX=0. The native
+launch-profile loader configures an ISO image under D:–Z:. Absolute file paths
+on that drive support DOS open/read/seek/close, read-only attributes, handle
+device information and timestamp queries. Writes return access denied. The
+independent `doslet-iso9660` crate handles primary-volume directory records,
+case-insensitive names and file-version suffixes; one media buffer is retained.
+Joliet/Rock Ridge names, multi-extent/interleaved files, CD default-drive/CWD,
+FCB/FindFirst enumeration, MSCDEX device requests and audio commands are pending.
+MSCDEX sector reads are limited to 32 sectors per call, bounding guest copies to
+64 KiB; larger requests stop explicitly. ISO lookup is limited to 4096 directory
+records per call and setup scans at most 64 volume descriptors.
 
 BIOS/DOS HLE services are installed at explicit F000h shim addresses. A guest
 INT must follow its current IVT vector, including vectors replaced by guest code.
@@ -316,7 +369,7 @@ bootstrap inspector.
 | --- | --- | --- |
 | i8259 | Master interrupt delivery plus independent slave register bank at A0h/A1h; fixed priority, masks, initialization and EOI | Cascading, full ICW/OCW behavior, auto-EOI and rotating/level modes |
 | i8237 | Independent four-channel register/transfer state; two PC controllers, page registers, byte/word RAM transfers, counts, masks and auto-init | Full arbitration/cascade timing, memory-to-memory and MMIO transfers |
-| i8254 | Binary modes 2/3, count latch, low/high accesses, batched clocks and IRQ0 through the functional timeline | Modes 0/1/4/5, gates, read-back, BCD and exact load-edge timing |
+| i8254 | Binary modes 0/2/3, count latch, low/high accesses, gates, batched clocks and IRQ0 through the functional timeline; channel 2 gate/output at 61h | Modes 1/4/5, read-back, BCD and exact periodic load-edge timing |
 | VGA | Linear A0000h aperture, mode-13h pixels, six-bit palette writes, miscellaneous/sequencer/graphics/CRTC configuration readback | Text/planar modes, register effects on rendering/memory, raster events and vendor SVGA extensions |
 | VBE | 512 KiB VRAM, banked 640×480×8 mode 101h, borrowed scanout; BIOS 4F00/01/02/03/05 and far-call bank switch | More modes, LFB/PM interface, scanline/display-start controls and timing |
 | MPU-401 | UART command/status/acknowledgements, 1024-byte output queue and allocation-free drain at 330h/331h | Synthesizer/host audio, serial timing, IRQs and intelligent mode |
@@ -329,6 +382,11 @@ entries form a test color cube. This is not complete VGA BIOS palette emulation.
 VGA configuration banks retain defined register fields, enforce CRTC protection
 and color/mono port selection, and report absent SVGA extension registers as FFh.
 Programmable register effects on raster/planar memory are not yet implemented.
+INT 10h AX=1000h/1001h updates the attribute palette/overscan registers with
+six-bit values. Selected extension BIOS probes (6F00h, 5F00h with BX=0 and
+AH=12h/BX=0080h) retain registers rather than returning an installed-vendor
+signature. The absent Tseng bank register at 3CDh floats high and ignores
+writes; generic VBE bank selection still uses the supported BIOS interface.
 Selected text/mode-13h/VBE timings drive input-status blanking/retrace; the guest
 can poll 3BAh/3DAh without host-refresh-dependent or read-toggle timing.
 The VBE adapter advertises version 1.2 and mode 101h only, with one 64-KiB
@@ -342,9 +400,19 @@ ports still stop explicitly. SB16 reports DSP 4.05 and mixer IRQ7/DMA1/DMA5
 configuration. Functional DMA/PCM/IRQ execution is covered by synthetic and real
 startup runs; host playback and MIDI synthesis remain pending. A 4096-frame
 preallocated PCM queue stops explicitly when the host fails to drain it.
+Uninstalled WSS codec windows 530h–537h, 608h–60Bh, E84h–E87h and F44h–F47h
+float high on reads and ignore writes so DOS setup probes detect no codec.
+The uninstalled legacy Sound Blaster base windows 210h, 230h, 240h, 250h, 260h
+and 280h behave the same; the emulated DSP remains at 220h.
 PIC advanced configuration is not yet validated; use its documented subset.
 PIT unsupported control modes return an error. The machine adapter's current
 port error identifies the rejected port, not yet the precise chip command.
+Mode 0 loads on the next clock edge, pauses under a low gate, raises OUT once
+at terminal count and continues wrapping the 16-bit counter without more IRQ
+edges. Its first low-byte write stops counting and clears OUT until the high
+byte completes the reload. All three channels receive guest PIT clock ticks;
+only channel 0 requests IRQ0. Port 61h bit 0 controls channel 2's gate and bit 5
+reads its output. Speaker audio generation remains pending.
 
 Keyboard/mouse, OPL and storage controllers must be
 separate chip/card libraries as they are implemented. Sound Blaster card
@@ -382,6 +450,17 @@ graphic cursor masks, motion counters and event callbacks (000Ch/0014h).
 Callbacks execute guest far-call code through a bounded interrupt wrapper,
 preserving full general registers, segment registers and FLAGS. Raw PS/2
 mouse-controller protocol and IRQ timing remain pending.
+Native pointer capture uses a local iced runtime/winit patch: Locked with
+Confined fallback, relative device motion and captured button events. A bounded
+128-event stream releases capture on overflow/disconnection. Esc is consumed
+to release capture; focus loss, pause, reset and termination release it too.
+Capture generations reject delayed events from a previous session. Browser
+capture uses DOM Pointer Lock from a display click and sends relative movement
+directly to the machine Worker. Raw INT 33h/000Bh motion counters continue at
+guest cursor bounds; only logical cursor coordinates are clamped. Fractional
+host movement is retained without allocating or retaining offscreen movement
+debt. The selected relative adapter uses one logical unit per motion unit;
+full historical mouse-driver acceleration and mickey-ratio scaling are pending.
 
 Browser presentation uses iced's tiny-skia renderer with Canvas2D. A small
 separate Rust/WASM AudioWorklet module pulls samples from a fixed 16384-byte

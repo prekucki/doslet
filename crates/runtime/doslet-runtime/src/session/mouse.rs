@@ -1,7 +1,43 @@
 use super::*;
 impl Session {
+    pub(super) fn mouse_video_mode_changed(&mut self) {
+        self.mouse_fraction = [0.0; 2];
+        let (_, height) = self.pointer_dimensions();
+        let old_height = u32::from(self.mouse.y_range.1.saturating_sub(self.mouse.y_range.0)) + 1;
+        let old_y = u32::from(self.mouse.y.saturating_sub(self.mouse.y_range.0));
+        self.mouse.y = (old_y * u32::from(height) / old_height).min(u32::from(height - 1)) as u16;
+        self.mouse.x = self.mouse.x.min(639);
+        self.mouse.x_range = (0, 639);
+        self.mouse.y_range = (0, height - 1);
+        self.mouse.motion = (0, 0);
+        self.mouse.pending = 0;
+        self.mouse.revision = self.mouse.revision.wrapping_add(1);
+    }
     pub fn pointer_move(&mut self, x: u16, y: u16) {
+        self.mouse_fraction = [0.0; 2];
         self.mouse.move_to(x, y);
+    }
+    /// Relative host movement continues at window edges. Fractional movement
+    /// is retained; movement beyond guest bounds never creates a return debt.
+    pub fn pointer_relative(&mut self, dx: f64, dy: f64) {
+        if !dx.is_finite() || !dy.is_finite() {
+            return;
+        }
+        let position = [self.mouse.x, self.mouse.y];
+        let mut motion = [0; 2];
+        let ranges = [self.mouse.x_range, self.mouse.y_range];
+        for (axis, delta) in [dx, dy].into_iter().enumerate() {
+            let delta = delta.clamp(-32767.0, 32767.0) + self.mouse_fraction[axis];
+            let whole = delta as i32;
+            motion[axis] = whole as i16;
+            self.mouse_fraction[axis] = delta - f64::from(whole);
+            let value = i32::from(position[axis]) + whole;
+            let (low, high) = ranges[axis];
+            if value < i32::from(low) || value > i32::from(high) {
+                self.mouse_fraction[axis] = 0.0;
+            }
+        }
+        self.mouse.move_relative(motion[0], motion[1]);
     }
     pub fn pointer_button(&mut self, button: u8, pressed: bool) {
         self.mouse.button(button, pressed);
@@ -18,6 +54,12 @@ impl Session {
                 200
             },
         )
+    }
+    pub fn pointer_position(&self) -> (u16, u16) {
+        (self.mouse.x, self.mouse.y)
+    }
+    pub fn pointer_ranges(&self) -> ((u16, u16), (u16, u16)) {
+        (self.mouse.x_range, self.mouse.y_range)
     }
     pub(super) fn dispatch_mouse(&mut self) -> Result<(), RuntimeError> {
         if self.machine.cpu.protected_mode() {
@@ -52,8 +94,10 @@ impl Session {
         let (bx, cx, dx, es) = (r.get(Gpr16::Bx), r.get(Gpr16::Cx), r.get(Gpr16::Dx), r.es);
         match ax {
             0 | 0x21 => {
+                self.mouse_fraction = [0.0; 2];
                 self.mouse = doslet_dos::mouse::Mouse::default();
                 self.mouse.y_range.1 = self.pointer_dimensions().1 - 1;
+                self.mouse.y = self.pointer_dimensions().1 / 2;
                 self.machine.cpu.registers.set(Gpr16::Ax, 0xFFFF);
                 self.machine.cpu.registers.set(Gpr16::Bx, 2);
             }
@@ -73,7 +117,10 @@ impl Session {
                 self.machine.cpu.registers.set(Gpr16::Cx, self.mouse.x);
                 self.machine.cpu.registers.set(Gpr16::Dx, self.mouse.y);
             }
-            4 => self.mouse.move_to(cx, dx),
+            4 => {
+                self.mouse_fraction = [0.0; 2];
+                self.mouse.move_to(cx, dx);
+            }
             5 | 6 if bx < 3 => {
                 let history = if ax == 5 {
                     &mut self.mouse.presses[usize::from(bx)]

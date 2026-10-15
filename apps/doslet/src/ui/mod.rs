@@ -170,22 +170,34 @@ pub fn view(app: &Doslet) -> Element<'_, Message> {
     let viewport: Element<'_, Message> = if let Some(handle) = &app.display.image {
         let handle = handle.clone();
         let (pointer_width, pointer_height) = app.pointer_dimensions();
-        responsive(move |size| {
-            let width = size.width.min(size.height * 4.0 / 3.0);
-            container(
+        let cursor = if app.hide_host_cursor() {
+            iced::mouse::Interaction::Hidden
+        } else {
+            iced::mouse::Interaction::None
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let actual_size = app.display_sizing.image_size(&app.display);
+        #[cfg(target_arch = "wasm32")]
+        let actual_size: Option<iced::Size> = None;
+        responsive(move |available| {
+            let size =
+                actual_size.unwrap_or_else(|| crate::presentation::fit_size(available, 4.0 / 3.0));
+            let (width, height) = (size.width, size.height);
+            let content = container(
                 iced::widget::mouse_area(
                     image(handle.clone())
                         .filter_method(image::FilterMethod::Nearest)
                         .content_fit(iced::ContentFit::Fill)
                         .width(width)
-                        .height(width * 3.0 / 4.0),
+                        .height(height),
                 )
+                .interaction(cursor)
                 .on_move(move |position| {
                     Message::PointerMoved(
                         (position.x / width * f32::from(pointer_width))
                             .clamp(0.0, f32::from(pointer_width - 1))
                             as u16,
-                        (position.y / (width * 3.0 / 4.0) * f32::from(pointer_height))
+                        (position.y / height * f32::from(pointer_height))
                             .clamp(0.0, f32::from(pointer_height - 1))
                             as u16,
                     )
@@ -195,10 +207,25 @@ pub fn view(app: &Doslet) -> Element<'_, Message> {
                 .on_right_press(Message::PointerButton(1, true))
                 .on_right_release(Message::PointerButton(1, false))
                 .on_exit(Message::PointerLeft),
-            )
-            .center_x(Fill)
-            .center_y(Fill)
-            .into()
+            );
+            if actual_size.is_some() {
+                // Keep the complete raster at 1:1 if the desktop limits the
+                // requested window size, or the user later shrinks the window.
+                scrollable(
+                    content
+                        .center_x(available.width.max(width))
+                        .center_y(available.height.max(height)),
+                )
+                .direction(scrollable::Direction::Both {
+                    vertical: scrollable::Scrollbar::default(),
+                    horizontal: scrollable::Scrollbar::default(),
+                })
+                .width(Fill)
+                .height(Fill)
+                .into()
+            } else {
+                content.center_x(Fill).center_y(Fill).into()
+            }
         })
         .into()
     } else {
@@ -217,26 +244,62 @@ pub fn view(app: &Doslet) -> Element<'_, Message> {
         .center_y(Fill)
         .into()
     };
+    #[cfg(not(target_arch = "wasm32"))]
+    let viewport = iced::widget::sensor(viewport)
+        .on_show(|size| Message::DisplaySizing(crate::presentation::SizingMessage::Viewport(size)))
+        .on_resize(|size| {
+            Message::DisplaySizing(crate::presentation::SizingMessage::Viewport(size))
+        });
     let viewport = container(viewport)
         .padding(18)
         .height(Fill)
         .width(Fill)
         .style(panel);
+    let display_heading = row![
+        text("GUEST DISPLAY · Click to capture mouse · Esc releases")
+            .size(11)
+            .color(MUTED),
+        space::horizontal(),
+        text(
+            app.session
+                .frame()
+                .map_or("80 × 25 · text".into(), |frame| format!(
+                    "{} × {} · 256 colors",
+                    frame.width, frame.height
+                ))
+        )
+        .size(12)
+        .color(MUTED)
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
+    #[cfg(not(target_arch = "wasm32"))]
+    let display_heading = {
+        use crate::presentation::SizingMessage;
+        let mut actual =
+            button(text("1:1").size(12))
+                .padding([4, 8])
+                .style(if app.display_sizing.actual_size {
+                    button::primary
+                } else {
+                    button::secondary
+                });
+        if app.display.dimensions().is_some() {
+            actual = actual.on_press(Message::DisplaySizing(SizingMessage::ActualSize));
+        }
+        display_heading.push(actual).push(
+            button(text("Fit").size(12))
+                .padding([4, 8])
+                .style(if app.display_sizing.actual_size {
+                    button::secondary
+                } else {
+                    button::primary
+                })
+                .on_press(Message::DisplaySizing(SizingMessage::Fit)),
+        )
+    };
     let display = column![
-        row![
-            text("GUEST DISPLAY").size(11).color(MUTED),
-            space::horizontal(),
-            text(
-                app.session
-                    .frame()
-                    .map_or("80 × 25 · text".into(), |frame| format!(
-                        "{} × {} · 256 colors",
-                        frame.width, frame.height
-                    ))
-            )
-            .size(12)
-            .color(MUTED)
-        ],
+        display_heading,
         viewport,
         text("Keyboard: type into the game; arrows and Enter select menu items.")
             .size(12)

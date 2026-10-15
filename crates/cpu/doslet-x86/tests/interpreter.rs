@@ -6,6 +6,137 @@ struct TestBus {
     writes: usize,
     ports: [u8; 256],
 }
+#[test]
+fn x87_fst_and_fstp_decode_all_registers_and_preserve_retained_precision() {
+    for pop in [false, true] {
+        for index in 0..8 {
+            let mut bus = TestBus::new(&[0xDD, (if pop { 0xD8 } else { 0xD0 }) + index]);
+            let mut cpu = Cpu::default().with_x87();
+            let exact = (1_i64 << 60) + 1;
+            let fpu = cpu.fpu.as_mut().unwrap();
+            fpu.push_integer(exact).unwrap();
+            fpu.load_control(0x007F); // Single-precision PC must not round register copies.
+            let flags = cpu.flags;
+            cpu.step(&mut bus).unwrap();
+            assert_eq!(cpu.registers.ip, 2);
+            assert_eq!(cpu.flags, flags);
+            assert_eq!(bus.writes, 0);
+            let fpu = cpu.fpu.as_mut().unwrap();
+            assert_eq!((fpu.status() >> 11) & 7, if pop { 0 } else { 7 });
+            if pop && index == 0 {
+                assert_eq!(fpu.tags(), 0xFFFF); // DD D8 discards precisely ST(0).
+            } else {
+                if pop {
+                    fpu.duplicate(index - 1).unwrap();
+                } else {
+                    fpu.exchange(index).unwrap();
+                }
+                assert_eq!(fpu.store_integer(64), Ok(exact as u64));
+            }
+        }
+    }
+}
+#[test]
+fn x87_register_arithmetic_decodes_without_popping_the_source() {
+    for (modrm, expected) in [(0xC1, 7.5), (0xC9, 12.5), (0xE1, 2.5), (0xE9, -2.5)] {
+        let mut bus = TestBus::new(&[0xD8, modrm]);
+        let mut cpu = Cpu::default().with_x87();
+        cpu.fpu.as_mut().unwrap().push(2.5).unwrap();
+        cpu.fpu.as_mut().unwrap().push(5.0).unwrap();
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.as_ref().unwrap().store_value(), Ok(expected));
+        assert_eq!(cpu.fpu.as_ref().unwrap().st(1), Ok(2.5));
+        assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x3800, 0x3000);
+    }
+}
+
+#[test]
+fn x87_faddp_updates_the_destination_and_pops_only_after_success() {
+    let mut bus = TestBus::new(&[0xDE, 0xC1]);
+    let mut cpu = Cpu::default().with_x87();
+    cpu.fpu.as_mut().unwrap().push_integer(1_i64 << 60).unwrap();
+    cpu.fpu.as_mut().unwrap().push_integer(1).unwrap();
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(
+        cpu.fpu.as_mut().unwrap().store_integer(64),
+        Ok((1_u64 << 60) + 1)
+    );
+    assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x3800, 0x3800);
+    assert!(cpu.fpu.as_ref().unwrap().st(1).is_err());
+
+    let mut bus = TestBus::new(&[0xDE, 0xC1]);
+    let mut cpu = Cpu::default().with_x87();
+    let fpu = cpu.fpu.as_mut().unwrap();
+    fpu.push(1.0).unwrap();
+    fpu.push(1.0 / 3.0).unwrap();
+    fpu.load_control(0x005F); // Single precision, unmasked precision exception.
+    assert!(cpu.step(&mut bus).is_err());
+    assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x3800, 0x3000);
+    assert_eq!(cpu.fpu.as_ref().unwrap().st(1), Ok(1.0));
+}
+
+#[test]
+fn bit_scans_cover_both_widths_zero_inputs_and_one_hot_positions() {
+    for dword in [false, true] {
+        for opcode in [0xBC, 0xBD] {
+            for bit in 0..if dword { 32 } else { 16 } {
+                let mut code = Vec::new();
+                if dword {
+                    code.push(0x66);
+                }
+                code.extend_from_slice(&[0x0F, opcode, 0xC2]);
+                let mut bus = TestBus::new(&code);
+                let mut cpu = Cpu::default();
+                cpu.registers.set32(Gpr32::Eax, 0xABCD_FFFF);
+                cpu.registers.set32(Gpr32::Edx, 1 << bit);
+                cpu.flags |= flags::ZERO;
+                cpu.step(&mut bus).unwrap();
+                assert_eq!(
+                    cpu.registers.get32(Gpr32::Eax),
+                    if dword { bit } else { 0xABCD0000 | bit }
+                );
+                assert_eq!(cpu.flags & flags::ZERO, 0);
+                cpu.registers.ip = 0;
+                cpu.registers.set32(Gpr32::Edx, 0);
+                let before = cpu.registers.get32(Gpr32::Eax);
+                cpu.step(&mut bus).unwrap();
+                assert_eq!(cpu.registers.get32(Gpr32::Eax), before);
+                assert_ne!(cpu.flags & flags::ZERO, 0);
+            }
+        }
+    }
+    let mut bus = TestBus::new(&[0x0F, 0xBD, 0x06, 0, 2]);
+    bus.write_u16(0x200, 0x8100).unwrap();
+    let mut cpu = Cpu::default();
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(cpu.registers.get(Gpr16::Ax), 15);
+}
+
+#[test]
+fn fistp_writes_each_integer_width_and_unmasked_invalid_does_not_store_or_pop() {
+    for (opcode, modrm, width) in [(0xDF, 0x1E, 2), (0xDB, 0x1E, 4), (0xDF, 0x3E, 8)] {
+        let mut bus = TestBus::new(&[opcode, modrm, 0, 2]);
+        let mut cpu = Cpu::default().with_x87();
+        cpu.fpu.as_mut().unwrap().push(-1.5).unwrap();
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(
+            &bus.ram[0x200..0x200 + width],
+            &(-2_i64).to_le_bytes()[..width]
+        );
+        assert_eq!(cpu.fpu.as_ref().unwrap().tags(), 0xFFFF);
+    }
+    let mut bus = TestBus::new(&[0xDF, 0x1E, 0, 2]);
+    bus.ram[0x200..0x202].fill(0xAA);
+    let mut cpu = Cpu::default().with_x87();
+    cpu.fpu.as_mut().unwrap().push(32768.0).unwrap();
+    cpu.fpu.as_mut().unwrap().load_control(0x037E);
+    assert!(matches!(
+        cpu.step(&mut bus),
+        Err(doslet_x86::CpuError::X87Arithmetic { .. })
+    ));
+    assert_eq!(&bus.ram[0x200..0x202], &[0xAA; 2]);
+    assert_eq!(cpu.fpu.as_ref().unwrap().st0(), Ok(32768.0));
+}
 impl TestBus {
     fn new(code: &[u8]) -> Self {
         let mut ram = vec![0; 1024 * 1024].into_boxed_slice();
@@ -47,6 +178,131 @@ impl PortBus for TestBus {
             .ok_or(BusError::UnmappedPort(port))? = value;
         Ok(())
     }
+}
+
+#[test]
+fn double_shifts_match_bit_serial_results_flags_and_operand_widths() {
+    for dword in [false, true] {
+        let width = if dword { 32 } else { 16 };
+        let mask = if dword { u32::MAX } else { 0xFFFF };
+        for opcode in [0xA4, 0xA5, 0xAC, 0xAD] {
+            for raw_count in [0u8, 1, 4, 15, 16, 31, 32, 33] {
+                let count = raw_count & 31;
+                if count > width {
+                    continue;
+                }
+                for (original, source) in [
+                    (0u32, 0u32),
+                    (u32::MAX, 0),
+                    (0x8000_8001, 0x1234_5678),
+                    (0x1234_ABCD, 0x8765_4321),
+                ] {
+                    let mut code = Vec::new();
+                    if dword {
+                        code.push(0x66);
+                    }
+                    code.extend_from_slice(&[0x0F, opcode, 0xD0]); // Destination AX/EAX, source DX/EDX.
+                    if opcode & 1 == 0 {
+                        code.push(raw_count);
+                    }
+                    let mut bus = TestBus::new(&code);
+                    let mut cpu = Cpu::default();
+                    cpu.registers.set32(Gpr32::Eax, original);
+                    cpu.registers.set32(Gpr32::Edx, source);
+                    cpu.registers
+                        .set32(Gpr32::Ecx, 0xFACE_1200 | u32::from(raw_count));
+                    let previous = 2
+                        | flags::CARRY
+                        | flags::OVERFLOW
+                        | flags::AUXILIARY
+                        | flags::DIRECTION
+                        | flags::INTERRUPT;
+                    cpu.flags = previous;
+                    let mut expected = original & mask;
+                    let mut feed = source & mask;
+                    let mut carry = 1;
+                    for _ in 0..count {
+                        if opcode & 8 != 0 {
+                            carry = expected & 1;
+                            expected = (expected >> 1) | ((feed & 1) << (width - 1));
+                            feed >>= 1;
+                        } else {
+                            carry = (expected >> (width - 1)) & 1;
+                            expected = ((expected << 1) & mask) | ((feed >> (width - 1)) & 1);
+                            feed = (feed << 1) & mask;
+                        }
+                    }
+                    cpu.step(&mut bus).unwrap();
+                    assert_eq!(
+                        cpu.registers.get32(Gpr32::Eax),
+                        (original & !mask) | expected
+                    );
+                    assert_eq!(cpu.registers.get32(Gpr32::Edx), source);
+                    assert_eq!(
+                        cpu.registers.get32(Gpr32::Ecx),
+                        0xFACE_1200 | u32::from(raw_count)
+                    );
+                    if count == 0 {
+                        assert_eq!(cpu.flags, previous);
+                        continue;
+                    }
+                    assert_eq!(cpu.flags & flags::CARRY, carry);
+                    assert_eq!(cpu.flags & flags::ZERO != 0, expected == 0);
+                    assert_eq!(
+                        cpu.flags & flags::SIGN != 0,
+                        expected & (1 << (width - 1)) != 0
+                    );
+                    assert_eq!(
+                        cpu.flags & flags::PARITY != 0,
+                        (expected as u8).count_ones().is_multiple_of(2)
+                    );
+                    let unaffected = flags::AUXILIARY | flags::DIRECTION | flags::INTERRUPT;
+                    assert_eq!(cpu.flags & unaffected, previous & unaffected);
+                    if count == 1 {
+                        assert_eq!(
+                            cpu.flags & flags::OVERFLOW != 0,
+                            (original ^ expected) & (1 << (width - 1)) != 0
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn double_shifts_use_segment_and_address_overrides_for_memory_destinations() {
+    let mut bus = TestBus::new(&[0x26, 0x0F, 0xAC, 0x15, 4]);
+    let mut cpu = Cpu::default();
+    cpu.registers.es = 0x2000;
+    cpu.registers.set(Gpr16::Di, 0x100);
+    cpu.registers.set(Gpr16::Dx, 0x000F);
+    bus.write_u16(0x20100, 0x1234).unwrap();
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(bus.read_u16(0x20100).unwrap(), 0xF123);
+    let mut bus = TestBus::new(&[0x67, 0x66, 0x0F, 0xAC, 0x54, 0xB3, 0x10, 8]);
+    let mut cpu = Cpu::default();
+    cpu.registers.ds = 0x1000;
+    cpu.registers.set32(Gpr32::Ebx, 0x200);
+    cpu.registers.set32(Gpr32::Esi, 0x20);
+    cpu.registers.set32(Gpr32::Edx, 0xAABB_CCDD);
+    bus.ram[0x10290..0x10294].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(&bus.ram[0x10290..0x10294], &0xDD12_3456u32.to_le_bytes());
+}
+
+#[test]
+fn undefined_word_double_shift_counts_stop_without_changing_registers() {
+    let mut bus = TestBus::new(&[0x0F, 0xAC, 0xD0, 17]);
+    let mut cpu = Cpu::default();
+    cpu.registers.set32(Gpr32::Eax, 0x1234_5678);
+    let previous = cpu.flags;
+    assert!(matches!(
+        cpu.step(&mut bus),
+        Err(doslet_x86::CpuError::UnsupportedOperand { .. })
+    ));
+    assert_eq!(cpu.registers.get32(Gpr32::Eax), 0x1234_5678);
+    assert_eq!(cpu.flags, previous);
 }
 
 #[test]
@@ -713,6 +969,67 @@ fn x87_control_initialization_and_zero_storage_use_real_state() {
     cpu.step(&mut bus).unwrap();
     assert_eq!(&bus.ram[0x210..0x218], &[0; 8]);
     assert_eq!(cpu.fpu.as_ref().unwrap().tags(), 0xFFFF);
+}
+
+#[test]
+fn fild_signed_integer_widths_and_address_override_preserve_cpu_state() {
+    for (opcode, modrm, width, value) in [
+        (0xDF, 0x06, 2, -32768_i64),
+        (0xDB, 0x06, 4, i64::from(i32::MIN)),
+        (0xDF, 0x2E, 8, i64::MIN),
+        (0xDF, 0x2E, 8, 123456789),
+    ] {
+        let mut bus = TestBus::new(&[opcode, modrm, 0, 2]);
+        bus.ram[0x200..0x200 + width].copy_from_slice(&value.to_le_bytes()[..width]);
+        let mut cpu = Cpu::default().with_x87();
+        let flags = cpu.flags;
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(
+            cpu.fpu.as_ref().unwrap().store_value().unwrap(),
+            value as f64
+        );
+        assert_eq!(cpu.flags, flags);
+        assert_eq!(cpu.fpu.as_ref().unwrap().status() & 0x3A00, 0x3800);
+    }
+    // Actual SETUP encoding DF 2C 24: FILD qword [ESP] in 32-bit addressing.
+    let mut bus = TestBus::new(&[0x67, 0xDF, 0x2C, 0x24]);
+    bus.ram[0x200..0x208].copy_from_slice(&(-42_i64).to_le_bytes());
+    let mut cpu = Cpu::default().with_x87();
+    cpu.registers.set32(doslet_x86::Gpr32::Esp, 0x200);
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(cpu.fpu.as_ref().unwrap().store_value().unwrap(), -42.0);
+    assert_eq!(cpu.registers.get32(doslet_x86::Gpr32::Esp), 0x200);
+}
+
+#[test]
+fn x87_integer_calibration_memory_arithmetic_and_rounded_store() {
+    let mut bus = TestBus::new(&[
+        0xDF, 0x2E, 0, 2, // FILD m64int [200h] = 3.
+        0xD8, 0x3E, 8, 2, // FDIVR m32real [208h] = 1 / 3.
+        0xD8, 0x0E, 12, 2, // FMUL m32real [20Ch] = * 2.
+        0xD9, 0x1E, 16, 2, // FSTP m32real [210h] (inexact).
+        0xD9, 0x06, 16, 2, // FLD m32real [210h].
+        0xDC, 0x06, 24, 2, // FADD m64real [218h] = + 1.
+    ]);
+    bus.ram[0x200..0x208].copy_from_slice(&3_i64.to_le_bytes());
+    bus.ram[0x208..0x20C].copy_from_slice(&1_f32.to_le_bytes());
+    bus.ram[0x20C..0x210].copy_from_slice(&2_f32.to_le_bytes());
+    bus.ram[0x218..0x220].copy_from_slice(&1_f64.to_le_bytes());
+    let mut cpu = Cpu::default().with_x87();
+    for _ in 0..4 {
+        cpu.step(&mut bus).unwrap();
+    }
+    let stored = f32::from_bits(bus.read_u32(0x210).unwrap());
+    assert_eq!(stored.to_bits(), 0x3F2AAAAB);
+    assert_eq!(cpu.fpu.as_ref().unwrap().tags(), 0xFFFF);
+    assert_ne!(cpu.fpu.as_ref().unwrap().status() & 0x20, 0);
+    for _ in 0..2 {
+        cpu.step(&mut bus).unwrap();
+    }
+    assert_eq!(
+        cpu.fpu.as_ref().unwrap().store_value(),
+        Ok(f64::from(stored) + 1.0)
+    );
 }
 
 #[test]

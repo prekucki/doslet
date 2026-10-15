@@ -5,3 +5,4 @@
 /PRINCE
 /games/
 *.log
+__pycache__/

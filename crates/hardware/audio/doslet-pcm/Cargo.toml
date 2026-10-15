@@ -1,0 +1,10 @@
+[package]
+name = "doslet-pcm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[lints]
+workspace = true
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+allocation-counter = "0.8.1"

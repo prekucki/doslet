@@ -4,13 +4,18 @@ import { initSync, AudioEngine } from './doslet_web_audio.js';
 class DosletProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
+        let stage = 'WASM initialization';
+        try {
         // The module was compiled on the window thread. Instantiation and every
         // buffer allocation finish here, before process() renders any audio.
         this.wasm = initSync({module: options.processorOptions.module});
+        stage = 'AudioEngine allocation';
         this.engine = new AudioEngine(sampleRate);
+        stage = 'buffer views';
         this.left = new Float32Array(this.wasm.memory.buffer, this.engine.left_ptr(), this.engine.capacity());
         this.right = new Float32Array(this.wasm.memory.buffer, this.engine.right_ptr(), this.engine.capacity());
         this.midi = new Uint8Array(this.wasm.memory.buffer, this.engine.midi_ptr(), 1024);
+        this.pcm = new Float64Array(this.wasm.memory.buffer, this.engine.pcm_ptr(), 128 * 4);
         this.epoch = -1; this.active = false; this.failed = false;
         this.warming = true; this.portToWorker = null;
         this.port.onmessage = ({data}) => {
@@ -20,12 +25,17 @@ class DosletProcessor extends AudioWorkletProcessor {
                 this.portToWorker = null;
             }
             if (data.kind === 'connect') {
+                if (this.portToWorker) this.portToWorker.close();
                 this.portToWorker = data.port;
                 const source = data.port;
                 source.onmessage = event => this.receive(event.data, source);
             }
         };
         this.port.postMessage({kind: 'ready'});
+        } catch (error) {
+            this.active = false; this.failed = true;
+            this.port.postMessage({kind: 'error', error: `AudioWorklet setup (${stage}): ${String(error)} ${error.stack || ''}`});
+        }
     }
     fail(error) {
         this.failed = true;
@@ -45,6 +55,7 @@ class DosletProcessor extends AudioWorkletProcessor {
                     const message = {kind: 'progress', epoch: this.epoch, nanos: this.engine.nanos(),
                         frames: this.engine.frames(), notes: this.engine.notes(),
                         peak: this.engine.peak(), underruns: this.engine.underruns()};
+                    message.pcmFrames = this.engine.pcm_frames(); message.pcmNonzero = this.engine.pcm_nonzero();
                     this.port.postMessage(message); this.portToWorker.postMessage(message);
                 }
                 if (data.kind === 'midi') {
@@ -54,6 +65,12 @@ class DosletProcessor extends AudioWorkletProcessor {
                         const result = this.engine.receive(data.nanos, count);
                         if (result) { this.fail(`WASM MIDI queue error ${result}`); break; }
                     }
+                }
+                if (data.kind === 'pcm') {
+                    if (!Number.isInteger(data.count) || data.count < 0 || data.count > 128) throw new Error('Invalid PCM packet size');
+                    this.pcm.set(new Float64Array(data.buffer, 0, data.count * 4));
+                    const result = this.engine.receive_pcm(data.count);
+                    if (result) this.fail(`WASM PCM queue error ${result}`);
                 }
                 if (data.kind === 'commit') {
                     const result = this.engine.receive(data.nanos, 0);

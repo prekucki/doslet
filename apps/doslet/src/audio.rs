@@ -58,6 +58,12 @@ impl Output {
             error: None,
         }));
         let config = supported.config();
+        eprintln!(
+            "[INFO doslet] Audio output: device={:?} rate={rate} Hz channels={} format={:?}",
+            device.name().unwrap_or_default(),
+            config.channels,
+            supported.sample_format()
+        );
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => build(&device, &config, queue.clone(), |v| v),
             cpal::SampleFormat::I16 => build(&device, &config, queue.clone(), |v| {

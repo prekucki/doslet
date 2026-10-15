@@ -1,5 +1,7 @@
-//! A bounded guest-time queue for pull-based audio hosts. No host clocks or heap.
+//! A bounded guest-time queue for pull-based audio hosts. Allocate storage once,
+//! then receive/render/reset without allocation or host clocks.
 use crate::{MidiError, Synth};
+use alloc::{boxed::Box, vec};
 
 const CAPACITY: usize = 16384;
 #[derive(Clone, Copy)]
@@ -18,7 +20,7 @@ pub enum StreamError {
 
 pub struct Stream {
     synth: Synth,
-    queue: [Byte; CAPACITY],
+    queue: Box<[Byte]>,
     head: usize,
     len: usize,
     cursor: u64,
@@ -29,7 +31,7 @@ impl Stream {
     pub fn new(rate: u32) -> Result<Self, MidiError> {
         Ok(Self {
             synth: Synth::new(rate)?,
-            queue: [EMPTY; CAPACITY],
+            queue: vec![EMPTY; CAPACITY].into_boxed_slice(),
             head: 0,
             len: 0,
             cursor: 0,
@@ -97,6 +99,9 @@ impl Stream {
     }
     pub fn nanos(&self) -> u64 {
         (u128::from(self.cursor) * 1_000_000_000 / u128::from(self.synth.sample_rate())) as u64
+    }
+    pub fn sample_rate(&self) -> u32 {
+        self.synth.sample_rate()
     }
     pub fn notes(&self) -> u64 {
         self.synth.note_events()

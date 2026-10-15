@@ -28,8 +28,18 @@ pub struct SampleEvent {
     pub frame: Option<[i16; 2]>,
     pub raised_irq: bool,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Diagnostics {
+    pub resets: u64,
+    pub commands: u64,
+    pub last_command: u8,
+    pub dma_requests: u64,
+    pub last_dma_command: u8,
+    pub dma_units: u64,
+}
 #[derive(Debug)]
 pub struct Dsp {
+    diagnostics: Diagnostics,
     reset: bool,
     reply: [u8; 2],
     reply_len: u8,
@@ -50,6 +60,7 @@ pub struct Dsp {
 impl Default for Dsp {
     fn default() -> Self {
         Self {
+            diagnostics: Diagnostics::default(),
             reset: false,
             reply: [0; 2],
             reply_len: 0,
@@ -57,7 +68,7 @@ impl Default for Dsp {
             parameter: None,
             rate_high: None,
             test: 0,
-            speaker: false,
+            speaker: true, // SB16 DAC output is always enabled; legacy speaker gating is absent.
             sample_rate: 22050,
             input_rate: 22050,
             dma_parameters: [0; 3],
@@ -72,7 +83,10 @@ impl Default for Dsp {
 impl Dsp {
     pub fn write_reset(&mut self, value: u8) {
         if value & 1 != 0 {
+            let mut diagnostics = self.diagnostics;
+            diagnostics.resets += 1;
             *self = Self::default();
+            self.diagnostics = diagnostics;
             self.reset = true;
         } else if self.reset {
             self.reset = false;
@@ -99,6 +113,9 @@ impl Dsp {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
+    pub fn diagnostics(&self) -> Diagnostics {
+        self.diagnostics
+    }
     pub fn playback_format(&self) -> Option<Format> {
         self.playback
             .filter(|state| !state.paused)
@@ -122,6 +139,7 @@ impl Dsp {
             .as_mut()
             .filter(|state| !state.paused)
             .ok_or(DspError::NoTransfer)?;
+        self.diagnostics.dma_units += 1;
         let format = state.format;
         let sample = if format.word {
             if format.signed {
@@ -196,6 +214,19 @@ impl Dsp {
                         self.parameter = Some(command);
                     }
                 }
+                0x14 | 0x1C => {
+                    // Legacy 8-bit DMA playback commands carry a 16-bit
+                    // transfer length. The PC DMA path is not connected to
+                    // this DSP yet, so consume the command cleanly without
+                    // claiming to produce audio or an IRQ.
+                    self.dma_parameters[self.dma_parameter_len] = value;
+                    self.dma_parameter_len += 1;
+                    if self.dma_parameter_len < 2 {
+                        self.parameter = Some(command);
+                    } else {
+                        self.dma_parameter_len = 0;
+                    }
+                }
                 0xE0 => self.response(&[!value]),
                 0xE4 => self.test = value,
                 0x40 => self.sample_rate = 1_000_000 / (256 - u32::from(value)),
@@ -218,8 +249,18 @@ impl Dsp {
                 _ => unreachable!(),
             }
         } else {
+            self.diagnostics.commands += 1;
+            self.diagnostics.last_command = value;
+            if matches!(value, 0xB0..=0xB7 | 0xC0..=0xC7 | 0x14 | 0x1C) {
+                self.diagnostics.dma_requests += 1;
+                self.diagnostics.last_dma_command = value;
+            }
             match value {
                 0xB0..=0xB7 | 0xC0..=0xC7 => {
+                    self.parameter = Some(value);
+                    self.dma_parameter_len = 0;
+                }
+                0x14 | 0x1C => {
                     self.parameter = Some(value);
                     self.dma_parameter_len = 0;
                 }
@@ -241,8 +282,7 @@ impl Dsp {
                 0xE0 | 0xE4 | 0x40 | 0x41 | 0x42 => self.parameter = Some(value),
                 0xE1 => self.response(&[4, 5]),
                 0xE8 => self.response(&[self.test]),
-                0xD1 => self.speaker = true,
-                0xD3 => self.speaker = false,
+                0xD1 | 0xD3 => {} // Legacy speaker on/off commands have no effect on SB16.
                 0xD8 => self.response(&[if self.speaker { 0xFF } else { 0 }]),
                 _ => return Err(DspError::UnsupportedCommand(value)),
             }
@@ -253,6 +293,22 @@ impl Dsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sb16_dac_remains_enabled_without_legacy_speaker_commands() {
+        let mut dsp = Dsp::default();
+        assert!(dsp.speaker_enabled());
+        dsp.write_command(0xD3).unwrap();
+        assert!(dsp.speaker_enabled());
+        dsp.write_reset(1);
+        dsp.write_reset(0);
+        assert!(dsp.speaker_enabled());
+        for byte in [0xC6, 0, 0, 0] {
+            dsp.write_command(byte).unwrap();
+        }
+        assert_eq!(dsp.accept_sample(192).unwrap().frame, Some([16384; 2]));
+        assert_eq!(dsp.diagnostics().dma_requests, 1);
+        assert_eq!(dsp.diagnostics().dma_units, 1);
+    }
     #[test]
     fn reset_edge_and_version_polling_produce_bounded_real_responses() {
         let mut dsp = Dsp::default();

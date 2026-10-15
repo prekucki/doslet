@@ -17,6 +17,19 @@ pub(crate) struct Rounded {
 }
 
 impl Finite {
+    pub fn from_i64(value: i64) -> Self {
+        let magnitude = value.unsigned_abs();
+        let shift = magnitude.leading_zeros();
+        Self {
+            negative: value < 0,
+            exponent: if magnitude == 0 { 0 } else { 63 - shift as i32 },
+            mantissa: if magnitude == 0 {
+                0
+            } else {
+                magnitude << shift
+            },
+        }
+    }
     pub fn compare(self, other: Self) -> core::cmp::Ordering {
         use core::cmp::Ordering;
         if self.mantissa == 0 && other.mantissa == 0 {
@@ -71,6 +84,70 @@ impl Finite {
             | (((rounded.exponent + 1023) as u64) << 52)
             | ((rounded.mantissa >> 11) & 0xF_FFFF_FFFF_FFFF);
         f64::from_bits(bits)
+    }
+    pub fn memory_round(self, single: bool, control: u16) -> Result<Rounded, ArithmeticError> {
+        let result = round(
+            self.mantissa,
+            self.exponent,
+            self.negative,
+            0,
+            1,
+            (control & !0x300) | if single { 0 } else { 0x200 },
+        )?;
+        if single && result.value.mantissa != 0 && !(-126..=127).contains(&result.value.exponent) {
+            return Err(ArithmeticError::Unsupported);
+        }
+        Ok(result)
+    }
+    pub fn integer_round(self, control: u16) -> Rounded {
+        if self.mantissa == 0 || self.exponent >= 63 {
+            return Rounded {
+                value: self,
+                inexact: false,
+                up: false,
+            };
+        }
+        let (kept, inexact, halfway) = if self.exponent < 0 {
+            (
+                0,
+                true,
+                if self.exponent == -1 {
+                    self.mantissa.cmp(&(1 << 63))
+                } else {
+                    core::cmp::Ordering::Less
+                },
+            )
+        } else {
+            let discard = 63 - self.exponent as u32;
+            let low = self.mantissa & ((1_u64 << discard) - 1);
+            (
+                self.mantissa >> discard,
+                low != 0,
+                low.cmp(&(1_u64 << (discard - 1))),
+            )
+        };
+        let up = inexact
+            && match (control >> 10) & 3 {
+                0 => halfway.is_gt() || (halfway.is_eq() && kept & 1 != 0),
+                1 => self.negative,
+                2 => !self.negative,
+                _ => false,
+            };
+        let magnitude = kept + u64::from(up);
+        let shift = magnitude.leading_zeros();
+        Rounded {
+            value: Self {
+                negative: self.negative,
+                exponent: if magnitude == 0 { 0 } else { 63 - shift as i32 },
+                mantissa: if magnitude == 0 {
+                    0
+                } else {
+                    magnitude << shift
+                },
+            },
+            inexact,
+            up,
+        }
     }
 
     pub fn divide(self, other: Self, control: u16) -> Result<Rounded, ArithmeticError> {

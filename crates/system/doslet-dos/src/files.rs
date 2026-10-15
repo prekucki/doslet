@@ -4,7 +4,7 @@ mod overlay;
 pub mod search;
 
 const NAME_BYTES: usize = 128;
-const HANDLE_COUNT: usize = 64;
+pub const HANDLE_COUNT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Name {
@@ -104,6 +104,23 @@ impl Default for ReadOnlyDrive {
     }
 }
 impl ReadOnlyDrive {
+    /// Mounted input plus the bounded writable overlay, in 512-byte clusters.
+    /// Free space describes the emulated write budget, not the host filesystem.
+    pub fn disk_space(&self) -> (u64, u64) {
+        let input = self
+            .files
+            .iter()
+            .map(|file| (file.bytes.len() as u64).div_ceil(512))
+            .sum::<u64>();
+        let (free, capacity) = self
+            .overlay
+            .as_ref()
+            .map_or((0, 0), |overlay| overlay.space());
+        (
+            free as u64 / 512,
+            1 + input + (capacity as u64).div_ceil(512),
+        )
+    }
     pub const fn new() -> Self {
         Self {
             files: Vec::new(),
@@ -311,6 +328,9 @@ impl ReadOnlyDrive {
         self.handles[Self::slot(handle)?].take().ok_or(6u16)?;
         Ok(())
     }
+    pub fn close_all(&mut self) {
+        self.handles.fill(None);
+    }
     pub fn is_open(&self, handle: u16) -> bool {
         Self::slot(handle).is_ok_and(|index| self.handles[index].is_some())
     }
@@ -382,6 +402,50 @@ impl ReadOnlyDrive {
             self.last_midi.map(|file| self.files[file].name.as_bytes()),
         )
     }
+    /// Platform writeback visits only dirty files after all their handles close.
+    /// A failed write remains dirty and can be retried by the platform adapter.
+    pub fn flush_writes<E>(
+        &mut self,
+        mut write: impl FnMut(&[u8], ReadView<'_>) -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let Some(overlay) = &mut self.overlay else {
+            return Ok(0);
+        };
+        let mut count = 0;
+        for (index, file) in self.files.iter().enumerate() {
+            if !overlay.dirty(index)
+                || self
+                    .handles
+                    .iter()
+                    .flatten()
+                    .any(|handle| handle.file == index)
+            {
+                continue;
+            }
+            let view = ReadView {
+                original: &file.bytes,
+                overlay: Some(overlay),
+                file: index,
+                start: 0,
+                len: overlay.length(index, file.bytes.len() as u32) as usize,
+            };
+            write(file.name.as_bytes(), view)?;
+            overlay.acknowledge(index);
+            count += 1;
+        }
+        Ok(count)
+    }
+    pub fn has_closed_writes(&self) -> bool {
+        self.overlay.as_ref().is_some_and(|overlay| {
+            overlay.dirty_files().any(|file| {
+                !self
+                    .handles
+                    .iter()
+                    .flatten()
+                    .any(|handle| handle.file == file)
+            })
+        })
+    }
     pub fn seek(&mut self, handle: u16, origin: u8, displacement: i32) -> Result<u32, u16> {
         let handle = self.handles[Self::slot(handle)?].as_mut().ok_or(6u16)?;
         let base =
@@ -412,7 +476,16 @@ pub struct ReadView<'a> {
     start: u32,
     len: usize,
 }
-impl ReadView<'_> {
+impl<'a> ReadView<'a> {
+    pub fn contiguous(bytes: &'a [u8]) -> Self {
+        Self {
+            original: bytes,
+            overlay: None,
+            file: 0,
+            start: 0,
+            len: bytes.len(),
+        }
+    }
     pub fn len(&self) -> usize {
         self.len
     }

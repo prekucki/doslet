@@ -15,6 +15,12 @@ impl From<MidiMode> for Mode {
     }
 }
 use std::path::PathBuf;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DriveMode {
+    Ro,
+    Overlay,
+    Rw,
+}
 
 /// Run a DOS game in the Doslet desktop window.
 #[derive(Debug, Default, Parser)]
@@ -29,10 +35,17 @@ pub struct Cli {
     /// DOS executable; its containing directory is mounted as C:
     #[arg(long, value_name = "EXE")]
     pub game: Option<PathBuf>,
+    /// C: writes: ro denies, overlay keeps in memory (default), rw persists closed files
+    #[arg(long, value_enum)]
+    pub drive_mode: Option<DriveMode>,
 
     /// Run without opening an audio output device
     #[arg(long, conflicts_with = "midi_output")]
     pub no_audio: bool,
+
+    /// Experimentally batch three Heroes timer polling loops; off by default
+    #[arg(long)]
+    pub experimental_heroes_timer_waits: bool,
 
     /// MIDI port index/name, rust, or moont
     #[arg(long, value_name = "PORT")]
@@ -94,6 +107,17 @@ mod tests {
         assert_eq!(cli.game.unwrap(), PathBuf::from("my game/PRINCE.EXE"));
         assert!(cli.no_audio);
         assert!(Cli::try_parse_from(["doslet"]).unwrap().game.is_none());
+    }
+
+    #[test]
+    fn experimental_timer_waits_are_explicit_and_survive_launch_resolution() {
+        let cli = Cli::try_parse_from(["doslet"]).unwrap().resolve().unwrap();
+        assert!(!cli.launch.heroes_timer_waits);
+        let cli = Cli::try_parse_from(["doslet", "--experimental-heroes-timer-waits"])
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert!(cli.launch.heroes_timer_waits);
     }
 
     #[test]

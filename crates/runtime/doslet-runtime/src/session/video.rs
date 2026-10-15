@@ -1,10 +1,26 @@
 use super::*;
+use doslet_bus::PortBus;
 
 impl Session {
     pub(super) fn palette_service(&mut self, ax: u16) -> Result<(), RuntimeError> {
         let r = self.registers();
         let (bx, cx, dx, es) = (r.get(Gpr16::Bx), r.get(Gpr16::Cx), r.get(Gpr16::Dx), r.es);
         match ax as u8 {
+            operation @ (0x00 | 0x01) if operation == 1 || (bx as u8) < 16 => {
+                let status = if self.machine.bus.vga.read_port(0x3CC).unwrap_or(1) & 1 != 0 {
+                    0x3DA
+                } else {
+                    0x3BA
+                };
+                self.machine.bus.read_port_u8(status)?; // Reset attribute-controller flip-flop.
+                self.machine
+                    .bus
+                    .write_port_u8(0x3C0, if operation == 1 { 0x11 } else { bx as u8 })?;
+                self.machine
+                    .bus
+                    .write_port_u8(0x3C0, (bx >> 8) as u8 & 0x3F)?;
+                self.machine.bus.write_port_u8(0x3C0, 0x20)?;
+            }
             0x10 => {
                 if bx > 255 {
                     return Err(RuntimeError::UnsupportedService { vector: 0x10, ax });

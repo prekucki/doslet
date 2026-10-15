@@ -12,6 +12,7 @@ struct Length {
     file: usize,
     len: u32,
     base_visible: u32,
+    dirty: bool,
 }
 pub(super) struct Overlay {
     bytes: Box<[u8]>,
@@ -20,6 +21,9 @@ pub(super) struct Overlay {
     lengths: [Option<Length>; 64],
 }
 impl Overlay {
+    pub fn space(&self) -> (usize, usize) {
+        (self.bytes.len() - self.used, self.bytes.len())
+    }
     pub fn new(capacity: usize) -> Self {
         Self {
             bytes: vec![0; capacity].into_boxed_slice(),
@@ -99,6 +103,7 @@ impl Overlay {
                 file,
                 len: position,
                 base_visible,
+                dirty: true,
             });
             return Ok(&mut self.bytes[..0]);
         }
@@ -120,8 +125,32 @@ impl Overlay {
             file,
             len: previous.max(end),
             base_visible,
+            dirty: true,
         });
         self.used += count;
         Ok(&mut self.bytes[offset..offset + count])
+    }
+    pub fn dirty(&self, file: usize) -> bool {
+        self.lengths
+            .iter()
+            .flatten()
+            .any(|entry| entry.file == file && entry.dirty)
+    }
+    pub fn dirty_files(&self) -> impl Iterator<Item = usize> + '_ {
+        self.lengths
+            .iter()
+            .flatten()
+            .filter(|entry| entry.dirty)
+            .map(|entry| entry.file)
+    }
+    pub fn acknowledge(&mut self, file: usize) {
+        for entry in self
+            .lengths
+            .iter_mut()
+            .flatten()
+            .filter(|entry| entry.file == file)
+        {
+            entry.dirty = false;
+        }
     }
 }

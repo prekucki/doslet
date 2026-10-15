@@ -469,6 +469,32 @@ impl Cpu {
                     _ => return Err(context.operand(opcode, modrm)),
                 }
             }
+            0xC8 => {
+                let allocation = decode::fetch_word(&mut self.registers, bus)?;
+                let nesting = decode::fetch(&mut self.registers, bus)? & 31;
+                let original_bp = self.registers.get32(Gpr32::Ebp);
+                self.push32(bus, original_bp)?;
+                let frame = self.stack_pointer();
+                let mut bp = original_bp;
+                if nesting != 0 {
+                    for _ in 1..nesting {
+                        bp = bp.wrapping_sub(4);
+                        let offset = if self.registers.stack32() {
+                            bp
+                        } else {
+                            u32::from(bp as u16)
+                        };
+                        let address =
+                            self.registers
+                                .address(SegmentRegister::Ss, offset, 4, Access::Read)?;
+                        let value = decode::read_dword(bus, address)?;
+                        self.push32(bus, value)?;
+                    }
+                    self.push32(bus, frame)?;
+                }
+                self.registers.set32(Gpr32::Ebp, frame);
+                self.adjust_stack(u32::from(allocation).wrapping_neg());
+            }
             0xC9 => {
                 self.set_stack_pointer(self.registers.get32(Gpr32::Ebp));
                 let value = self.pop32(bus)?;
@@ -688,6 +714,78 @@ impl Cpu {
     ) -> Result<StepOutcome, CpuError> {
         let opcode = decode::fetch(&mut self.registers, bus)?;
         match opcode {
+            0xA4 | 0xA5 | 0xAC | 0xAD => {
+                let modrm = decode::fetch(&mut self.registers, bus)?;
+                let operand = decode::operand(
+                    &mut self.registers,
+                    bus,
+                    modrm,
+                    context.segment_override,
+                    context.address_32,
+                )?;
+                let count = if opcode & 1 == 0 {
+                    decode::fetch(&mut self.registers, bus)?
+                } else {
+                    self.registers.get_byte(1)
+                } & 31;
+                if count == 0 {
+                    return Ok(StepOutcome::Continue);
+                }
+                let width = if dword { 32 } else { 16 };
+                if count > width {
+                    return Err(context.operand(opcode, modrm));
+                }
+                let (original, source) = if dword {
+                    (
+                        operand.read32(&self.registers, bus)?,
+                        self.registers.get32(Gpr32::decode(modrm >> 3)),
+                    )
+                } else {
+                    (
+                        u32::from(operand.read(&self.registers, bus, true)?),
+                        u32::from(self.registers.get(Gpr16::decode(modrm >> 3))),
+                    )
+                };
+                let mask = if dword { u32::MAX } else { 0xFFFF };
+                let (value, carry) = if opcode & 8 != 0 {
+                    let joined = (u64::from(source) << width) | u64::from(original);
+                    (
+                        (joined >> count) as u32 & mask,
+                        (original >> (count - 1)) & 1,
+                    )
+                } else {
+                    let joined = (u64::from(original) << width) | u64::from(source);
+                    (
+                        ((joined << count) >> width) as u32 & mask,
+                        (original >> (width - count)) & 1,
+                    )
+                };
+                let mut updated =
+                    self.flags & !(flags::CARRY | flags::SIGN | flags::ZERO | flags::PARITY);
+                updated |= carry;
+                if value == 0 {
+                    updated |= flags::ZERO;
+                }
+                if value & (1 << (width - 1)) != 0 {
+                    updated |= flags::SIGN;
+                }
+                if (value as u8).count_ones().is_multiple_of(2) {
+                    updated |= flags::PARITY;
+                }
+                // AF is undefined; OF is defined only for a one-bit shift.
+                if count == 1 {
+                    updated &= !flags::OVERFLOW;
+                    if (original ^ value) & (1 << (width - 1)) != 0 {
+                        updated |= flags::OVERFLOW;
+                    }
+                }
+                if dword {
+                    operand.write32(&mut self.registers, bus, value)?;
+                } else {
+                    operand.write(&mut self.registers, bus, true, value as u16)?;
+                }
+                self.flags = updated;
+            }
             0xAF => {
                 let modrm = decode::fetch(&mut self.registers, bus)?;
                 let operand = decode::operand(
@@ -993,6 +1091,36 @@ impl Cpu {
                         2 => self.control.cr2 = value,
                         3 => self.control.cr3 = value,
                         _ => return Err(context.operand(opcode, modrm)),
+                    }
+                }
+            }
+            0xBC | 0xBD => {
+                let modrm = decode::fetch(&mut self.registers, bus)?;
+                let operand = decode::operand(
+                    &mut self.registers,
+                    bus,
+                    modrm,
+                    context.segment_override,
+                    context.address_32,
+                )?;
+                let value = if dword {
+                    operand.read32(&self.registers, bus)?
+                } else {
+                    u32::from(operand.read(&self.registers, bus, true)?)
+                };
+                if value == 0 {
+                    self.flags |= flags::ZERO; // Destination is architecturally undefined; retain it.
+                } else {
+                    self.flags &= !flags::ZERO;
+                    let bit = if opcode == 0xBC {
+                        value.trailing_zeros()
+                    } else {
+                        31 - value.leading_zeros()
+                    };
+                    if dword {
+                        self.registers.set32(Gpr32::decode(modrm >> 3), bit);
+                    } else {
+                        self.registers.set(Gpr16::decode(modrm >> 3), bit as u16);
                     }
                 }
             }

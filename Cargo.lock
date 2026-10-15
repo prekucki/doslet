@@ -875,6 +875,7 @@ dependencies = [
  "doslet-midi-routing",
  "doslet-midi-synth",
  "doslet-mt32",
+ "doslet-pcm",
  "doslet-runtime",
  "doslet-x86",
  "iced",
@@ -915,6 +916,7 @@ dependencies = [
  "doslet-midi-routing",
  "doslet-midi-synth",
  "doslet-mt32",
+ "doslet-pcm",
  "doslet-runtime",
  "doslet-x86",
 ]
@@ -933,6 +935,10 @@ version = "0.1.0"
 
 [[package]]
 name = "doslet-i8259"
+version = "0.1.0"
+
+[[package]]
+name = "doslet-iso9660"
 version = "0.1.0"
 
 [[package]]
@@ -985,11 +991,19 @@ dependencies = [
  "doslet-i8259",
  "doslet-mc146818",
  "doslet-mpu401",
+ "doslet-pcm",
  "doslet-sb-dsp",
  "doslet-sb-mixer",
  "doslet-time",
  "doslet-vga",
  "doslet-x86",
+]
+
+[[package]]
+name = "doslet-pcm"
+version = "0.1.0"
+dependencies = [
+ "allocation-counter",
 ]
 
 [[package]]
@@ -999,7 +1013,9 @@ dependencies = [
  "allocation-counter",
  "doslet-bus",
  "doslet-dos",
+ "doslet-iso9660",
  "doslet-pc",
+ "doslet-pcm",
  "doslet-vga",
  "doslet-x86",
 ]
@@ -1026,6 +1042,7 @@ version = "0.1.0"
 dependencies = [
  "allocation-counter",
  "doslet-midi-synth",
+ "doslet-pcm",
  "wasm-bindgen",
 ]
 
@@ -1041,6 +1058,7 @@ dependencies = [
  "doslet-dos",
  "doslet-midi-routing",
  "doslet-midi-synth",
+ "doslet-pcm",
  "doslet-runtime",
  "doslet-x86",
  "wasm-bindgen",
@@ -1637,8 +1655,6 @@ dependencies = [
 [[package]]
 name = "iced_runtime"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1889b819ce4c06674183242e336c8d49465665441396914dc07cc86f44fa8d4"
 dependencies = [
  "bytes",
  "iced_core",
@@ -1701,8 +1717,6 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7589888c8e951899cc688247a69933bb7a0511f0b4b2e122ac3fcd5dacb37f72"
 dependencies = [
  "iced_debug",
  "iced_program",

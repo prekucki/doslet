@@ -10,9 +10,11 @@ target/release/doslet --config games/PRINCE.toml --no-audio
 target/release/doslet --config games/HoMnM.toml
 ```
 
-The three local profiles live in ignored `games/`. The HoMnM profile records
-`HoMnM/homm1.gog`, an ISO 9660 image, in a comment. CD-ROM mounting and MSCDEX
-remain pending; the game still reports `Unable to access CD Drive.`
+The three local profiles live in ignored `games/`. Profiles can mount a single
+ISO 9660 image as a DOS CD-ROM alongside the C: game directory. HoMnM's profile
+mounts `HoMnM/homm1.gog` as D:. The recorded game run passes its CD check and
+enters VBE graphics and the publisher intro. Playable-session compatibility
+remains unverified.
 
 ## Supported fields
 
@@ -47,13 +49,43 @@ An explicit single C: directory mount can expose a larger game tree:
 letter = "C"
 kind = "directory"
 source = "PRINCE"
-writable = true
+mode = "overlay"
 ```
 
-The executable must be inside the mounted directory. `writable` defaults to
-true and enables the existing sparse RAM overlay. Setting it to false mounts
-read-only input files. Reset and exit discard overlays; this is not persistent
-host storage. Multiple drives and `kind = "cdrom"` are rejected explicitly.
+The executable must be inside the mounted directory. `mode` selects `ro`
+(deny writes), `overlay` (default, RAM only) or `rw` (native host writeback).
+Legacy `writable = true` selects overlay and false selects ro; do not combine
+it with `mode`. Explicit `--drive-mode ro|overlay|rw` overrides the profile.
+Overlay writes disappear on reset/exit. RW flushes modified files after their
+handles close, using a temporary sibling and atomic rename. It preserves the
+case of existing names and refuses symlinks and paths outside C:. The RAM byte,
+extent and file limits still apply; delete/rename and writable CDs are pending.
+
+To persist Heroes sound setup, choose Save Changes inside SETUP:
+
+```sh
+target/release/doslet --config games/HoMnM.toml --game games/HoMnM/SETUP.EXE --drive-mode rw
+```
+
+An optional immutable CD-ROM image uses a separate drive letter
+from D: to Z:
+
+```toml
+[[drives]]
+letter = "D"
+kind = "cdrom"
+source = "HoMnM/homm1.gog"
+```
+
+The image is validated as sector-aligned ISO 9660 during session setup. MSCDEX
+exposes drive discovery, version, primary-volume metadata and raw sector reads.
+Absolute DOS file paths on the CD support open/read/seek/close, read-only
+attributes and handle information. Reads borrow image extents without copying
+the media. The configured ISO is excluded from the C: directory mount so it is
+not loaded twice. Joliet/Rock Ridge, multi-extent files, CD default-drive/CWD,
+FindFirst enumeration, MSCDEX driver info/device requests and CD audio remain
+pending. `writable = false` or `mode = "ro"` is accepted for CD images; other
+write modes are rejected.
 
 `game.arguments` is a string array. Doslet joins it into the PSP command tail
 with a leading space and quotes empty arguments or arguments containing spaces.
@@ -97,10 +129,7 @@ CLI options such as `--no-audio --midi-output` remain Clap errors.
 
 ## Remaining storage work
 
-A future D: CD-ROM mount must expose sectors, directories and MSCDEX services,
-not merely include an ISO path in a TOML file. `homm1.gog` can be treated as ISO
-data independently of its filename extension. CD audio requires separate
-support. Browser profiles need archive-relative paths and user-selected media handles
+Browser profiles need archive-relative paths and user-selected media handles
 before the resolved description is sent to the Worker.
 
 No `loadfix` workaround is added by default: PRINCE's observed memory failure

@@ -53,6 +53,20 @@ impl Default for Mouse {
     }
 }
 impl Mouse {
+    /// Raw motion counters keep moving even when the logical cursor is clamped.
+    /// Games using INT 33h/000Bh maintain their own cursor position.
+    pub fn move_relative(&mut self, dx: i16, dy: i16) {
+        let motion = self.motion;
+        let x = (i32::from(self.x) + i32::from(dx))
+            .clamp(i32::from(self.x_range.0), i32::from(self.x_range.1));
+        let y = (i32::from(self.y) + i32::from(dy))
+            .clamp(i32::from(self.y_range.0), i32::from(self.y_range.1));
+        self.move_to(x as u16, y as u16);
+        self.motion = (motion.0.saturating_add(dx), motion.1.saturating_add(dy));
+        if dx != 0 || dy != 0 {
+            self.pending |= 1;
+        }
+    }
     pub fn move_to(&mut self, x: u16, y: u16) {
         let x = x.clamp(self.x_range.0, self.x_range.1);
         let y = y.clamp(self.y_range.0, self.y_range.1);

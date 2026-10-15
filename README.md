@@ -54,6 +54,10 @@ Keep the executable alongside its original DOS4GW and data files. DOS text
 screens now render during startup; the recorded PRINCE HDI logo appears around
 7.3 seconds of emulated time. Host speed may affect how long startup takes.
 BIOS/DOS keyboard input is available. DOS mouse input includes position, buttons, ranges, a graphics cursor and guest callbacks.
+Click the guest display to capture the mouse and use relative movement. **Esc**
+releases capture; a subsequent Esc reaches the game. Focus loss, pause, reset
+and game termination also release capture. The system cursor stays visible
+until capture succeeds. Browser capture uses Pointer Lock.
 
 MIDI from the guest is rendered by a basic procedural synthesizer and sent to the
 default audio device. This is not a sample-based GM or Roland MT-32 synthesizer;
@@ -114,7 +118,7 @@ completed campaign or an audio-device listening test. See
 [CIV evidence](docs/compatibility/civ.md) for commands and limits.
 
 [HEROES startup evidence](docs/compatibility/heroes.md) records the x87 fixes
-and the remaining CD-ROM requirement. [TOML launch profiles](docs/launch-profiles.md)
+and remaining CPU requirements. [TOML launch profiles](docs/launch-profiles.md)
 store native game/audio/MIDI settings, DOS arguments and a C: directory mount.
 CLI options override profile settings:
 
@@ -124,8 +128,9 @@ target/release/doslet --config games/PRINCE.toml --no-audio
 target/release/doslet --config games/HoMnM.toml
 ```
 
-The local profiles live in ignored `games/`. HoMnM still requires CD-ROM mounting
-and MSCDEX support; its known `homm1.gog` ISO image is recorded in the profile.
+The local game installations stay ignored. HoMnM's profile mounts its
+`homm1.gog` ISO and exposes MSCDEX sector services plus read-only DOS file
+access. The recorded run passes its CD check; gameplay remains unverified.
 
 Guest-created files use the reserved RAM overlay. They can be reopened during
 the session; Reset or exit discards them. Persistent host saves remain pending.
@@ -158,6 +163,11 @@ require a C linker, `pkg-config` and ALSA development files (`libasound2-dev` on
 Ubuntu/Debian); launching requires a working Wayland or X11
 session and graphics driver. Dependency resolution and native compilation are
 separate from checking a live window.
+
+On desktop, **1:1** beside **GUEST DISPLAY** resizes the window to show each guest
+pixel as one physical screen pixel, including on HiDPI displays. It uses the raw
+image dimensions (for example, 720×400 for text) and allows scrolling if the
+window is too small. **Fit** restores automatic scaling with 4:3 proportions.
 
 Build the browser application with [Trunk](https://trunkrs.dev/):
 
@@ -250,11 +260,11 @@ already set the compatible value.
 | Component | Implemented | Still needed |
 | --- | --- | --- |
 | x86 CPU | Selected real/protected-mode 386 operations, cached GDT/LDT segments, EIP32, 16/32-bit ModR/M/SIB, same-privilege gates, bounded REP | Full instruction/privilege coverage, paging, precise faults, timing |
-| x87 | Independent control/status/stack, selected loads/stores, constants, exact division and infinity comparison | Full 80-bit arithmetic, rounding and exception delivery |
+| x87 | Independent control/status/stack, exact signed integer loads, selected finite arithmetic and rounded normal memory stores, constants and infinity comparison | Full extended exponent range, subnormal arithmetic/stores and exception delivery |
 | i8042 / CMOS | Controller/A20, keyboard command/ACK protocol, CMOS register bank and memory-size fields | Raw keyboard/mouse protocols and IRQs, RTC clock/IRQ behavior and persistence |
 | PIC | Master CPU interrupt delivery; independent slave register bank at A0h/A1h; masks, fixed priority and EOI | Cascading and remaining operating modes |
 | DMA | Independent 8237 state, PC page registers, bounded byte/word RAM transfers and auto-init | Full arbitration/cascade timing, MMIO and memory-to-memory |
-| PIT | Binary modes 2/3, latches, fractional guest clock input and IRQ0 | Remaining modes, gates and precise timing |
+| PIT | Binary modes 0/2/3, latches, gates, channel-2 output at 61h, fractional guest clock input and IRQ0 | Modes 1/4/5, read-back, BCD and precise periodic load timing |
 | VGA/VBE | Mode-13h and banked 640×480×8 pixels, palette writes, borrowed scanout, configuration readback, selected VBE 1.2 BIOS calls | Text/planar modes, register rendering effects, raster timing, more SVGA modes |
 | DOS/BIOS | COM/MZ/overlay setup, bounded memory arena, immutable input files/directories, optional sparse RAM writes, timer/user-hook shims | Full DOS kernel, extender compatibility, raw mouse hardware, persistent storage |
 | MPU-401 / MIDI | UART setup, bounded output at 330h/331h; independent procedural synth, guest-timed WAV, native and Web Audio output | General MIDI instrument fidelity, serial timing, IRQs and intelligent mode |
@@ -314,11 +324,21 @@ still running at the finite step limit reports budget exhaustion and exits with
 code 1 after printing its profile. Ordinary builds contain no profiling counters.
 Interrupt-enabled HLT waits can advance together up to the next PIT/DSP deadline,
 the remaining step budget, or 1 ms of guest time. Confirmed
-`IN AL,DX; AND AL,08h; JZ/JNZ -5` loops on the active VGA status port can batch
+`IN AL,DX; AND AL,08h; JZ/JNZ -5` and `IN AL,DX; TEST AL,AH; JZ/JNZ -5`
+loops (AH=08h for TEST) on the active VGA status port can batch
 whole iterations strictly before the next raster/PIT/DSP event; other polling
 loops execute normally. Append `--no-vga-waits` to disable recognition and
 batching for reference measurements. [The driver report](docs/compatibility/prince-svga.md)
 records the supported scope and differential checks.
+
+For diagnostic inventories of game polling, the optional `inspect_civ` wait
+tracer and Python/objdump scanner correlate backward branches with executed I/O.
+See the [Heroes wait inventory](docs/compatibility/heroes-waits.md) for commands,
+addresses and the distinction between confirmed waits and ordinary repeated work.
+The native `--experimental-heroes-timer-waits` flag optionally batches three
+version-specific Heroes countdown waits. It is disabled by default; the terminal
+reports the first actual batch. These sites were inactive in the sampled main
+menu, so the flag does not promise a reduction in menu CPU usage.
 
 Selected instructions in default-32-bit code use a fixed single-instruction
 decode cache shared by native and WASM builds. Page write generations, A20 mapping

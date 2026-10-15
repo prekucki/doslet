@@ -6,6 +6,56 @@ struct Bus {
 }
 
 #[test]
+fn enter_dword_builds_nested_frames_and_leave_restores_stack() {
+    for nesting in [0_u8, 1, 3, 35] {
+        let (mut cpu, mut bus) = Bus::setup();
+        Bus::enter(&mut cpu, &mut bus, true);
+        cpu.load_segment(&mut bus, SegmentRegister::Ss, 0x20)
+            .unwrap();
+        cpu.registers.set32(Gpr32::Esp, 0x38000);
+        cpu.registers.set32(Gpr32::Ebp, 0x37000);
+        bus.write_u32(0x36FFC, 0x11223344).unwrap();
+        bus.write_u32(0x36FF8, 0x55667788).unwrap();
+        bus.ram[0x30020..0x30025].copy_from_slice(&[0xC8, 16, 0, nesting, 0xC9]);
+        let flags = cpu.flags;
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.registers.get32(Gpr32::Ebp), 0x37FFC);
+        let count = if nesting & 31 == 0 {
+            1
+        } else {
+            u32::from(nesting & 31) + 1
+        };
+        assert_eq!(cpu.registers.get32(Gpr32::Esp), 0x38000 - count * 4 - 16);
+        assert_eq!(bus.read_u32(0x37FFC).unwrap(), 0x37000);
+        if nesting & 31 == 3 {
+            assert_eq!(bus.read_u32(0x37FF8).unwrap(), 0x11223344);
+            assert_eq!(bus.read_u32(0x37FF4).unwrap(), 0x55667788);
+            assert_eq!(bus.read_u32(0x37FF0).unwrap(), 0x37FFC);
+        }
+        assert_eq!(cpu.flags, flags);
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.registers.get32(Gpr32::Ebp), 0x37000);
+        assert_eq!(cpu.registers.get32(Gpr32::Esp), 0x38000);
+    }
+}
+
+#[test]
+fn double_shift_in_dword_code_honors_the_word_operand_override() {
+    for (code, expected) in [
+        (&[0x0F, 0xAC, 0xD0, 8][..], 0xDD12_3456),
+        (&[0x66, 0x0F, 0xAC, 0xD0, 8][..], 0x1234_DD56),
+    ] {
+        let (mut cpu, mut bus) = Bus::setup();
+        Bus::enter(&mut cpu, &mut bus, true);
+        cpu.registers.set32(Gpr32::Eax, 0x1234_5678);
+        cpu.registers.set32(Gpr32::Edx, 0xAABB_CCDD);
+        bus.ram[0x30020..0x30020 + code.len()].copy_from_slice(code);
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.registers.get32(Gpr32::Eax), expected);
+    }
+}
+
+#[test]
 fn xlat_in_32_bit_code_uses_ebx_and_checks_segment_limits() {
     for (code, offset) in [(&[0xD7][..], 0x200DE), (&[0x67, 0xD7][..], 0xDE)] {
         let (mut cpu, mut bus) = Bus::setup();

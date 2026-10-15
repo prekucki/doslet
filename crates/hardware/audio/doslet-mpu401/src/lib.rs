@@ -100,7 +100,11 @@ impl Mpu401 {
                 self.uart = true;
                 self.acknowledgement = Some(0xFE);
             }
-            _ => return Err(MpuError::UnsupportedCommand(command)),
+            // The MPU accepts command-port writes even when this UART-only
+            // implementation has no intelligent-mode behavior for them.
+            // Acknowledge the command rather than turning device probing into
+            // a fatal PC bus error.
+            _ => self.acknowledgement = Some(0xFE),
         }
         Ok(())
     }
@@ -174,9 +178,7 @@ mod tests {
         for (index, byte) in rest.iter().enumerate() {
             assert_eq!(*byte, (index + 700) as u8);
         }
-        assert_eq!(
-            mpu.write_command(0xAC),
-            Err(MpuError::UnsupportedCommand(0xAC))
-        );
+        assert_eq!(mpu.write_command(0xAC), Ok(()));
+        assert_eq!(mpu.read_data(), 0xFE);
     }
 }

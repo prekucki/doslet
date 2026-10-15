@@ -1,6 +1,7 @@
 //! Bounded, allocation-free MIDI wire receiver and procedural stereo synthesizer.
 //! These are basic program families, not sample-based GM or Roland LA emulation.
 #![no_std]
+extern crate alloc;
 pub mod stream;
 mod tables;
 pub mod wire;

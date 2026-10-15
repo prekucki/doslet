@@ -4,11 +4,23 @@ Doslet separates architectural CPU behavior, chip behavior, machine wiring and
 application policy. Libraries live in nested domains, with independent manifests
 and tests. No emulation library depends on iced or accesses a host filesystem.
 
+The [configurable machines proposal](design/configurable-machines.md) describes
+device registration, layered storage, HTTPS media and the shared machine editor.
+Its [input and write overlay extension](design/input-and-write-overlays.md)
+describes keyboard/joystick routing and transactional save stores, including a
+proposed SQL adapter. These interfaces and version-2 profiles are proposals.
+
 Native TOML launch profiles are parsed with `toml_edit` in the desktop frontend.
 The frontend merges explicit CLI options, resolves host paths and transfers
 mounted file ownership during setup. `Session::configure_launch` accepts DOS
 command-tail and working-directory byte slices before execution; the CPU and
 chip graph does not depend on TOML. The desktop retains launch settings for Reset.
+
+`doslet-iso9660` owns one immutable media buffer and returns validated file/sector
+views. It is an independent `no_std` system crate with no external dependencies.
+The runtime maps its read-only files and MSCDEX calls to guest memory. File
+handles store extent/position values; reads borrow media without cloning it.
+The native adapter excludes the configured ISO from the C: directory mount.
 
 ## Dependency graph
 
@@ -28,6 +40,7 @@ graph TD
   CLI --> Executable[doslet-executable]
   Runtime --> PC[doslet-pc]
   Runtime --> DOS[doslet-dos]
+  Runtime --> ISO[doslet-iso9660]
   Runtime --> VGA[doslet-vga]
   Runtime --> CPU[doslet-x86]
   DOS --> CPU
@@ -171,7 +184,12 @@ not a full GM sound bank. Output switches restart voices rather than preserve
 voice envelopes and reverb tails.
 
 The session owns the selected DOS mouse-driver state. Host adapters supply
-logical pointer coordinates and button transitions. Guest callbacks execute as
+logical pointer coordinates, relative movement and button transitions. The
+native iced backend is locally patched to expose winit cursor capture and a
+bounded relative-motion task stream (see [vendor notes](../vendor/README.md)).
+The browser uses DOM Pointer Lock and Worker messages. The session retains
+fractional movement and keeps raw motion counters independent of clamped
+logical coordinates. Guest callbacks execute as
 far calls through an interrupt wrapper that preserves registers and FLAGS;
 protected-mode mouse callbacks remain unsupported. Pointer events do not mutate
 VRAM: presentation borrows cursor masks and applies AND/XOR while converting
@@ -250,8 +268,10 @@ Interrupt-enabled HLT can combine those same logical steps until the first
 PIT/DSP deadline, the remaining budget, or 1 ms of guest time. IRQ eligibility
 still takes precedence. VGA accumulates bounded guest nanoseconds and resolves
 raster phase when status is read or at its 1-ms flush bound. The PC composition
-recognizes only confirmed unprefixed `IN AL,DX; AND AL,08h; JZ/JNZ -5` status
-waits. A CPU-independent bus notification on actual VGA status I/O gates discovery,
+recognizes confirmed unprefixed `IN AL,DX; AND AL,08h; JZ/JNZ -5` and
+`IN AL,DX; TEST AL,AH; JZ/JNZ -5` status waits, with AH=08h for TEST.
+The TEST path executes its final iteration normally so unmasked AL bits retain
+their exact raster-time value. A CPU-independent bus notification on actual VGA status I/O gates discovery,
 so unrelated CPU transfers require no code inspection. VGA exposes an exact
 next-retrace deadline with retained pixel fractions;
 PC combines it with PIT/DSP deadlines and skips whole three-unit iterations
@@ -260,6 +280,12 @@ the CPU library has no VGA dependency. IF-disabled waits preserve pending PIC
 requests. TF, interrupt shadows, paging, changed code and one-step execution fall
 back. A runtime switch disables recognition for reference measurements. Optional
 profiling counters are absent from ordinary builds.
+An additional opt-in PC path accepts three caller-selected CMP-dword/JNE sites
+and a DS-relative operand. The native Heroes experiment supplies its known
+addresses outside the chip/CPU libraries. Exact code, mapped ordinary RAM,
+positive data, invariant flags and IRQ/debug state are checked per batch.
+Whole two-step iterations advance strictly before PIT/DSP events with the same
+1-ms bound. The path remains disabled by default and does not patch guest code.
 No chip reads a host clock or depends on UI refresh. Precise CPU/bus timing and
 complete arbitration/cascading remain future work.
 

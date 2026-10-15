@@ -9,6 +9,7 @@ pub(crate) struct Candidate {
     cr0: u32,
     port: u16,
     jump: u8,
+    test_ah: bool,
     phase: u8,
     confirmed: bool,
 }
@@ -62,7 +63,15 @@ impl PcMachine {
             && self.cpu.control.cr0 == candidate.cr0
             && self.cpu.registers.get(Gpr16::Dx) == candidate.port
             && self.bus.vga.input_status_port() == candidate.port
-            && self.wait_code(candidate.start) == Some(&[0xEC, 0x24, 8, candidate.jump, 0xFB]);
+            && (!candidate.test_ah || self.cpu.registers.get_byte(4) == 8)
+            && self.wait_code(candidate.start)
+                == Some(&[
+                    0xEC,
+                    if candidate.test_ah { 0x84 } else { 0x24 },
+                    if candidate.test_ah { 0xC4 } else { 8 },
+                    candidate.jump,
+                    0xFB,
+                ]);
         if !valid {
             self.vga_wait.candidate = None;
         }
@@ -106,7 +115,11 @@ impl PcMachine {
             0
         };
         if !taken
-            || self.cpu.registers.get_byte(0) != masked
+            || (if candidate.test_ah {
+                self.cpu.registers.get_byte(0) & 8
+            } else {
+                self.cpu.registers.get_byte(0)
+            }) != masked
             || self.cpu.flags & arithmetic != expected
         {
             return Ok(None);
@@ -121,17 +134,30 @@ impl PcMachine {
         // Jcc phase. At the boundary the next few instructions run normally.
         let event_step = self.steps_to_event_nanos(u32::MAX, deadline);
         let steps = budget.min(event_step.saturating_sub(1)) / 3 * 3;
-        if steps == 0 {
+        let skipped = if candidate.test_ah {
+            steps.saturating_sub(3)
+        } else {
+            steps
+        };
+        if skipped == 0 {
             return Ok(None);
         }
         // A whole taken iteration restores exactly the same AL, flags and IP.
         // VGA status reads currently have no other architectural side effects.
-        self.advance_hardware_steps(steps)?;
+        self.advance_hardware_steps(skipped)?;
         #[cfg(feature = "profiling")]
         {
-            self.bus.stats.cpu_steps += u64::from(steps);
-            self.bus.stats.vga_wait_steps += u64::from(steps);
+            self.bus.stats.cpu_steps += u64::from(skipped);
+            self.bus.stats.vga_wait_steps += u64::from(skipped);
             self.bus.stats.vga_wait_batches += 1;
+        }
+        if candidate.test_ah {
+            // TEST leaves unmasked AL bits intact. Display-enable bit 0 can
+            // change while retrace bit 3 stays constant. Execute the last whole
+            // iteration normally to retain the exact final AL and flags.
+            for _ in 0..3 {
+                self.step()?;
+            }
         }
         Ok(Some(steps))
     }
@@ -186,7 +212,11 @@ impl PcMachine {
         let Some(code) = self.wait_code(start) else {
             return;
         };
-        if code[..3] != [0xEC, 0x24, 8] || !matches!(code[3], 0x74 | 0x75) || code[4] != 0xFB {
+        let test_ah = code[..3] == [0xEC, 0x84, 0xC4] && self.cpu.registers.get_byte(4) == 8;
+        if (code[..3] != [0xEC, 0x24, 8] && !test_ah)
+            || !matches!(code[3], 0x74 | 0x75)
+            || code[4] != 0xFB
+        {
             return;
         }
         self.vga_wait.candidate = Some(Candidate {
@@ -195,6 +225,7 @@ impl PcMachine {
             cr0: self.cpu.control.cr0,
             port,
             jump: code[3],
+            test_ah,
             phase: 1,
             confirmed: false,
         });
@@ -362,6 +393,50 @@ mod tests {
                         dispatched < total * 3 / 4,
                         "wide={wide} jump={jump:X} dma={dma}: {dispatched}/{total}"
                     );
+                }
+            }
+        }
+    }
+    #[test]
+    fn test_al_ah_waits_preserve_unmasked_al_bits_irqs_dma_and_partial_budgets() {
+        for wide in [false, true] {
+            for jump in [0x74, 0x75] {
+                for dma in [false, true] {
+                    let mut fast = machine(wide, jump, dma);
+                    let mut reference = machine(wide, jump, dma);
+                    for machine in [&mut fast, &mut reference] {
+                        let address = machine
+                            .cpu
+                            .registers
+                            .address(
+                                SegmentRegister::Cs,
+                                machine.cpu.registers.ip,
+                                11,
+                                Access::Execute,
+                            )
+                            .unwrap();
+                        for offset in [1, 6] {
+                            machine.bus.write_u8(address + offset, 0x84).unwrap();
+                            machine.bus.write_u8(address + offset + 1, 0xC4).unwrap();
+                        }
+                        machine.cpu.registers.set_byte(4, 8);
+                    }
+                    reference.set_vga_wait_acceleration(false);
+                    let mut dispatched = 0;
+                    let mut total = 0;
+                    for i in 0..150 {
+                        let steps = [1, 2, 3, 7, 100, 10000][i % 6];
+                        dispatched += advance(&mut fast, steps);
+                        advance(&mut reference, steps);
+                        total += steps;
+                        compare(&mut fast, &mut reference);
+                    }
+                    assert!(dispatched < total * 3 / 4);
+                    fast.cpu.registers.set_byte(4, 1);
+                    reference.cpu.registers.set_byte(4, 1);
+                    assert_eq!(advance(&mut fast, 100), 100);
+                    advance(&mut reference, 100);
+                    compare(&mut fast, &mut reference);
                 }
             }
         }

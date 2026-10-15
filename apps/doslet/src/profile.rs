@@ -1,5 +1,5 @@
 //! Native launch policy. TOML and host paths never enter emulation libraries.
-use crate::cli::{Cli, MidiMode};
+use crate::cli::{Cli, DriveMode, MidiMode};
 use std::{
     error::Error,
     path::{Path, PathBuf},
@@ -13,7 +13,9 @@ struct Profile {
     arguments: Vec<String>,
     working_directory: Option<String>,
     root: Option<PathBuf>,
+    cdrom: Option<(u8, PathBuf)>,
     writable: bool,
+    drive_mode: Option<DriveMode>,
     game_mode: Option<MidiMode>,
     host_mode: Option<MidiMode>,
     output: Option<String>,
@@ -140,25 +142,66 @@ impl Profile {
             let drives = drives
                 .as_array_of_tables()
                 .ok_or("drives must use [[drives]] tables")?;
-            if drives.len() != 1 {
-                return Err("drives currently supports one C: directory; multiple drives and CD-ROM/MSCDEX mounts are not implemented".into());
+            if drives.is_empty() || drives.len() > 2 {
+                return Err("drives supports one C: directory and at most one CD-ROM image".into());
             }
             for drive in drives.iter() {
-                fields(drive, &["letter", "kind", "source", "writable"], "drives.")?;
-                if string(drive, "kind", "drives.")?.as_deref() != Some("directory") {
-                    return Err("drives.kind: CD-ROM/MSCDEX and other drive kinds are not implemented; use directory".into());
-                }
-                if !string(drive, "letter", "drives.")?
-                    .is_some_and(|letter| letter.eq_ignore_ascii_case("C"))
-                {
-                    return Err("drives.letter: only C is implemented".into());
-                }
-                profile.root = Some(path(
+                fields(
+                    drive,
+                    &["letter", "kind", "source", "writable", "mode"],
+                    "drives.",
+                )?;
+                let letter =
+                    string(drive, "letter", "drives.")?.ok_or("drives.letter is required")?;
+                let kind = string(drive, "kind", "drives.")?.ok_or("drives.kind is required")?;
+                let source = path(
                     base,
                     string(drive, "source", "drives.")?.ok_or("drives.source is required")?,
                     "drives.source",
-                )?);
-                profile.writable = boolean(drive, "writable", "drives.")?.unwrap_or(true);
+                )?;
+                match kind.as_str() {
+                    "directory" if letter.eq_ignore_ascii_case("C") && profile.root.is_none() => {
+                        profile.root = Some(source);
+                        profile.writable = boolean(drive, "writable", "drives.")?.unwrap_or(true);
+                        if let Some(mode) = string(drive, "mode", "drives.")? {
+                            if drive.contains_key("writable") {
+                                return Err(
+                                    "drives.mode and drives.writable are mutually exclusive".into(),
+                                );
+                            }
+                            profile.drive_mode = Some(match mode.as_str() {
+                                "ro" => DriveMode::Ro,
+                                "overlay" => DriveMode::Overlay,
+                                "rw" => DriveMode::Rw,
+                                _ => return Err("drives.mode must be ro, overlay or rw".into()),
+                            });
+                        }
+                    }
+                    "cdrom"
+                        if letter.len() == 1
+                            && (b'D'..=b'Z')
+                                .contains(&letter.as_bytes()[0].to_ascii_uppercase())
+                            && profile.cdrom.is_none() =>
+                    {
+                        if boolean(drive, "writable", "drives.")? == Some(true) {
+                            return Err(
+                                "CD-ROM drives are read-only; drives.writable cannot be true"
+                                    .into(),
+                            );
+                        }
+                        if string(drive, "mode", "drives.")?.is_some_and(|mode| mode != "ro") {
+                            return Err("CD-ROM mode must be ro".into());
+                        }
+                        profile.cdrom = Some((letter.as_bytes()[0].to_ascii_uppercase(), source));
+                    }
+                    "directory" | "cdrom" => {
+                        return Err("drives must contain one C: directory and at most one CD-ROM with a distinct letter from D: to Z:".into());
+                    }
+                    _ => return Err("drives.kind must be directory or cdrom".into()),
+                }
+            }
+            if profile.root.is_none() {
+                return Err("drives must include a C: directory".into());
             }
         }
         Ok(profile)
@@ -225,11 +268,18 @@ impl Cli {
             }
             self.launch.root = profile.root;
             self.launch.writable = profile.writable;
+            self.drive_mode = self.drive_mode.or(profile.drive_mode);
+            self.launch.cdrom = profile.cdrom;
             if self.game.is_none() {
                 return Err("profile requires game.executable or --game".into());
             }
         }
         self.midi_mode.get_or_insert(MidiMode::Gm);
+        self.launch.heroes_timer_waits = self.experimental_heroes_timer_waits;
+        if let Some(mode) = self.drive_mode {
+            self.launch.writable = mode != DriveMode::Ro;
+            self.launch.persist = mode == DriveMode::Rw;
+        }
         self.midi_output_mode.get_or_insert(MidiMode::Gm);
         if self.no_audio {
             self.midi_output = None;
@@ -249,6 +299,15 @@ impl Cli {
                     return Err("game.executable must belong to the mounted C: directory".into());
                 }
             }
+        }
+        if let Some((_, image)) = &self.launch.cdrom
+            && !image.is_file()
+        {
+            return Err(format!(
+                "drives.source is not a CD-ROM image file: {}",
+                image.display()
+            )
+            .into());
         }
         if let Some(directory) = &self.mt32_rom_dir {
             for name in ["CM32L_CONTROL.ROM", "CM32L_PCM.ROM"] {
@@ -274,6 +333,37 @@ pub(crate) mod tests {
     use clap::Parser;
     use std::sync::atomic::{AtomicU64, Ordering};
     include!("../../../tests/fixtures/relocated_mz.rs");
+    include!("../../../tests/fixtures/iso9660.rs");
+    #[test]
+    fn drive_modes_select_persistence_and_cli_overrides_profile() {
+        let fixture = Fixture::new(
+            "version=1\n[game]\nexecutable='../TINY.EXE'\n[[drives]]\nletter='C'\nkind='directory'\nsource='..'\nmode='rw'\n",
+        );
+        let cli = Cli::parse_from([
+            std::ffi::OsString::from("doslet"),
+            "--config".into(),
+            fixture.config.clone().into_os_string(),
+        ])
+        .resolve()
+        .unwrap();
+        assert!(cli.launch.persist && cli.launch.writable);
+        let cli = Cli::parse_from([
+            std::ffi::OsString::from("doslet"),
+            "--config".into(),
+            fixture.config.clone().into_os_string(),
+            "--drive-mode".into(),
+            "overlay".into(),
+        ])
+        .resolve()
+        .unwrap();
+        assert!(cli.launch.writable && !cli.launch.persist);
+        let cli = Cli::parse_from(["doslet", "--drive-mode", "ro"])
+            .resolve()
+            .unwrap();
+        assert!(!cli.launch.writable && !cli.launch.persist);
+        assert!(Cli::try_parse_from(["doslet", "--drive-mode", "bad"]).is_err());
+        assert!(Profile::parse("version=1\n[[drives]]\nletter='C'\nkind='directory'\nsource='.'\nmode='rw'\nwritable=true", Path::new(".")).is_err());
+    }
 
     pub(crate) struct Fixture {
         pub root: PathBuf,
@@ -372,6 +462,22 @@ enabled = false
     }
 
     #[test]
+    fn cdrom_profile_resolves_the_iso_path_and_mounts_it_readonly() {
+        let fixture = Fixture::new(
+            "version=1\n[game]\nexecutable='../TINY.EXE'\n[[drives]]\nletter='C'\nkind='directory'\nsource='..'\n[[drives]]\nletter='D'\nkind='cdrom'\nsource='../disc.gog'\nwritable=false\n",
+        );
+        std::fs::write(fixture.root.join("disc.gog"), test_iso()).unwrap();
+        let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
+        let (letter, image) = cli.launch.cdrom.as_ref().unwrap();
+        assert_eq!(*letter, b'D');
+        assert_eq!(image.canonicalize().unwrap(), fixture.root.join("disc.gog"));
+        let session =
+            crate::native_input::load_game_with_settings(cli.game.as_ref().unwrap(), &cli.launch)
+                .unwrap();
+        assert_eq!(session.status(), doslet_runtime::SessionStatus::Ready);
+    }
+
+    #[test]
     fn malformed_fields_versions_modes_and_mounts_are_rejected() {
         for (text, expected) in [
             ("version=2", "version"),
@@ -382,11 +488,11 @@ enabled = false
             ("version=1\n[audio]\nenabled='yes'", "boolean"),
             (
                 "version=1\n[[drives]]\nletter='D'\nkind='cdrom'\nsource='image.iso'",
-                "CD-ROM/MSCDEX",
+                "include a C:",
             ),
             (
                 "version=1\n[[drives]]\nletter='D'\nkind='directory'\nsource='data'",
-                "only C",
+                "one C:",
             ),
             ("version=1\n[midi]\noutput=''", "empty"),
         ] {

@@ -3,6 +3,31 @@ use doslet_runtime::{Session, SessionStatus};
 
 include!("../../../../tests/fixtures/relocated_mz.rs");
 include!("../../../../tests/fixtures/protected_graphics.rs");
+include!("../../../../tests/fixtures/iso9660.rs");
+#[test]
+fn cdrom_file_open_seek_read_and_close_allocate_nothing_after_setup() {
+    let mut program = vec![0; 0x130];
+    let code = [
+        0xBA, 0, 2, 0xB8, 0, 0x3D, 0xCD, 0x21, 0x89, 0xC3, // Open CD file.
+        0xB9, 0, 0, 0xBA, 1, 0, 0xB8, 0, 0x42, 0xCD, 0x21, // Seek to byte one.
+        0xBA, 0, 3, 0xB9, 3, 0, 0xB4, 0x3F, 0xCD, 0x21, 0xB4, 0x3E, 0xCD, 0x21, 0xB8, 0, 0x4C,
+        0xCD, 0x21,
+    ];
+    program[..code.len()].copy_from_slice(&code);
+    let name = b"D:\\HEROES\\SOUND\\HEROES01.62S\0";
+    program[0x100..0x100 + name.len()].copy_from_slice(name);
+    let mut session = Session::new(&program)
+        .unwrap()
+        .with_cdrom_image(b'D', test_iso())
+        .unwrap();
+    session.start();
+    let measured = allocation_counter::measure(|| {
+        session.advance(100);
+    });
+    assert_eq!(session.status(), SessionStatus::Exited(0));
+    assert_eq!(session.ram_view(0x10300..0x10303).unwrap(), b"ata");
+    assert_eq!(measured.count_total, 0);
+}
 #[test]
 fn creating_a_save_reading_it_and_converting_text_allocate_nothing_after_setup() {
     let mut program = vec![0; 0xB0];

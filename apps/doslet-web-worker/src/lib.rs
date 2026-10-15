@@ -18,7 +18,8 @@ pub struct WorkerEngine {
     midi: [u8; 16384],
     source_midi: [u8; 64],
     output_mode: Mode,
-    pcm: [[i16; 2]; 128],
+    pcm: [doslet_pcm::Frame; 128],
+    pcm_wire: [f64; 128 * 4],
     routing: Routing,
     replay: Box<[u8]>,
 }
@@ -29,6 +30,11 @@ impl Default for WorkerEngine {
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl WorkerEngine {
+    pub fn pointer_relative(&mut self, dx: f64, dy: f64) {
+        if self.session.status() == SessionStatus::Running {
+            self.session.pointer_relative(dx, dy);
+        }
+    }
     pub fn pointer_event(&mut self, x: u16, y: u16, button: i8, pressed: bool) {
         if button == -2 {
             self.session.release_pointer_buttons();
@@ -51,7 +57,8 @@ impl WorkerEngine {
             midi: [0; 16384],
             source_midi: [0; 64],
             output_mode: Mode::Gm,
-            pcm: [[0; 2]; 128],
+            pcm: [doslet_pcm::EMPTY; 128],
+            pcm_wire: [0.0; 128 * 4],
             routing: Routing::new(Mode::Gm),
             replay: vec![0; SNAPSHOT_CAPACITY].into_boxed_slice(),
         }
@@ -214,8 +221,23 @@ impl WorkerEngine {
     pub fn midi_display(&self) -> String {
         String::from_utf8_lossy(self.routing.translator().display()).into_owned()
     }
-    pub fn drain_pcm(&mut self) {
-        while self.session.drain_pcm(&mut self.pcm) != 0 {}
+    pub fn pcm_ptr(&self) -> usize {
+        self.pcm_wire.as_ptr() as usize
+    }
+    pub fn drain_pcm(&mut self) -> usize {
+        let count = self.session.drain_pcm_timed(&mut self.pcm);
+        for (frame, wire) in self.pcm[..count]
+            .iter()
+            .zip(self.pcm_wire.chunks_exact_mut(4))
+        {
+            wire.copy_from_slice(&[
+                frame.nanos as f64,
+                f64::from(frame.duration),
+                f64::from(frame.samples[0]),
+                f64::from(frame.samples[1]),
+            ]);
+        }
+        count
     }
     pub fn width(&self) -> usize {
         self.session.presentation_frame().width()

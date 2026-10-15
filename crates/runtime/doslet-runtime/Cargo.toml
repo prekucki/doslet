@@ -7,6 +7,8 @@ license.workspace = true
 [features]
 profiling = ["doslet-pc/profiling"]
 [dependencies]
+doslet-pcm.workspace = true
+doslet-iso9660.workspace = true
 doslet-bus.workspace = true
 doslet-x86.workspace = true
 doslet-pc.workspace = true

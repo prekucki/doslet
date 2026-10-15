@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [dependencies]
+doslet-pcm.workspace = true
 doslet-runtime.workspace = true
 doslet-midi-synth.workspace = true
 doslet-midi-routing.workspace = true

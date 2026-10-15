@@ -4,13 +4,28 @@ extern crate alloc;
 mod audio;
 pub mod io;
 pub mod memory;
+mod memory_wait;
 mod timing;
 mod vga_wait;
+pub use memory_wait::MemoryWaitSites;
 
 use core::fmt;
 use doslet_bus::BusError;
 use doslet_x86::{Cpu, CpuError, StepOutcome};
 pub use io::PcBus;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioStatus {
+    pub dsp: doslet_sb_dsp::Diagnostics,
+    pub rate: u32,
+    pub format: Option<doslet_sb_dsp::Format>,
+    pub speaker: bool,
+    pub irq: Option<u8>,
+    pub dma8: Option<u8>,
+    pub dma16: Option<u8>,
+    pub pcm_frames: u64,
+    pub pcm_nonzero: u64,
+    pub awe_writes: u64,
+}
 #[cfg(feature = "profiling")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionStats {
@@ -78,6 +93,8 @@ pub struct PcMachine {
     pub bus: PcBus,
     timing: timing::Timing,
     vga_wait: vga_wait::WaitState,
+    memory_wait_sites: Option<MemoryWaitSites>,
+    memory_wait_steps: u64,
 }
 impl Default for PcMachine {
     fn default() -> Self {
@@ -90,6 +107,8 @@ impl Default for PcMachine {
             bus,
             timing: timing::Timing::default(),
             vga_wait: vga_wait::WaitState::default(),
+            memory_wait_sites: None,
+            memory_wait_steps: 0,
         }
     }
 }
@@ -134,6 +153,13 @@ impl PcMachine {
         &mut self,
         budget: u32,
     ) -> Result<(StepOutcome, u32), MachineError> {
+        if self
+            .memory_wait_sites
+            .is_some_and(|sites| sites.starts.contains(&self.cpu.registers.ip))
+            && let Some(consumed) = self.advance_memory_wait(budget)?
+        {
+            return Ok((StepOutcome::Continue, consumed));
+        }
         if self.vga_wait.ready(budget)
             && let Some(consumed) = self.advance_vga_wait(budget)?
         {
@@ -185,6 +211,24 @@ impl PcMachine {
     pub fn drain_pcm(&mut self, output: &mut [[i16; 2]]) -> usize {
         self.bus.pcm.drain(output)
     }
+    pub fn drain_pcm_timed(&mut self, output: &mut [doslet_pcm::Frame]) -> usize {
+        self.bus.pcm.drain_timed(output)
+    }
+    pub fn audio_status(&self) -> AudioStatus {
+        let (pcm_frames, pcm_nonzero) = self.bus.pcm.stats();
+        AudioStatus {
+            dsp: self.bus.dsp.diagnostics(),
+            rate: self.bus.dsp.sample_rate(),
+            format: self.bus.dsp.playback_format(),
+            speaker: self.bus.dsp.speaker_enabled(),
+            irq: self.bus.mixer.interrupt_line(),
+            dma8: self.bus.mixer.dma_channel(false),
+            dma16: self.bus.mixer.dma_channel(true),
+            pcm_frames,
+            pcm_nonzero,
+            awe_writes: self.bus.awe_writes,
+        }
+    }
     pub fn time(&self) -> doslet_time::EmuTime {
         self.timing.time
     }
@@ -193,5 +237,7 @@ impl PcMachine {
         if self.bus.pit.advance(0, ticks).unwrap_or(0) != 0 {
             self.bus.pic.raise_edge(0);
         }
+        self.bus.pit.advance(1, ticks).unwrap();
+        self.bus.pit.advance(2, ticks).unwrap();
     }
 }

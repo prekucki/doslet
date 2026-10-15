@@ -7,6 +7,7 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 [dependencies]
+doslet-pcm.workspace = true
 doslet-runtime.workspace = true
 doslet-dos.workspace = true
 doslet-x86.workspace = true

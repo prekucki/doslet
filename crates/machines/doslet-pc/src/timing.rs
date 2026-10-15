@@ -117,10 +117,21 @@ impl PcMachine {
             };
             let event = self.bus.dsp.accept_sample(value)?;
             if let Some(frame) = event.frame {
-                self.bus.pcm.push(if self.bus.dsp.speaker_enabled() {
+                let samples = if self.bus.dsp.speaker_enabled() {
                     frame
                 } else {
                     [0; 2]
+                };
+                let rate = u64::from(self.bus.dsp.sample_rate());
+                let duration = 1_000_000_000_u64.div_ceil(rate);
+                let end = self
+                    .time()
+                    .as_nanos()
+                    .saturating_sub(self.timing.pcm_fraction / rate);
+                self.bus.pcm.push(doslet_pcm::Frame {
+                    nanos: end,
+                    duration: duration as u32,
+                    samples,
                 });
             }
             if event.raised_irq {
