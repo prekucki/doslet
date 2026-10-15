@@ -7,6 +7,11 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 [dependencies]
+serde_json = "1"
+doslet-config.workspace = true
+doslet-input.workspace = true
+doslet-storage.workspace = true
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 doslet-pcm.workspace = true
 doslet-runtime.workspace = true
 doslet-dos.workspace = true

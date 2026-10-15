@@ -1,5 +1,5 @@
 //! DOS 8.3 find-first/find-next state lives in the caller's 21-byte DTA prefix.
-use super::{Name, ReadOnlyDrive};
+use super::{DirectoryTree, Name};
 #[derive(Clone, Copy)]
 pub struct Search {
     directory: Name,
@@ -27,7 +27,7 @@ impl Search {
         state
     }
 }
-impl ReadOnlyDrive {
+impl DirectoryTree {
     pub fn start_search(&self, path: &[u8], attributes: u16) -> Result<Search, u16> {
         let path = if path.get(1) == Some(&b':') {
             if !path[0].eq_ignore_ascii_case(&b'C') {
@@ -52,8 +52,9 @@ impl ReadOnlyDrive {
                 .files
                 .iter()
                 .position(|file| {
-                    file.name.as_bytes().starts_with(directory.as_bytes())
-                        && file.name.as_bytes().get(directory.len) == Some(&b'\\')
+                    file.name == directory
+                        || (file.name.as_bytes().starts_with(directory.as_bytes())
+                            && file.name.as_bytes().get(directory.len) == Some(&b'\\'))
                 })
                 .ok_or(3u16)?;
             if index >= usize::from(u16::MAX) {
@@ -79,7 +80,9 @@ impl ReadOnlyDrive {
             Name::ROOT
         } else {
             let file = self.files.get(usize::from(parent)).ok_or(18u16)?;
-            if length >= super::NAME_BYTES || file.name.as_bytes().get(length) != Some(&b'\\') {
+            if length >= super::NAME_BYTES
+                || (file.name.len != length && file.name.as_bytes().get(length) != Some(&b'\\'))
+            {
                 return Err(18);
             }
             let mut directory = file.name;
@@ -102,6 +105,9 @@ impl ReadOnlyDrive {
         } // No volume label on this virtual drive.
         for (index, file) in self.files.iter().enumerate().skip(search.next as usize) {
             search.next = index as u32 + 1;
+            if file.deleted {
+                continue;
+            }
             let path = file.name.as_bytes();
             let suffix = if search.directory.len == 0 {
                 path
@@ -121,9 +127,15 @@ impl ReadOnlyDrive {
                 }
                 let length = path.len() - suffix.len() + i;
                 if self.files[..index].iter().any(|previous| {
-                    previous.name.as_bytes().starts_with(&path[..length])
+                    !previous.deleted
+                        && previous.name.as_bytes().starts_with(&path[..length])
                         && previous.name.as_bytes().get(length) == Some(&b'\\')
                 }) {
+                    continue;
+                }
+                0x10
+            } else if file.directory {
+                if search.attributes & 0x10 == 0 {
                     continue;
                 }
                 0x10
@@ -208,7 +220,7 @@ mod tests {
     use alloc::vec;
     #[test]
     fn masks_subdirectories_attributes_and_independent_dtas() {
-        let mut drive = ReadOnlyDrive::new();
+        let mut drive = DirectoryTree::new();
         for (name, length) in [
             (b"GAME\\ONE.SAV".as_slice(), 3),
             (b"GAME\\TWO.SAV", 4),
@@ -250,7 +262,7 @@ mod tests {
     }
     #[test]
     fn searches_include_overlay_files_and_current_lengths() {
-        let mut drive = ReadOnlyDrive::new().with_write_overlay(256);
+        let mut drive = DirectoryTree::new().with_write_overlay(256);
         let handle = drive.create(b"SAVE.SAV", 0).unwrap();
         drive.write_buffer(handle, 5).unwrap().fill(42);
         drive.close(handle).unwrap();

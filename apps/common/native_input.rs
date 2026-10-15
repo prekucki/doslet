@@ -9,6 +9,8 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub struct LaunchSettings {
+    pub hardware: doslet_config::HardwareConfig,
+    pub machine_spec: Option<doslet_config::MachineSpec>,
     pub command_tail: Vec<u8>,
     pub working_directory: Vec<u8>,
     pub root: Option<PathBuf>,
@@ -20,6 +22,8 @@ pub struct LaunchSettings {
 impl Default for LaunchSettings {
     fn default() -> Self {
         Self {
+            hardware: doslet_config::HardwareConfig::default(),
+            machine_spec: None,
             command_tail: Vec::new(),
             working_directory: b"C:\\".to_vec(),
             root: None,
@@ -74,14 +78,17 @@ pub fn load_game_with_settings(
     } else {
         drive
     };
-    let mut session = Session::from_mz_stub_named(
+    let mut session = Session::from_mz_stub_named_configured(
         drive
             .file(filename.as_bytes())
             .map_err(|code| format!("DOS mount error {code}"))?,
         dos_name.as_bytes(),
+        settings.hardware,
     )?
     .with_drive(drive);
-    if let Some((letter, image)) = &settings.cdrom {
+    if settings.machine_spec.is_none()
+        && let Some((letter, image)) = &settings.cdrom
+    {
         session = session.with_cdrom_image(*letter, fs::read(image)?)?;
     }
     session.configure_launch(&settings.command_tail, &settings.working_directory)?;

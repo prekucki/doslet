@@ -138,3 +138,190 @@ impl Session {
         Ok(())
     }
 }
+
+impl Session {
+    /// Consume one controller byte only when the installed IRQ1 handler runs.
+    /// A guest replacing vector 09h receives raw hardware bytes instead.
+    pub(super) fn keyboard_irq(&mut self) -> Result<(), RuntimeError> {
+        let Some(raw) = self.machine.bus.read_pending_keyboard() else {
+            return Ok(());
+        };
+        if raw == 0xE0 {
+            self.keyboard_prefix = true;
+            return Ok(());
+        }
+        if matches!(raw, 0xFA | 0xFE | 0xE1) {
+            self.keyboard_prefix = false;
+            return Ok(());
+        }
+        let extended = core::mem::take(&mut self.keyboard_prefix);
+        let released = raw & 0x80 != 0;
+        let scan = raw & 0x7F;
+        let mut modifiers = self.machine.bus.read_u8(0x417)?;
+        let flag = match scan {
+            0x2A if !extended => 2,
+            0x36 if !extended => 1,
+            0x1D => 4,
+            0x38 => 8,
+            _ => 0,
+        };
+        if flag != 0 {
+            if released {
+                modifiers &= !flag;
+            } else {
+                modifiers |= flag;
+            }
+            self.machine.bus.write_u8(0x417, modifiers)?;
+            return Ok(());
+        }
+        if released {
+            return Ok(());
+        }
+        if !extended && matches!(scan, 0x3A | 0x45 | 0x46) {
+            modifiers ^= match scan {
+                0x3A => 0x40,
+                0x45 => 0x20,
+                _ => 0x10,
+            };
+            self.machine.bus.write_u8(0x417, modifiers)?;
+            return Ok(());
+        }
+        let shift = modifiers & 3 != 0;
+        let ctrl = modifiers & 4 != 0;
+        let alt = modifiers & 8 != 0;
+        let mut ascii = if extended {
+            match scan {
+                0x1C => 13,
+                0x35 => b'/',
+                _ => 0,
+            }
+        } else {
+            scan_ascii(scan, shift, modifiers & 0x40 != 0)
+        };
+        if ctrl {
+            ascii = match ascii.to_ascii_uppercase() {
+                b'A'..=b'Z' => ascii.to_ascii_uppercase() - b'A' + 1,
+                b'[' => 27,
+                b'\\' => 28,
+                b']' => 29,
+                b'6' => 30,
+                b'-' => 31,
+                _ => ascii,
+            };
+        }
+        if alt {
+            ascii = 0;
+        }
+        if ascii != 0 || matches!(scan,0x3B..=0x44|0x47..=0x53|0x57|0x58) {
+            self.push_key(scan, ascii)?;
+        }
+        Ok(())
+    }
+}
+fn scan_ascii(scan: u8, shift: bool, caps: bool) -> u8 {
+    let letter = match scan {
+        0x10..=0x19 => b"qwertyuiop".get((scan - 0x10) as usize).copied(),
+        0x1E..=0x26 => b"asdfghjkl".get((scan - 0x1E) as usize).copied(),
+        0x2C..=0x32 => b"zxcvbnm".get((scan - 0x2C) as usize).copied(),
+        _ => None,
+    };
+    if let Some(letter) = letter {
+        return if shift ^ caps {
+            letter.to_ascii_uppercase()
+        } else {
+            letter
+        };
+    }
+    match scan {
+        1 => 27,
+        0x02..=0x0B => {
+            if shift {
+                b"!@#$%^&*()"[(scan - 2) as usize]
+            } else {
+                b"1234567890"[(scan - 2) as usize]
+            }
+        }
+        0x0C => {
+            if shift {
+                b'_'
+            } else {
+                b'-'
+            }
+        }
+        0x0D => {
+            if shift {
+                b'+'
+            } else {
+                b'='
+            }
+        }
+        0x0E => 8,
+        0x0F => 9,
+        0x1C => 13,
+        0x39 => 32,
+        0x1A => {
+            if shift {
+                b'{'
+            } else {
+                b'['
+            }
+        }
+        0x1B => {
+            if shift {
+                b'}'
+            } else {
+                b']'
+            }
+        }
+        0x27 => {
+            if shift {
+                b':'
+            } else {
+                b';'
+            }
+        }
+        0x28 => {
+            if shift {
+                b'"'
+            } else {
+                b'\''
+            }
+        }
+        0x29 => {
+            if shift {
+                b'~'
+            } else {
+                b'`'
+            }
+        }
+        0x2B => {
+            if shift {
+                b'|'
+            } else {
+                b'\\'
+            }
+        }
+        0x33 => {
+            if shift {
+                b'<'
+            } else {
+                b','
+            }
+        }
+        0x34 => {
+            if shift {
+                b'>'
+            } else {
+                b'.'
+            }
+        }
+        0x35 => {
+            if shift {
+                b'?'
+            } else {
+                b'/'
+            }
+        }
+        _ => 0,
+    }
+}

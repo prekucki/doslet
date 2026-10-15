@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [dependencies]
+doslet-config.workspace = true
+doslet-input.workspace = true
+doslet-storage.workspace = true
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 doslet-pcm.workspace = true
 doslet-runtime.workspace = true
 doslet-midi-synth.workspace = true
@@ -17,7 +21,8 @@ iced = { version = "0.14.0", default-features = false, features = ["image-withou
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap = { version = "4", features = ["derive"] }
-toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+gilrs = "0.11.2"
+ureq = "3"
 cpal = "0.15.3"
 midir = "0.11.1"
 iced = { version = "0.14.0", default-features = false, features = ["wgpu", "tokio", "x11", "wayland"] }

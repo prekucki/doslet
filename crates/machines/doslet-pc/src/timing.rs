@@ -67,7 +67,12 @@ impl PcMachine {
                 (u64::from(ticks) * 1_000_000_000 - self.timing.pit_fraction).div_ceil(1_193_182);
             nanos = nanos.min(deadline);
         }
-        if self.bus.dsp.playback_format().is_some() {
+        if self.hardware_config().keyboard == doslet_config::KeyboardMode::At
+            && let Some(deadline) = self.bus.keyboard.next_deadline()
+        {
+            nanos = nanos.min(deadline.saturating_sub(self.time().as_nanos()));
+        }
+        if self.hardware_config().sb16 && self.bus.dsp.playback_format().is_some() {
             let deadline = (1_000_000_000 - self.timing.pcm_fraction)
                 .div_ceil(u64::from(self.bus.dsp.sample_rate()));
             nanos = nanos.min(deadline);
@@ -91,6 +96,18 @@ impl PcMachine {
         }
         // Normal steps and idle deadline slices are bounded to <=1 ms.
         self.bus.vga.advance_nanos(nanos as u32);
+        self.bus.guest_nanos = self.time().as_nanos();
+        if self.hardware_config().keyboard == doslet_config::KeyboardMode::At {
+            self.bus
+                .keyboard
+                .advance_time(self.time().as_nanos())
+                .map_err(MachineError::Keyboard)?;
+            self.bus.update_keyboard_irq();
+        }
+        if !self.hardware_config().sb16 {
+            self.timing.pcm_fraction = 0;
+            return Ok(());
+        }
         let Some(format) = self.bus.dsp.playback_format() else {
             self.timing.pcm_fraction = 0;
             return Ok(());

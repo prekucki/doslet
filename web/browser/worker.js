@@ -1,7 +1,20 @@
 import init, { WorkerEngine } from './doslet_web_worker.js';
+import {HostIo} from './io.js';
 
 const wasm = await init();
 const engine = new WorkerEngine();
+const io = new HostIo(engine, error => self.postMessage({kind:'storage-error',error}));
+let transitioning = false, wasWaiting = false;
+let outputToken=0;
+const outputPreparations=new Map();
+function prepareOutput(output) {
+    const token=++outputToken;
+    return new Promise((resolve,reject)=>{
+        const timer=setTimeout(()=>{outputPreparations.delete(token);reject(new Error('Host output preparation timed out'));},20000);
+        outputPreparations.set(token,{resolve:()=>{clearTimeout(timer);resolve(token);},reject:error=>{clearTimeout(timer);reject(new Error(error));}});
+        self.postMessage({kind:'prepare-output',token,output});
+    });
+}
 let port = null, audioPort = null, audioRunning = false, epoch = 0, played = 0;
 let clockMode = 'worklet', nextPoll = 0;
 let ended = false;
@@ -73,7 +86,7 @@ function present(force = false) {
     if (!force && now < nextVideo) return;
     nextVideo = now + 16;
     const state = {kind: 'state', epoch, status: engine.status(), steps: engine.steps(),
-        nanos: engine.nanos(), cs: engine.cs(), ip: engine.ip(), ax: engine.ax(),
+        nanos: engine.nanos(), waitingForIo:engine.waiting_for_io(), dirty:engine.dirty_overlay(), pendingCommit:engine.pending_commit(), cs: engine.cs(), ip: engine.ip(), ax: engine.ax(),
         cx: engine.cx(), di: engine.di(), fault: engine.fault(), midiMode: engine.midi_mode(),
         midiUpgraded: engine.midi_upgraded(), midiSysex: engine.midi_sysex(),
         midiUnmapped: engine.midi_unmapped(), midiDisplay: engine.midi_display()};
@@ -88,6 +101,13 @@ function present(force = false) {
 }
 self.onmessage = ({data}) => {
     try {
+        if(data.kind==='output-prepared') {const p=outputPreparations.get(data.token);outputPreparations.delete(data.token);if(p)data.error?p.reject(data.error):p.resolve();else self.postMessage({kind:'discard-output',token:data.token});return;}
+        if(data.kind === 'gamepads') { if(!transitioning) io.gamepads(data.states,data.enabled); self.postMessage({kind:'input-ack'});return; }
+        if(data.kind === 'physical-key') {if(!transitioning)engine.physical_key(data.usage,data.pressed);return;}
+        if(data.kind === 'joystick') {if(!transitioning)engine.joystick(data.x,data.y,data.buttons);return;}
+        if(data.kind === 'release-input') {engine.release_input();return;}
+        if(['apply-machine','start-game','reset','import-saves','export-saves','import-iso'].includes(data.kind)) { hostCommand(data); return; }
+        if(transitioning && !['video-return','connect','audio-running','resync-audio'].includes(data.kind)) throw new Error('Machine preparation is still in progress');
         if (data.kind === 'key') {
             engine.key_event(data.scan, data.ascii, data.modifiers, data.pressed);
             return;
@@ -139,12 +159,6 @@ self.onmessage = ({data}) => {
                 const programs = engine.import_zip(new Uint8Array(data.buffer)).split('\n');
                 self.postMessage({kind: 'imported', programs});
             } catch (error) { self.postMessage({kind: 'import-error', error: String(error)}); }
-        } else if (data.kind === 'start-game') {
-            engine.start_game(data.program); failed = false; syncAudio();
-            self.postMessage({kind: 'started', name: data.program.split('/').pop()});
-        } else if (data.kind === 'reset') {
-            engine.reset(); failed = false; syncAudio();
-            self.postMessage({kind: 'reset-done'});
         } else if (data.kind === 'pause') {
             engine.pause(); anchor = null;
             audioMessage({kind: 'active', epoch, active: false});
@@ -161,10 +175,51 @@ self.onmessage = ({data}) => {
         present(true);
     } catch (error) { report(error); }
 };
+async function hostCommand(data) {
+    let preparedOutput=null,prepared=null;
+    const reply=(error,result={},transfer=[])=>{
+        if(data.id) self.postMessage({kind:'call-result',id:data.id,error,...result},transfer);
+        else if(error) self.postMessage({kind:data.kind==='apply-machine'?'machine-failed':'error',error,message:error});
+    };
+    if(transitioning) {reply('Another storage or machine operation is in progress');return;}
+    if(data.kind==='import-iso') {io.selectedBlob=data.blob;reply(null);return;}
+    transitioning=true;engine.release_input();anchor=null;
+    try {
+        await io.settled();
+        if(data.kind==='export-saves') {
+            const bytes=engine.export_saves();reply(null,{buffer:bytes.buffer},[bytes.buffer]);return;
+        }
+        const discard=data.discardChanges || data.program==='discard' || data.kind==='import-saves';
+        if(engine.dirty_overlay() && !discard) throw new Error('Export unsaved changes or enable Discard temporary changes before replacing this session');
+        const reset=!['apply-machine','start-game'].includes(data.kind);
+        const metadata=JSON.parse(reset?engine.prepare_reset():data.kind==='start-game'?engine.prepare_start_game(data.program):engine.prepare_machine(data.profile,data.program||''));
+        prepared=await io.prepare(metadata,reset);
+        if(data.kind==='import-saves') engine.candidate_import(new Uint8Array(data.buffer));
+        if(data.kind==='apply-machine') preparedOutput=await prepareOutput(metadata.output);
+        await io.install(prepared);
+        prepared=null;
+        if(io.namespace && data.kind==='apply-machine') self.postMessage({kind:'storage-status-request'});
+        if(preparedOutput!==null) {self.postMessage({kind:'commit-output',token:preparedOutput});preparedOutput=null;}
+        failed=false;syncAudio();
+        if(data.kind==='import-saves') {
+            engine.pause();engine.request_save_commit();await io.settled();
+            if(engine.pending_commit() || (io.namespace && engine.dirty_overlay())) throw new Error('Imported saves remain dirty; persistent commit failed');
+            reply(null);
+        } else if(data.kind==='apply-machine') self.postMessage({kind:'machine-applied',message:'Machine configuration applied',output:metadata.output});
+        else if(data.kind==='start-game') self.postMessage({kind:'started',name:data.program.split('/').pop()});
+        else self.postMessage({kind:'reset-done'});
+    } catch(error) {engine.discard_machine();try{await io.discard(prepared);}catch{}if(preparedOutput!==null)self.postMessage({kind:'discard-output',token:preparedOutput});reply(String(error));}
+    finally {transitioning=false;anchor=null;present(true);}
+}
 function tick() {
     try {
+        io.pump();
+        const waiting=engine.waiting_for_io();
+        if(wasWaiting && !waiting && clockMode==='midi') syncAudio(audioRunning);
+        if(waiting || wasWaiting!==waiting) anchor=null;
+        wasWaiting=waiting;
         let behind = false;
-        if (engine.status() === 1 && !failed && !snapshotPending) {
+        if (engine.status() === 1 && !failed && !snapshotPending && !transitioning && !waiting) {
             const now = performance.now();
             if (!anchor) anchor = {host: now, guest: engine.nanos()};
             const wallTarget = anchor.guest + (now - anchor.host) * 1_000_000;
@@ -176,7 +231,9 @@ function tick() {
                 if (audioRunning && midiPool.length < 12) break;
                 const completed = engine.advance(Math.min(budget, 10000));
                 budget -= completed; drain();
-                if (!completed) break;
+                io.pump();
+                if(engine.waiting_for_io()) {anchor=null;break;}
+                if (!completed || engine.timeslice_yielded()) break;
             }
             if (audioRunning && port) audioMessage({kind: 'commit', epoch, nanos: engine.nanos()});
             if (engine.status() !== 1 && !ended && port && audioRunning) {
@@ -186,7 +243,7 @@ function tick() {
             if (audioRunning && port && (clockMode === 'worklet' || audioPort) && now >= nextPoll) {
                 audioMessage({kind: 'poll', epoch}); nextPoll = now + 20;
             }
-            behind = engine.nanos() < target;
+            behind = engine.nanos() < target && !engine.waiting_for_io();
         }
         present();
         if (behind && midiPool.length >= 12) wake.port2.postMessage(null);

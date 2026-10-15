@@ -13,12 +13,20 @@ mod browser_diagnostics;
 mod browser_input;
 #[cfg(not(target_arch = "wasm32"))]
 mod cli;
+mod configurator;
 mod keyboard;
+#[path = "../../common/machine_profile.rs"]
+mod machine_profile;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_gamepad;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "../../common/native_input.rs"]
 mod native_input;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_midi;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/native_storage.rs"]
+mod native_storage;
 mod presentation;
 #[cfg(not(target_arch = "wasm32"))]
 mod profile;
@@ -37,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = app::Doslet::from_cli(cli)?;
     // Transfer ownership once at iced startup. Execution owns the state directly.
     let initial = std::cell::Cell::new(Some(app));
-    run(move || initial.take().expect("iced boots the application once"))?;
+    run(move || *initial.take().expect("iced boots the application once"))?;
     Ok(())
 }
 
@@ -49,10 +57,21 @@ fn main() -> iced::Result {
 }
 
 fn run(boot: impl iced::application::BootFn<app::Doslet, app::Message> + 'static) -> iced::Result {
+    let window = iced::window::Settings {
+        #[cfg(target_os = "linux")]
+        platform_specific: iced::window::settings::PlatformSpecific {
+            // Match the desktop entry so Wayland and X11 can resolve our icon.
+            application_id: "org.doslet.Doslet".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
     iced::application(boot, app::Doslet::update, app::Doslet::view)
         .title("Doslet · A little DOS")
         .theme(app::Doslet::theme)
         .subscription(app::Doslet::subscription)
+        .window(window)
         .window_size((1120.0, 760.0))
         .centered()
         .run()

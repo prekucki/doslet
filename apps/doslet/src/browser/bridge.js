@@ -11,6 +11,18 @@ export class Browser {
         this.midiAccess = null; this.midiLabels = new Map(); this.hostMidi = null;
         this.stats = {frames: 0, notes: 0, peak: 0, underruns: 0};
         this.mouseCanvas = null; this.mouseWanted = false; this.mousePending = false;
+        this.padGeneration = new Map(); this.padSuppressed = new Map(); this.padSequence = 0;
+        this.padInFlight = false; this.inputEnabled = true; this.pendingCalls = new Map(); this.nextCall = 1;
+        this.heldKeys = new Set(); this.suppressedKeys = new Set();
+        this.preparedOutputs = new Map();
+        window.addEventListener('gamepadconnected', event => {
+            this.padGeneration.set(event.gamepad.index, (this.padGeneration.get(event.gamepad.index) || 0) + 1);
+        });
+        window.addEventListener('gamepaddisconnected', event => {
+            this.padGeneration.set(event.gamepad.index, (this.padGeneration.get(event.gamepad.index) || 0) + 1);
+            this.releaseInput();
+        });
+        document.addEventListener('visibilitychange', () => { if (document.hidden) this.releaseInput(); });
         document.addEventListener('pointerlockchange', () => {
             if (this.mouseCaptured() && !this.mouseWanted) document.exitPointerLock();
             if (!this.mouseCaptured()) {
@@ -42,9 +54,38 @@ export class Browser {
                 this.releaseMouse(); event.stopImmediatePropagation();
             }
         }, true);
-        window.addEventListener('blur', () => this.releaseMouse());
-        this.worker.onerror = event => this.events.push({kind: 'error', error: event.message || 'Worker startup failed'});
+        window.addEventListener('blur', () => { this.releaseMouse(); this.releaseInput(); });
+        this.worker.onerror = event => {
+            const error=event.message || 'Machine Worker failed';
+            for(const call of this.pendingCalls.values()) {clearTimeout(call.timer);call.reject(new Error(error));}
+            this.pendingCalls.clear();this.events.push({kind:'machine-failed',message:error,error});
+        };
         this.worker.onmessage = ({data}) => {
+            if(data.kind==='storage-status-request') {
+                (async()=>{
+                    let persisted=false;
+                    try {persisted=await navigator.storage?.persisted() || await navigator.storage?.persist() || false;}catch {}
+                    let estimate={};try{estimate=await navigator.storage?.estimate() || {};}catch {}
+                    this.events.push({kind:'storage-policy',persisted,...estimate,message:persisted?'Browser saves: durable storage granted':'Browser saves: best effort; keep exported backups'});
+                })();return;
+            }
+            if(data.kind === 'prepare-output') {
+                this.prepareOutput(data.output).then(prepared=>{
+                    this.preparedOutputs.set(data.token,prepared);this.send({kind:'output-prepared',token:data.token});
+                }).catch(error=>this.send({kind:'output-prepared',token:data.token,error:String(error)}));
+                return;
+            }
+            if(data.kind === 'commit-output') {
+                const prepared=this.preparedOutputs.get(data.token);this.preparedOutputs.delete(data.token);
+                if(prepared) this.commitOutput(prepared);return;
+            }
+            if(data.kind === 'discard-output') {this.preparedOutputs.delete(data.token);return;}
+            if (data.kind === 'input-ack') { this.padInFlight = false; return; }
+            if (data.kind === 'call-result') {
+                const call = this.pendingCalls.get(data.id); this.pendingCalls.delete(data.id);
+                if (call) {clearTimeout(call.timer);data.error ? call.reject(new Error(data.error)) : call.resolve(data);}
+                return;
+            }
             if (data.kind === 'ready') {
                 this.ready = true;
                 for (const [message, transfer] of this.queue) this.worker.postMessage(message, transfer);
@@ -57,7 +98,7 @@ export class Browser {
             else if (data.kind === 'frame') {
                 if (this.frame) this.returnFrame(this.frame);
                 this.frame = data;
-            } else this.events.push(data);
+            } else { if(this.events.length >= 256) this.events.shift(); this.events.push(data); }
         };
     }
     send(message, transfer = []) {
@@ -68,8 +109,113 @@ export class Browser {
         }
     }
     command(kind, program) {
-        if (['pause','reset','import','start'].includes(kind)) this.releaseMouse();
+        if (['pause','reset','import','start'].includes(kind)) { this.releaseMouse(); this.releaseInput(); }
         this.send({kind, program});
+    }
+    applyMachine(profile, program, discardChanges = false) {
+        this.releaseInput(); this.releaseMouse(); this.send({kind:'apply-machine', profile, program, discardChanges});
+    }
+    physicalKey(usage, pressed, enabled=true) {
+        if (!pressed) { this.heldKeys.delete(usage); this.suppressedKeys.delete(usage); }
+        else { if (this.heldKeys.has(usage)) return; this.heldKeys.add(usage); }
+        if(pressed && !enabled) this.suppressedKeys.add(usage);
+        if (!this.suppressedKeys.has(usage)) this.send({kind:'physical-key', usage, pressed});
+    }
+    joystick(x, y, buttons) { this.send({kind:'joystick', x, y, buttons}); }
+    releaseInput() {
+        for (const usage of this.heldKeys) this.suppressedKeys.add(usage);
+        for (const pad of navigator.getGamepads?.() || []) if (pad) this.padSuppressed.set(pad.index, {
+            buttons: pad.buttons.map(button => button.pressed), axes: pad.axes.map(value => Math.abs(value) > 0.12),
+        });
+        this.send({kind:'release-input'});
+    }
+    inputCapture(enabled) { if (this.inputEnabled && !enabled) this.releaseInput(); this.inputEnabled = enabled; }
+    sampleGamepads() {
+        const pads = [...(navigator.getGamepads?.() || [])].filter(Boolean).slice(0, 16);
+        if (!this.padInFlight) {
+            const enabled=this.inputEnabled && document.hasFocus() && !document.hidden && this.state?.status === 1;
+            const states = pads.map(pad => {
+                const blocked = this.padSuppressed.get(pad.index);
+                const axes = pad.axes.slice(0, 8).map((value, index) => {
+                    if (blocked?.axes[index]) { if (Math.abs(value) <= 0.12) blocked.axes[index] = false; return 0; }
+                    return Math.round(Math.max(-1, Math.min(1, value)) * 32767);
+                });
+                let buttons = 0;
+                pad.buttons.slice(0,32).forEach((button,index) => {
+                    if (blocked?.buttons[index]) { if (!button.pressed) blocked.buttons[index] = false; }
+                    else if (button.pressed) buttons = (buttons | (1 << index)) >>> 0;
+                });
+                return {id:pad.index,identity:pad.id,generation:this.padGeneration.get(pad.index)||1,axes,buttons};
+            });
+            this.padInFlight = true;
+            this.send({kind:'gamepads', enabled, sequence:++this.padSequence, states});
+        }
+        return pads.map(pad=>({id:pad.id,index:pad.index,connected:pad.connected}));
+    }
+    pickFile(accept) {
+        return new Promise((resolve, reject) => {
+            const input = document.createElement('input'); input.type = 'file'; input.accept = accept;
+            input.onchange = () => resolve(input.files?.[0] || null);
+            input.oncancel = () => resolve(null);
+            try { input.click(); } catch(error) { reject(error); }
+        });
+    }
+    async chooseProfile() {
+        const file = await this.pickFile('.toml,text/plain');
+        if (!file) return null;
+        if (file.size > 1024 * 1024) throw new Error('Profile exceeds 1 MiB');
+        return file.text();
+    }
+    download(bytes, name, type) {
+        const url = URL.createObjectURL(new Blob([bytes], {type}));
+        const link = document.createElement('a'); link.href = url; link.download = name; link.click();
+        setTimeout(()=>URL.revokeObjectURL(url), 1000);
+    }
+    downloadProfile(text) { this.download(text, 'doslet-machine.toml', 'application/toml'); }
+    async chooseIso() { const blob = await this.pickFile('.iso,application/x-iso9660-image'); if (blob) await this.call('import-iso', {blob}); }
+    importIso(bytes) { this.send({kind:'import-iso',blob:new Blob([bytes])}); }
+    call(kind, fields = {}, transfer = []) {
+        if (this.pendingCalls.size >= 8) return Promise.reject(new Error('Too many pending storage commands'));
+        const id = this.nextCall++;
+        return new Promise((resolve,reject)=> {
+            const timer=setTimeout(()=>{this.pendingCalls.delete(id);reject(new Error('Storage operation timed out; export current changes before restarting'));},120000);
+            this.pendingCalls.set(id,{resolve,reject,timer});this.send({kind,id,...fields},transfer);
+        });
+    }
+    async exportSaves() { const result = await this.call('export-saves'); this.download(result.buffer,'doslet-saves.dsv','application/octet-stream'); }
+    async importSaves() {
+        const file = await this.pickFile('.dsv,application/octet-stream'); if (!file) return;
+        if (file.size > 16*1024*1024) throw new Error('Save import exceeds 16 MiB');
+        const buffer = await file.arrayBuffer(); await this.call('import-saves',{buffer},[buffer]);
+    }
+    async prepareOutput(output) {
+        if(!output.audio) return {disabled:true};
+        const selection=output.midi_output;
+        if(selection==='moont') throw new Error('CM-32L ROM synthesis is available on desktop; choose rust or an exposed MIDI port in the browser');
+        if(selection==='rust') {await this.startRustAudio();return {selection:'Rust synth',output};}
+        const id=this.midiLabels.get(selection);
+        if(!id) throw new Error('Find MIDI outputs and choose an available port before applying the profile');
+        if(output.host_midi==='mt32' && !this.midiAccess?.sysexEnabled) throw new Error('Select the MT-32 MIDI port with SysEx permission before applying this profile');
+        const device=this.midiAccess.outputs.get(id);
+        if(!device || device.state!=='connected') throw new Error('Selected MIDI output is disconnected');
+        const {HostMidi}=await import(new URL('host-midi.js',this.assets));
+        await device.open();await this.startRustAudio();
+        return {selection,device,HostMidi,output};
+    }
+    commitOutput(prepared) {
+        if(prepared.disabled) {
+            this.muted=true;if(this.gain)this.gain.gain.value=0;if(this.hostMidi)this.hostMidi.mute(true);
+            this.send({kind:'audio-running',running:false});return;
+        }
+        if(this.hostMidi) {this.hostMidi.close();this.hostMidi=null;}
+        this.muted=false;this.gain.gain.value=1;this.backend=prepared.selection;
+        if(prepared.selection==='Rust synth') {this.attachWorklet();this.syncAudioState();return;}
+        const pcm=new MessageChannel(),midi=new MessageChannel();
+        this.node.port.postMessage({kind:'connect',port:pcm.port1},[pcm.port1]);
+        this.hostMidi=new prepared.HostMidi(prepared.device,midi.port1,error=>this.events.push({kind:'audio-error',error}),prepared.output.host_midi==='mt32');
+        this.connectedBackend='midi';
+        this.send({kind:'connect',mode:'midi',dialect:prepared.output.host_midi,port:midi.port2,audioPort:pcm.port2},[midi.port2,pcm.port2]);
+        this.syncAudioState();
     }
     mouseCaptured() { return !!this.mouseCanvas && document.pointerLockElement === this.mouseCanvas; }
     captureMouse() {
@@ -102,7 +248,7 @@ export class Browser {
         this.send({kind: 'import', buffer}, [buffer]);
     }
     poll() {
-        const data = {state: this.state, mouseCaptured: this.mouseCaptured(), event: this.events.shift() || null,
+        const data = {state: this.state, gamepads:this.sampleGamepads(), mouseCaptured: this.mouseCaptured(), event: this.events.shift() || null,
             audio: {state: this.backend === 'Rust synth' ? this.context?.state || 'inactive' : 'MIDI port', ready: !!this.node,
                 muted: this.muted, ...this.stats}};
         if (this.hostMidi) data.audio = {...this.stats, state: 'MIDI port', ready: true, muted: this.muted,

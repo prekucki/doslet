@@ -69,6 +69,30 @@ cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE --no-audio
 cargo run -p doslet --release --locked -- --help
 ```
 
+### Linux launcher and application icon
+
+Install the launcher and icon for COSMIC and other Linux desktops:
+
+```sh
+mise run desktop-install
+```
+
+This builds the release binary and uses Python 3's standard library to install
+`org.doslet.Doslet.desktop` and the SVG icon under `$XDG_DATA_HOME` (default:
+`~/.local/share`). No `sudo` is needed. Without mise, run:
+
+```sh
+cargo build -p doslet --release --locked
+python3 tools/install_desktop.py
+```
+
+The launcher uses the absolute path to the built binary, so it does not depend
+on the desktop session's `PATH`. For a custom Cargo target directory or another
+installed binary, pass its path to `tools/install_desktop.py`. Run the installer
+again after moving the binary or checkout. Rebuilding at the same path needs no
+reinstallation. Restart any open Doslet windows after the first build/install;
+the Linux window application ID matches the desktop entry and icon name.
+
 ### Civilization and MT-32-family audio
 
 Launch your own installation of Civilization 474.03:
@@ -84,10 +108,10 @@ F1–F10. Keyboard events captured by application controls stay with those contr
 
 **GAME MIDI** chooses the game's MIDI dialect; **MIDI OUTPUT** chooses the
 renderer or host port. The default game mode is GM. Roland MT-32 SysEx
-automatically upgrades it to MT-32 and shows that change in the inspector.
+automatically upgrades it to MT-32 and shows that change under **Info**.
 Rust synth and GM host ports use **MT-32 → GM (przybliżenie)** translation in
 MT-32 mode. This approximation needs no ROMs and does not reproduce LA synthesis.
-The inspector also shows SysEx counts, unmapped notes and the module's LCD text.
+**Info** also shows SysEx counts, unmapped notes and the module's LCD text.
 For example, ROM-free CIV audio uses:
 
 ```sh
@@ -128,12 +152,30 @@ target/release/doslet --config games/PRINCE.toml --no-audio
 target/release/doslet --config games/HoMnM.toml
 ```
 
+### Machine configuration and saves
+
+Open **Settings** in either frontend to edit a draft, validate its
+resources and **Apply and restart**. The editor configures RAM, x87, SB16 and
+MPU-401 hardware, AT/BIOS keyboard input, a two-axis/two-button gameport, host
+output, installation media and save policy. Native Apply prepares sources on a
+separate thread; failed preparation preserves the active session and reset
+settings. Native **Fit** and **1:1** display sizing remain available.
+
+Profiles import version 1 or 2 and export version 2. Persistent overlays use an
+explicit native save directory or browser **IndexedDB** namespace. Save
+export/import remains available; pending commits and storage errors are shown
+in the workspace. Legacy native `rw` continues direct installation writeback.
+See [machine configuration](docs/configuration.md) for a version-2 profile,
+controller bindings, write policies, local/HTTPS ISO requirements and current
+implementation limits.
+
 The local game installations stay ignored. HoMnM's profile mounts its
 `homm1.gog` ISO and exposes MSCDEX sector services plus read-only DOS file
 access. The recorded run passes its CD check; gameplay remains unverified.
 
-Guest-created files use the reserved RAM overlay. They can be reopened during
-the session; Reset or exit discards them. Persistent host saves remain pending.
+Guest-created files use the reserved RAM overlay by default. They can be reopened
+during the session. Export them or explicitly discard temporary changes before
+restart; select a persistent save store to retain acknowledged changes.
 `--no-audio` retains a silent path; choose **1 — No sounds please** in CIV.
 
 To use an external or system MIDI synthesizer, click **Find MIDI outputs** in
@@ -153,14 +195,14 @@ sends complete messages at deadlines derived from guest time. Execution runs up
 to 80 ms ahead to buffer short UI stalls; message timestamps retain bounded
 execution-chunk resolution (about 1.2 ms). The preallocated queue holds at most
 8192 messages and reports exhaustion. Pause/reset/output replacement cancel
-queued messages and silence the selected port. The inspector reports queued
+queued messages and silence the selected port. **Info** reports queued
 messages and dispatches more than 2 ms late, with maximum dispatch lateness.
 These counters measure Doslet scheduling, not the external synth's PCM buffers.
 
 Press **Run** to execute the built-in demo, **Pause** to suspend execution, **Step** to
 advance one execution step, or **Reset** to create a fresh session. Linux builds
-require a C linker, `pkg-config` and ALSA development files (`libasound2-dev` on
-Ubuntu/Debian); launching requires a working Wayland or X11
+require a C linker, `pkg-config`, ALSA and udev development files
+(`libasound2-dev` and `libudev-dev` on Ubuntu/Debian); launching requires a working Wayland or X11
 session and graphics driver. Dependency resolution and native compilation are
 separate from checking a live window.
 
@@ -206,7 +248,7 @@ to the console.
 To mount a local game in the browser, pack its complete installation directory
 as a ZIP, including DOS4GW, graphics drivers, music and other data files. The
 ZIP may contain the files directly or inside a wrapping folder such as `PRINCE/`.
-In Doslet, choose **Open game ZIP**, select **PRINCE/PRINCE.EXE** (or the relevant
+In Doslet, choose **Open… → Choose ZIP…**, select **PRINCE/PRINCE.EXE** (or the relevant
 EXE/COM), then press **Start game**. The selected program's containing directory
 becomes C:, with its subdirectories preserved. ZIP data stays in the browser;
 there is no upload, and commercial files are not included in the web build.
@@ -217,12 +259,14 @@ paths must use ASCII names; duplicate case-insensitive names, symbolic links,
 encrypted files, absolute paths and parent-directory traversal are rejected.
 Unsupported compression and corrupt data produce an error.
 
-Reset recreates the running game's drive from the original ZIP. Guest writes
-use a separate 1-MiB RAM overlay and are lost on reset or page reload; creating
-new files are supported in that overlay. Persistent storage remains pending.
+Restart recreates the running game's drive from the original ZIP. Guest writes
+use a separate 1-MiB overlay. Choose temporary or persistent saves under
+**Settings → Drives**; persistent browser saves use IndexedDB. Temporary changes
+must be exported or explicitly discarded before restart. See
+[configuration](docs/configuration.md) for save policies and limits.
 BIOS/DOS keyboard input and DOS mouse-driver input are mapped from the UI. **Start game** creates and resumes Web Audio for the actual
-guest MIDI stream. If the browser keeps audio suspended, click **Enable audio**;
-the same button offers **Mute** / **Unmute** once audio is running. The inspector
+guest MIDI stream. If the browser keeps audio suspended, open **Audio → Enable audio**;
+the same button offers **Mute** / **Unmute** once audio is running. **Info**
 reports context state, note events, peak, rendered audio frames and underruns.
 The machine and ZIP live in a dedicated Web Worker. A separate Rust/WASM module
 synthesizes 48-kHz stereo directly in AudioWorklet; samples do not pass through
@@ -425,6 +469,7 @@ and Python's standard library (no Node, Selenium or package installation):
 ```sh
 python3 tests/browser_smoke.py
 python3 tests/browser_smoke.py --prince
+python3 tests/browser_components.py
 ```
 
 The second command needs the local `target/prince-game.zip` created by
@@ -434,6 +479,14 @@ pause/resume/reset, output recovery, and continued audio/CPU progress during an
 800-ms window-thread stall. Web MIDI uses a mock device, including a port without
 `clear()`; MT-32 checks cover automatic upgrade, translation, RPN replay and raw
 SysEx output with explicit permission; this does not establish playback on a real external synthesizer.
+
+The component check also needs `openssl`. It exercises real IndexedDB/Web Locks,
+HTTPS Range/CORS, candidate configuration, DOS save acknowledgements and
+save export/import/reset. A mocked Gamepad API drives the actual browser
+transport, input router and guest gameport. The HTTPS fixture generates a
+self-signed certificate in a temporary directory and uses an isolated Firefox
+profile; it does not install certificates in system or user trust stores.
+The temporary certificate, key and profile are removed when the test ends.
 
 Capture the guest framebuffer without opening a window:
 

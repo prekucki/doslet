@@ -1,19 +1,24 @@
 use crate::{bios, demo::COLOR_BARS_COM};
+use alloc::boxed::Box;
 #[cfg(test)]
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 use doslet_bus::{BusError, MemoryBus};
+use doslet_config::HardwareConfig;
 use doslet_dos::files::ReadOnlyDrive;
 use doslet_dos::memory::MemoryArena;
 use doslet_dos::{ComError, MzError, ProcessMemory, load_com, load_mz, load_mz_stub};
 use doslet_pc::PcMachine;
+use doslet_storage::{CachedSource, HostCompletion, HostRequest, StorageError};
+use doslet_vfs::{HandleTable, MountId, NodeId, OpenFile};
 use doslet_vga::IndexedFrame;
 use doslet_x86::{CpuError, Gpr16, Registers, StepOutcome, linear_address};
 mod cdrom;
 use cdrom::CdromImage;
 mod keyboard;
 mod mouse;
+mod storage;
 mod vesa;
 mod video;
 
@@ -42,6 +47,8 @@ pub enum RuntimeError {
     InvalidLaunch,
     InvalidWorkingDirectory(u16),
     InvalidCdromImage,
+    Storage(StorageError),
+    Input(doslet_input::InputError),
 }
 impl From<ComError> for RuntimeError {
     fn from(error: ComError) -> Self {
@@ -89,6 +96,8 @@ impl fmt::Display for RuntimeError {
             }
             Self::InvalidLaunch => f.write_str("launch setup requires a ready session and a printable ASCII DOS command tail of at most 126 bytes"),
             Self::InvalidWorkingDirectory(code) => write!(f, "invalid DOS working directory (DOS error {code})"),
+            Self::Input(error)=>write!(f,"input error: {error:?}"),
+            Self::Storage(error) => write!(f,"storage error: {error:?}"),
             Self::InvalidCdromImage => f.write_str("MSCDEX image must be a sector-aligned ISO 9660 image with a valid primary volume descriptor"),
         }
     }
@@ -96,7 +105,7 @@ impl fmt::Display for RuntimeError {
 impl core::error::Error for RuntimeError {}
 
 pub struct Session {
-    machine: PcMachine,
+    machine: Box<PcMachine>,
     status: SessionStatus,
     fault: Option<RuntimeError>,
     steps: u64,
@@ -111,6 +120,19 @@ pub struct Session {
     overlays: u32,
     break_check: bool,
     cdrom: Option<CdromImage>,
+    handles: HandleTable,
+    staging: Box<[u8]>,
+    continuation: Option<storage::Continuation>,
+    storage_wait: bool,
+    timeslice_yielded: bool,
+    epoch: u64,
+    active_service: u8,
+    persistent: Option<storage::Persistent>,
+    base_identity: [u8; 32],
+    keyboard_prefix: bool,
+    input: doslet_input::InputRouter,
+    joystick_axes: [i16; 2],
+    joystick_buttons: [bool; 2],
 }
 
 impl Session {
@@ -152,12 +174,15 @@ impl Session {
         Ok(())
     }
     pub fn new(program: &[u8]) -> Result<Self, RuntimeError> {
-        let mut machine = PcMachine::default();
+        Self::new_configured(program, HardwareConfig::default())
+    }
+    pub fn new_configured(program: &[u8], config: HardwareConfig) -> Result<Self, RuntimeError> {
+        let mut machine = PcMachine::from_config(config)?;
         machine.cpu.registers = load_com(&mut machine.bus, program)?;
         Self::from_machine(machine)
     }
     pub fn from_mz(program: &[u8]) -> Result<Self, RuntimeError> {
-        Self::mz_session(program, false)
+        Self::mz_session(program, false, HardwareConfig::default())
     }
     /// Begin with the DOS startup stub. A guest extender may load the extended
     /// image through DOS services and enter the implemented protected-mode subset.
@@ -168,7 +193,17 @@ impl Session {
         if name.is_empty() || name.len() > 127 || !name.is_ascii() || name.contains(&0) {
             return Err(RuntimeError::InvalidProgramName);
         }
-        let mut session = Self::mz_session(program, true)?;
+        Self::from_mz_stub_named_configured(program, name, HardwareConfig::default())
+    }
+    pub fn from_mz_stub_named_configured(
+        program: &[u8],
+        name: &[u8],
+        config: HardwareConfig,
+    ) -> Result<Self, RuntimeError> {
+        if name.is_empty() || name.len() > 127 || !name.is_ascii() || name.contains(&0) {
+            return Err(RuntimeError::InvalidProgramName);
+        }
+        let mut session = Self::mz_session(program, true, config)?;
         session.memory = session.memory.with_environment(0x0F00, 0x1000);
         session.memory.write_mcbs(&mut session.machine.bus)?;
         let bus = &mut session.machine.bus;
@@ -184,8 +219,21 @@ impl Session {
         bus.write_u16(0x1002C, 0x0F00)?;
         Ok(session)
     }
-    fn mz_session(program: &[u8], dos_stub: bool) -> Result<Self, RuntimeError> {
-        let mut machine = PcMachine::default();
+    pub fn from_mz_configured(
+        program: &[u8],
+        config: HardwareConfig,
+    ) -> Result<Self, RuntimeError> {
+        Self::mz_session(program, false, config)
+    }
+    pub fn demo_configured(config: HardwareConfig) -> Result<Self, RuntimeError> {
+        Self::new_configured(COLOR_BARS_COM, config)
+    }
+    fn mz_session(
+        program: &[u8],
+        dos_stub: bool,
+        config: HardwareConfig,
+    ) -> Result<Self, RuntimeError> {
+        let mut machine = PcMachine::from_config(config)?;
         let memory = ProcessMemory {
             psp_segment: doslet_dos::loader::PSP_SEGMENT,
             end_segment: 0xA000,
@@ -201,7 +249,8 @@ impl Session {
         };
         Self::from_machine(machine)
     }
-    fn from_machine(mut machine: PcMachine) -> Result<Self, RuntimeError> {
+    fn from_machine(machine: PcMachine) -> Result<Self, RuntimeError> {
+        let mut machine = Box::new(machine);
         bios::install(&mut machine.bus)?;
         // Virtual mouse IRQ wrapper preserves full general and segment registers.
         machine.bus.write_u16(0x74 * 4, 0x400)?;
@@ -218,6 +267,7 @@ impl Session {
         let process_end = machine.bus.read_u16(0x10002)?;
         let memory = MemoryArena::new(0x1000, process_end, 0xA000);
         memory.write_mcbs(&mut machine.bus)?;
+        let epoch = storage::new_epoch()?;
         Ok(Self {
             machine,
             status: SessionStatus::Ready,
@@ -234,10 +284,24 @@ impl Session {
             overlays: 0,
             break_check: false,
             cdrom: None,
+            handles: HandleTable::default(),
+            staging: alloc::vec![0;65536].into_boxed_slice(),
+            continuation: None,
+            storage_wait: false,
+            timeslice_yielded: false,
+            epoch,
+            active_service: 0,
+            persistent: None,
+            base_identity: [0; 32],
+            keyboard_prefix: false,
+            input: doslet_input::InputRouter::new(epoch),
+            joystick_axes: [0; 2],
+            joystick_buttons: [false; 2],
         })
     }
     /// Transfer a preloaded input drive into the session during setup.
     pub fn with_drive(mut self, drive: ReadOnlyDrive) -> Self {
+        self.base_identity = drive.base_identity();
         self.drive = drive;
         self
     }
@@ -422,12 +486,20 @@ impl Session {
     pub fn pause(&mut self) {
         if self.status == SessionStatus::Running {
             self.status = SessionStatus::Paused;
+            self.input.release_all();
+            let _ = self.release_keys();
         }
     }
     /// No wall-clock checks or allocations. Every batch is limited by execution steps.
     pub fn advance(&mut self, budget: u32) -> u32 {
+        self.timeslice_yielded = false;
+        self.apply_input();
         let mut completed = 0;
-        while completed < budget && self.status == SessionStatus::Running {
+        while completed < budget
+            && self.status == SessionStatus::Running
+            && !self.storage_wait
+            && !self.timeslice_yielded
+        {
             match self.execute_step(budget - completed) {
                 Ok(consumed) => {
                     completed += consumed;
@@ -441,6 +513,11 @@ impl Session {
         }
         completed
     }
+    /// Whether the most recent `advance` ended on INT 2Fh/1680h. Frontends
+    /// should return to their event loop before starting another batch.
+    pub fn timeslice_yielded(&self) -> bool {
+        self.timeslice_yielded
+    }
     pub fn single_step(&mut self) {
         if matches!(self.status, SessionStatus::Ready | SessionStatus::Paused) {
             self.start();
@@ -449,14 +526,29 @@ impl Session {
         }
     }
     fn execute_step(&mut self, budget: u32) -> Result<u32, RuntimeError> {
-        self.dispatch_mouse()?;
-        if !self.machine.cpu.protected_mode() && self.machine.cpu.registers.cs == bios::SHIM_SEGMENT
-        {
-            let ip = self.machine.cpu.registers.ip;
-            if let Some(vector) = bios::service_at(&mut self.machine.bus, ip)? {
-                self.service(vector)?;
-                if self.status != SessionStatus::Running {
-                    return Ok(1);
+        self.apply_input();
+        if self.continuation.is_some() {
+            if !self.resume_storage()? {
+                return Ok(1);
+            }
+        } else {
+            self.dispatch_mouse()?;
+            if !self.machine.cpu.protected_mode()
+                && self.machine.cpu.registers.cs == bios::SHIM_SEGMENT
+            {
+                let ip = self.machine.cpu.registers.ip;
+                if let Some(selector) = bios::service_at(&mut self.machine.bus, ip)? {
+                    let vector = selector.vector();
+                    self.active_service = vector;
+                    self.service(vector)?;
+                    if self.continuation.is_some()
+                        && (self.storage_wait || !self.resume_storage()?)
+                    {
+                        return Ok(1);
+                    }
+                    if self.status != SessionStatus::Running {
+                        return Ok(1);
+                    }
                 }
             }
         }
@@ -484,6 +576,7 @@ impl Session {
             return Ok(());
         }
         match (vector, ax >> 8) {
+            (0x09, _) => self.keyboard_irq()?,
             (0x33, _) => self.mouse_service(ax)?,
             (0x10, 0x4F) => self.vesa_service(ax as u8)?,
             (0x10, 0x10) => self.palette_service(ax)?,
@@ -588,6 +681,10 @@ impl Session {
             (0x67, _) if ax == 0xDE00 => {
                 self.machine.cpu.registers.set_byte(4, 0x84); // VCPI function unavailable, EMS AH status ABI.
             }
+            (0x2F, _) if ax == 0x1680 => {
+                self.machine.cpu.registers.set_byte(0, 0);
+                self.timeslice_yielded = true;
+            }
             (0x2F, _) if ax == 0x1687 => {
                 self.machine.cpu.registers.set(Gpr16::Ax, 1); // No external DPMI host installed.
             }
@@ -601,7 +698,7 @@ impl Session {
                 self.machine.cpu.registers.set_byte(0, 0); // No external XMS driver installed.
             }
             (0x15, 0x88) => {
-                let kilobytes = (doslet_pc::memory::RAM_SIZE - 0x100000) / 1024;
+                let kilobytes = (self.machine.bus.ram_size() - 0x100000) / 1024;
                 self.machine
                     .cpu
                     .registers
@@ -637,12 +734,10 @@ impl Session {
                 self.mouse_video_mode_changed();
             }
             (0x20, _) => {
-                self.drive.close_all();
-                self.status = SessionStatus::Exited(0);
+                self.finish_exit(0)?;
             }
             (0x21, 0x4C) => {
-                self.drive.close_all();
-                self.status = SessionStatus::Exited(ax as u8);
+                self.finish_exit(ax as u8)?;
             }
             (0x21, 0x30) => {
                 self.machine.cpu.registers.set(Gpr16::Ax, 5);
@@ -679,7 +774,7 @@ impl Session {
                     self.cdrom
                         .as_ref()
                         .filter(|cd| drive == cd.drive - b'A' + 1)
-                        .map(|cd| (0, cd.image.bytes().len() as u64 / 512))
+                        .map(|cd| (0, cd.length() / 512))
                 };
                 if let Some((free, total)) = space {
                     // Keep the whole volume representable in DOS's 16-bit counts.
@@ -868,7 +963,10 @@ impl Session {
                 if handle <= 2 || self.file_is_open(handle) {
                     let info = if handle <= 2 {
                         0x80D3
-                    } else if CdromImage::owns_handle(handle) {
+                    } else if self
+                        .backend_handle(handle)
+                        .is_ok_and(CdromImage::owns_handle)
+                    {
                         u16::from(self.cdrom.as_ref().unwrap().drive - b'A')
                     } else {
                         2
@@ -957,6 +1055,11 @@ impl Session {
                 } else {
                     Err(5)
                 };
+                let result = if ax >> 8 == 0x3D {
+                    result.and_then(|handle| self.register_handle(handle, ax as u8))
+                } else {
+                    result
+                };
                 match result {
                     Ok(value) => {
                         self.machine.cpu.registers.set(
@@ -973,6 +1076,10 @@ impl Session {
                 }
             }
             (0x21, 0x3C) => {
+                if !self.handles.has_capacity() {
+                    self.dos_error(4)?;
+                    return Ok(());
+                }
                 let Some((name, length)) = self.read_path()? else {
                     return Ok(());
                 };
@@ -981,7 +1088,15 @@ impl Session {
                     .create(&name[..length], self.registers().get(Gpr16::Cx))
                 {
                     Ok(handle) => {
+                        let handle = match self.register_handle(handle, 2) {
+                            Ok(handle) => handle,
+                            Err(code) => {
+                                self.dos_error(code)?;
+                                return Ok(());
+                            }
+                        };
                         self.machine.cpu.registers.set(Gpr16::Ax, handle);
+                        self.begin_commit()?;
                         self.set_carry(false)?;
                     }
                     Err(code) => self.dos_error(code)?,
@@ -1000,43 +1115,44 @@ impl Session {
                 }
             }
             (0x21, 0x3E) => {
-                let handle = self.machine.cpu.registers.get(Gpr16::Bx);
-                let result = if CdromImage::owns_handle(handle) {
-                    self.cdrom
-                        .as_mut()
-                        .ok_or(6u16)
-                        .and_then(|cd| cd.close(handle))
-                } else {
-                    self.drive.close(handle)
-                };
+                let public = self.machine.cpu.registers.get(Gpr16::Bx);
+                let result = self.close_handle(public);
                 match result {
-                    Ok(()) => self.set_carry(false)?,
+                    Ok(()) => {
+                        self.set_carry(false)?;
+                        self.begin_commit()?;
+                    }
                     Err(code) => self.dos_error(code)?,
                 }
             }
             (0x21, 0x3F) => {
                 let r = &self.machine.cpu.registers;
-                let (ds, dx) = (r.ds, r.get(Gpr16::Dx));
-                let handle = r.get(Gpr16::Bx);
+                let (ds, dx, count, public) =
+                    (r.ds, r.get(Gpr16::Dx), r.get(Gpr16::Cx), r.get(Gpr16::Bx));
+                let handle = match self.backend_handle(public) {
+                    Ok(h) => h,
+                    Err(code) => {
+                        self.dos_error(code)?;
+                        return Ok(());
+                    }
+                };
                 let result = if CdromImage::owns_handle(handle) {
                     self.cdrom
                         .as_mut()
                         .ok_or(6u16)
-                        .and_then(|cd| cd.read(handle, r.get(Gpr16::Cx)))
+                        .and_then(|cd| cd.prepare_read(handle, count))
                 } else {
-                    self.drive.read_view(handle, r.get(Gpr16::Cx))
+                    self.drive.prepare_read(handle, count)
                 };
                 match result {
-                    Ok(bytes) => {
-                        let length = bytes.len() as u16;
-                        for offset in 0..bytes.len() {
-                            self.machine.bus.write_u8(
-                                linear_address(ds, dx.wrapping_add(offset as u16)),
-                                bytes.byte(offset).unwrap(),
-                            )?;
-                        }
-                        self.machine.cpu.registers.set(Gpr16::Ax, length);
-                        self.set_carry(false)?;
+                    Ok((position, length)) => {
+                        self.continuation = Some(storage::Continuation::ReadStage {
+                            handle,
+                            position,
+                            target: storage::CopyTarget::Segment(ds, dx),
+                            length,
+                            done: 0,
+                        })
                     }
                     Err(code) => self.dos_error(code)?,
                 }
@@ -1044,7 +1160,9 @@ impl Session {
             (0x21, 0x40) => {
                 let r = &self.machine.cpu.registers;
                 let count = usize::from(r.get(Gpr16::Cx));
-                if CdromImage::owns_handle(r.get(Gpr16::Bx)) {
+                let public = r.get(Gpr16::Bx);
+                let backend = self.backend_handle(public);
+                if backend.is_ok_and(CdromImage::owns_handle) {
                     self.dos_error(if self.file_is_open(r.get(Gpr16::Bx)) {
                         5
                     } else {
@@ -1052,16 +1170,27 @@ impl Session {
                     })?;
                 } else if !matches!(r.get(Gpr16::Bx), 1 | 2) {
                     let (ds, dx) = (r.ds, r.get(Gpr16::Dx));
-                    match self.drive.write_buffer(r.get(Gpr16::Bx), r.get(Gpr16::Cx)) {
-                        Ok(bytes) => {
-                            for (offset, byte) in bytes.iter_mut().enumerate() {
-                                *byte = self
-                                    .machine
-                                    .bus
-                                    .read_u8(linear_address(ds, dx.wrapping_add(offset as u16)))?;
+                    let handle = match backend {
+                        Ok(handle) => handle,
+                        Err(code) => {
+                            self.dos_error(code)?;
+                            return Ok(());
+                        }
+                    };
+                    match self.drive.write_buffer(handle, r.get(Gpr16::Cx)) {
+                        Ok(_) => {
+                            if count == 0 {
+                                self.machine.cpu.registers.set(Gpr16::Ax, 0);
+                                self.set_carry(false)?;
+                            } else {
+                                self.continuation = Some(storage::Continuation::WriteStage {
+                                    handle,
+                                    segment: ds,
+                                    offset: dx,
+                                    length: count,
+                                    done: 0,
+                                });
                             }
-                            self.machine.cpu.registers.set(Gpr16::Ax, count as u16);
-                            self.set_carry(false)?;
                         }
                         Err(code) => self.dos_error(code)?,
                     }
@@ -1082,7 +1211,13 @@ impl Session {
                 let r = &self.machine.cpu.registers;
                 let displacement =
                     ((u32::from(r.get(Gpr16::Cx)) << 16) | u32::from(r.get(Gpr16::Dx))) as i32;
-                let handle = r.get(Gpr16::Bx);
+                let handle = match self.backend_handle(r.get(Gpr16::Bx)) {
+                    Ok(handle) => handle,
+                    Err(code) => {
+                        self.dos_error(code)?;
+                        return Ok(());
+                    }
+                };
                 let result = if CdromImage::owns_handle(handle) {
                     self.cdrom
                         .as_mut()
@@ -1101,6 +1236,109 @@ impl Session {
                         self.set_carry(false)?;
                     }
                     Err(code) => self.dos_error(code)?,
+                }
+            }
+            (0x21, 0x39 | 0x3A) => {
+                let Some((name, length)) = self.read_path()? else {
+                    return Ok(());
+                };
+                let result = if ax >> 8 == 0x39 {
+                    self.drive.make_directory(&name[..length])
+                } else {
+                    self.drive.remove_directory(&name[..length])
+                };
+                match result {
+                    Ok(()) => {
+                        self.set_carry(false)?;
+                        self.begin_commit()?;
+                    }
+                    Err(code) => self.dos_error(code)?,
+                }
+            }
+            (0x21, 0x41) => {
+                let Some((name, length)) = self.read_path()? else {
+                    return Ok(());
+                };
+                match self.drive.delete(&name[..length]) {
+                    Ok(()) => {
+                        self.set_carry(false)?;
+                        self.begin_commit()?;
+                    }
+                    Err(code) => self.dos_error(code)?,
+                }
+            }
+            (0x21, 0x56) => {
+                let Some((from, length)) = self.read_path()? else {
+                    return Ok(());
+                };
+                let r = &self.machine.cpu.registers;
+                let (es, di) = (r.es, r.get(Gpr16::Di));
+                let mut to = [0; 128];
+                let mut end = None;
+                for (i, byte) in to.iter_mut().enumerate() {
+                    *byte = self
+                        .machine
+                        .bus
+                        .read_u8(linear_address(es, di.wrapping_add(i as u16)))?;
+                    if *byte == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                let result = if let Some(end) = end {
+                    let source_drive = if from.get(1) == Some(&b':') {
+                        from[0].to_ascii_uppercase()
+                    } else {
+                        b'C'
+                    };
+                    let target_drive = if to.get(1) == Some(&b':') {
+                        to[0].to_ascii_uppercase()
+                    } else {
+                        b'C'
+                    };
+                    if source_drive != target_drive {
+                        Err(17)
+                    } else if source_drive != b'C' {
+                        Err(5)
+                    } else {
+                        self.drive.rename(&from[..length], &to[..end])
+                    }
+                } else {
+                    Err(3)
+                };
+                match result {
+                    Ok(()) => {
+                        self.set_carry(false)?;
+                        self.begin_commit()?;
+                    }
+                    Err(code) => self.dos_error(code)?,
+                }
+            }
+            (0x21, 0x45 | 0x46) => {
+                let source = self.registers().get(Gpr16::Bx);
+                let result = if ax >> 8 == 0x45 {
+                    self.handles.duplicate(source)
+                } else {
+                    let target = self.registers().get(Gpr16::Cx);
+                    self.force_duplicate_handle(source, target).map(|()| target)
+                };
+                match result {
+                    Ok(handle) => {
+                        self.machine.cpu.registers.set(Gpr16::Ax, handle);
+                        self.set_carry(false)?;
+                        if ax >> 8 == 0x46 {
+                            self.begin_commit()?;
+                        }
+                    }
+                    Err(code) => self.dos_error(code)?,
+                }
+            }
+            (0x21, 0x68 | 0x6A) => {
+                if self.file_is_open(self.registers().get(Gpr16::Bx)) {
+                    self.set_carry(false)?;
+                    self.begin_commit()?;
+                } else {
+                    self.dos_error(6)?;
                 }
             }
             (0x21, 0x48..=0x4A) => {
@@ -1185,80 +1423,73 @@ impl Session {
                 self.machine.cpu.registers.set(Gpr16::Ax, 1);
                 self.set_carry(true)?;
             }
-            0x1502..=0x1504 => {
+            0x1502..=0x1504 | 0x1505 | 0x1508 => {
                 let drive = self.machine.cpu.registers.get(Gpr16::Cx);
-                if let Some(cd) = cdrom.filter(|_| drive == drive_number) {
-                    let field = 702 + usize::from((ax as u8).saturating_sub(2)) * 37;
-                    let start = cd.image.primary_descriptor() + field;
-                    let mut length = 0usize;
-                    while length < 37
-                        && cd
-                            .image
-                            .bytes()
-                            .get(start + length)
-                            .is_some_and(|byte| *byte != 0 && *byte != b' ')
-                    {
-                        length += 1;
-                    }
-                    for (index, byte) in cd.image.bytes()[start..start + length]
-                        .iter()
-                        .copied()
-                        .enumerate()
-                    {
-                        self.machine.bus.write_u8(buffer + index as u32, byte)?;
-                    }
-                    self.machine.bus.write_u8(buffer + length as u32, 0)?;
-                    self.set_carry(false)?;
-                } else {
-                    self.machine.cpu.registers.set(Gpr16::Ax, 15);
-                    self.set_carry(true)?;
+                if self
+                    .cdrom
+                    .as_ref()
+                    .is_none_or(|cd| u16::from(cd.drive - b'A') != drive)
+                {
+                    self.dos_error(15)?;
+                    return Ok(());
                 }
-            }
-            0x1505 => {
-                let drive = self.machine.cpu.registers.get(Gpr16::Cx);
-                let volume = self.machine.cpu.registers.get(Gpr16::Dx);
-                let result = cdrom.filter(|_| drive == drive_number).and_then(|cd| {
-                    let start = 16usize
-                        .checked_add(usize::from(volume))?
-                        .checked_mul(2048)?;
-                    let end = start.checked_add(2048)?;
-                    cd.image.bytes().get(start..end)
-                });
-                if let Some(sector) = result {
-                    for (index, byte) in sector.iter().copied().enumerate() {
-                        self.machine.bus.write_u8(buffer + index as u32, byte)?;
+                let result = if matches!(ax, 0x1502..=0x1504) {
+                    let cd = self.cdrom.as_mut().unwrap();
+                    match cd.primary() {
+                        Ok(primary) => cd
+                            .raw(
+                                primary + 702 + u64::from((ax as u8).saturating_sub(2)) * 37,
+                                &mut self.staging[..37],
+                            )
+                            .map(|_| {
+                                let length = self.staging[..37]
+                                    .iter()
+                                    .position(|b| matches!(b, 0 | b' '))
+                                    .unwrap_or(37);
+                                self.staging[length] = 0;
+                                (length + 1, ax)
+                            }),
+                        Err(code) => Err(code),
                     }
-                    let kind = sector[0];
-                    self.machine.cpu.registers.set(Gpr16::Ax, u16::from(kind));
-                    self.set_carry(false)?;
+                } else if ax == 0x1505 {
+                    let volume = self.machine.cpu.registers.get(Gpr16::Dx);
+                    self.cdrom
+                        .as_mut()
+                        .unwrap()
+                        .raw((16 + u64::from(volume)) * 2048, &mut self.staging[..2048])
+                        .map(|count| (count, u16::from(self.staging[0])))
                 } else {
-                    self.machine.cpu.registers.set(Gpr16::Ax, 21);
-                    self.set_carry(true)?;
-                }
-            }
-            0x1508 => {
-                let drive = self.machine.cpu.registers.get(Gpr16::Cx);
-                let count = usize::from(self.machine.cpu.registers.get(Gpr16::Dx));
-                if count > 32 {
-                    return Err(RuntimeError::UnsupportedService { vector: 0x2F, ax });
-                }
-                let sector = (usize::from(self.machine.cpu.registers.get(Gpr16::Si)) << 16)
-                    | usize::from(self.machine.cpu.registers.get(Gpr16::Di));
-                let result = cdrom.filter(|_| drive == drive_number).and_then(|cd| {
-                    let start = sector.checked_mul(2048)?;
-                    let size = count.checked_mul(2048)?;
-                    let end = start.checked_add(size)?;
-                    cd.image.bytes().get(start..end)
-                });
-                if let Some(bytes) = result {
-                    for (index, byte) in bytes.iter().copied().enumerate() {
-                        self.machine.bus.write_u8(buffer + index as u32, byte)?;
+                    let r = &self.machine.cpu.registers;
+                    let count = usize::from(r.get(Gpr16::Dx));
+                    if count > 32 {
+                        return Err(RuntimeError::UnsupportedService { vector: 0x2F, ax });
                     }
-                    self.machine.cpu.registers.set(Gpr16::Ax, 0);
-                    self.set_carry(false)?;
-                } else {
-                    self.machine.cpu.registers.set(Gpr16::Ax, 15);
-                    self.set_carry(true)?;
+                    let sector = (u64::from(r.get(Gpr16::Si)) << 16) | u64::from(r.get(Gpr16::Di));
+                    if count > 2 {
+                        self.continuation = Some(storage::Continuation::RawStage {
+                            offset: sector * 2048,
+                            target: storage::CopyTarget::Linear(buffer),
+                            length: count * 2048,
+                            done: 0,
+                            ax: 0,
+                        });
+                        return Ok(());
+                    }
+                    self.cdrom
+                        .as_mut()
+                        .unwrap()
+                        .raw(sector * 2048, &mut self.staging[..count * 2048])
+                        .map(|count| (count, 0))
+                };
+                match result {
+                    Ok((length, value)) => {
+                        self.begin_copy(storage::CopyTarget::Linear(buffer), length, value)
+                    }
+                    Err(code) => self.dos_error(if ax == 0x1508 && code != cdrom::PENDING {
+                        15
+                    } else {
+                        code
+                    })?,
                 }
             }
             0x150B => {
@@ -1315,7 +1546,7 @@ impl Session {
     }
 
     fn file_is_open(&self, handle: u16) -> bool {
-        self.drive.is_open(handle) || self.cdrom.as_ref().is_some_and(|cd| cd.is_open(handle))
+        self.handles.get(handle).is_ok()
     }
 
     fn set_carry(&mut self, carry: bool) -> Result<(), BusError> {
@@ -1327,6 +1558,11 @@ impl Session {
             .write_u16(address, (flags & !1) | u16::from(carry))
     }
     fn dos_error(&mut self, code: u16) -> Result<(), BusError> {
+        if code == cdrom::PENDING {
+            self.continuation = Some(storage::Continuation::Resolve(self.active_service));
+            self.storage_wait = true;
+            return Ok(());
+        }
         self.machine.cpu.registers.set(Gpr16::Ax, code);
         self.set_carry(true)
     }

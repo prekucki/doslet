@@ -14,6 +14,34 @@ extern "C" {
     fn new() -> Result<Browser, JsValue>;
     #[wasm_bindgen(method, catch)]
     fn command(this: &Browser, kind: &str, program: &str) -> Result<(), JsValue>;
+    #[wasm_bindgen(method, catch, js_name = applyMachine)]
+    fn apply_machine(
+        this: &Browser,
+        profile: &str,
+        program: &str,
+        discard_changes: bool,
+    ) -> Result<(), JsValue>;
+    #[wasm_bindgen(method, catch, js_name = physicalKey)]
+    fn physical_key(
+        this: &Browser,
+        usage: u16,
+        pressed: bool,
+        enabled: bool,
+    ) -> Result<(), JsValue>;
+    #[wasm_bindgen(method, js_name = releaseInput)]
+    fn release_input(this: &Browser);
+    #[wasm_bindgen(method, js_name = inputCapture)]
+    fn input_capture(this: &Browser, enabled: bool);
+    #[wasm_bindgen(method, catch, js_name = chooseProfile)]
+    fn choose_profile(this: &Browser) -> Result<js_sys::Promise, JsValue>;
+    #[wasm_bindgen(method, catch, js_name = downloadProfile)]
+    fn download_profile(this: &Browser, text: &str) -> Result<(), JsValue>;
+    #[wasm_bindgen(method, catch, js_name = chooseIso)]
+    fn choose_iso(this: &Browser) -> Result<js_sys::Promise, JsValue>;
+    #[wasm_bindgen(method, catch, js_name = exportSaves)]
+    fn export_saves(this: &Browser) -> Result<js_sys::Promise, JsValue>;
+    #[wasm_bindgen(method, catch, js_name = importSaves)]
+    fn import_saves(this: &Browser) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(method, catch, js_name = keyEvent)]
     fn key_event(
         this: &Browser,
@@ -61,6 +89,9 @@ pub struct Snapshot {
     registers: Registers,
     graphics: Option<Graphics>,
     fault: Option<String>,
+    waiting_for_io: bool,
+    pending_commit: bool,
+    dirty: bool,
 }
 impl Snapshot {
     pub fn status(&self) -> SessionStatus {
@@ -68,6 +99,15 @@ impl Snapshot {
     }
     pub fn steps(&self) -> u64 {
         self.steps
+    }
+    pub fn dirty_overlay(&self) -> bool {
+        self.dirty
+    }
+    pub fn storage_waiting(&self) -> bool {
+        self.waiting_for_io
+    }
+    pub fn pending_commit(&self) -> bool {
+        self.pending_commit
     }
     pub fn registers(&self) -> &Registers {
         &self.registers
@@ -84,6 +124,8 @@ pub struct Archive {
 }
 pub struct Doslet {
     pub session: Snapshot,
+    pub workspace: crate::ui::Workspace,
+    pub configurator: crate::configurator::ConfiguratorState,
     pub display: DisplayFrame,
     pub name: String,
     pub notice: Option<String>,
@@ -106,13 +148,19 @@ pub struct Doslet {
     host_messages: u64,
     pcm_frames: u64,
     mouse_captured: bool,
+    storage_policy: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub enum Message {
+    Ui(crate::ui::Action),
+    Config(crate::configurator::Edit),
+    ProfilePicked(Result<Option<String>, String>),
+    ConfigIoFinished(&'static str, Result<(), String>),
     PointerMoved(u16, u16),
     PointerButton(u8, bool),
     PointerLeft,
     Keyboard(iced::keyboard::Event),
+    KeyboardCaptured(iced::keyboard::Event),
     RunPause,
     Step,
     Reset,
@@ -137,12 +185,17 @@ impl Doslet {
             Err(error) => (None, Some(format!("Worker startup failed: {error:?}"))),
         };
         Self {
+            workspace: crate::ui::Workspace::default(),
+            configurator: crate::configurator::ConfiguratorState::default(),
             session: Snapshot {
                 status: SessionStatus::Ready,
                 steps: 0,
                 registers: Registers::default(),
                 graphics: None,
                 fault: None,
+                waiting_for_io: false,
+                pending_commit: false,
+                dirty: false,
             },
             display: DisplayFrame::default(),
             name: "Color bars".into(),
@@ -166,6 +219,7 @@ impl Doslet {
             host_messages: 0,
             pcm_frames: 0,
             mouse_captured: false,
+            storage_policy: None,
         }
     }
     fn command(&mut self, kind: &str, program: &str) {
@@ -176,20 +230,189 @@ impl Doslet {
         }
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        if let Message::Keyboard(event) = &message {
-            if self.session.status() == SessionStatus::Running
-                && let Some(bridge) = &self.bridge
-            {
-                let (modifiers, key) = crate::keyboard::translate(event);
-                let (scan, ascii) = key.unwrap_or((0, 0));
-                if let Err(error) = bridge.key_event(scan, ascii, modifiers, key.is_some()) {
-                    self.notice = Some(format!("Keyboard: {error:?}"));
+        if matches!(
+            &message,
+            Message::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            })
+        ) && (self.configurator.open || self.workspace.panel.is_some())
+        {
+            self.configurator.open = false;
+            self.workspace.panel = None;
+            if let Some(bridge) = &self.bridge {
+                bridge.release_input();
+            }
+            return Task::none();
+        }
+        if let Message::Keyboard(event) | Message::KeyboardCaptured(event) = &message {
+            let enabled = self.session.status() == SessionStatus::Running
+                && !self.configurator.open
+                && self.workspace.panel.is_none()
+                && !self.configurator.pending
+                && !matches!(message, Message::KeyboardCaptured(_));
+            if let Some(bridge) = &self.bridge {
+                if self.configurator.active.hardware.keyboard == doslet_config::KeyboardMode::At {
+                    if let Some((usage, pressed)) = crate::keyboard::physical(event)
+                        && let Err(error) = bridge.physical_key(usage, pressed, enabled)
+                    {
+                        self.notice = Some(format!("Keyboard: {error:?}"));
+                    }
+                } else if enabled {
+                    let (modifiers, key) = crate::keyboard::translate(event);
+                    let (scan, ascii) = key.unwrap_or((0, 0));
+                    if let Err(error) = bridge.key_event(scan, ascii, modifiers, key.is_some()) {
+                        self.notice = Some(format!("Keyboard: {error:?}"));
+                    }
                 }
             }
             return Task::none();
         }
         match message {
+            Message::Ui(action) => match action {
+                crate::ui::Action::Open(panel) => {
+                    self.workspace.panel = Some(panel);
+                    self.configurator.open = false;
+                    if let Some(bridge) = &self.bridge {
+                        bridge.input_capture(false);
+                        bridge.release_input();
+                    }
+                }
+                crate::ui::Action::Close => {
+                    self.workspace.panel = None;
+                    self.configurator.open = false;
+                }
+                crate::ui::Action::DismissNotice => self.notice = None,
+                crate::ui::Action::ActualSize(actual) => self.workspace.actual_size = actual,
+            },
+            Message::Config(edit) => {
+                use crate::configurator::Edit;
+                self.workspace.panel = None;
+                self.configurator.edit(&edit);
+                if matches!(edit, Edit::Toggle)
+                    && self.configurator.open
+                    && let Some(bridge) = &self.bridge
+                {
+                    bridge.input_capture(false);
+                    bridge.release_input();
+                }
+                if let Some(bridge) = &self.bridge {
+                    match edit {
+                        Edit::LoadProfileFile => match bridge.choose_profile() {
+                            Ok(p) => {
+                                return Task::perform(
+                                    async move {
+                                        wasm_bindgen_futures::JsFuture::from(p)
+                                            .await
+                                            .map(|v| v.as_string())
+                                            .map_err(|e| format!("Profile import failed: {e:?}"))
+                                    },
+                                    Message::ProfilePicked,
+                                );
+                            }
+                            Err(e) => {
+                                self.configurator.message =
+                                    Some(format!("Profile import failed: {e:?}"))
+                            }
+                        },
+                        Edit::SaveProfileFile => {
+                            let text = crate::machine_profile::export_machine_profile(
+                                &self.configurator.draft,
+                            );
+                            if let Err(e) = bridge.download_profile(&text) {
+                                self.configurator.message =
+                                    Some(format!("Profile download failed: {e:?}"));
+                            }
+                        }
+                        Edit::OpenIso | Edit::ExportSaves | Edit::ImportSaves => {
+                            let (label, promise) = match edit {
+                                Edit::OpenIso => ("ISO", bridge.choose_iso()),
+                                Edit::ExportSaves => ("Save export", bridge.export_saves()),
+                                _ => ("Save import", bridge.import_saves()),
+                            };
+                            match promise {
+                                Ok(p) => {
+                                    return Task::perform(
+                                        async move {
+                                            wasm_bindgen_futures::JsFuture::from(p)
+                                                .await
+                                                .map(|_| ())
+                                                .map_err(|e| format!("{label} failed: {e:?}"))
+                                        },
+                                        move |r| Message::ConfigIoFinished(label, r),
+                                    );
+                                }
+                                Err(e) => {
+                                    self.configurator.message =
+                                        Some(format!("{label} failed: {e:?}"))
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if matches!(edit, Edit::Apply) {
+                    let audio = if self.configurator.draft.output.audio {
+                        self.resume_audio()
+                    } else {
+                        Task::none()
+                    };
+                    match self.configurator.draft.resolve() {
+                        Ok(_) => {
+                            if let Some(bridge) = &self.bridge {
+                                let profile = crate::machine_profile::export_machine_profile(
+                                    &self.configurator.draft,
+                                );
+                                let program = self
+                                    .program
+                                    .as_deref()
+                                    .unwrap_or(&self.configurator.draft.game.executable);
+                                match bridge.apply_machine(
+                                    &profile,
+                                    program,
+                                    self.configurator.discard_changes,
+                                ) {
+                                    Ok(()) => {
+                                        self.configurator.pending = true;
+                                        self.configurator.message =
+                                            Some("Preparing machine and sources…".into());
+                                    }
+                                    Err(e) => {
+                                        self.configurator.message =
+                                            Some(format!("Machine preparation failed: {e:?}"))
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => self.configurator.message = Some(e.to_string()),
+                    }
+                    return audio;
+                }
+            }
+            Message::ProfilePicked(result) => match result {
+                Ok(Some(text)) => {
+                    self.configurator
+                        .edit(&crate::configurator::Edit::ProfileText(text));
+                    self.configurator
+                        .edit(&crate::configurator::Edit::ImportProfile);
+                }
+                Ok(None) => {}
+                Err(e) => self.configurator.message = Some(e),
+            },
+            Message::ConfigIoFinished(label, result) => match result {
+                Ok(()) => {
+                    if label == "ISO" {
+                        self.configurator
+                            .edit(&crate::configurator::Edit::Iso("selected-iso".into()));
+                    }
+                    self.configurator.message = Some(format!("{label} completed."));
+                }
+                Err(e) => self.configurator.message = Some(e),
+            },
             Message::PointerMoved(x, y) => {
+                if self.configurator.open || self.workspace.panel.is_some() {
+                    return Task::none();
+                }
                 if let Some(bridge) = &self.bridge
                     && let Err(error) = bridge.pointer_event(x, y, -1, false)
                 {
@@ -197,9 +420,13 @@ impl Doslet {
                 }
             }
             Message::PointerButton(button, pressed) => {
+                if pressed && (self.configurator.open || self.workspace.panel.is_some()) {
+                    return Task::none();
+                }
                 if pressed
                     && !self.mouse_captured
                     && self.session.status() == SessionStatus::Running
+                    && self.configurator.active.input.capture
                 {
                     if let Some(bridge) = &self.bridge
                         && let Err(error) = bridge.capture_mouse()
@@ -219,7 +446,7 @@ impl Doslet {
                     let _ = bridge.pointer_event(0, 0, -2, false);
                 }
             }
-            Message::Keyboard(_) => unreachable!("handled above"),
+            Message::Keyboard(_) | Message::KeyboardCaptured(_) => unreachable!("handled above"),
             Message::RefreshMidi => {
                 if let Some(bridge) = &self.bridge {
                     match bridge.list_midi() {
@@ -289,7 +516,12 @@ impl Doslet {
                 }
                 Err(error) => self.notice = Some(error),
             },
-            Message::Tick => self.poll(),
+            Message::Tick => {
+                if let Some(bridge) = &self.bridge {
+                    bridge.input_capture(!self.configurator.open && self.workspace.panel.is_none());
+                }
+                self.poll();
+            }
             Message::RunPause => {
                 self.command(
                     if self.session.status() == SessionStatus::Running {
@@ -301,7 +533,10 @@ impl Doslet {
                 );
             }
             Message::Step => self.command("step", ""),
-            Message::Reset => self.command("reset", ""),
+            Message::Reset => {
+                let discard = self.configurator.discard_changes;
+                self.command("reset", if discard { "discard" } else { "" });
+            }
             Message::OpenArchive => {
                 self.command("pause", "");
                 match crate::browser_input::pick_zip() {
@@ -329,13 +564,17 @@ impl Doslet {
                     self.notice = Some(error);
                 }
             },
-            Message::ProgramSelected(program) => self.program = Some(program),
+            Message::ProgramSelected(program) => {
+                self.configurator
+                    .edit(&crate::configurator::Edit::Executable(program.clone()));
+                self.program = Some(program);
+            }
             Message::StartArchive => {
-                let audio = self.resume_audio();
                 if let Some(program) = self.program.clone() {
-                    self.command("start-game", &program);
+                    self.configurator
+                        .edit(&crate::configurator::Edit::Executable(program));
                 }
-                return audio;
+                return self.update(Message::Config(crate::configurator::Edit::Apply));
             }
             Message::ToggleAudio => {
                 if self.midi_choice != "Rust synth"
@@ -388,6 +627,16 @@ impl Doslet {
             return;
         };
         let packet = bridge.poll();
+        self.configurator.controllers = Array::from(&field(&packet, "gamepads"))
+            .iter()
+            .map(|pad| {
+                format!(
+                    "{}: {}",
+                    number(&pad, "index") as usize,
+                    field(&pad, "id").as_string().unwrap_or_default()
+                )
+            })
+            .collect();
         self.mouse_captured = field(&packet, "mouseCaptured").as_bool().unwrap_or(false);
         let state = field(&packet, "state");
         if !state.is_null() && !state.is_undefined() {
@@ -412,9 +661,51 @@ impl Doslet {
                 .registers
                 .set(Gpr16::Di, number(&state, "di") as u16);
             self.session.fault = field(&state, "fault").as_string();
+            self.session.waiting_for_io = field(&state, "waitingForIo").as_bool().unwrap_or(false);
+            self.session.pending_commit = field(&state, "pendingCommit").as_bool().unwrap_or(false);
+            self.session.dirty = field(&state, "dirty").as_bool().unwrap_or(false);
         }
         let event = field(&packet, "event");
         match field(&event, "kind").as_string().as_deref() {
+            Some("storage-policy") => {
+                self.storage_policy = field(&event, "message").as_string();
+            }
+            Some("machine-applied") => {
+                self.configurator.open = false;
+                self.workspace.panel = None;
+                self.midi_mode = if self.configurator.draft.output.game_midi == "mt32" {
+                    Mode::Mt32
+                } else {
+                    Mode::Gm
+                };
+                self.midi_output_mode = if self.configurator.draft.output.host_midi == "mt32" {
+                    Mode::Mt32
+                } else {
+                    Mode::Gm
+                };
+                self.midi_choice = match self.configurator.draft.output.midi_output.as_str() {
+                    "rust" => "Rust synth".into(),
+                    v => v.into(),
+                };
+                if let Some(name) = field(&event, "name").as_string() {
+                    self.name = name;
+                }
+                self.display = DisplayFrame::default();
+                self.session.graphics = None;
+                self.configurator
+                    .set_active(self.configurator.draft.clone());
+                self.configurator.message = Some("Machine applied and restarted.".into());
+            }
+            Some("machine-failed") => {
+                self.configurator.open = true;
+                self.workspace.panel = None;
+                self.configurator.pending = false;
+                self.configurator.message = Some(
+                    field(&event, "message")
+                        .as_string()
+                        .unwrap_or_else(|| "Machine preparation failed".into()),
+                );
+            }
             Some("imported") => {
                 self.importing = false;
                 let programs = Array::from(&field(&event, "programs"))
@@ -422,6 +713,12 @@ impl Doslet {
                     .filter_map(|v| v.as_string())
                     .collect::<Vec<_>>();
                 self.program = (programs.len() == 1).then(|| programs[0].clone());
+                if let Some(program) = &self.program {
+                    self.configurator
+                        .edit(&crate::configurator::Edit::Executable(program.clone()));
+                }
+                self.configurator
+                    .edit(&crate::configurator::Edit::Root("selected-zip".into()));
                 self.archive = Some(Archive { programs });
                 self.notice = None;
             }
@@ -433,7 +730,7 @@ impl Doslet {
                 self.session.graphics = None;
                 self.notice = None;
             }
-            Some("import-error" | "error" | "audio-error") => {
+            Some("import-error" | "error" | "audio-error" | "storage-error") => {
                 self.importing = false;
                 self.notice = field(&event, "error").as_string();
             }
@@ -488,6 +785,24 @@ impl Doslet {
     }
     pub fn midi_mode_label(&self) -> String {
         self.midi_summary.clone()
+    }
+    pub fn storage_label(&self) -> String {
+        if self.configurator.pending {
+            return "Preparing machine and sources…".into();
+        }
+        let status: String = if self.session.pending_commit {
+            "Saving changes…".into()
+        } else if self.session.waiting_for_io {
+            "Waiting for storage…".into()
+        } else if self.session.dirty {
+            "Unsaved changes".into()
+        } else {
+            "No unsaved changes".into()
+        };
+        match &self.storage_policy {
+            Some(policy) => format!("{status}\n{policy}"),
+            None => status,
+        }
     }
     pub fn audio_label(&self) -> String {
         if self.midi_choice != "Rust synth" {
@@ -546,10 +861,12 @@ impl Doslet {
         Subscription::batch([
             iced::time::every(web_time::Duration::from_millis(16)).map(|_| Message::Tick),
             iced::event::listen_with(|event, status, _| {
-                if status == iced::event::Status::Ignored
-                    && let iced::Event::Keyboard(event) = event
-                {
-                    Some(Message::Keyboard(event))
+                if let iced::Event::Keyboard(event) = event {
+                    Some(if status == iced::event::Status::Ignored {
+                        Message::Keyboard(event)
+                    } else {
+                        Message::KeyboardCaptured(event)
+                    })
                 } else {
                     None
                 }

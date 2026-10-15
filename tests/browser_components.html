@@ -1,0 +1,123 @@
+<!doctype html><meta charset="utf-8"><title>Doslet component acceptance</title>
+<script type="module">
+import init, {WorkerEngine} from '/browser/doslet_web_worker.js';
+import {HttpMedia, BlobMedia} from '/browser/media.js';
+window.result={cases:[]};
+const assert=(condition,message)=>{if(!condition)throw new Error(message);};
+const rejects=async(action,code)=>{try{await action();}catch(error){assert(error.code===code,`Expected ${code}, got ${error.code}: ${error}`);return;}throw new Error(`Expected ${code}`);};
+const checksum=bytes=>{let h=0xcbf29ce484222325n;for(const b of bytes)h=BigInt.asUintN(64,(h^BigInt(b))*0x100000001b3n);return String(h);};
+function storage(){
+    const worker=new Worker('/browser/storage-worker.js',{type:'module'}),pending=new Map();let next=1;
+    worker.onmessage=({data})=>{const p=pending.get(data.id);pending.delete(data.id);data.ok?p.resolve(data):p.reject(Object.assign(new Error(data.error),{code:data.code}));};
+    return {worker,call:data=>new Promise((resolve,reject)=>{const id=next++;pending.set(id,{resolve,reject});worker.postMessage({...data,id});})};
+}
+try {
+    const first=storage(),second=storage();
+    const namespace='acceptance-store',base='12'.repeat(32);
+    let state=await first.call({kind:'open',namespace,base});
+    await rejects(()=>second.call({kind:'open',namespace,base}),'BusyWriter');
+    const payload=new Uint8Array([1,2,3,4]);
+    const batch={kind:'commit',namespace,base,fence:state.fence,expected:'0',mutation:'1',digest:checksum(payload),payload};
+    const ack=await first.call(batch);assert(ack.revision==='1','Commit revision');
+    assert((await first.call(batch)).revision==='1','Lost-ack replay must be idempotent');
+    await rejects(()=>first.call({...batch,expected:'1'}),'MutationConflict');
+    await rejects(()=>first.call({...batch,mutation:'2',digest:'0'}),'Corrupt');
+    await rejects(()=>first.call({...batch,mutation:'2',expected:'1',fence:'0'}),'BusyWriter');
+    await rejects(()=>first.call({...batch,mutation:'2',expected:'1',payload:new Uint8Array(16*1024*1024+1)}),'Quota');
+    await first.call({kind:'close',namespace});
+    state=await second.call({kind:'open',namespace,base});
+    assert(state.revision==='1'&&state.payload[3]===4&&state.fence!==batch.fence,'Durable reopen and fencing');
+    await rejects(()=>second.call({kind:'open',namespace,base:'99'.repeat(32)}),'MissingBase');
+    await second.call({kind:'close',namespace});
+    await new Promise((resolve,reject)=>{
+        const open=indexedDB.open('doslet-saves',1);open.onerror=()=>reject(open.error);
+        open.onsuccess=()=>{const db=open.result,tx=db.transaction('namespaces','readwrite'),table=tx.objectStore('namespaces'),get=table.get(namespace);
+            get.onsuccess=()=>{const record=get.result;record.payload=new Uint8Array([9,2,3,4]);table.put(record,namespace);};
+            tx.oncomplete=()=>{db.close();resolve();};tx.onerror=()=>reject(tx.error);
+        };
+    });
+    await rejects(()=>first.call({kind:'open',namespace,base}),'Corrupt');
+    first.worker.terminate();second.worker.terminate();
+    result.cases.push('IndexedDB atomic commit, duplicate ack, fencing, two-writer rejection, quota, reopen and corruption');
+
+    const image=new Uint8Array(1024*1024);for(let i=0;i<image.length;i++)image[i]=i%251;
+    const blob=await new BlobMedia(new Blob([image])).prepare();
+    assert((await blob.read(131071,4))[0]===image[131071],'Blob positional offset');
+    await rejects(()=>blob.read(image.length,1),'OutOfBounds');
+    result.cases.push('Immutable Blob positional reads and bounds');
+    // A real HTTPS/CORS server is supplied by the Python harness.
+    const origin=new URLSearchParams(location.search).get('media');
+    const media=await new HttpMedia(`${origin}/iso`).prepare();
+    assert(media.length===1024*1024,'HTTP source size');
+    assert((await media.read(131071,4))[0]===131071%251,'HTTPS Range byte offset');
+    await rejects(()=>new HttpMedia(`${origin}/ignored`).prepare(),'UnsupportedRange');
+    await rejects(()=>new HttpMedia(`${origin}/weak`).prepare(),'UnsupportedRange');
+    await rejects(()=>new HttpMedia(`${origin}/wrong`).prepare(),'Corrupt');
+    const changed=await new HttpMedia(`${origin}/changed`).prepare();
+    await rejects(()=>changed.read(65536,100),'IdentityChanged');
+    const noCors=new HttpMedia(`${origin}/no-cors`);
+    try{await noCors.prepare();throw new Error('CORS should reject');}catch(error){assert(error.message!=='CORS should reject','CORS enforced');}
+    media.close();
+    result.cases.push('Real HTTPS Range, If-Match, CORS, ignored range, weak validator and changed source');
+
+    await init();
+    const engine=new WorkerEngine();
+    const profile=`version=2\nname="Acceptance"\n[machine]\nmemory_mib=4\nx87=false\n[sound]\nsb16=false\nmpu401=false\n[input]\nkeyboard="at"\ngameport=true\n[output]\naudio=false\n`;
+    const before=engine.steps();
+    engine.prepare_machine(profile,'');assert(engine.steps()===before,'Candidate must not execute');
+    engine.install_machine();engine.advance(100);assert(engine.steps()>before,'Candidate installed');
+    const steps=engine.steps();
+    try{engine.prepare_machine(profile.replace('memory_mib=4','memory_mib=3'),'');throw new Error('Invalid candidate accepted');}catch(error){assert(String(error).includes('memory'),'Invalid candidate error');}
+    assert(engine.steps()===steps,'Failed candidate preserves active session');
+    engine.prepare_reset();engine.install_machine();assert(engine.steps()===0,'Reset uses active recipe');
+    result.cases.push('Real WASM candidate install, validation rollback and active reset');
+    engine.free();
+    const {Browser}=await import('__BRIDGE__');
+    const bridge=new Browser(),events=[];
+    const timer=setInterval(()=>{const packet=bridge.poll();if(packet.event)events.push(packet.event);bridge.releaseFrame();},16);
+    const wait=async condition=>{for(let i=0;i<400;i++){if(condition())return;await new Promise(resolve=>setTimeout(resolve,25));}throw new Error(`Browser flow timeout: ${JSON.stringify(events)}`);};
+    const zip=new Uint8Array(await (await fetch('/save.zip')).arrayBuffer());
+    bridge.importZip(zip);await wait(()=>events.some(event=>event.kind==='imported'));
+    const savedProfile=profile+`\n[[drives]]\nletter="C"\nkind="zip"\nsource="selected-zip"\npolicy="persistent"\nstore="acceptance-session"\n`;
+    bridge.applyMachine(savedProfile,'SAVE.COM',false);
+    await wait(()=>events.some(event=>event.kind==='machine-applied') || events.some(event=>event.kind==='machine-failed'));
+    assert(!events.some(event=>event.kind==='machine-failed'),`Apply failed: ${JSON.stringify(events)}`);
+    await wait(()=>bridge.state?.status===256 && !bridge.state?.pendingCommit);
+    assert(!bridge.state.dirty,'DOS close must wait for persistent ack');
+    const exported=await bridge.call('export-saves');
+    assert(new TextDecoder().decode(exported.buffer).includes('save'),'Export contains guest-written bytes');
+    bridge.command('reset','');await wait(()=>events.some(event=>event.kind==='reset-done'));
+    await wait(()=>bridge.state?.status===256 && !bridge.state?.pendingCommit);
+    const importBytes=exported.buffer.slice(0);
+    await bridge.call('import-saves',{buffer:importBytes},[importBytes]);
+    await wait(()=>bridge.state?.status===2 && !bridge.state.pendingCommit && !bridge.state.dirty);
+    clearInterval(timer);
+    result.cases.push('Browser UI bridge → machine Worker → storage Worker: DOS save ack, export, persistent reset and import');
+    const pad={id:'fixture-controller',index:0,connected:true,axes:[0,0],buttons:[{pressed:false},{pressed:false}]};
+    Object.defineProperty(navigator,'getGamepads',{configurable:true,value:()=>[pad]});
+    const padBridge=new Browser(),padEvents=[];
+    const padTimer=setInterval(()=>{const p=padBridge.poll();if(p.event)padEvents.push(p.event);padBridge.releaseFrame();},16);
+    padBridge.importZip(new Uint8Array(await(await fetch('/pad.zip')).arrayBuffer()));
+    await wait(()=>padEvents.some(event=>event.kind==='imported'));
+    padBridge.applyMachine(profile+'\n[[drives]]\nletter="C"\nkind="zip"\nsource="selected-zip"\npolicy="temporary"\n','PAD.COM',false);
+    await wait(()=>padEvents.some(event=>event.kind==='machine-applied'));
+    await wait(()=>padBridge.state?.status===1);
+    assert(document.hasFocus(),'Controller fixture requires a focused browser window');
+    pad.buttons[0].pressed=true;
+    await wait(()=>padBridge.state?.status===293);
+    clearInterval(padTimer);
+    result.cases.push('Mock physical Gamepad API → bounded window transport → input router → guest gameport polling');
+    const cdBridge=new Browser(),cdEvents=[];
+    const cdTimer=setInterval(()=>{const p=cdBridge.poll();if(p.event)cdEvents.push(p.event);cdBridge.releaseFrame();},16);
+    cdBridge.importZip(new Uint8Array(await(await fetch('/cd.zip')).arrayBuffer()));
+    await wait(()=>cdEvents.some(event=>event.kind==='imported'));
+    const cdProfile=profile+`\n[[drives]]\nletter="C"\nkind="zip"\nsource="selected-zip"\npolicy="read-only"\n[[drives]]\nletter="D"\nkind="https-iso"\nsource="${origin}/volume"\npolicy="read-only"\n`;
+    cdBridge.applyMachine(cdProfile,'CD.COM',false);
+    await wait(()=>cdEvents.some(event=>event.kind==='machine-applied'));
+    await wait(()=>cdBridge.state?.status===356);
+    assert(!cdEvents.some(event=>['error','storage-error'].includes(event.kind)),JSON.stringify(cdEvents));
+    clearInterval(cdTimer);
+    result.cases.push('DOS open/read/close → ISO parser/cache → real HTTPS Range → guest bytes');
+    result.done=true;
+} catch(error) {result.error=String(error);result.stack=error.stack;}
+</script>

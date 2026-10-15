@@ -8,6 +8,7 @@ members = [
     "crates/hardware/video/*",
     "crates/hardware/audio/*",
     "crates/hardware/clocks/*",
+    "crates/hardware/input/*",
     "crates/machines/*",
     "crates/system/*",
     "crates/runtime/*",
@@ -22,6 +23,12 @@ rust-version = "1.93"
 license = "GPL-2.0-or-later"
 
 [workspace.dependencies]
+doslet-config = { path = "crates/foundation/doslet-config" }
+doslet-input = { path = "crates/foundation/doslet-input" }
+doslet-storage = { path = "crates/system/doslet-storage" }
+doslet-vfs = { path = "crates/system/doslet-vfs" }
+doslet-at-keyboard = { path = "crates/hardware/input/doslet-at-keyboard" }
+doslet-gameport = { path = "crates/hardware/input/doslet-gameport" }
 doslet-bus = { path = "crates/foundation/doslet-bus" }
 doslet-time = { path = "crates/foundation/doslet-time" }
 doslet-x86 = { path = "crates/cpu/doslet-x86" }

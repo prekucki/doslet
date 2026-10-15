@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Doslet
+Comment=A modular DOS emulator
+Exec=doslet
+Icon=org.doslet.Doslet
+Terminal=false
+Categories=Game;Emulator;
+StartupWMClass=org.doslet.Doslet

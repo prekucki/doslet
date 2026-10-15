@@ -1,6 +1,8 @@
 use crate::memory::{A20Gate, Ram};
+use crate::resources::{Endpoint, MemoryEndpoint, MemoryRoutes, Routes};
 use core::ops::Range;
 use doslet_bus::{BusError, MemoryBus, PortBus};
+use doslet_config::{HardwareConfig, KeyboardMode};
 use doslet_i8042::Controller;
 use doslet_i8254::Pit;
 use doslet_i8259::Pic;
@@ -9,6 +11,12 @@ use doslet_mpu401::Mpu401;
 use doslet_vga::{APERTURE_LEN, APERTURE_START, Vga};
 
 pub struct PcBus {
+    config: HardwareConfig,
+    routes: Routes,
+    memory_routes: MemoryRoutes,
+    pub gameport: doslet_gameport::Gameport,
+    pub(crate) guest_nanos: u64,
+    keyboard_irq_line: bool,
     /// CPU-independent notification generation. Only successful active VGA
     /// status reads increment it; the PC compares before/after one CPU step.
     pub(crate) vga_status_read_generation: u32,
@@ -34,6 +42,13 @@ pub struct PcBus {
 }
 impl Default for PcBus {
     fn default() -> Self {
+        Self::from_config(HardwareConfig::default()).expect("valid default hardware")
+    }
+}
+impl PcBus {
+    pub fn from_config(config: HardwareConfig) -> Result<Self, crate::MachineError> {
+        config.validate().map_err(crate::MachineError::Hardware)?;
+        let routes = Routes::build(config).map_err(crate::MachineError::Resource)?;
         let mut pit = Pit::default();
         pit.write_control(0x36).unwrap();
         pit.write_counter(0, 0).unwrap();
@@ -41,31 +56,63 @@ impl Default for PcBus {
         pit.set_gate(2, false).unwrap();
         let mut slave_pic = Pic::new(0x70);
         slave_pic.write_data(0xFF);
-        Self {
+        Ok(Self {
+            config,
+            routes,
+            memory_routes: MemoryRoutes::new(config.memory_bytes()),
+            gameport: doslet_gameport::Gameport::default(),
+            guest_nanos: 0,
+            keyboard_irq_line: false,
             vga_status_read_generation: 0,
             observe_vga_status: true,
             #[cfg(feature = "profiling")]
             stats: crate::ExecutionStats::default(),
-            ram: Ram::default(),
+            ram: Ram::new(config.memory_bytes()),
             vga: Vga::default(),
             pic: Pic::default(),
             slave_pic,
             pit,
             mpu: Mpu401::default(),
             dsp: doslet_sb_dsp::Dsp::default(),
-            mixer: doslet_sb_mixer::Mixer::default(),
+            mixer: doslet_sb_mixer::Mixer::with_routing(
+                config.sb_irq,
+                config.sb_dma8,
+                config.sb_dma16,
+            ),
             dma: core::array::from_fn(|_| doslet_i8237::Dma::default()),
             dma_pages: [0; 8],
             pcm: crate::audio::PcmQueue::default(),
             keyboard: Controller::default(),
             a20: A20Gate::default(),
-            cmos: Cmos::new(640, ((crate::memory::RAM_SIZE - 0x100000) / 1024) as u16),
+            cmos: Cmos::new(640, ((config.memory_bytes() - 0x100000) / 1024) as u16),
             system_control: 0,
             awe_writes: 0,
-        }
+        })
     }
 }
 impl PcBus {
+    pub fn hardware_config(&self) -> HardwareConfig {
+        self.config
+    }
+    pub fn ram_size(&self) -> usize {
+        self.ram.len()
+    }
+    pub fn read_pending_keyboard(&mut self) -> Option<u8> {
+        if !self.keyboard.has_output() {
+            return None;
+        }
+        let byte = self.keyboard.read_data();
+        self.keyboard_irq_line = false;
+        self.update_keyboard_irq();
+        Some(byte)
+    }
+    pub(crate) fn update_keyboard_irq(&mut self) {
+        let pending = self.config.keyboard == KeyboardMode::At && self.keyboard.irq_pending();
+        if pending && !self.keyboard_irq_line {
+            self.pic.raise_edge(1);
+        }
+        self.keyboard_irq_line = pending;
+    }
     pub fn text_revision(&self) -> u64 {
         self.ram.text_revision()
     }
@@ -148,7 +195,7 @@ impl PcBus {
     #[inline]
     fn wide_ram_range(&self, address: u32, length: u32) -> Option<Range<usize>> {
         let start = self.a20.address(address);
-        if start > crate::memory::RAM_SIZE as u32 - length
+        if start > self.ram.len() as u32 - length
             || (!self.a20.enabled && (address & 0xFFFFF) > 0x100000 - length)
             || (start < APERTURE_START + APERTURE_LEN as u32 && start + length > APERTURE_START)
         {
@@ -207,12 +254,12 @@ impl MemoryBus for PcBus {
         // Decoding may inspect a short view at RAM/MMIO/A20 boundaries, but
         // never touches a device or changes guest state on a failed attempt.
         let start = self.a20.address(address);
-        if start >= crate::memory::RAM_SIZE as u32
+        if start >= self.ram.len() as u32
             || (APERTURE_START..APERTURE_START + APERTURE_LEN as u32).contains(&start)
         {
             return None;
         }
-        let mut length = u32::from(length).min(crate::memory::RAM_SIZE as u32 - start);
+        let mut length = u32::from(length).min(self.ram.len() as u32 - start);
         if start < APERTURE_START {
             length = length.min(APERTURE_START - start);
         }
@@ -244,85 +291,55 @@ impl MemoryBus for PcBus {
         if (0x46C..0x470).contains(&address) {
             self.stats.bda_tick_reads += 1;
         }
-        if (APERTURE_START..APERTURE_START + APERTURE_LEN as u32).contains(&address) {
-            self.vga
+        match self.memory_routes.endpoint(address) {
+            MemoryEndpoint::Vga => self
+                .vga
                 .read_memory((address - APERTURE_START) as usize)
-                .ok_or(BusError::UnmappedMemory(address))
-        } else {
-            self.ram.read(address)
+                .ok_or(BusError::UnmappedMemory(address)),
+            MemoryEndpoint::Ram => self.ram.read(address),
+            MemoryEndpoint::Absent => Err(BusError::UnmappedMemory(address)),
         }
     }
     fn write_u8(&mut self, address: u32, value: u8) -> Result<(), BusError> {
         let address = self.a20.address(address);
-        if (APERTURE_START..APERTURE_START + APERTURE_LEN as u32).contains(&address) {
-            if self
-                .vga
-                .write_memory((address - APERTURE_START) as usize, value)
-            {
-                Ok(())
-            } else {
-                Err(BusError::UnmappedMemory(address))
+        match self.memory_routes.endpoint(address) {
+            MemoryEndpoint::Vga => {
+                if self
+                    .vga
+                    .write_memory((address - APERTURE_START) as usize, value)
+                {
+                    Ok(())
+                } else {
+                    Err(BusError::UnmappedMemory(address))
+                }
             }
-        } else {
-            self.ram.write(address, value)
+            MemoryEndpoint::Ram => self.ram.write(address, value),
+            MemoryEndpoint::Absent => Err(BusError::UnmappedMemory(address)),
         }
     }
 }
 impl PortBus for PcBus {
     fn read_port_u8(&mut self, port: u16) -> Result<u8, BusError> {
-        if port == 0x61 {
-            return Ok(self.system_control | (u8::from(self.pit.output(2).unwrap()) << 5));
-        }
         #[cfg(feature = "profiling")]
         {
             self.stats.port_reads += 1;
             self.stats.vga_status_reads += u64::from(matches!(port, 0x3BA | 0x3DA));
             self.stats.pit_reads += u64::from((0x40..=0x42).contains(&port));
         }
-        match port {
-            0x3C6..=0x3C8 => Ok(self.vga.read_port(port).unwrap()),
-            0x3CD => Ok(0xFF), // No Tseng ET3000/ET4000 segment-select register.
-            0x3C9 => Ok(self.vga.read_dac()),
-            0..=0x0F => self.dma[0]
-                .read_register(port as u8)
-                .map_err(|_| BusError::UnmappedPort(port)),
-            0xC0..=0xDE if port & 1 == 0 => self.dma[1]
-                .read_register(((port - 0xC0) / 2) as u8)
-                .map_err(|_| BusError::UnmappedPort(port)),
-            0x81 | 0x82 | 0x83 | 0x87 | 0x89 | 0x8A | 0x8B | 0x8F => {
-                Ok(self.dma_pages[Self::dma_page_channel(port)])
+        match self.routes.read(port) {
+            Endpoint::Absent => Err(BusError::UnmappedPort(port)),
+            Endpoint::Probe | Endpoint::AweProbe | Endpoint::DspReset => Ok(0xFF),
+            Endpoint::SystemControl => {
+                Ok(self.system_control | (u8::from(self.pit.output(2).unwrap()) << 5))
             }
-            0x224 => Ok(self.mixer.index()),
-            0x225 => {
-                self.mixer.set_interrupt_status(self.dsp.irq_status());
-                self.mixer.read().map_err(|_| BusError::UnmappedPort(port))
+            Endpoint::Vga => {
+                if port == 0x3C9 {
+                    Ok(self.vga.read_dac())
+                } else {
+                    self.vga.read_port(port).ok_or(BusError::UnmappedPort(port))
+                }
             }
-            0x226 => Ok(0xFF), // DSP reset is write-only.
-            0x22A => Ok(self.dsp.read_data()),
-            0x22C => Ok(self.dsp.write_status()),
-            0x22E => {
-                self.dsp.acknowledge_irq(false);
-                Ok(self.dsp.read_status())
-            }
-            0x22F => {
-                self.dsp.acknowledge_irq(true);
-                Ok(0xFF)
-            }
-            // The emulated DSP is fixed at 220h. DOS setup programs probe
-            // common legacy Sound Blaster bases; unclaimed ISA reads float high.
-            0x210..=0x21F
-            | 0x230..=0x23F
-            | 0x240..=0x24F
-            | 0x250..=0x25F
-            | 0x260..=0x26F
-            | 0x280..=0x28F => Ok(0xFF),
-            // No OPTi/CS4231-compatible WSS codec is installed. These are
-            // documented codec decode windows used by DOS setup probes.
-            0x530..=0x537 | 0x608..=0x60B | 0xE84..=0xE87 | 0xF44..=0xF47 => Ok(0xFF),
-            // No AWE/EMU8000 is installed. Its probe ranges float high on
-            // this ISA machine; they must not identify a nonexistent synth.
-            0x600..=0x6FF | 0xA00..=0xAFF | 0xE00..=0xEFF => Ok(0xFF),
-            0x3BA | 0x3DA => {
+            Endpoint::VgaStatus => {
                 let value = self
                     .vga
                     .read_status(port)
@@ -333,77 +350,94 @@ impl PortBus for PcBus {
                 }
                 Ok(value)
             }
-            0x3B4 | 0x3B5 | 0x3D4 | 0x3D5 | 0x3C0 | 0x3C1 | 0x3C4 | 0x3C5 | 0x3CC | 0x3CE
-            | 0x3CF => self.vga.read_port(port).ok_or(BusError::UnmappedPort(port)),
-            0x70 => Ok(self.cmos.selected()),
-            0x71 => Ok(self.cmos.read()),
-            0x60 => Ok(self.keyboard.read_data()),
-            0x64 => Ok(self.keyboard.status()),
-            0x92 => Ok(if self.a20.enabled { 2 } else { 0 }),
-            0x330 => Ok(self.mpu.read_data()),
-            0x331 => Ok(self.mpu.status()),
-            0x320..=0x321 => Ok(0xFF), // No device at the probed 320h base.
-            0xA0 => Ok(self.slave_pic.read_command()),
-            0xA1 => Ok(self.slave_pic.read_data()),
-            0x20 => Ok(self.pic.read_command()),
-            0x21 => Ok(self.pic.read_data()),
-            0x40..=0x42 => self
+            Endpoint::Dma0 => self.dma[0]
+                .read_register(port as u8)
+                .map_err(|_| BusError::UnmappedPort(port)),
+            Endpoint::Dma1 => self.dma[1]
+                .read_register(((port - 0xC0) / 2) as u8)
+                .map_err(|_| BusError::UnmappedPort(port)),
+            Endpoint::DmaPage => Ok(self.dma_pages[Self::dma_page_channel(port)]),
+            Endpoint::MixerIndex => Ok(self.mixer.index()),
+            Endpoint::MixerData => {
+                self.mixer.set_interrupt_status(self.dsp.irq_status());
+                self.mixer.read().map_err(|_| BusError::UnmappedPort(port))
+            }
+            Endpoint::DspData => Ok(self.dsp.read_data()),
+            Endpoint::DspCommand => Ok(self.dsp.write_status()),
+            Endpoint::DspStatus => {
+                self.dsp.acknowledge_irq(false);
+                Ok(self.dsp.read_status())
+            }
+            Endpoint::DspWordAck => {
+                self.dsp.acknowledge_irq(true);
+                Ok(0xFF)
+            }
+            Endpoint::CmosIndex => Ok(self.cmos.selected()),
+            Endpoint::CmosData => Ok(self.cmos.read()),
+            Endpoint::KeyboardData => Ok(self.read_pending_keyboard().unwrap_or(0xFF)),
+            Endpoint::KeyboardCommand => Ok(self.keyboard.status()),
+            Endpoint::A20 => Ok(if self.a20.enabled { 2 } else { 0 }),
+            Endpoint::MidiData => Ok(self.mpu.read_data()),
+            Endpoint::MidiCommand => Ok(self.mpu.status()),
+            Endpoint::PicCommand => Ok(self.pic.read_command()),
+            Endpoint::PicData => Ok(self.pic.read_data()),
+            Endpoint::SlavePicCommand => Ok(self.slave_pic.read_command()),
+            Endpoint::SlavePicData => Ok(self.slave_pic.read_data()),
+            Endpoint::PitData => self
                 .pit
                 .read_counter((port - 0x40) as u8)
                 .map_err(|_| BusError::UnmappedPort(port)),
-            _ => Err(BusError::UnmappedPort(port)),
+            Endpoint::Gameport => Ok(self.gameport.read(self.guest_nanos)),
+            Endpoint::PitControl => Err(BusError::UnmappedPort(port)),
         }
     }
     fn write_port_u8(&mut self, port: u16, value: u8) -> Result<(), BusError> {
-        if port == 0x61 {
-            self.pit.set_gate(2, value & 1 != 0).unwrap();
-            self.system_control = value & 0x0F;
-            return Ok(());
-        }
-        match port {
-            0x3CD => {} // No Tseng vendor bank register on the generic VBE adapter.
-            0x3C6 => {
-                self.vga.write_port(port, value);
+        match self.routes.write(port) {
+            Endpoint::Absent => return Err(BusError::UnmappedPort(port)),
+            Endpoint::Probe => {}
+            Endpoint::AweProbe => self.awe_writes += 1,
+            Endpoint::SystemControl => {
+                self.pit.set_gate(2, value & 1 != 0).unwrap();
+                self.system_control = value & 0x0F;
             }
-            0x3C7 => self.vga.set_dac_read_index(value),
-            0..=0x0F => self.dma[0]
+            Endpoint::Vga => match port {
+                0x3C7 => self.vga.set_dac_read_index(value),
+                0x3C8 => self.vga.set_dac_index(value),
+                0x3C9 => self.vga.write_dac(value),
+                _ => {
+                    if !self.vga.write_port(port, value) {
+                        return Err(BusError::UnmappedPort(port));
+                    }
+                }
+            },
+            Endpoint::Dma0 => self.dma[0]
                 .write_register(port as u8, value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
-            0xC0..=0xDE if port & 1 == 0 => self.dma[1]
+            Endpoint::Dma1 => self.dma[1]
                 .write_register(((port - 0xC0) / 2) as u8, value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
-            0x81 | 0x82 | 0x83 | 0x87 | 0x89 | 0x8A | 0x8B | 0x8F => {
-                self.dma_pages[Self::dma_page_channel(port)] = value
+            Endpoint::DmaPage => self.dma_pages[Self::dma_page_channel(port)] = value,
+            Endpoint::MixerIndex => self.mixer.select(value),
+            Endpoint::MixerData => {
+                if let Some((irq, dma8, dma16)) = self.mixer.proposed_routing(value)
+                    && (!irq.is_some_and(|v| self.routes.allows_irq(v))
+                        || !dma8.is_some_and(|v| self.routes.allows_dma(v))
+                        || !dma16.is_some_and(|v| self.routes.allows_dma(v)))
+                {
+                    return Err(BusError::UnmappedPort(port));
+                }
+                self.mixer
+                    .write(value)
+                    .map_err(|_| BusError::UnmappedPort(port))?;
             }
-            0x224 => self.mixer.select(value),
-            0x225 => self
-                .mixer
-                .write(value)
-                .map_err(|_| BusError::UnmappedPort(port))?,
-            0x226 => self.dsp.write_reset(value),
-            0x22C => self
+            Endpoint::DspReset => self.dsp.write_reset(value),
+            Endpoint::DspCommand => self
                 .dsp
                 .write_command(value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
-            0x210..=0x21F
-            | 0x230..=0x23F
-            | 0x240..=0x24F
-            | 0x250..=0x25F
-            | 0x260..=0x26F
-            | 0x280..=0x28F => {} // No DSP at these candidate bases.
-            0x320..=0x321 => {} // No device at the probed 320h base.
-            0x530..=0x537 | 0x608..=0x60B | 0xE84..=0xE87 | 0xF44..=0xF47 => {} // No WSS codec is installed.
-            0x600..=0x6FF | 0xA00..=0xAFF | 0xE00..=0xEFF => {
-                self.awe_writes += 1;
-            } // Absent AWE probe banks.
-            0x3B4 | 0x3B5 | 0x3D4 | 0x3D5 | 0x3C0 | 0x3C2 | 0x3C4 | 0x3C5 | 0x3CE | 0x3CF => {
-                if !self.vga.write_port(port, value) {
-                    return Err(BusError::UnmappedPort(port));
-                }
-            }
-            0x70 => self.cmos.select(value),
-            0x71 => self.cmos.write(value),
-            0x60 => {
+            Endpoint::CmosIndex => self.cmos.select(value),
+            Endpoint::CmosData => self.cmos.write(value),
+            Endpoint::KeyboardData => {
                 if let Some(lines) = self
                     .keyboard
                     .write_data(value)
@@ -414,40 +448,45 @@ impl PortBus for PcBus {
                     }
                     self.set_a20(lines.a20_enabled);
                 }
+                self.update_keyboard_irq();
             }
-            0x64 => self
-                .keyboard
-                .write_command(value)
-                .map_err(|_| BusError::UnmappedPort(port))?,
-            0x92 => {
+            Endpoint::KeyboardCommand => {
+                self.keyboard
+                    .write_command(value)
+                    .map_err(|_| BusError::UnmappedPort(port))?;
+                self.update_keyboard_irq();
+            }
+            Endpoint::A20 => {
                 if value & 1 != 0 {
                     return Err(BusError::UnmappedPort(port));
                 }
                 self.set_a20(value & 2 != 0);
             }
-            0x330 => self
+            Endpoint::MidiData => self
                 .mpu
                 .write_data(value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
-            0x331 => self
+            Endpoint::MidiCommand => self
                 .mpu
                 .write_command(value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
-            0xA0 => self.slave_pic.write_command(value),
-            0xA1 => self.slave_pic.write_data(value),
-            0x20 => self.pic.write_command(value),
-            0x21 => self.pic.write_data(value),
-            0x40..=0x42 => self
+            Endpoint::PicCommand => self.pic.write_command(value),
+            Endpoint::PicData => self.pic.write_data(value),
+            Endpoint::SlavePicCommand => self.slave_pic.write_command(value),
+            Endpoint::SlavePicData => self.slave_pic.write_data(value),
+            Endpoint::PitData => self
                 .pit
                 .write_counter((port - 0x40) as u8, value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
-            0x43 => self
+            Endpoint::PitControl => self
                 .pit
                 .write_control(value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
-            0x3C8 => self.vga.set_dac_index(value),
-            0x3C9 => self.vga.write_dac(value),
-            _ => return Err(BusError::UnmappedPort(port)),
+            Endpoint::Gameport => self.gameport.trigger(self.guest_nanos),
+            Endpoint::VgaStatus
+            | Endpoint::DspData
+            | Endpoint::DspStatus
+            | Endpoint::DspWordAck => return Err(BusError::UnmappedPort(port)),
         }
         Ok(())
     }

@@ -31,17 +31,23 @@ pub(crate) struct Ram {
 }
 impl Default for Ram {
     fn default() -> Self {
+        Self::new(RAM_SIZE)
+    }
+}
+impl Ram {
+    pub(crate) fn new(size: usize) -> Self {
         let mut ram = Self {
-            bytes: vec![0; RAM_SIZE].into_boxed_slice(),
-            generations: vec![0; RAM_SIZE / PAGE_SIZE].into_boxed_slice(),
+            bytes: vec![0; size].into_boxed_slice(),
+            generations: vec![0; size / PAGE_SIZE].into_boxed_slice(),
             identity: CodeOwnerId::fresh(),
             code_space: 0,
         };
         ram.set_mapping(0);
         ram
     }
-}
-impl Ram {
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
     pub(crate) fn text_revision(&self) -> u64 {
         self.generations[0].wrapping_add(
             self.generations[0xB8..0xC0]

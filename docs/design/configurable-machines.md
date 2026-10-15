@@ -1,8 +1,12 @@
 # Configurable machines, storage and the machine editor
 
-Status: proposal, 2026-10-15. The interfaces and version-2 profile below are
-proposed, not implemented. Current behavior remains documented in
-[architecture.md](../architecture.md) and [SPEC.md](../SPEC.md).
+Status: design record, 2026-10-15. The initial implementation now provides the
+shared machine editor, device routes, positional ISO sources, input routing and
+transactional overlays. The examples below retain the original design sketches;
+use [configuration.md](../configuration.md) for the implemented profile schema.
+Browser persistence uses IndexedDB. SQL remains a future adapter. Implemented
+scope is documented in [architecture.md](../architecture.md) and
+[SPEC.md](../SPEC.md).
 
 ## Decision
 

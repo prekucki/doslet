@@ -1,8 +1,18 @@
 //! Single owner of the browser machine, imported storage and scanout conversion.
 #[path = "../../doslet/src/archive.rs"]
 mod archive;
+#[path = "../../common/machine_profile.rs"]
+#[allow(
+    dead_code,
+    reason = "Worker parses profiles; export lives in the window frontend"
+)]
+mod machine_profile;
+use doslet_config::{MachineSpec, SourceKind, WritePolicy};
 use doslet_midi_routing::{Mode, Routing, SNAPSHOT_CAPACITY};
 use doslet_runtime::{Session, SessionStatus};
+use doslet_storage::{
+    CachedSource, HostCompletion, HostRequest, RequestTag, SourceId, SourceIdentity, StorageError,
+};
 use doslet_x86::Gpr16;
 use std::sync::Arc;
 #[cfg(target_arch = "wasm32")]
@@ -13,6 +23,12 @@ pub struct WorkerEngine {
     session: Session,
     archive: Option<archive::GameArchive>,
     active: Option<(archive::GameArchive, String)>,
+    active_spec: MachineSpec,
+    candidate: Option<Session>,
+    candidate_spec: Option<MachineSpec>,
+    candidate_archive: Option<(archive::GameArchive, String)>,
+    request: Option<HostRequest>,
+    machine_epoch: u64,
     pixels: Vec<u8>,
     revision: Option<(usize, usize, u64)>,
     midi: [u8; 16384],
@@ -52,6 +68,12 @@ impl WorkerEngine {
             session: Session::demo(),
             archive: None,
             active: None,
+            active_spec: MachineSpec::default(),
+            candidate: None,
+            candidate_spec: None,
+            candidate_archive: None,
+            request: None,
+            machine_epoch: 1,
             pixels: Vec::new(),
             revision: None,
             midi: [0; 16384],
@@ -70,16 +92,246 @@ impl WorkerEngine {
         Ok(programs)
     }
     pub fn start_game(&mut self, program: &str) -> Result<(), String> {
+        self.guard_direct_replacement()?;
         let archive = self.archive.as_ref().ok_or("Open a game ZIP first")?;
         let mut session = archive.load(program)?;
         session.start();
         self.active = Some((archive.clone(), program.into()));
+        self.active_spec = MachineSpec::default();
+        self.machine_epoch += 1;
         self.session = session;
         self.routing = Routing::new(self.routing.mode());
         self.revision = None;
         Ok(())
     }
+    /// Build a candidate without touching the active session. Host preparation
+    /// (media probe / writer lease) must finish before install_machine.
+    pub fn prepare_machine(&mut self, profile: &str, program: &str) -> Result<String, String> {
+        let spec = machine_profile::parse_machine_profile(profile)?;
+        self.prepare(spec, program, false)
+    }
+    pub fn prepare_reset(&mut self) -> Result<String, String> {
+        let program = self
+            .active
+            .as_ref()
+            .map_or(String::new(), |(_, p)| p.clone());
+        self.prepare(self.active_spec.clone(), &program, true)
+    }
+    pub fn prepare_start_game(&mut self, program: &str) -> Result<String, String> {
+        self.prepare(self.active_spec.clone(), program, false)
+    }
+    pub fn candidate_source(&mut self, length: u64, validator: &[u8]) -> Result<(), String> {
+        let spec = self
+            .candidate_spec
+            .as_ref()
+            .ok_or("No prepared configuration")?;
+        let letter = spec
+            .mounts
+            .iter()
+            .find(|m| matches!(m.kind, SourceKind::LocalIso | SourceKind::HttpsIso))
+            .ok_or("No ISO mount in configuration")?
+            .letter;
+        let validator: [u8; 32] = validator
+            .try_into()
+            .map_err(|_| "Invalid source fingerprint")?;
+        let session = self.candidate.take().ok_or("No prepared machine")?;
+        self.candidate = Some(
+            session
+                .with_cdrom_source(
+                    letter,
+                    CachedSource::new(
+                        SourceIdentity {
+                            id: SourceId(1),
+                            generation: self.machine_epoch + 1,
+                            length,
+                            validator,
+                        },
+                        self.machine_epoch + 1,
+                    ),
+                )
+                .map_err(|e| e.to_string())?,
+        );
+        Ok(())
+    }
+    pub fn candidate_store(
+        &mut self,
+        namespace: &[u8],
+        fence: u64,
+        revision: u64,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let namespace = namespace.try_into().map_err(|_| "Invalid save namespace")?;
+        let session = self.candidate.as_mut().ok_or("No prepared machine")?;
+        session
+            .attach_persistent_store(
+                namespace,
+                session.base_identity(),
+                fence,
+                revision,
+                if payload.is_empty() {
+                    None
+                } else {
+                    Some(payload)
+                },
+            )
+            .map_err(|e| format!("Save attachment: {e:?}"))
+    }
+    pub fn install_machine(&mut self) -> Result<(), String> {
+        let mut candidate = self.candidate.take().ok_or("No prepared machine")?;
+        let spec = self
+            .candidate_spec
+            .take()
+            .ok_or("No prepared configuration")?;
+        candidate.start();
+        self.session = candidate;
+        self.active = self.candidate_archive.take();
+        self.active_spec = spec;
+        self.machine_epoch = self.machine_epoch.wrapping_add(1);
+        self.request = None;
+        self.routing = Routing::new(parse_mode(&self.active_spec.output.game_midi)?);
+        self.revision = None;
+        Ok(())
+    }
+    pub fn discard_machine(&mut self) {
+        self.candidate = None;
+        self.candidate_spec = None;
+        self.candidate_archive = None;
+    }
+    pub fn waiting_for_io(&self) -> bool {
+        self.session.storage_waiting()
+    }
+    pub fn pending_commit(&self) -> bool {
+        self.session.pending_commit()
+    }
+    pub fn dirty_overlay(&self) -> bool {
+        self.session.dirty_overlay()
+    }
+    pub fn request_save_commit(&mut self) -> Result<(), String> {
+        self.session
+            .request_overlay_commit()
+            .map_err(|e| e.to_string())
+    }
+    pub fn candidate_import(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.candidate
+            .as_mut()
+            .ok_or("No prepared machine")?
+            .import_overlay(bytes)
+            .map_err(|e| format!("Import: {e:?}"))
+    }
+    pub fn export_saves(&mut self) -> Result<Vec<u8>, String> {
+        self.session
+            .export_overlay()
+            .map_err(|e| format!("Save export: {e:?}"))
+    }
+    pub fn import_saves(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.session
+            .import_overlay(bytes)
+            .map_err(|e| format!("Save import: {e:?}"))
+    }
+    pub fn physical_key(&mut self, usage: u16, pressed: bool) {
+        let _ = self.session.physical_key(usage, pressed);
+    }
+    pub fn joystick(&mut self, x: i16, y: i16, buttons: u8) {
+        self.session
+            .set_joystick([x, y], [buttons & 1 != 0, buttons & 2 != 0]);
+    }
+    pub fn release_input(&mut self) {
+        let _ = self.session.release_keys();
+        self.session.release_pointer_buttons();
+    }
+    pub fn release_joystick(&mut self) {
+        let _ = self
+            .session
+            .release_input_source(doslet_input::InputSourceId(1));
+    }
+    /// Metadata is bounded JSON; byte payloads use their own explicit transfer.
+    pub fn next_io_request(&mut self) -> Option<String> {
+        if self.request.is_some() {
+            return None;
+        }
+        let request = self.session.next_host_request()?;
+        let tag = request.tag();
+        let mut metadata = serde_json::json!({"machine":self.machine_epoch.to_string(),"epoch":tag.epoch.to_string(),"id":tag.id.to_string(),"generation":tag.generation.to_string(),"slot":tag.slot});
+        match &request {
+            HostRequest::Read {
+                source,
+                offset,
+                length,
+                ..
+            } => {
+                metadata["kind"] = "read".into();
+                metadata["source"] = source.0.to_string().into();
+                metadata["offset"] = offset.to_string().into();
+                metadata["length"] = (*length).into();
+            }
+            HostRequest::Commit { batch, .. } => {
+                metadata["kind"] = "commit".into();
+                metadata["namespace"] = hex(&batch.namespace).into();
+                metadata["base"] = hex(&batch.base).into();
+                metadata["fence"] = batch.fencing_token.to_string().into();
+                metadata["expected"] = batch.expected_revision.to_string().into();
+                metadata["mutation"] = batch.mutation_id.to_string().into();
+                metadata["digest"] = batch.digest.to_string().into();
+            }
+        }
+        self.request = Some(request);
+        Some(metadata.to_string())
+    }
+    pub fn take_io_payload(&mut self) -> Vec<u8> {
+        let request = self.request.take();
+        match request {
+            Some(HostRequest::Commit { batch, .. }) => batch.payload,
+            _ => Vec::new(),
+        }
+    }
+    pub fn complete_io(
+        &mut self,
+        metadata: &str,
+        bytes: Vec<u8>,
+        error: &str,
+        revision: u64,
+    ) -> Result<(), String> {
+        let value: serde_json::Value = serde_json::from_str(metadata).map_err(|e| e.to_string())?;
+        let number = |key: &str| -> Result<u64, String> {
+            value[key]
+                .as_str()
+                .ok_or_else(|| format!("Missing {key}"))?
+                .parse()
+                .map_err(|_| format!("Invalid {key}"))
+        };
+        if number("machine")? != self.machine_epoch {
+            return Ok(());
+        }
+        let tag = RequestTag {
+            epoch: number("epoch")?,
+            id: number("id")?,
+            generation: number("generation")?,
+            slot: value["slot"]
+                .as_u64()
+                .ok_or("Missing slot")?
+                .try_into()
+                .map_err(|_| "Invalid slot")?,
+        };
+        let result = if error.is_empty() {
+            Ok(())
+        } else {
+            Err(storage_error(error))
+        };
+        let completion = if value["kind"] == "commit" {
+            HostCompletion::Commit {
+                tag,
+                result: result.map(|()| revision),
+            }
+        } else {
+            HostCompletion::Read { tag, bytes, result }
+        };
+        match self.session.complete_host_request(completion) {
+            Ok(()) | Err(StorageError::StaleCompletion) => Ok(()),
+            Err(e) => Err(format!("Storage completion: {e:?}")),
+        }
+    }
     pub fn reset(&mut self) -> Result<(), String> {
+        self.guard_direct_replacement()?;
         self.session = if let Some((archive, program)) = &self.active {
             let mut session = archive.load(program)?;
             session.start();
@@ -88,6 +340,7 @@ impl WorkerEngine {
             Session::demo()
         };
         self.routing = Routing::new(self.routing.mode());
+        self.machine_epoch += 1;
         self.revision = None;
         Ok(())
     }
@@ -102,6 +355,9 @@ impl WorkerEngine {
     }
     pub fn advance(&mut self, budget: u32) -> u32 {
         self.session.advance(budget.min(10000))
+    }
+    pub fn timeslice_yielded(&self) -> bool {
+        self.session.timeslice_yielded()
     }
     pub fn key_event(
         &mut self,
@@ -263,6 +519,88 @@ impl WorkerEngine {
     }
 }
 
+impl WorkerEngine {
+    fn guard_direct_replacement(&self) -> Result<(), String> {
+        if self.session.pending_commit() || self.session.dirty_overlay() {
+            return Err("Settle or export changes before replacing this machine".into());
+        }
+        if self.active_spec.mounts.iter().any(|m| {
+            m.policy == WritePolicy::Persistent
+                || matches!(m.kind, SourceKind::LocalIso | SourceKind::HttpsIso)
+        }) {
+            return Err("This machine requires host preparation before replacement".into());
+        }
+        Ok(())
+    }
+    fn prepare(&mut self, spec: MachineSpec, program: &str, reset: bool) -> Result<String, String> {
+        if self.session.pending_commit() {
+            return Err("Wait for the current save commit before replacing this session".into());
+        }
+        spec.resolve().map_err(|e| e.to_string())?;
+        let archive = if reset {
+            self.active.as_ref().map(|(a, _)| a)
+        } else {
+            self.archive.as_ref()
+        };
+        let mut session = if program.is_empty() {
+            Session::demo_configured(spec.hardware).map_err(|e| e.to_string())?
+        } else {
+            archive
+                .ok_or("Open a game ZIP first")?
+                .load_configured(program, &spec)?
+        };
+        session
+            .set_epoch(self.machine_epoch + 1)
+            .map_err(|e| e.to_string())?;
+        session
+            .configure_launch(
+                &spec.resolve().map_err(|e| e.to_string())?.command_tail,
+                spec.game.working_directory.as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+        let cd = spec
+            .mounts
+            .iter()
+            .find(|m| matches!(m.kind, SourceKind::LocalIso | SourceKind::HttpsIso));
+        let persistent = spec
+            .mounts
+            .iter()
+            .find(|m| m.policy == WritePolicy::Persistent);
+        let metadata = serde_json::json!({
+            "base":hex(&session.base_identity()),
+            "iso":cd.map(|m|serde_json::json!({"kind":if m.kind==SourceKind::HttpsIso {"https"}else{"blob"},"location":spec.binding(&m.source),"letter":m.letter})),
+            "store":persistent.map(|m|spec.binding(m.store.as_deref().unwrap_or(""))),
+            "input":{"pad_id":spec.input.pad_id,"pad_index":spec.input.pad_index,"axis_x":spec.input.axis_x,"axis_y":spec.input.axis_y,"button_1":spec.input.button_1,"button_2":spec.input.button_2,"deadzone_percent":spec.input.deadzone_percent},
+            "output":{"audio":spec.output.audio,"midi_output":spec.output.midi_output,"game_midi":spec.output.game_midi,"host_midi":spec.output.host_midi},
+        });
+        self.candidate_archive = if program.is_empty() {
+            None
+        } else {
+            Some((archive.ok_or("Missing archive")?.clone(), program.into()))
+        };
+        self.candidate_spec = Some(spec);
+        self.candidate = Some(session);
+        Ok(metadata.to_string())
+    }
+}
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|v| format!("{v:02x}")).collect()
+}
+fn storage_error(code: &str) -> StorageError {
+    match code {
+        "Quota" => StorageError::Quota,
+        "BusyWriter" => StorageError::BusyWriter,
+        "StaleRevision" => StorageError::StaleRevision,
+        "MissingBase" => StorageError::MissingBase,
+        "Corrupt" => StorageError::Corrupt,
+        "IdentityChanged" => StorageError::IdentityChanged,
+        "UnsupportedRange" => StorageError::UnsupportedRange,
+        "OutOfBounds" => StorageError::OutOfBounds,
+        "MutationConflict" => StorageError::MutationConflict,
+        "UnsupportedSchema" => StorageError::UnsupportedSchema,
+        _ => StorageError::Unavailable,
+    }
+}
 fn parse_mode(mode: &str) -> Result<Mode, String> {
     match mode {
         "gm" => Ok(Mode::Gm),
@@ -274,6 +612,19 @@ fn parse_mode(mode: &str) -> Result<Mode, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_exposes_guest_yield_before_the_next_batch() {
+        let mut engine = WorkerEngine::new();
+        engine.session =
+            Session::new(&[0xB8, 0x80, 0x16, 0xCD, 0x2F, 0xB8, 0, 0x4C, 0xCD, 0x21]).unwrap();
+        engine.start();
+        assert!(engine.advance(1000) < 1000);
+        assert!(engine.timeslice_yielded());
+        assert_eq!(engine.session.status(), SessionStatus::Running);
+        engine.advance(1000);
+        assert!(!engine.timeslice_yielded());
+        assert_eq!(engine.session.status(), SessionStatus::Exited(0));
+    }
     #[test]
     fn gm_to_raw_mt32_port_is_rejected_without_changing_dialects() {
         let mut engine = WorkerEngine::new();

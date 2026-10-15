@@ -7,6 +7,10 @@ license.workspace = true
 [features]
 profiling = ["doslet-pc/profiling"]
 [dependencies]
+doslet-storage.workspace = true
+doslet-vfs.workspace = true
+doslet-config.workspace = true
+doslet-input.workspace = true
 doslet-pcm.workspace = true
 doslet-iso9660.workspace = true
 doslet-bus.workspace = true

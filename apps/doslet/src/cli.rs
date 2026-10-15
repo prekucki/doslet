@@ -32,6 +32,18 @@ pub struct Cli {
     /// Load a TOML launch profile; explicit CLI options override profile values
     #[arg(long, value_name = "TOML")]
     pub config: Option<PathBuf>,
+    /// RAM size in MiB (4, 8, 16 or 32)
+    #[arg(long)]
+    pub memory_mib: Option<u8>,
+    /// Disable the emulated x87
+    #[arg(long)]
+    pub no_x87: bool,
+    /// Disable emulated Sound Blaster 16 hardware
+    #[arg(long)]
+    pub no_sb16: bool,
+    /// Disable emulated MPU-401 hardware
+    #[arg(long)]
+    pub no_mpu401: bool,
     /// DOS executable; its containing directory is mounted as C:
     #[arg(long, value_name = "EXE")]
     pub game: Option<PathBuf>,

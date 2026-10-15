@@ -109,6 +109,17 @@ impl Timeline {
     /// SysEx ownership is copied by moont into its bounded event queue here,
     /// outside the audio render callback. Channel messages allocate nothing.
     pub fn push_byte(&mut self, byte: u8) -> Result<(), Error> {
+        self.receive_byte(byte, false)
+    }
+    /// Restore a snapshot into a freshly created synth. Service its event
+    /// queue between complete messages rather than submitting the whole
+    /// snapshot as one live MIDI burst. Warm-up PCM is discarded; neither the
+    /// guest clock nor the output-frame position advances. Voice envelopes
+    /// restart on an output switch, as with the existing replay contract.
+    pub fn restore_byte(&mut self, byte: u8) -> Result<(), Error> {
+        self.receive_byte(byte, true)
+    }
+    fn receive_byte(&mut self, byte: u8, restore: bool) -> Result<(), Error> {
         if let Some(message) = self.wire.push(byte).map_err(Error::Wire)? {
             let accepted = if message[0] == 0xF0 {
                 self.sysex += 1;
@@ -126,6 +137,12 @@ impl Timeline {
             };
             if !accepted {
                 return Err(Error::QueueFull);
+            }
+            if restore {
+                // More than the engine's 16/24-frame channel-message transfer
+                // delay. This setup-only work keeps arbitrarily large bounded
+                // snapshots from filling the 4096-event live queue.
+                self.device.render(&mut self.scratch[..64]);
             }
         }
         Ok(())

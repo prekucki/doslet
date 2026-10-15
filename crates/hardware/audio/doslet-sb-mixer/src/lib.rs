@@ -21,6 +21,34 @@ impl Default for Mixer {
     }
 }
 impl Mixer {
+    /// Machine builder selects the initial, already validated ISA resources.
+    pub fn with_routing(irq: u8, dma8: u8, dma16: u8) -> Self {
+        let mut mixer = Self::default();
+        mixer.registers[0x80] = match irq {
+            5 => 2,
+            7 => 4,
+            _ => 0,
+        };
+        mixer.registers[0x81] = 1u8.checked_shl(u32::from(dma8)).unwrap_or(0)
+            | 1u8.checked_shl(u32::from(dma16)).unwrap_or(0);
+        mixer
+    }
+    /// Decode without modifying registers so machine resource checks are atomic.
+    pub fn proposed_routing(&self, value: u8) -> Option<(Option<u8>, Option<u8>, Option<u8>)> {
+        if !matches!(self.index, 0x80 | 0x81) {
+            return None;
+        }
+        let mut proposed = Self::default();
+        proposed.registers[0x80] = self.registers[0x80];
+        proposed.registers[0x81] = self.registers[0x81];
+        proposed.index = self.index;
+        proposed.write(value).ok()?;
+        Some((
+            proposed.interrupt_line(),
+            proposed.dma_channel(false),
+            proposed.dma_channel(true),
+        ))
+    }
     pub fn interrupt_line(&self) -> Option<u8> {
         match self.registers[0x80] {
             1 => Some(2),

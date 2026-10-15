@@ -7,6 +7,10 @@ license.workspace = true
 [features]
 profiling = ["doslet-x86/profiling"]
 [dependencies]
+doslet-config.workspace = true
+doslet-input.workspace = true
+doslet-at-keyboard.workspace = true
+doslet-gameport.workspace = true
 doslet-pcm.workspace = true
 doslet-i8042.workspace = true
 doslet-mc146818.workspace = true

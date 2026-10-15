@@ -2,13 +2,15 @@ use doslet_bus::{BusError, MemoryBus};
 
 pub const SHIM_SEGMENT: u16 = 0xF000;
 pub const SHIM_BASE: u32 = 0xF0000;
-pub const SERVICES: [u8; 10] = [0x08, 0x10, 0x15, 0x16, 0x1A, 0x20, 0x21, 0x2F, 0x33, 0x67];
+
 pub const UPPERCASE_OFFSET: u16 = 0x100;
 pub const VBE_OEM_OFFSET: u16 = 0x200;
 pub const VBE_MODES_OFFSET: u16 = 0x210;
 pub const VBE_BANK_OFFSET: u16 = 0x220;
 pub const INDOS_OFFSET: u16 = 0x240;
 pub const IRQ0_OFFSET: u16 = 0x180;
+pub const IRQ1_OFFSET: u16 = 0x1A0;
+const IRQ1_CODE: [u8; 7] = [0x50, 0xB0, 0x20, 0xE6, 0x20, 0x58, 0xCF];
 const IRQ0_CODE: [u8; 9] = [0x50, 0xCD, 0x1C, 0xB0, 0x20, 0xE6, 0x20, 0x58, 0xCF];
 
 /// Selected mode-03h BIOS state. B800h is currently ordinary PC RAM;
@@ -36,23 +38,115 @@ pub fn set_text_mode<B: MemoryBus>(bus: &mut B, preserve: bool) -> Result<(), Bu
     Ok(())
 }
 
-pub fn service_at<B: MemoryBus>(bus: &mut B, offset: u32) -> Result<Option<u8>, BusError> {
-    if offset == u32::from(IRQ0_OFFSET) {
-        for (index, byte) in IRQ0_CODE.iter().enumerate() {
-            if bus.read_u8(SHIM_BASE + offset + index as u32)? != *byte {
-                return Ok(None);
-            }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceSelector {
+    Timer,
+    KeyboardIrq,
+    Video,
+    ExtendedBios,
+    Keyboard,
+    Clock,
+    Terminate,
+    Dos,
+    Mscdex,
+    Mouse,
+    Ems,
+}
+impl ServiceSelector {
+    pub const fn vector(self) -> u8 {
+        match self {
+            Self::Timer => 8,
+            Self::KeyboardIrq => 9,
+            Self::Video => 0x10,
+            Self::ExtendedBios => 0x15,
+            Self::Keyboard => 0x16,
+            Self::Clock => 0x1A,
+            Self::Terminate => 0x20,
+            Self::Dos => 0x21,
+            Self::Mscdex => 0x2F,
+            Self::Mouse => 0x33,
+            Self::Ems => 0x67,
         }
-        return Ok(Some(8));
     }
-    if let Ok(vector) = u8::try_from(offset)
-        && vector != 8
-        && SERVICES.contains(&vector)
-        && bus.read_u8(SHIM_BASE + offset)? == 0xCF
-    {
-        return Ok(Some(vector));
+}
+struct ServiceDefinition {
+    selector: ServiceSelector,
+    offset: u16,
+    signature: &'static [u8],
+}
+const SERVICES: [ServiceDefinition; 11] = [
+    ServiceDefinition {
+        selector: ServiceSelector::Timer,
+        offset: IRQ0_OFFSET,
+        signature: &IRQ0_CODE,
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::KeyboardIrq,
+        offset: IRQ1_OFFSET,
+        signature: &IRQ1_CODE,
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::Video,
+        offset: 0x10,
+        signature: &[0xCF],
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::ExtendedBios,
+        offset: 0x15,
+        signature: &[0xCF],
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::Keyboard,
+        offset: 0x16,
+        signature: &[0xCF],
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::Clock,
+        offset: 0x1A,
+        signature: &[0xCF],
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::Terminate,
+        offset: 0x20,
+        signature: &[0xCF],
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::Dos,
+        offset: 0x21,
+        signature: &[0xCF],
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::Mscdex,
+        offset: 0x2F,
+        signature: &[0xCF],
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::Mouse,
+        offset: 0x33,
+        signature: &[0xCF],
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::Ems,
+        offset: 0x67,
+        signature: &[0xCF],
+    },
+];
+pub fn service_at<B: MemoryBus>(
+    bus: &mut B,
+    offset: u32,
+) -> Result<Option<ServiceSelector>, BusError> {
+    let Some(service) = SERVICES
+        .iter()
+        .find(|service| u32::from(service.offset) == offset)
+    else {
+        return Ok(None);
+    };
+    for (index, byte) in service.signature.iter().enumerate() {
+        if bus.read_u8(SHIM_BASE + offset + index as u32)? != *byte {
+            return Ok(None);
+        }
     }
-    Ok(None)
+    Ok(Some(service.selector))
 }
 
 /// Guest interrupts still traverse the IVT. Only arrival at an installed shim invokes HLE.
@@ -62,18 +156,13 @@ pub fn install<B: MemoryBus>(bus: &mut B) -> Result<(), BusError> {
     bus.write_u16(0x41C, 0x1E)?;
     bus.write_u16(0x480, 0x1E)?;
     bus.write_u16(0x482, 0x3E)?;
-    for vector in SERVICES {
-        let offset = if vector == 8 {
-            IRQ0_OFFSET
-        } else {
-            u16::from(vector)
-        };
-        bus.write_u16(u32::from(vector) * 4, offset)?;
+    for service in SERVICES {
+        let vector = service.selector.vector();
+        bus.write_u16(u32::from(vector) * 4, service.offset)?;
         bus.write_u16(u32::from(vector) * 4 + 2, SHIM_SEGMENT)?;
-        bus.write_u8(SHIM_BASE + u32::from(vector), 0xCF)?; // IRET
-    }
-    for (offset, byte) in IRQ0_CODE.iter().enumerate() {
-        bus.write_u8(SHIM_BASE + u32::from(IRQ0_OFFSET) + offset as u32, *byte)?;
+        for (index, byte) in service.signature.iter().enumerate() {
+            bus.write_u8(SHIM_BASE + u32::from(service.offset) + index as u32, *byte)?;
+        }
     }
     // The default user timer hook is ordinary guest IRET code; replacement
     // handlers execute through their current vector, including extender relays.

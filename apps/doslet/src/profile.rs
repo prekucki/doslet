@@ -238,12 +238,107 @@ fn command_tail(arguments: &[String]) -> Result<Vec<u8>, String> {
 
 impl Cli {
     pub fn resolve(mut self) -> Result<Self, Box<dyn Error>> {
+        let explicit_drive_mode = self.drive_mode;
         if let Some(config) = &self.config {
             let text = std::fs::read_to_string(config)
                 .map_err(|error| format!("Cannot read {}: {error}", config.display()))?;
             let base = config.parent().unwrap_or(Path::new("."));
-            let profile = Profile::parse(&text, base)
-                .map_err(|error| format!("{}: {error}", config.display()))?;
+            let is_v2 = text
+                .parse::<DocumentMut>()?
+                .get("version")
+                .and_then(Item::as_integer)
+                == Some(2);
+            let profile = if is_v2 {
+                let mut spec = crate::machine_profile::parse_machine_profile(&text)?;
+                for binding in &mut spec.host.bindings {
+                    if matches!(
+                        binding.kind,
+                        doslet_config::BindingKind::NativeDirectory
+                            | doslet_config::BindingKind::LocalIso
+                            | doslet_config::BindingKind::NativeStore
+                    ) {
+                        binding.location =
+                            base.join(&binding.location).to_string_lossy().into_owned();
+                    }
+                }
+                let mut profile = Profile {
+                    name: (!spec.name.is_empty()).then(|| spec.name.clone()),
+                    arguments: spec.game.arguments.clone(),
+                    working_directory: Some(spec.game.working_directory.clone()),
+                    writable: true,
+                    audio: Some(spec.output.audio),
+                    game_mode: Some(if spec.output.game_midi == "mt32" {
+                        MidiMode::Mt32
+                    } else {
+                        MidiMode::Gm
+                    }),
+                    host_mode: Some(if spec.output.host_midi == "mt32" {
+                        MidiMode::Mt32
+                    } else {
+                        MidiMode::Gm
+                    }),
+                    output: Some(spec.output.midi_output.clone()),
+                    ..Profile::default()
+                };
+                if !spec.game.executable.is_empty() {
+                    profile.executable = Some(base.join(&spec.game.executable));
+                }
+                if let Some(binding) = &spec.output.rom_binding {
+                    profile.rom_directory =
+                        Some(if spec.host.bindings.iter().any(|b| b.id == *binding) {
+                            PathBuf::from(spec.binding(binding))
+                        } else {
+                            base.join(binding)
+                        });
+                }
+                for mount in &mut spec.mounts {
+                    if matches!(
+                        mount.kind,
+                        doslet_config::SourceKind::NativeDirectory
+                            | doslet_config::SourceKind::LocalIso
+                    ) && !spec.host.bindings.iter().any(|b| b.id == mount.source)
+                    {
+                        mount.source = base.join(&mount.source).to_string_lossy().into_owned();
+                    }
+                    if let Some(store) = &mut mount.store
+                        && !spec.host.bindings.iter().any(|b| b.id == *store)
+                    {
+                        *store = base.join(&*store).to_string_lossy().into_owned();
+                    }
+                }
+                for mount in &spec.mounts {
+                    let source = if spec.host.bindings.iter().any(|b| b.id == mount.source) {
+                        PathBuf::from(spec.binding(&mount.source))
+                    } else {
+                        PathBuf::from(&mount.source)
+                    };
+                    match mount.kind {
+                        doslet_config::SourceKind::NativeDirectory => {
+                            profile.root = Some(source);
+                            profile.drive_mode = Some(match mount.policy {
+                                doslet_config::WritePolicy::ReadOnly => DriveMode::Ro,
+                                doslet_config::WritePolicy::LegacyWriteback => DriveMode::Rw,
+                                _ => DriveMode::Overlay,
+                            });
+                        }
+                        doslet_config::SourceKind::LocalIso => {
+                            profile.cdrom = Some((mount.letter, source))
+                        }
+                        doslet_config::SourceKind::HttpsIso => {}
+                        _ => {
+                            return Err(
+                                "native profiles require directory and local ISO sources".into()
+                            );
+                        }
+                    }
+                }
+                self.launch.hardware = spec.hardware;
+                self.launch.machine_spec = Some(spec);
+                Ok(profile)
+            } else {
+                Profile::parse(&text, base)
+            }
+            .map_err(|error| format!("{}: {error}", config.display()))?;
             self.game = self.game.or(profile.executable);
             self.midi_mode = self.midi_mode.or(profile.game_mode);
             self.midi_output_mode = self.midi_output_mode.or(profile.host_mode);
@@ -252,6 +347,11 @@ impl Cli {
             // An explicit output selection also enables audio disabled in a profile.
             self.no_audio |= profile.audio == Some(false) && !explicit_audio;
             self.midi_output = self.midi_output.or(profile.output);
+            if self.launch.machine_spec.is_none() {
+                let mut spec = doslet_config::MachineSpec::default();
+                spec.game.arguments = profile.arguments.clone();
+                self.launch.machine_spec = Some(spec);
+            }
             self.profile_name = profile.name;
             self.launch.command_tail = command_tail(&profile.arguments)?;
             if let Some(directory) = profile.working_directory {
@@ -270,9 +370,22 @@ impl Cli {
             self.launch.writable = profile.writable;
             self.drive_mode = self.drive_mode.or(profile.drive_mode);
             self.launch.cdrom = profile.cdrom;
-            if self.game.is_none() {
+            if self.game.is_none() && !is_v2 {
                 return Err("profile requires game.executable or --game".into());
             }
+        }
+        if let Some(memory) = self.memory_mib {
+            self.launch.hardware.memory_mib = memory;
+        }
+        self.launch.hardware.x87 &= !self.no_x87;
+        self.launch.hardware.sb16 &= !self.no_sb16;
+        self.launch.hardware.mpu401 &= !self.no_mpu401;
+        self.launch
+            .hardware
+            .validate()
+            .map_err(|error| format!("invalid hardware configuration: {error:?}"))?;
+        if let Some(spec) = &mut self.launch.machine_spec {
+            spec.hardware = self.launch.hardware;
         }
         self.midi_mode.get_or_insert(MidiMode::Gm);
         self.launch.heroes_timer_waits = self.experimental_heroes_timer_waits;
@@ -323,6 +436,72 @@ impl Cli {
         if self.midi_output.as_deref() == Some("moont") && self.mt32_rom_dir.is_none() {
             return Err("midi.output=moont requires midi.rom_directory or --mt32-rom-dir".into());
         }
+        let mut spec = self.launch.machine_spec.take().unwrap_or_default();
+        spec.hardware = self.launch.hardware;
+        spec.name = self.profile_name.clone().unwrap_or_default();
+        spec.game.executable = self
+            .game
+            .as_ref()
+            .map_or(String::new(), |p| p.to_string_lossy().into_owned());
+        spec.game.working_directory = String::from_utf8(self.launch.working_directory.clone())?;
+        spec.output.audio = !self.no_audio;
+        spec.output.game_midi = if self.midi_mode == Some(MidiMode::Mt32) {
+            "mt32"
+        } else {
+            "gm"
+        }
+        .into();
+        spec.output.host_midi = if self.midi_output_mode == Some(MidiMode::Mt32) {
+            "mt32"
+        } else {
+            "gm"
+        }
+        .into();
+        spec.output.midi_output = self.midi_output.clone().unwrap_or_else(|| "rust".into());
+        if let Some(path) = &self.mt32_rom_dir {
+            spec.output.rom_binding = Some(path.to_string_lossy().into_owned());
+        }
+        if spec.mounts.is_empty() {
+            if let Some(game) = &self.game {
+                let root = self
+                    .launch
+                    .root
+                    .as_deref()
+                    .unwrap_or_else(|| game.parent().unwrap_or(Path::new(".")));
+                spec.mounts.push(doslet_config::MountSpec {
+                    letter: b'C',
+                    source: root.to_string_lossy().into_owned(),
+                    kind: doslet_config::SourceKind::NativeDirectory,
+                    policy: if self.launch.persist {
+                        doslet_config::WritePolicy::LegacyWriteback
+                    } else if self.launch.writable {
+                        doslet_config::WritePolicy::Temporary
+                    } else {
+                        doslet_config::WritePolicy::ReadOnly
+                    },
+                    store: None,
+                });
+            }
+            if let Some((letter, path)) = &self.launch.cdrom {
+                spec.mounts.push(doslet_config::MountSpec {
+                    letter: *letter,
+                    source: path.to_string_lossy().into_owned(),
+                    kind: doslet_config::SourceKind::LocalIso,
+                    policy: doslet_config::WritePolicy::ReadOnly,
+                    store: None,
+                });
+            }
+        } else if let Some(mode) = explicit_drive_mode
+            && let Some(c) = spec.mounts.iter_mut().find(|m| m.letter == b'C')
+        {
+            c.policy = match mode {
+                DriveMode::Ro => doslet_config::WritePolicy::ReadOnly,
+                DriveMode::Overlay => doslet_config::WritePolicy::Temporary,
+                DriveMode::Rw => doslet_config::WritePolicy::LegacyWriteback,
+            };
+        }
+        spec.resolve().map_err(|e| e.to_string())?;
+        self.launch.machine_spec = Some(spec);
         Ok(self)
     }
 }
@@ -334,6 +513,56 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     include!("../../../tests/fixtures/relocated_mz.rs");
     include!("../../../tests/fixtures/iso9660.rs");
+    #[test]
+    fn version_two_hardware_paths_and_cli_precedence_preserve_persistent_policy() {
+        let fixture = Fixture::new(
+            "version=2\n[game]\nexecutable='../TINY.EXE'\n[machine]\nmemory_mib=8\nx87=false\n[sound]\nsb16=false\n[[drives]]\nletter='C'\nkind='directory'\nsource='..'\npolicy='persistent'\nstore='../saves'\n",
+        );
+        let cli = fixture
+            .cli(&["--memory-mib", "32", "--no-mpu401", "--no-audio"])
+            .resolve()
+            .unwrap();
+        assert_eq!(cli.launch.hardware.memory_mib, 32);
+        assert!(
+            !cli.launch.hardware.x87 && !cli.launch.hardware.sb16 && !cli.launch.hardware.mpu401
+        );
+        let spec = cli.launch.machine_spec.unwrap();
+        assert_eq!(
+            spec.mounts[0].policy,
+            doslet_config::WritePolicy::Persistent
+        );
+        assert_eq!(
+            std::path::Path::new(&spec.mounts[0].source)
+                .canonicalize()
+                .unwrap(),
+            fixture.root
+        );
+        assert!(!cli.launch.persist && cli.launch.writable);
+        let cli = fixture
+            .cli(&["--drive-mode", "overlay", "--no-audio"])
+            .resolve()
+            .unwrap();
+        assert_eq!(
+            cli.launch.machine_spec.unwrap().mounts[0].policy,
+            doslet_config::WritePolicy::Temporary
+        );
+    }
+
+    #[test]
+    fn version_one_import_exports_resolved_version_two_without_losing_arguments() {
+        let fixture = Fixture::new(
+            "version=1\nname='Legacy'\n[game]\nexecutable='../TINY.EXE'\narguments=['/test','two words']\n[audio]\nenabled=false\n",
+        );
+        let cli = fixture.cli(&[]).resolve().unwrap();
+        let spec = cli.launch.machine_spec.unwrap();
+        assert_eq!(spec.hardware, doslet_config::HardwareConfig::default());
+        assert_eq!(spec.game.arguments, ["/test", "two words"]);
+        let exported = crate::machine_profile::export_machine_profile(&spec);
+        assert_eq!(
+            crate::machine_profile::parse_machine_profile(&exported).unwrap(),
+            spec
+        );
+    }
     #[test]
     fn drive_modes_select_persistence_and_cli_overrides_profile() {
         let fixture = Fixture::new(

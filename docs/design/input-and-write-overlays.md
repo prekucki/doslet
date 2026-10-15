@@ -1,8 +1,11 @@
 # Input devices and persistent write overlays
 
-Status: proposal, 2026-10-15. This extends
-[configurable machines](configurable-machines.md); the interfaces, profiles and
-backends below are not implemented contracts.
+Status: design record, 2026-10-15. This extends
+[configurable machines](configurable-machines.md). Input routing, the AT keyboard,
+gameport and transactional overlays are now implemented. The selected initial
+browser store is IndexedDB; the SQL sections below describe future adapters.
+Use [configuration.md](../configuration.md) for current profiles, limits and
+host bindings; interface sketches below preserve the original proposal.
 
 ## Decision
 

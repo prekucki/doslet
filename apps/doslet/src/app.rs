@@ -7,8 +7,47 @@ use std::time::{Duration, Instant};
 
 const MAX_STEPS_PER_TICK: u32 = 400_000;
 const CHUNK: u32 = 10_000;
+struct PreparedOutput {
+    audio: Option<crate::audio::Output>,
+    host_midi: Option<crate::native_midi::Output>,
+    mt32: Option<doslet_mt32::Timeline>,
+    rom_dir: Option<std::path::PathBuf>,
+    midi: Timeline,
+    midi_mode: Mode,
+    output_mode: Mode,
+    choice: String,
+    choices: Vec<String>,
+    routing: Routing,
+    mixer: doslet_pcm::Mixer,
+}
+struct PreparedMachine {
+    session: Session,
+    source: Option<std::path::PathBuf>,
+    launch: crate::native_input::LaunchSettings,
+    spec: doslet_config::MachineSpec,
+}
+pub(crate) struct MachinePreparation {
+    old_storage: Option<crate::native_storage::NativeStorage>,
+    result: Result<(PreparedMachine, crate::native_storage::NativeStorage), String>,
+}
+impl core::fmt::Debug for MachinePreparation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("MachinePreparation")
+    }
+}
+type PreparationSlot = std::sync::Arc<std::sync::Mutex<Option<MachinePreparation>>>;
 pub struct Doslet {
     pub session: Session,
+    pub workspace: crate::ui::Workspace,
+    pub configurator: crate::configurator::ConfiguratorState,
+    storage: Option<crate::native_storage::NativeStorage>,
+    gamepads: Option<crate::native_gamepad::NativeGamepads>,
+    pad_axes: [i16; 2],
+    pad_buttons: [bool; 2],
+    pad_generation: Option<u64>,
+    pad_sequence: u64,
+    pending_output: Option<Box<PreparedOutput>>,
+    preparation_was_running: bool,
     pub display: DisplayFrame,
     pub display_sizing: DisplaySizing,
     pub name: String,
@@ -48,6 +87,9 @@ pub struct Doslet {
 }
 #[derive(Clone, Debug)]
 pub enum Message {
+    Ui(crate::ui::Action),
+    Config(crate::configurator::Edit),
+    MachinePrepared(Result<PreparationSlot, String>),
     DisplaySizing(SizingMessage),
     PointerMoved(u16, u16),
     PointerButton(u8, bool),
@@ -55,10 +97,12 @@ pub enum Message {
     CaptureWindow(iced::window::Id, u64),
     MouseCapture(iced::window::Id, u64, iced::window::MouseCaptureEvent),
     Keyboard(iced::keyboard::Event),
+    KeyboardCaptured(iced::keyboard::Event),
     RunPause,
     Step,
     Reset,
     Tick,
+    FocusLost,
     RefreshMidi,
     MidiSelected(String),
     MidiModeSelected(Mode),
@@ -74,6 +118,16 @@ impl Doslet {
     pub fn new() -> Self {
         Self {
             session: Session::demo(),
+            workspace: crate::ui::Workspace::default(),
+            configurator: crate::configurator::ConfiguratorState::default(),
+            storage: None,
+            gamepads: None,
+            pad_axes: [0; 2],
+            pad_buttons: [false; 2],
+            pad_generation: None,
+            pad_sequence: 0,
+            pending_output: None,
+            preparation_was_running: false,
             display: DisplayFrame::default(),
             display_sizing: DisplaySizing::default(),
             name: "Color bars".into(),
@@ -113,23 +167,42 @@ impl Doslet {
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn from_cli(cli: crate::cli::Cli) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_cli(cli: crate::cli::Cli) -> Result<Box<Self>, Box<dyn std::error::Error>> {
         let cli = cli.resolve()?;
-        let mut app = Self::new();
+        let mut app = Box::new(Self::new());
+        app.gamepads = Some(crate::native_gamepad::NativeGamepads::new());
         app.midi_mode = cli.midi_mode.unwrap_or_default().into();
         app.midi_output_mode = cli.midi_output_mode.unwrap_or_default().into();
         app.launch = cli.launch;
+        let mut machine_spec = app.launch.machine_spec.clone().unwrap_or_default();
+        machine_spec.hardware = app.launch.hardware;
+        machine_spec.name = cli.profile_name.clone().unwrap_or_default();
+        machine_spec.game.executable = cli
+            .game
+            .as_ref()
+            .map_or(String::new(), |p| p.to_string_lossy().into_owned());
+        machine_spec.output.audio = !cli.no_audio;
+        machine_spec.output.game_midi = app.midi_mode.as_str().into();
+        machine_spec.output.host_midi = app.midi_output_mode.as_str().into();
+        machine_spec.output.midi_output = cli.midi_output.clone().unwrap_or_else(|| "rust".into());
+        app.configurator.set_active(machine_spec);
+        if cli.game.is_none() {
+            app.session = Session::demo_configured(app.launch.hardware)?;
+        }
         app.routing.set_mode(app.midi_mode);
         if let Some(path) = cli.game {
             let mut session = crate::native_input::load_game_with_settings(&path, &app.launch)
                 .map_err(|error| format!("Cannot load {}: {error}", path.display()))?;
+            let storage =
+                crate::native_storage::NativeStorage::prepare_mut(&mut session, &app.launch)?;
+            app.storage = Some(storage);
             session.start();
             app.session = session;
             app.name = cli
                 .profile_name
                 .unwrap_or_else(|| path.file_name().unwrap().to_string_lossy().into_owned());
             app.source = Some(path);
-            if !cli.no_audio && cli.midi_output.is_none() {
+            if !cli.no_audio && cli.midi_output.is_none() && cli.mt32_rom_dir.is_none() {
                 match crate::audio::Output::new() {
                     Ok(audio) => {
                         app.midi = Timeline::new(audio.rate).unwrap();
@@ -178,6 +251,79 @@ impl Doslet {
             Task::none()
         };
         match message {
+            Message::Ui(action) => match action {
+                crate::ui::Action::Open(panel) => {
+                    self.workspace.panel = Some(panel);
+                    self.configurator.open = false;
+                    return self.release_mouse();
+                }
+                crate::ui::Action::Close => {
+                    self.workspace.panel = None;
+                    self.configurator.open = false;
+                }
+                crate::ui::Action::DismissNotice => self.notice = None,
+            },
+            Message::Config(edit) => {
+                use crate::configurator::Edit;
+                self.workspace.panel = None;
+                if self.configurator.pending && !matches!(edit, Edit::Toggle) {
+                    return Task::none();
+                }
+                self.configurator.edit(&edit);
+                match edit {
+                    Edit::Apply => return self.prepare_machine(self.configurator.draft.clone()),
+                    Edit::LoadProfileFile => {
+                        use clap::Parser;
+                        let path = self.configurator.profile_path.clone();
+                        match crate::cli::Cli::try_parse_from(["doslet", "--config", &path])
+                            .map_err(|e| e.to_string())
+                            .and_then(|cli| cli.resolve().map_err(|e| e.to_string()))
+                        {
+                            Ok(cli) => {
+                                self.configurator.draft =
+                                    cli.launch.machine_spec.unwrap_or_default();
+                                self.configurator.edit(&Edit::ExportProfile);
+                            }
+                            Err(e) => self.configurator.message = Some(e),
+                        }
+                    }
+                    Edit::SaveProfileFile => {
+                        let text = crate::machine_profile::export_machine_profile(
+                            &self.configurator.draft,
+                        );
+                        self.configurator.message = Some(
+                            match std::fs::write(&self.configurator.profile_path, text) {
+                                Ok(()) => "Profile saved.".into(),
+                                Err(e) => e.to_string(),
+                            },
+                        );
+                    }
+                    Edit::ImportSaves => {
+                        let path = std::path::PathBuf::from(&self.configurator.save_path);
+                        return self.prepare_machine_with_import(
+                            self.configurator.active.clone(),
+                            Some(path),
+                        );
+                    }
+                    Edit::ExportSaves => {
+                        let path = std::path::PathBuf::from(&self.configurator.save_path);
+                        self.configurator.message =
+                            Some(if let Some(storage) = &mut self.storage {
+                                storage.export(&mut self.session, &path).map_or_else(
+                                    |e| e,
+                                    |_| format!("Save data exported: {}", path.display()),
+                                )
+                            } else {
+                                "Start a configured machine first.".into()
+                            });
+                    }
+                    _ => {}
+                }
+                if self.configurator.open {
+                    return self.release_mouse();
+                }
+            }
+            Message::MachinePrepared(result) => self.finish_preparation(result),
             Message::DisplaySizing(message) => {
                 return self
                     .display_sizing
@@ -188,6 +334,8 @@ impl Doslet {
                 if self.mouse_capture.is_none()
                     && !self.mouse_capture_pending
                     && self.session.status() == SessionStatus::Running
+                    && !self.configurator.open
+                    && self.workspace.panel.is_none()
                 {
                     self.session.pointer_move(x, y);
                 }
@@ -197,6 +345,9 @@ impl Doslet {
                     && self.session.status() == SessionStatus::Running
                     && self.mouse_capture.is_none()
                     && !self.mouse_capture_pending
+                    && self.configurator.active.input.capture
+                    && !self.configurator.open
+                    && self.workspace.panel.is_none()
                 {
                     self.mouse_capture_pending = true;
                     self.mouse_capture_generation = self.mouse_capture_generation.wrapping_add(1);
@@ -207,7 +358,11 @@ impl Doslet {
                 if self.mouse_capture_pending {
                     return Task::none();
                 }
-                if self.session.status() == SessionStatus::Running || !pressed {
+                if (self.session.status() == SessionStatus::Running
+                    && !self.configurator.open
+                    && self.workspace.panel.is_none())
+                    || !pressed
+                {
                     self.session.pointer_button(button, pressed);
                 }
             }
@@ -258,6 +413,7 @@ impl Doslet {
                             self.mouse_capture = None;
                             self.mouse_capture_pending = false;
                             self.session.release_pointer_buttons();
+                            let _ = self.session.release_keys();
                         }
                     }
                     MouseCaptureEvent::Failed(error) => {
@@ -266,6 +422,19 @@ impl Doslet {
                 }
             }
             Message::Keyboard(event) => {
+                if (self.configurator.open || self.workspace.panel.is_some())
+                    && matches!(
+                        &event,
+                        iced::keyboard::Event::KeyPressed {
+                            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                            ..
+                        }
+                    )
+                {
+                    self.configurator.open = false;
+                    self.workspace.panel = None;
+                    return self.release_mouse();
+                }
                 if (self.mouse_capture.is_some() || self.mouse_capture_pending)
                     && matches!(
                         &event,
@@ -277,7 +446,20 @@ impl Doslet {
                 {
                     return self.release_mouse();
                 }
-                if self.session.status() == SessionStatus::Running {
+                if self.configurator.active.hardware.keyboard == doslet_config::KeyboardMode::At {
+                    self.track_physical_key(
+                        &event,
+                        self.session.status() == SessionStatus::Running
+                            && !self.configurator.open
+                            && self.workspace.panel.is_none()
+                            && !self.configurator.pending,
+                    );
+                    return Task::none();
+                }
+                if self.session.status() == SessionStatus::Running
+                    && !self.configurator.open
+                    && self.workspace.panel.is_none()
+                {
                     let (modifiers, key) = crate::keyboard::translate(&event);
                     if let Err(error) = self.session.set_key_modifiers(modifiers).and_then(|()| {
                         if let Some((scan, ascii)) = key {
@@ -288,6 +470,11 @@ impl Doslet {
                     }) {
                         self.notice = Some(error.to_string());
                     }
+                }
+            }
+            Message::KeyboardCaptured(event) => {
+                if self.configurator.active.hardware.keyboard == doslet_config::KeyboardMode::At {
+                    self.track_physical_key(&event, false);
                 }
             }
             Message::RefreshMidi => match crate::native_midi::ports() {
@@ -359,6 +546,9 @@ impl Doslet {
                 }
             }
             Message::RunPause => {
+                if self.configurator.pending {
+                    return Task::none();
+                }
                 if self.session.status() == SessionStatus::Running {
                     self.session.pause();
                 } else {
@@ -371,12 +561,33 @@ impl Doslet {
                 }
             }
             Message::Step => {
+                if self.configurator.pending {
+                    return Task::none();
+                }
                 self.session.single_step();
                 if let Err(error) = self.process_audio() {
                     self.notice = Some(error);
                 }
             }
-            Message::Reset => self.reset(),
+            Message::Reset => {
+                if self.configurator.pending {
+                    return Task::none();
+                }
+                if self
+                    .configurator
+                    .active
+                    .mounts
+                    .iter()
+                    .any(|m| m.kind == doslet_config::SourceKind::HttpsIso)
+                {
+                    return self.prepare_machine(self.configurator.active.clone());
+                }
+                self.reset();
+            }
+            Message::FocusLost => {
+                let _ = self.session.release_keys();
+                return self.release_mouse();
+            }
             Message::Tick => self.tick(),
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -416,7 +627,287 @@ impl Doslet {
             }
         }
     }
+    fn prepare_output(spec: &doslet_config::MachineSpec) -> Result<PreparedOutput, String> {
+        let mut output = Self::new();
+        output.midi_mode = if spec.output.game_midi == "mt32" {
+            Mode::Mt32
+        } else {
+            Mode::Gm
+        };
+        output.midi_output_mode = if spec.output.host_midi == "mt32" {
+            Mode::Mt32
+        } else {
+            Mode::Gm
+        };
+        output.routing.set_mode(output.midi_mode);
+        output.mt32_rom_dir = spec
+            .output
+            .rom_binding
+            .as_ref()
+            .map(|id| std::path::PathBuf::from(spec.binding(id)));
+        if spec.output.audio {
+            let selection = match spec.output.midi_output.as_str() {
+                "rust" => "Rust synth",
+                "moont" => "CM-32L / MT-32",
+                other => other,
+            };
+            output.select_midi(selection)?;
+        }
+        Ok(PreparedOutput {
+            audio: output.audio,
+            host_midi: output.host_midi,
+            mt32: output.mt32,
+            rom_dir: output.mt32_rom_dir,
+            midi: output.midi,
+            midi_mode: output.midi_mode,
+            output_mode: output.midi_output_mode,
+            choice: output.midi_choice,
+            choices: output.midi_choices,
+            routing: output.routing,
+            mixer: output.pcm_mixer,
+        })
+    }
+    fn prepare_machine(&mut self, spec: doslet_config::MachineSpec) -> Task<Message> {
+        self.prepare_machine_with_import(spec, None)
+    }
+    fn prepare_machine_with_import(
+        &mut self,
+        spec: doslet_config::MachineSpec,
+        import_path: Option<std::path::PathBuf>,
+    ) -> Task<Message> {
+        if self.configurator.pending {
+            return Task::none();
+        }
+        let plan = match spec.resolve() {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.configurator.message = Some(e.to_string());
+                return Task::none();
+            }
+        };
+        if let Some(storage) = &mut self.storage
+            && let Err(e) = storage.service(&mut self.session)
+        {
+            self.configurator.message = Some(e);
+            return Task::none();
+        }
+        if self.session.storage_waiting() || self.session.pending_commit() {
+            self.configurator.message =
+                Some("Wait for pending storage operations before restarting.".into());
+            return Task::none();
+        }
+        if self.session.dirty_overlay()
+            && !self.launch.persist
+            && !self.configurator.discard_changes
+        {
+            self.configurator.message = Some(
+                "Export saves or select Discard unsaved temporary changes before restarting."
+                    .into(),
+            );
+            return Task::none();
+        }
+        if let Some(path) = &self.source
+            && let Err(e) = crate::native_input::flush_writes(&mut self.session, path, &self.launch)
+        {
+            self.configurator.message = Some(e.to_string());
+            return Task::none();
+        }
+        let output = match Self::prepare_output(&spec) {
+            Ok(output) => output,
+            Err(e) => {
+                self.configurator.message = Some(e);
+                return Task::none();
+            }
+        };
+        let mut settings = self.launch.clone();
+        settings.hardware = plan.hardware;
+        settings.machine_spec = Some(spec.clone());
+        settings.command_tail = plan.command_tail;
+        settings.working_directory = spec.game.working_directory.as_bytes().to_vec();
+        settings.root = None;
+        settings.cdrom = None;
+        for mount in &spec.mounts {
+            match mount.kind {
+                doslet_config::SourceKind::NativeDirectory => {
+                    settings.root = Some(std::path::PathBuf::from(spec.binding(&mount.source)));
+                    settings.writable = mount.policy != doslet_config::WritePolicy::ReadOnly;
+                    settings.persist = mount.policy == doslet_config::WritePolicy::LegacyWriteback;
+                }
+                doslet_config::SourceKind::LocalIso => {
+                    settings.cdrom = Some((
+                        mount.letter,
+                        std::path::PathBuf::from(spec.binding(&mount.source)),
+                    ))
+                }
+                doslet_config::SourceKind::HttpsIso => {}
+                _ => {
+                    self.configurator.message = Some(
+                        "Native machines require a folder and local or HTTPS ISO sources.".into(),
+                    );
+                    return Task::none();
+                }
+            }
+        }
+        self.pending_output = Some(Box::new(output));
+        self.preparation_was_running = self.session.status() == SessionStatus::Running;
+        self.session.pause();
+        self.anchor = None;
+        if let Some(audio) = &self.audio {
+            audio.set_active(false);
+        }
+        if let Some(output) = &mut self.host_midi {
+            let _ = output.set_active(false);
+        }
+        self.configurator.pending = true;
+        self.configurator.message = Some("Preparing machine and sources…".into());
+        let old_storage = self.storage.take();
+        let (sender, receiver) = iced::futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(Self::prepare_candidate(
+                spec,
+                settings,
+                old_storage,
+                import_path,
+            ));
+        });
+        let task = Task::perform(
+            async move {
+                receiver
+                    .await
+                    .map(|r| std::sync::Arc::new(std::sync::Mutex::new(Some(r))))
+                    .map_err(|_| "Machine preparation worker stopped.".into())
+            },
+            Message::MachinePrepared,
+        );
+        Task::batch([self.release_mouse(), task])
+    }
+    fn prepare_candidate(
+        spec: doslet_config::MachineSpec,
+        settings: crate::native_input::LaunchSettings,
+        mut old_storage: Option<crate::native_storage::NativeStorage>,
+        import_path: Option<std::path::PathBuf>,
+    ) -> MachinePreparation {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
+                let path = (!spec.game.executable.is_empty())
+                    .then(|| std::path::PathBuf::from(&spec.game.executable));
+                let mut session = match &path {
+                    Some(path) => crate::native_input::load_game_with_settings(path, &settings)
+                        .map_err(|e| e.to_string())?,
+                    None => {
+                        Session::demo_configured(settings.hardware).map_err(|e| e.to_string())?
+                    }
+                };
+                let mut storage = if let Some(old) = &mut old_storage {
+                    old.prepare_replacement_mut(&mut session, &settings)
+                } else {
+                    crate::native_storage::NativeStorage::prepare_mut(&mut session, &settings)
+                }
+                .map_err(|e| e.to_string())?;
+                if let Some(path) = import_path {
+                    storage.import(&mut session, &path)?;
+                }
+                Ok((
+                    PreparedMachine {
+                        session,
+                        source: path,
+                        launch: settings,
+                        spec,
+                    },
+                    storage,
+                ))
+            }))
+            .unwrap_or_else(|_| Err("Machine preparation worker failed.".into()));
+        MachinePreparation {
+            old_storage,
+            result,
+        }
+    }
+    fn finish_preparation(&mut self, result: Result<PreparationSlot, String>) {
+        self.configurator.pending = false;
+        let prepared = result.and_then(|slot| {
+            slot.lock()
+                .map_err(|_| "Machine preparation result unavailable.".to_string())
+                .and_then(|mut slot| {
+                    slot.take()
+                        .ok_or_else(|| "Machine preparation result already consumed.".into())
+                })
+        });
+        match prepared {
+            Ok(prepared) => {
+                self.storage = prepared.old_storage;
+                match prepared.result {
+                    Ok((mut candidate, storage)) => {
+                        let Some(output) = self.pending_output.take() else {
+                            self.configurator.message =
+                                Some("Prepared host output unavailable.".into());
+                            return;
+                        };
+                        let output = *output;
+                        if candidate.spec.input.pad_id == self.configurator.active.input.pad_id
+                            && candidate.spec.input.pad_index
+                                == self.configurator.active.input.pad_index
+                        {
+                            self.seed_pad(&mut candidate.session);
+                        } else {
+                            self.pad_generation = None;
+                            self.pad_axes = [0; 2];
+                            self.pad_buttons = [false; 2];
+                        }
+                        let _ = candidate.session.release_keys();
+                        candidate.session.start();
+                        self.session = candidate.session;
+                        self.source = candidate.source;
+                        self.launch = candidate.launch;
+                        self.storage = Some(storage);
+                        self.audio = output.audio;
+                        self.host_midi = output.host_midi;
+                        self.mt32 = output.mt32;
+                        self.mt32_rom_dir = output.rom_dir;
+                        self.midi = output.midi;
+                        self.midi_mode = output.midi_mode;
+                        self.midi_output_mode = output.output_mode;
+                        self.midi_choice = output.choice;
+                        self.midi_choices = output.choices;
+                        self.routing = output.routing;
+                        self.pcm_mixer = output.mixer;
+                        self.display = DisplayFrame::default();
+                        self.anchor = None;
+                        self.notice = None;
+                        self.name = if candidate.spec.name.is_empty() {
+                            "Configured machine".into()
+                        } else {
+                            candidate.spec.name.clone()
+                        };
+                        self.configurator.set_active(candidate.spec);
+                        self.configurator.open = false;
+                        self.workspace.panel = None;
+                        self.configurator.message = Some("Machine applied and restarted.".into());
+                    }
+                    Err(error) => {
+                        self.pending_output = None;
+                        if self.preparation_was_running {
+                            self.session.start();
+                        }
+                        self.anchor = None;
+                        self.notice = Some(error.clone());
+                        self.configurator.message = Some(error);
+                    }
+                }
+            }
+            Err(error) => {
+                self.pending_output = None;
+                if self.preparation_was_running {
+                    self.session.start();
+                }
+                self.anchor = None;
+                self.notice = Some(error.clone());
+                self.configurator.message = Some(error);
+            }
+        }
+    }
     fn release_mouse(&mut self) -> Task<Message> {
+        let _ = self.session.release_keys();
         if self.mouse_capture.is_some() || self.mouse_capture_pending {
             self.mouse_capture_generation = self.mouse_capture_generation.wrapping_add(1);
         }
@@ -443,11 +934,42 @@ impl Doslet {
     }
     fn reset(&mut self) {
         self.notice = None;
+        if self.session.dirty_overlay()
+            && !self.launch.persist
+            && !self.configurator.discard_changes
+        {
+            self.configurator.open = true;
+            self.configurator.message = Some(
+                "Export saves or select Discard unsaved temporary changes before Reset.".into(),
+            );
+            return;
+        }
+        if let Some(storage) = &mut self.storage
+            && let Err(error) = storage.service(&mut self.session)
+        {
+            self.notice = Some(error);
+            return;
+        }
+        if self.session.storage_waiting() {
+            self.notice = Some(
+                "Save commit is pending; reset will be available after acknowledgement.".into(),
+            );
+            return;
+        }
+        if let Some(path) = &self.source
+            && let Err(error) =
+                crate::native_input::flush_writes(&mut self.session, path, &self.launch)
+        {
+            self.notice = Some(error.to_string());
+            return;
+        }
         #[cfg(test)]
         if let Some((archive, program)) = &self.active_archive {
             match archive.load(program) {
                 Ok(mut session) => {
                     session.start();
+                    self.seed_pad(&mut session);
+                    let _ = session.release_keys();
                     self.session = session;
                     self.name = program.rsplit('/').next().unwrap().into();
                     self.clear_presentation();
@@ -461,8 +983,24 @@ impl Doslet {
             if let Some(path) = &self.source {
                 match crate::native_input::load_game_with_settings(path, &self.launch) {
                     Ok(mut session) => {
-                        session.start();
-                        self.session = session;
+                        match if let Some(storage) = &mut self.storage {
+                            storage.prepare_replacement_mut(&mut session, &self.launch)
+                        } else {
+                            crate::native_storage::NativeStorage::prepare_mut(
+                                &mut session,
+                                &self.launch,
+                            )
+                        } {
+                            Ok(storage) => {
+                                session.start();
+                                self.session = session;
+                                self.storage = Some(storage);
+                            }
+                            Err(error) => {
+                                self.notice = Some(format!("Cannot reload saves: {error}"));
+                                return;
+                            }
+                        }
                     }
                     Err(error) => {
                         self.notice = Some(format!("Cannot reload game: {error}"));
@@ -470,9 +1008,20 @@ impl Doslet {
                     }
                 }
             } else {
-                self.session = Session::demo();
+                self.session = Session::demo_configured(self.launch.hardware)
+                    .expect("validated demo hardware");
             }
         }
+        if let Some(generation) = self.pad_generation {
+            let _ = Self::route_pad(
+                &mut self.session,
+                generation,
+                self.pad_sequence,
+                self.pad_axes,
+                self.pad_buttons,
+            );
+        }
+        let _ = self.session.release_keys();
         self.clear_presentation();
     }
     fn clear_presentation(&mut self) {
@@ -512,10 +1061,214 @@ impl Doslet {
         self.display = DisplayFrame::default();
         self.anchor = None;
     }
+    fn track_physical_key(&mut self, event: &iced::keyboard::Event, enabled: bool) {
+        if let Some((key, pressed)) = crate::keyboard::physical(event)
+            && let Err(e) = self
+                .session
+                .key_event(doslet_input::PhysicalKey(key), pressed)
+        {
+            self.notice = Some(e.to_string());
+        }
+        if !enabled {
+            let _ = self.session.release_keys();
+        }
+    }
+    fn route_pad(
+        session: &mut Session,
+        generation: u64,
+        sequence: u64,
+        axes: [i16; 2],
+        buttons: [bool; 2],
+    ) -> Result<(), RuntimeError> {
+        use doslet_input::{InputAction, InputEvent, InputSourceId};
+        session.connect_input_joystick(InputSourceId(1), generation)?;
+        let epoch = session.input_router_mut().epoch();
+        for (index, action) in [
+            InputAction::Axis {
+                axis: 0,
+                value: axes[0],
+            },
+            InputAction::Axis {
+                axis: 1,
+                value: axes[1],
+            },
+            InputAction::Button {
+                button: 0,
+                pressed: buttons[0],
+            },
+            InputAction::Button {
+                button: 1,
+                pressed: buttons[1],
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            session.route_input(InputEvent {
+                session_epoch: epoch,
+                source: InputSourceId(1),
+                connection_generation: generation,
+                sequence: sequence + index as u64,
+                action,
+            })?;
+        }
+        Ok(())
+    }
+    fn seed_pad(&self, session: &mut Session) {
+        if let Some(generation) = self.pad_generation {
+            let _ = Self::route_pad(
+                session,
+                generation,
+                self.pad_sequence,
+                self.pad_axes,
+                self.pad_buttons,
+            );
+            let _ = session.release_input_source(doslet_input::InputSourceId(1));
+        }
+    }
+    fn poll_gamepads(&mut self) {
+        use crate::native_gamepad::{GamepadUpdate, uuid_string};
+        let Some(gamepads) = &mut self.gamepads else {
+            return;
+        };
+        for _ in 0..256 {
+            let Some(update) = gamepads.poll() else {
+                break;
+            };
+            match update {
+                GamepadUpdate::State(state) => {
+                    let settings = &self.configurator.active.input;
+                    if let Some(id) = &settings.pad_id {
+                        if *id != uuid_string(state.uuid) {
+                            continue;
+                        }
+                        if state.ambiguous {
+                            let _ = self
+                                .session
+                                .release_input_source(doslet_input::InputSourceId(1));
+                            self.notice=Some("Controller identity is ambiguous; choose a controller index explicitly.".into());
+                            continue;
+                        }
+                    } else if usize::from(settings.pad_index) != state.id {
+                        continue;
+                    }
+                    let axis = |index: u8| {
+                        let value = state.axes.get(usize::from(index)).copied().unwrap_or(0);
+                        if i32::from(value).abs() * 100
+                            < i32::from(settings.deadzone_percent) * 32767
+                        {
+                            0
+                        } else {
+                            value
+                        }
+                    };
+                    let button = |index: u8| index < 32 && state.buttons & (1u32 << index) != 0;
+                    let axes = [axis(settings.axis_x), axis(settings.axis_y)];
+                    let buttons = [button(settings.button_1), button(settings.button_2)];
+                    match Self::route_pad(
+                        &mut self.session,
+                        state.generation,
+                        state.sequence,
+                        axes,
+                        buttons,
+                    ) {
+                        Ok(()) => {}
+                        Err(RuntimeError::Input(doslet_input::InputError::Stale)) => continue,
+                        Err(error) => {
+                            self.notice = Some(error.to_string());
+                            continue;
+                        }
+                    }
+                    self.pad_axes = axes;
+                    self.pad_buttons = buttons;
+                    self.pad_generation = Some(state.generation);
+                    self.pad_sequence = state.sequence;
+                    if self.session.status() != SessionStatus::Running
+                        || self.configurator.open
+                        || self.workspace.panel.is_some()
+                        || state.resync
+                    {
+                        let _ = self
+                            .session
+                            .release_input_source(doslet_input::InputSourceId(1));
+                    }
+                }
+                GamepadUpdate::Disconnected {
+                    id,
+                    uuid,
+                    generation,
+                    sequence,
+                } => {
+                    if self.configurator.active.input.pad_id.as_ref().map_or(
+                        id == usize::from(self.configurator.active.input.pad_index),
+                        |selected| *selected == uuid,
+                    ) && self.pad_generation == Some(generation)
+                    {
+                        let epoch = self.session.input_router_mut().epoch();
+                        let _ = self.session.route_input(doslet_input::InputEvent {
+                            session_epoch: epoch,
+                            source: doslet_input::InputSourceId(1),
+                            connection_generation: generation,
+                            sequence,
+                            action: doslet_input::InputAction::ReleaseSource,
+                        });
+                        self.pad_axes = [0; 2];
+                        self.pad_buttons = [false; 2];
+                    }
+                }
+                GamepadUpdate::ReleaseAll => {
+                    let _ = self
+                        .session
+                        .release_input_source(doslet_input::InputSourceId(1));
+                }
+                GamepadUpdate::Error(error) => {
+                    self.notice = Some(format!("Controller unavailable: {error}"))
+                }
+                GamepadUpdate::Connected {
+                    id,
+                    name,
+                    uuid,
+                    generation,
+                } => {
+                    if self.configurator.active.input.pad_id.as_ref().map_or(
+                        id == usize::from(self.configurator.active.input.pad_index),
+                        |selected| *selected == uuid,
+                    ) {
+                        let _ = self
+                            .session
+                            .connect_input_joystick(doslet_input::InputSourceId(1), generation);
+                        self.pad_generation = Some(generation);
+                        self.pad_sequence = 0;
+                    }
+                    self.configurator
+                        .controllers
+                        .retain(|label| !label.starts_with(&format!("{id}:")));
+                    self.configurator
+                        .controllers
+                        .push(format!("{id}: {name} · {uuid}"));
+                }
+            }
+        }
+    }
     fn tick(&mut self) {
         self.tick_at(Instant::now());
     }
     fn tick_at(&mut self, now: Instant) {
+        self.poll_gamepads();
+        if self.configurator.pending {
+            return;
+        }
+        if let Some(storage) = &mut self.storage
+            && let Err(error) = storage.service(&mut self.session)
+        {
+            self.notice = Some(error);
+            self.session.pause();
+        }
+        if self.session.storage_waiting() {
+            self.anchor = None;
+            return;
+        }
+
         if self.session.status() != SessionStatus::Running {
             return;
         }
@@ -556,7 +1309,7 @@ impl Doslet {
                 self.session.pause();
                 break;
             }
-            if completed == 0 {
+            if completed == 0 || self.session.timeslice_yielded() {
                 break;
             }
         }
@@ -655,7 +1408,14 @@ impl Doslet {
             output.push(self.session.emulated_nanos(), &bytes[..used])?;
         } else if let Some(mt32) = &mut self.mt32 {
             for &byte in &bytes[..used] {
-                mt32.push_byte(byte).map_err(|e| e.to_string())?;
+                mt32.push_byte(byte).map_err(|error| {
+                    format!(
+                        "{error} at guest {} ms (notes={}, SysEx={})",
+                        self.session.emulated_nanos() / 1_000_000,
+                        mt32.note_events(),
+                        mt32.sysex_messages()
+                    )
+                })?;
             }
         } else {
             for &byte in &bytes[..used] {
@@ -700,6 +1460,21 @@ impl Doslet {
         }
         "Audio output inactive".into()
     }
+    pub fn storage_label(&self) -> String {
+        if self.configurator.pending {
+            "Preparing machine and sources…".into()
+        } else if self.session.pending_commit() {
+            "Saving changes…".into()
+        } else if self.session.storage_waiting() {
+            "Waiting for storage…".into()
+        } else if self.session.dirty_overlay() {
+            "Unsaved changes".into()
+        } else if let Some(revision) = self.session.committed_revision() {
+            format!("Saved · revision {revision}")
+        } else {
+            "No unsaved changes".into()
+        }
+    }
     fn output_dialect(&self) -> Mode {
         if self.host_midi.is_some() {
             self.midi_output_mode
@@ -709,38 +1484,57 @@ impl Doslet {
             Mode::Gm
         }
     }
+    fn restored_mt32(&self, rate: u32) -> Result<doslet_mt32::Timeline, String> {
+        let directory = self
+            .mt32_rom_dir
+            .as_ref()
+            .ok_or("Use --mt32-rom-dir to load CM-32L ROMs")?;
+        let mut engine =
+            Self::load_mt32(directory, rate, self.midi_mode).map_err(|error| error.to_string())?;
+        engine.rebase(self.session.emulated_nanos());
+        let mut replay_error = None;
+        self.routing.replay(self.midi_mode, &mut |message| {
+            if replay_error.is_some() {
+                return;
+            }
+            for &byte in message {
+                if let Err(error) = engine.restore_byte(byte) {
+                    replay_error = Some(error.to_string());
+                    break;
+                }
+            }
+        });
+        if let Some(error) = replay_error {
+            return Err(error);
+        }
+        Ok(engine)
+    }
     fn reselect_midi(&mut self, selection: &str) -> Result<(), String> {
         if selection == "CM-32L / MT-32" || selection == "Rust synth" {
-            let audio = crate::audio::Output::new()?;
+            // A MIDI dialect/synth change does not require reopening CPAL.
+            // Keep the current stream until the replacement synth is ready.
+            let new_audio = if self.audio.is_none() {
+                Some(crate::audio::Output::new()?)
+            } else {
+                None
+            };
+            let rate = self.audio.as_ref().or(new_audio.as_ref()).unwrap().rate;
             let mut replay_error = None;
             if selection == "CM-32L / MT-32" {
-                let directory = self
-                    .mt32_rom_dir
-                    .as_ref()
-                    .ok_or("Use --mt32-rom-dir to load CM-32L ROMs")?;
-                let mut engine = Self::load_mt32(directory, audio.rate, self.midi_mode)
-                    .map_err(|e| e.to_string())?;
-                engine.rebase(self.session.emulated_nanos());
-                self.routing.replay(self.midi_mode, &mut |message| {
-                    for &byte in message {
-                        if let Err(error) = engine.push_byte(byte) {
-                            replay_error = Some(error.to_string());
-                        }
-                    }
-                });
-                if let Some(error) = replay_error {
-                    return Err(error);
-                }
-                self.mt32 = Some(engine);
+                self.mt32 = Some(self.restored_mt32(rate)?);
             } else {
-                let mut engine = Timeline::new(audio.rate).map_err(|e| e.to_string())?;
+                let mut engine = Timeline::new(rate).map_err(|e| e.to_string())?;
                 engine
                     .skip_until(self.session.emulated_nanos())
                     .map_err(|e| e.to_string())?;
                 self.routing.replay(Mode::Gm, &mut |message| {
+                    if replay_error.is_some() {
+                        return;
+                    }
                     for &byte in message {
                         if let Err(error) = engine.push_byte(byte) {
                             replay_error = Some(error.to_string());
+                            break;
                         }
                     }
                 });
@@ -750,15 +1544,19 @@ impl Doslet {
                 self.midi = engine;
                 self.mt32 = None;
             }
-            audio.set_active(self.session.status() == SessionStatus::Running);
             if let Some(output) = &mut self.host_midi {
                 output.clear()?;
             }
             self.host_midi = None;
             self.pcm_mixer
-                .reset(audio.rate, self.session.emulated_nanos())
+                .reset(rate, self.session.emulated_nanos())
                 .map_err(|e| e.to_string())?;
-            self.audio = Some(audio);
+            if let Some(audio) = new_audio {
+                self.audio = Some(audio);
+            }
+            let audio = self.audio.as_ref().unwrap();
+            audio.clear();
+            audio.set_active(self.session.status() == SessionStatus::Running);
         } else {
             if self.midi_mode == Mode::Gm && self.midi_output_mode == Mode::Mt32 {
                 return Err("GM to an MT-32 host port is unsupported; select MT-32 game mode. GM on moont uses GmDevice.".into());
@@ -858,7 +1656,10 @@ impl Doslet {
         self.mouse_capture.is_some() && !self.mouse_capture_pending
     }
     pub fn subscription(&self) -> Subscription<Message> {
-        let tick = if self.session.status() == SessionStatus::Running {
+        let tick = if self.session.status() == SessionStatus::Running
+            || self.session.storage_waiting()
+            || self.gamepads.is_some()
+        {
             iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
         } else {
             Subscription::none()
@@ -867,10 +1668,15 @@ impl Doslet {
             tick,
             DisplaySizing::subscription().map(Message::DisplaySizing),
             iced::event::listen_with(|event, status, _| {
-                if status == iced::event::Status::Ignored
-                    && let iced::Event::Keyboard(event) = event
-                {
-                    Some(Message::Keyboard(event))
+                if matches!(event, iced::Event::Window(iced::window::Event::Unfocused)) {
+                    return Some(Message::FocusLost);
+                }
+                if let iced::Event::Keyboard(event) = event {
+                    Some(if status == iced::event::Status::Ignored {
+                        Message::Keyboard(event)
+                    } else {
+                        Message::KeyboardCaptured(event)
+                    })
                 } else {
                     None
                 }
@@ -882,6 +1688,112 @@ impl Doslet {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    #[test]
+    fn captured_at_typing_is_discarded_and_paused_release_allows_a_fresh_press() {
+        use iced::keyboard::{
+            Event, Key, Location, Modifiers,
+            key::{Code, Physical},
+        };
+        let press = Event::KeyPressed {
+            key: Key::Character("a".into()),
+            modified_key: Key::Character("a".into()),
+            physical_key: Physical::Code(Code::KeyA),
+            location: Location::Standard,
+            modifiers: Modifiers::empty(),
+            text: Some("a".into()),
+            repeat: false,
+        };
+        let release = Event::KeyReleased {
+            key: Key::Character("a".into()),
+            modified_key: Key::Character("a".into()),
+            physical_key: Physical::Code(Code::KeyA),
+            location: Location::Standard,
+            modifiers: Modifiers::empty(),
+        };
+        let mut app = Doslet::new();
+        let hardware = doslet_config::HardwareConfig {
+            keyboard: doslet_config::KeyboardMode::At,
+            ..Default::default()
+        };
+        app.session = Session::demo_configured(hardware).unwrap();
+        app.configurator.active.hardware = hardware;
+        app.session.start();
+        let _ = app.update(Message::KeyboardCaptured(press.clone()));
+        assert_eq!(
+            app.session.input_router_mut().next_event(),
+            Some(doslet_input::GuestEvent::ReleaseAll)
+        );
+        assert_eq!(app.session.input_router_mut().next_event(), None);
+        app.session.pause();
+        let _ = app.update(Message::Keyboard(release));
+        while app.session.input_router_mut().next_event().is_some() {}
+        app.session.start();
+        let _ = app.update(Message::Keyboard(press));
+        assert_eq!(
+            app.session.input_router_mut().next_event(),
+            Some(doslet_input::GuestEvent::Key {
+                key: doslet_input::PhysicalKey(4),
+                pressed: true
+            })
+        );
+        assert_eq!(app.session.steps(), 0);
+    }
+    #[test]
+    fn failed_candidate_restores_running_session_and_reset_recipe() {
+        let mut app = Doslet::new();
+        app.session.start();
+        app.session.advance(25);
+        let steps = app.session.steps();
+        app.source = Some(std::path::PathBuf::from("old-game.exe"));
+        let old = app.configurator.active.clone();
+        let mut draft = old.clone();
+        draft.hardware.memory_mib = 8;
+        draft.game.executable = "/missing/doslet-game.exe".into();
+        draft.output.audio = false;
+        app.configurator.draft = draft.clone();
+        app.configurator.pending = true;
+        app.preparation_was_running = true;
+        app.session.pause();
+        let mut settings = app.launch.clone();
+        settings.hardware = draft.hardware;
+        let result = Doslet::prepare_candidate(draft, settings, None, None);
+        assert!(result.result.is_err());
+        app.finish_preparation(Ok(std::sync::Arc::new(std::sync::Mutex::new(Some(result)))));
+        assert_eq!(app.session.steps(), steps);
+        assert_eq!(app.session.status(), SessionStatus::Running);
+        assert_eq!(app.configurator.active, old);
+        assert_eq!(app.launch.hardware.memory_mib, 16);
+        assert_eq!(
+            app.source.as_deref(),
+            Some(std::path::Path::new("old-game.exe"))
+        );
+        assert!(!app.configurator.pending);
+    }
+    #[test]
+    fn prepared_hardware_becomes_the_active_session_and_reset_recipe() {
+        let mut app = Doslet::new();
+        let mut spec = doslet_config::MachineSpec::default();
+        spec.hardware.memory_mib = 4;
+        spec.hardware.sb16 = false;
+        spec.output.audio = false;
+        let settings = crate::native_input::LaunchSettings {
+            hardware: spec.hardware,
+            machine_spec: Some(spec.clone()),
+            ..Default::default()
+        };
+        let candidate = Doslet::prepare_candidate(spec.clone(), settings, None, None);
+        assert!(candidate.result.is_ok());
+        app.pending_output = Some(Box::new(Doslet::prepare_output(&spec).unwrap()));
+        app.configurator.pending = true;
+        app.finish_preparation(Ok(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            candidate,
+        )))));
+        assert_eq!(app.session.hardware_config(), spec.hardware);
+        assert_eq!(app.configurator.active, spec);
+        assert_eq!(app.launch.hardware.memory_mib, 4);
+        app.reset();
+        assert_eq!(app.session.hardware_config(), spec.hardware);
+    }
     include!("../../../tests/fixtures/sb16_pcm.rs");
     #[test]
     fn mouse_capture_uses_relative_motion_releases_on_escape_and_ignores_stale_events() {
@@ -1278,6 +2190,24 @@ enabled = false
     }
 
     #[test]
+    fn guest_timeslice_yield_ends_the_native_tick() {
+        let mut app = Doslet::new();
+        app.session = Session::new(&[
+            0xB8, 0x80, 0x16, 0xCD, 0x2F, // Yield.
+            0xB8, 0, 0x4C, 0xCD, 0x21, // Exit only on the next tick.
+        ])
+        .unwrap();
+        app.session.start();
+        let start = Instant::now();
+        app.tick_at(start);
+        app.tick_at(start + Duration::from_millis(16));
+        assert!(app.session.timeslice_yielded());
+        assert_eq!(app.session.status(), SessionStatus::Running);
+        app.tick_at(start + Duration::from_millis(32));
+        assert_eq!(app.session.status(), SessionStatus::Exited(0));
+    }
+
+    #[test]
     fn archive_selection_failure_and_reset_preserve_the_active_game() {
         use std::{
             io::{Cursor, Write},
@@ -1336,9 +2266,56 @@ enabled = false
 
     #[test]
     #[ignore = "requires the user's local PRINCE installation; run from repository root"]
+    fn local_prince_moont_queue_survives_repeated_restoration() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let legacy = root.join("PRINCE/PRINCE.EXE");
+        let path = if legacy.is_file() {
+            legacy
+        } else {
+            root.join("games/PRINCE/PRINCE.EXE")
+        };
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("DOSLET_MT32_ROM_DIR").expect("set DOSLET_MT32_ROM_DIR"),
+        );
+        let mut app = Doslet::new();
+        app.session = crate::native_input::load_game_with_settings(&path, &app.launch).unwrap();
+        app.mt32 = Some(Doslet::load_mt32(&directory, 44100, Mode::Gm).unwrap());
+        app.mt32_rom_dir = Some(directory);
+        app.pcm_mixer.reset(44100, 0).unwrap();
+        app.session.start();
+        for batch in 0..100000 {
+            if batch != 0 && batch % 20000 == 0 {
+                app.mt32 = Some(app.restored_mt32(44100).unwrap());
+            }
+            app.session.advance(CHUNK);
+            assert_eq!(
+                app.session.status(),
+                SessionStatus::Running,
+                "{:?}",
+                app.session.fault()
+            );
+            app.process_audio().unwrap_or_else(|error| {
+                panic!(
+                    "step={} nanos={} notes={} sysex={}: {error}",
+                    app.session.steps(),
+                    app.session.emulated_nanos(),
+                    app.mt32.as_ref().unwrap().note_events(),
+                    app.mt32.as_ref().unwrap().sysex_messages()
+                )
+            });
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the user's local PRINCE installation; run from repository root"]
     fn local_prince_reaches_intro_through_ui_batches() {
-        let path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../PRINCE/PRINCE.EXE");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let legacy = root.join("PRINCE/PRINCE.EXE");
+        let path = if legacy.is_file() {
+            legacy
+        } else {
+            root.join("games/PRINCE/PRINCE.EXE")
+        };
         let mut app = Doslet::from_cli(crate::cli::Cli {
             game: Some(path),
             no_audio: true,

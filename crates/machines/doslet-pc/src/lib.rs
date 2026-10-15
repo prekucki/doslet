@@ -5,6 +5,7 @@ mod audio;
 pub mod io;
 pub mod memory;
 mod memory_wait;
+pub mod resources;
 mod timing;
 mod vga_wait;
 pub use memory_wait::MemoryWaitSites;
@@ -13,6 +14,8 @@ use core::fmt;
 use doslet_bus::BusError;
 use doslet_x86::{Cpu, CpuError, StepOutcome};
 pub use io::PcBus;
+#[cfg(test)]
+mod config_tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioStatus {
     pub dsp: doslet_sb_dsp::Diagnostics,
@@ -45,6 +48,9 @@ pub struct ExecutionStats {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachineError {
+    Hardware(doslet_config::HardwareError),
+    Resource(resources::ResourceError),
+    Keyboard(doslet_i8042::ControllerError),
     Cpu(CpuError),
     Bus(BusError),
     Dma(doslet_i8237::DmaError),
@@ -76,6 +82,9 @@ impl From<doslet_sb_dsp::DspError> for MachineError {
 impl fmt::Display for MachineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Hardware(error) => write!(f, "hardware configuration: {error:?}"),
+            Self::Resource(error) => write!(f, "resource conflict: {error:?}"),
+            Self::Keyboard(error) => write!(f, "keyboard: {error:?}"),
             Self::Cpu(error) => error.fmt(f),
             Self::Bus(error) => error.fmt(f),
             Self::Dma(error) => write!(f, "DMA: {error:?}"),
@@ -98,21 +107,58 @@ pub struct PcMachine {
 }
 impl Default for PcMachine {
     fn default() -> Self {
-        let mut bus = PcBus::default();
+        Self::from_config(doslet_config::HardwareConfig::default()).expect("valid default hardware")
+    }
+}
+impl PcMachine {
+    pub fn from_config(config: doslet_config::HardwareConfig) -> Result<Self, MachineError> {
+        let mut bus = PcBus::from_config(config)?;
         bus.cmos.select(0x14);
-        bus.cmos.write(2); // x87 installed in the default PC composition.
+        bus.cmos.write(if config.x87 { 2 } else { 0 });
         bus.cmos.select(0);
-        Self {
-            cpu: Cpu::default().with_x87(),
+        Ok(Self {
+            cpu: if config.x87 {
+                Cpu::default().with_x87()
+            } else {
+                Cpu::default()
+            },
             bus,
             timing: timing::Timing::default(),
             vga_wait: vga_wait::WaitState::default(),
             memory_wait_sites: None,
             memory_wait_steps: 0,
-        }
+        })
     }
 }
 impl PcMachine {
+    pub fn hardware_config(&self) -> doslet_config::HardwareConfig {
+        self.bus.hardware_config()
+    }
+    pub fn key_event(
+        &mut self,
+        key: doslet_input::PhysicalKey,
+        pressed: bool,
+    ) -> Result<(), MachineError> {
+        if self.hardware_config().keyboard == doslet_config::KeyboardMode::At {
+            self.bus
+                .keyboard
+                .key_event(key, pressed)
+                .map_err(MachineError::Keyboard)?;
+            self.bus.update_keyboard_irq();
+        }
+        Ok(())
+    }
+    pub fn release_keys(&mut self) -> Result<(), MachineError> {
+        self.bus
+            .keyboard
+            .release_keys()
+            .map_err(MachineError::Keyboard)?;
+        self.bus.update_keyboard_irq();
+        Ok(())
+    }
+    pub fn set_joystick(&mut self, axes: [i16; 2], buttons: [bool; 2]) {
+        self.bus.gameport.set_state(axes, buttons);
+    }
     /// Disable recognition as well as batching for interpreter comparisons.
     pub fn set_vga_wait_acceleration(&mut self, enabled: bool) {
         self.vga_wait.enabled = enabled;
@@ -221,9 +267,21 @@ impl PcMachine {
             rate: self.bus.dsp.sample_rate(),
             format: self.bus.dsp.playback_format(),
             speaker: self.bus.dsp.speaker_enabled(),
-            irq: self.bus.mixer.interrupt_line(),
-            dma8: self.bus.mixer.dma_channel(false),
-            dma16: self.bus.mixer.dma_channel(true),
+            irq: self
+                .hardware_config()
+                .sb16
+                .then(|| self.bus.mixer.interrupt_line())
+                .flatten(),
+            dma8: self
+                .hardware_config()
+                .sb16
+                .then(|| self.bus.mixer.dma_channel(false))
+                .flatten(),
+            dma16: self
+                .hardware_config()
+                .sb16
+                .then(|| self.bus.mixer.dma_channel(true))
+                .flatten(),
             pcm_frames,
             pcm_nonzero,
             awe_writes: self.bus.awe_writes,

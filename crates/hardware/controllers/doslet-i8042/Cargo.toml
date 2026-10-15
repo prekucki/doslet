@@ -4,5 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+[dependencies]
+doslet-input.workspace = true
+doslet-at-keyboard.workspace = true
 [lints]
 workspace = true

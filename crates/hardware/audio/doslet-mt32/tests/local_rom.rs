@@ -11,6 +11,62 @@ fn invalid_roms_and_rates_are_rejected_before_parsing() {
 
 #[test]
 #[ignore = "requires DOSLET_MT32_ROM_DIR with local CM-32L ROMs"]
+fn local_rom_large_snapshot_does_not_overflow_or_advance_output_time() {
+    use doslet_midi_synth::wire::{REPLAY_CAPACITY, State};
+    let path = std::path::PathBuf::from(std::env::var_os("DOSLET_MT32_ROM_DIR").unwrap());
+    let control = std::fs::read(path.join("CM32L_CONTROL.ROM")).unwrap();
+    let pcm = std::fs::read(path.join("CM32L_PCM.ROM")).unwrap();
+    let mut state = State::new();
+    for channel in 0..16 {
+        state.receive(&[0xB0 | channel, 64, 127]);
+        for key in 0..128 {
+            state.receive(&[0x90 | channel, key, 100]);
+            state.receive(&[0x80 | channel, key, 0]);
+        }
+    }
+    let mut bytes = [0; REPLAY_CAPACITY];
+    let used = state.write(&mut bytes);
+    for gm in [false, true] {
+        // Prove that submitting this valid snapshot as a live burst reproduces
+        // the failure, independently of an audio device or a game installation.
+        let mut burst = Timeline::with_gm(&control, &pcm, 44100, gm).unwrap();
+        assert!(
+            bytes[..used]
+                .iter()
+                .any(|&byte| matches!(burst.push_byte(byte), Err(Error::QueueFull)))
+        );
+
+        let mut restored = Timeline::with_gm(&control, &pcm, 44100, gm).unwrap();
+        restored.rebase(60_000_000_000);
+        for &byte in &bytes[..used] {
+            restored.restore_byte(byte).unwrap();
+        }
+        assert_eq!(restored.note_events(), 2048);
+        let mut output = [[0.0; 2]; 256];
+        assert_eq!(
+            restored.render_until(60_000_000_000, &mut output).unwrap(),
+            0
+        );
+        let mut produced = 0;
+        loop {
+            let count = restored.render_until(60_010_000_000, &mut output).unwrap();
+            if count == 0 {
+                break;
+            }
+            produced += count;
+        }
+        assert_eq!(produced, 441);
+        // Live messages still render normally after setup, without reopening
+        // or resetting the output and without losing the wire decoder state.
+        for byte in [0xB0, 64, 0, 0x90, 60, 100] {
+            restored.push_byte(byte).unwrap();
+        }
+        assert_eq!(restored.note_events(), 2049);
+    }
+}
+
+#[test]
+#[ignore = "requires DOSLET_MT32_ROM_DIR with local CM-32L ROMs"]
 fn local_rom_notes_sysex_rendering_and_chunk_boundaries() {
     let path = std::path::PathBuf::from(
         std::env::var_os("DOSLET_MT32_ROM_DIR").expect("set DOSLET_MT32_ROM_DIR"),

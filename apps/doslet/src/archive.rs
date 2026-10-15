@@ -59,6 +59,14 @@ impl GameArchive {
         Ok(Self { bytes, programs })
     }
     pub fn load(&self, program: &str) -> Result<Session, String> {
+        self.load_configured(program, &doslet_config::MachineSpec::default())
+    }
+    pub fn load_configured(
+        &self,
+        program: &str,
+        spec: &doslet_config::MachineSpec,
+    ) -> Result<Session, String> {
+        let plan = spec.resolve().map_err(|e| e.to_string())?;
         if !self.programs.iter().any(|name| name == program) {
             return Err("Choose a program from the ZIP".into());
         }
@@ -66,7 +74,15 @@ impl GameArchive {
         let filename = &program[prefix.len()..];
         let mut zip =
             zip::ZipArchive::new(Cursor::new(self.bytes.as_slice())).map_err(|e| e.to_string())?;
-        let mut drive = ReadOnlyDrive::new().with_write_overlay(1024 * 1024);
+        let mut drive = ReadOnlyDrive::new();
+        if spec
+            .mounts
+            .iter()
+            .find(|m| m.letter == b'C')
+            .is_none_or(|m| m.policy != doslet_config::WritePolicy::ReadOnly)
+        {
+            drive = drive.with_write_overlay(1024 * 1024);
+        }
         for i in 0..zip.len() {
             let mut file = zip.by_index(i).map_err(|e| e.to_string())?;
             if file.is_dir() {
@@ -92,12 +108,20 @@ impl GameArchive {
             .file(filename.as_bytes())
             .map_err(|code| format!("Cannot load {filename}: DOS error {code}"))?;
         let session = if filename.ends_with(".COM") {
-            Session::new(data)
+            Session::new_configured(data, plan.hardware)
         } else {
-            Session::from_mz_stub_named(data, format!("C:\\{filename}").as_bytes())
+            Session::from_mz_stub_named_configured(
+                data,
+                format!("C:\\{filename}").as_bytes(),
+                plan.hardware,
+            )
         }
         .map_err(|e| e.to_string())?;
-        Ok(session.with_drive(drive))
+        let mut session = session.with_drive(drive);
+        session
+            .configure_launch(&plan.command_tail, spec.game.working_directory.as_bytes())
+            .map_err(|e| e.to_string())?;
+        Ok(session)
     }
 }
 

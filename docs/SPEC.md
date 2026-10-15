@@ -290,12 +290,14 @@ The runtime still owns one process; EXEC/AL=00, child-process restoration and
 handle inheritance remain unsupported.
 
 The headless stub runner preloads its input directory into `ReadOnlyDrive` before
-execution. It supports case-insensitive C: paths and 64 file handles, attributes,
+execution. It supports case-insensitive C: paths and a shared table of 96 DOS
+handles with aliased open descriptions, attributes,
 open/close/read/seek, current-directory change/query and stdout/stderr console
 writes. The default drive remains read-only. An optional sparse RAM overlay
 permits read/write opens and writes to existing guest files without changing
-input buffers or host files. The headless stub runner reserves 1 MiB and 64
-write extents during setup. Merged reads borrow base/patch storage; exhaustion
+input buffers or host files. Standard launches reserve 1 MiB of changed-data
+storage as 256 chunks of 4 KiB and a fixed staging buffer during setup. Merged
+reads borrow base/chunk storage; exhaustion
 returns DOS error 8. Zero-length writes truncate/extend, including zero-filled
 gaps. Create/truncate reserves up to 64 new file records during overlay setup;
 guest creation, reads and writes do not allocate. FCB find-first/find-next searches
@@ -336,16 +338,29 @@ services reflect the actual gate. Other unavailable INT 15h functions return
 AH=86h/CF=1. DPMI, XMS and VCPI installation probes report absence through their
 defined status registers; no external host is installed. Their explicit IVT
 shims prevent startup from running uninitialized RAM through a null vector.
+INT 2Fh/AX=1680h releases the current execution batch and returns AL=00h.
+The session remains running; `Session::timeslice_yielded()` reports this stop
+until the next `advance` call. Native and Worker schedulers return to their
+event loop before executing another batch. This service does not sleep,
+advance hardware time beyond executed steps, or wait for an interrupt. Guest
+INT 2Fh vector replacements retain ownership of their handler.
 The runtime accepts one immutable ISO 9660 image through `Session::with_cdrom_image`
+or one bounded positional provider through `Session::with_cdrom_source`,
 and implements MSCDEX INT 2Fh services 1500h, 1502h–1508h, 150Ah–150Eh
 for drive discovery, primary-volume metadata and sector reads. Invalid image
-layouts are rejected during setup; out-of-range reads return DOS/MSCDEX errors.
+layouts are rejected during setup for resident images and during the first
+descriptor read for positional sources; out-of-range reads return DOS/MSCDEX errors.
 Without a configured image, the installation probe reports BX=CX=0. The native
 launch-profile loader configures an ISO image under D:–Z:. Absolute file paths
 on that drive support DOS open/read/seek/close, read-only attributes, handle
 device information and timestamp queries. Writes return access denied. The
 independent `doslet-iso9660` crate handles primary-volume directory records,
-case-insensitive names and file-version suffixes; one media buffer is retained.
+case-insensitive names and file-version suffixes. Positional sources share a
+16-MiB cache of 128-KiB chunks across file and raw sector reads, with at most four
+requests in flight. Browser local images retain an immutable Blob; HTTPS sources
+require exact 206 responses and a pinned strong ETag. Three bounded attempts
+use 10-second per-attempt and 35-second overall deadlines. Range/CORS failures
+remain visible; there is no automatic full-image download.
 Joliet/Rock Ridge names, multi-extent/interleaved files, CD default-drive/CWD,
 FCB/FindFirst enumeration, MSCDEX device requests and audio commands are pending.
 MSCDEX sector reads are limited to 32 sectors per call, bounding guest copies to
@@ -377,8 +392,14 @@ INT 16h/AH=00h/01h/02h/05h/10h/11h uses a guest-visible 15-key BIOS ring.
 INT 21h/AH=01h/06h/07h/08h/0Bh/0Ch consumes/queries/flushes the same input, with
 DOS extended keys returning zero then scan code. Empty blocking reads yield in
 guest STI/HLT retry loops, preserving timer IRQs and bounded host execution.
-Native iced and browser Worker adapters inject BIOS keys and aggregate modifiers;
-raw AT make/break protocol and IRQ1 keyboard delivery remain pending.
+Native iced and browser Worker adapters support BIOS injection or physical AT
+keys. AT mode uses scan sets 1/2, make/break sequences, guest-time typematic and
+IRQ1. The installed IRQ1 shim updates the BIOS ring when the guest executes it;
+a replaced guest handler receives the hardware interrupt instead. Keyboard and
+joystick events pass through a bounded contributor-aware input router. The
+optional 201h gameport exposes two axes and two buttons with guest-time charge
+deadlines. Native gilrs and browser Gamepad adapters support device selection,
+axis/button mapping and deadzone settings.
 Implemented BIOS/termination services also include INT 10h/AX=0013h, INT 20h and
 INT 21h/AH=4Ch, alongside the DOS services above and bounded AH=09h string
 output plus AH=02h single-character output, including tab expansion. DOS carry
@@ -403,7 +424,8 @@ bootstrap inspector.
 | VBE | 512 KiB VRAM, banked 640×480×8 mode 101h, borrowed scanout; BIOS 4F00/01/02/03/05 and far-call bank switch | More modes, LFB/PM interface, scanline/display-start controls and timing |
 | MPU-401 | UART command/status/acknowledgements, 1024-byte output queue and allocation-free drain at 330h/331h | Synthesizer/host audio, serial timing, IRQs and intelligent mode |
 | SB16 DSP / CT1745 | Control probes, rates/mixer state, selected 8/16-bit mono/stereo playback through DMA, auto-init/pause/resume, bounded stereo PCM queue and block IRQ acknowledgements | ADC/legacy/ADPCM commands, busy/reset timing, cascaded IRQ routing and applying mixer gain to audio |
-| i8042 | Controller commands/A20 and bounded keyboard ACK replies; LED, typematic, scan-set query/select, ID, enable/defaults, echo, resend and reset/self-test | Raw guest keystrokes and scancode translation, typematic timing, mouse/auxiliary channel and IRQs |
+| i8042 / AT keyboard | Controller commands/A20, bounded replies, scan sets 1/2, make/break, IRQ1, guest-time typematic, LED/query/ID/reset commands | Scan set 3, mouse/auxiliary protocol |
+| ISA gameport | Two axes/two buttons at 201h; guest-time charge deadlines | Additional joysticks and gameport MIDI |
 | MC146818 | CMOS register bank and installed-memory fields at 70h/71h; initial BCD date/time | RTC ticking, clock-format conversion, alarms, periodic IRQs and persistence |
 
 Only the first sixteen bootstrap palette entries are EGA colors; the remaining
@@ -473,7 +495,15 @@ Import limits are 64 MiB compressed, 4096 entries, 64 MiB per file and 256 MiB
 expanded. Invalid/duplicate DOS paths, symbolic links, encrypted files and
 unsupported compression are rejected explicitly. Reset targets the running
 program, independently of subsequent import/selection changes. Page reload loses
-the mount and RAM writes. BIOS/DOS keyboard mapping and DOS mouse input are available. The selected
+the imported ZIP mount and temporary writes. Explicit persistent stores retain
+the changed-data overlay: native versioned files use an OS writer lock and atomic
+manifest publication; browser IndexedDB uses an exclusive Web Lock and a fenced
+transaction. Close/commit/namespace changes wait for the durable acknowledgement.
+Stores bind to the immutable base identity, so reopening requires the same game
+data. Export/import exchanges a versioned overlay with a base-identity check.
+Neither backend writes to the immutable base; legacy native `rw` retains its
+explicit direct-writeback behavior. SQL storage is not implemented.
+BIOS/DOS keyboard mapping and DOS mouse input are available. The selected
 INT 33h driver supports reset, visibility, position, button histories, ranges,
 graphic cursor masks, motion counters and event callbacks (000Ch/0014h).
 Callbacks execute guest far-call code through a bounded interrupt wrapper,
@@ -519,7 +549,10 @@ supports GM through GmDevice, with CM-32L instruments and eight melodic parts.
 GM to external MT-32 ports remains unsupported. Output transitions replay RPN 0,
 channel state, held/sustained notes, and for raw MT-32, bounded DT1 packets only
 for guest-written state. The router owns the partial wire message across output
-transitions; exact voice envelopes/effects are not restored. Browser ports with
+transitions; exact voice envelopes/effects are not restored. Native moont
+restoration services its event queue between complete messages, discarding
+setup PCM without advancing guest/output time. Synth/dialect switches reuse
+the native audio stream rather than reopening it. Browser ports with
 clear() use timestamped output, while ports lacking it use a bounded cancelable
 window timer queue. Native output has a dedicated thread that owns the midir
 connection and sends from a preallocated 8192-message queue at guest-derived

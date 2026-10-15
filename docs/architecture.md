@@ -4,23 +4,47 @@ Doslet separates architectural CPU behavior, chip behavior, machine wiring and
 application policy. Libraries live in nested domains, with independent manifests
 and tests. No emulation library depends on iced or accesses a host filesystem.
 
-The [configurable machines proposal](design/configurable-machines.md) describes
-device registration, layered storage, HTTPS media and the shared machine editor.
-Its [input and write overlay extension](design/input-and-write-overlays.md)
-describes keyboard/joystick routing and transactional save stores, including a
-proposed SQL adapter. These interfaces and version-2 profiles are proposals.
+The [machine design](design/configurable-machines.md) and its
+[input and overlay extension](design/input-and-write-overlays.md) record the
+design decisions. The initial implementation now includes device registration,
+version-2 profiles, the shared machine editor, positional ISO sources, input
+routing and transactional save stores. SQL remains a future host adapter.
+See [configuration](configuration.md) for the implemented settings and limits.
 
-Native TOML launch profiles are parsed with `toml_edit` in the desktop frontend.
+TOML launch profiles use a shared native/browser `toml_edit` codec.
 The frontend merges explicit CLI options, resolves host paths and transfers
 mounted file ownership during setup. `Session::configure_launch` accepts DOS
 command-tail and working-directory byte slices before execution; the CPU and
 chip graph does not depend on TOML. The desktop retains launch settings for Reset.
 
-`doslet-iso9660` owns one immutable media buffer and returns validated file/sector
-views. It is an independent `no_std` system crate with no external dependencies.
-The runtime maps its read-only files and MSCDEX calls to guest memory. File
-handles store extent/position values; reads borrow media without cloning it.
-The native adapter excludes the configured ISO from the C: directory mount.
+`doslet-storage` defines bounded positional reads, source identities, request
+epochs and atomic commit messages. `doslet-iso9660` parses either an owned
+immutable image or a cached positional provider. Its DOS file and MSCDEX paths
+share one cache. `doslet-vfs` owns the directory tree, changed 4-KiB chunks and
+96-handle table. The DOS facade retains the existing mount API. Native directory
+and ZIP mounts enter at the filesystem layer; they do not pretend to be sectors.
+
+The native host worker performs file/HTTPS reads and durable save publication.
+A browser storage Worker owns IndexedDB transactions and Web Locks; the machine
+Worker performs Fetch/Blob reads and owns the cache. Host completions carry an
+epoch, generation, request ID and slot. The runtime retains an explicit service
+continuation across a miss or commit. It stages reads before guest writes and
+copies at most 4 KiB per visit. Guest clocks freeze during storage waits; host
+presentation remains responsive. A failed write remains dirty and exportable.
+
+`doslet-config` separates portable machine intent from host bindings. Setup
+resolves available components and compiles independent port read/write maps,
+page routing, IRQ grants and DMA grants. Concrete endpoint enums preserve static
+dispatch in execution. A candidate machine is installed only after validation
+and host preparation; Reset uses the active recipe. Hardware options include
+4/8/16/32-MiB RAM, x87, SB16, MPU-401, BIOS/AT input and the optional gameport.
+
+`doslet-input` owns bounded contributor-aware key, button and axis routes.
+Native gilrs and browser Gamepad adapters normalize host input; disconnection,
+focus loss, pause and overflow release affected contributors. The independent
+AT keyboard crate implements scan sets 1/2 and guest-time typematic. Its IRQ1
+shim updates the BIOS key ring only when executed through the guest IVT.
+The gameport implements guest-time charge deadlines at port 201h.
 
 ## Dependency graph
 
@@ -41,6 +65,13 @@ graph TD
   Runtime --> PC[doslet-pc]
   Runtime --> DOS[doslet-dos]
   Runtime --> ISO[doslet-iso9660]
+  Runtime --> VFS[doslet-vfs]
+  Runtime --> Input[doslet-input]
+  Runtime --> Storage[doslet-storage]
+  UI --> Config[doslet-config]
+  PC --> Config
+  DOS --> VFS
+  ISO --> Storage
   Runtime --> VGA[doslet-vga]
   Runtime --> CPU[doslet-x86]
   DOS --> CPU
@@ -57,6 +88,8 @@ graph TD
   PC --> DSP[doslet-sb-dsp]
   PC --> Mixer[doslet-sb-mixer]
   PC --> KBC[doslet-i8042]
+  KBC --> Keyboard[doslet-at-keyboard]
+  PC --> Gameport[doslet-gameport]
   PC --> CMOS[doslet-mc146818]
   CPU --> Bus
   CPU --> X87[doslet-x87]
@@ -65,7 +98,8 @@ graph TD
 
 ## Ownership and borrowing
 
-`Session` owns one `PcMachine`. Its CPU and `PcBus` are separate fields, so the
+`Session` owns one boxed `PcMachine`, allocated during setup to bound host stack
+usage. Its CPU and `PcBus` are separate fields, so the
 CPU can execute with `&mut bus` without interior mutability. The bus owns RAM and
 devices. VGA owns its aperture and palette. `IndexedFrame<'a>` borrows those
 arrays; Rust prevents mutating VGA while that frame remains borrowed.
@@ -158,6 +192,12 @@ sample-based GM or MT-32 emulation. Optional native `doslet-mt32` uses the
 Control v1.02 and PCM ROMs. Its timeline renders bounded blocks and explicitly
 resamples 32-kHz output to the host rate. ROM loading and SysEx ownership occur
 outside the audio callback. Browser ROM selection remains pending.
+Output-switch snapshots use a separate setup path that services moont between
+complete MIDI messages and discards the warm-up PCM. This avoids submitting a
+snapshot larger than the engine's 4096-event live queue in one burst. The guest
+clock and output-frame position do not advance during restoration. Native
+synth/dialect switches reuse an already open CPAL stream and clear its old PCM
+only after the replacement synth is ready.
 
 The independent `no_std` `doslet-mt32-gm` crate translates the MT-32 MIDI
 dialect to GM channel messages without ROM data. It owns a fixed ~23-KiB model
@@ -281,6 +321,11 @@ Its functional timeline advances four nominal 33-MHz clocks per bounded step,
 using 121 ns plus a retained 7/33-ns fraction. Single steps use addition and
 carry; batches preserve the same fraction. PIT, selected raster status and DSP
 rates retain fractional clock conversion.
+The runtime handles cooperative INT 2Fh/1680h yields by returning AL=00h and
+ending the current bounded batch after the BIOS shim returns. It exposes the
+yield to native and Worker schedulers so they return to their event loops
+before executing another batch. The CPU and hardware clock have no host sleep
+dependency; a yield does not fast-forward guest time or pause the session.
 Interrupt-enabled HLT can combine those same logical steps until the first
 PIT/DSP deadline, the remaining budget, or 1 ms of guest time. IRQ eligibility
 still takes precedence. VGA accumulates bounded guest nanoseconds and resolves
@@ -311,10 +356,13 @@ owns page registers and byte/word address wiring, including 64/128-KiB wrapping.
 Audio DMA reads ordinary physical RAM independently of the CPU A20 line and
 commits one unit after the memory access. No intermediate RAM copy is made.
 
-An optional sparse DOS write overlay owns reserved byte storage and fixed patch
-records. Read/write opens retain the original input owner; merged reads borrow
-base bytes and patches. Guest writes append bounded extents rather than clone
-whole files or use the host filesystem. The default drive stays read-only.
+The optional VFS write overlay owns reserved 4-KiB chunks and bounded file
+metadata. Read/write opens retain the original input owner; merged reads borrow
+base and upper storage. Repeated writes replace existing upper chunks. Truncate
+tracks the visible base prefix so extending a shortened file returns zeros.
+Whiteouts and renamed entries survive snapshot recovery. A compact extent mode
+remains for callers requesting legacy overlay budgets below 4 KiB. The default
+library drive stays read-only.
 
 This makes chip tests independent of CPU instruction coverage. Future cards can
 compose existing chips without introducing cycles: the Sound Blaster card may
