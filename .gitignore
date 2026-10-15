@@ -6,3 +6,4 @@
 /games/
 *.log
 __pycache__/
+/docs/HANDOFF.md

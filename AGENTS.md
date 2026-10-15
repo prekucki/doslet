@@ -29,7 +29,8 @@
 
 ## Validation
 
-Use the commands in `README.md`. The allocation regression test measures the
-guest demo and conversion after setup. Game compatibility needs a recorded real
+Use the commands in `README.md` and `docs/development.md`. The allocation
+regression test measures the guest demo and conversion after setup. Game
+compatibility needs a recorded real
 run; compilation, header inspection and a synthetic benchmark are separate
 evidence. Keep `Cargo.lock` checked in for application reproducibility.
