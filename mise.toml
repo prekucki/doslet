@@ -26,6 +26,10 @@ run = "cargo run -p doslet --locked"
 description = "Build Doslet and install its Linux launcher and icon for the current user"
 run = ["cargo build -p doslet --release --locked", "python3 tools/install_desktop.py"]
 
+[tasks.macos-app]
+description = "Build a local macOS application bundle"
+run = "python3 tools/package_macos.py"
+
 [tasks.demo]
 description = "Run the guest COM demo without a window"
 run = "cargo run -p doslet-headless --locked -- demo"

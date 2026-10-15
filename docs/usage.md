@@ -220,6 +220,25 @@ producing nonzero PCM. These are bounded compatibility observations, not a
 completed campaign or an audio-device listening test. See
 [CIV evidence](compatibility/civ.md) for commands and limits.
 
+### Local macOS application
+
+On macOS, build a release application bundle with Cargo and Python 3:
+
+```sh
+python3 tools/package_macos.py
+```
+
+The same command is available as `mise run macos-app`. Open
+`target/macos/Doslet.app` in Finder, or copy it to `/Applications`.
+The bundle contains its own executable and can be moved independently of the
+checkout. It uses the build machine's architecture. The icon is rendered with
+Swift and AppKit and packaged with macOS `iconutil`; this requires the Xcode
+Command Line Tools. Games and synthesizer ROMs are not included.
+
+This bundle is for local use; the script does not apply a Developer ID signature
+or notarize it. Run the command again after changing the code, and replace any
+copy you previously placed in `/Applications`.
+
 ### Linux launcher and application icon
 
 Install the launcher and icon for COSMIC and other Linux desktops:
