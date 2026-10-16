@@ -41,6 +41,8 @@ struct InputState {
 }
 
 struct Proof {
+    /// Started at the last proven loop head rather than an arbitrary point.
+    at_head: bool,
     cpu: CpuSnapshot,
     input: InputState,
     mark: IdleProofMark,
@@ -84,9 +86,11 @@ impl Default for IdleLoops {
 
 impl IdleLoops {
     /// A service that is not a pure query ends the running proof.
-    pub(super) fn note_service(&mut self, vector: u8, ax: u16, dl: u8) {
+    pub(super) fn note_service(&mut self, vector: u8, ax: u16, dl: u8, motion: (i16, i16)) {
+        // Reading zero relative motion and resetting it to zero changes nothing.
+        let pure = pure_service(vector, ax, dl) || (vector, ax, motion) == (0x33, 0x0B, (0, 0));
         if let Some(proof) = &mut self.proof
-            && !pure_service(vector, ax, dl)
+            && !pure
         {
             proof.failure.get_or_insert("service");
         }
@@ -153,6 +157,10 @@ impl Session {
     }
 
     fn idle_fail(&mut self, now: u64, reason: &'static str) {
+        // A loop head whose own proof fails no longer bypasses the backoff.
+        if self.idle.proof.as_ref().is_some_and(|proof| proof.at_head) {
+            self.idle.head = None;
+        }
         self.idle_abandon();
         self.idle.stats.failures += 1;
         self.idle.stats.last_failure = reason;
@@ -189,12 +197,12 @@ impl Session {
                 // The next pass crosses an event or follows a change: prove it
                 // again as it runs instead of executing it unobserved.
                 self.idle.proven = None;
-                self.idle_start();
+                self.idle_start(true);
             } else {
                 let r = &self.machine.cpu.registers;
                 let at_head = self.idle.head == Some((r.cs, r.ip));
                 if at_head || now >= self.idle.next_attempt {
-                    self.idle_start();
+                    self.idle_start(at_head);
                 }
             }
         }
@@ -244,11 +252,12 @@ impl Session {
         Ok(Some(consumed))
     }
 
-    fn idle_start(&mut self) {
+    fn idle_start(&mut self, at_head: bool) {
         if self.machine.interrupt_pending() || self.machine.cpu.is_halted() {
             return;
         }
         self.idle.proof = Some(Proof {
+            at_head,
             cpu: self.machine.cpu.snapshot(),
             input: self.input_state(),
             mark: self.machine.begin_idle_proof(),
@@ -260,12 +269,13 @@ impl Session {
     /// Hooks for `service`: classify the call and note empty input polls.
     pub(super) fn idle_service(&mut self, vector: u8, ax: u16) {
         let dl = self.machine.cpu.registers.get_byte(2);
-        self.idle.note_service(vector, ax, dl);
+        self.idle.note_service(vector, ax, dl, self.mouse.motion);
         let poll = matches!(
             (vector, (ax >> 8) as u8),
             (0x16, 0x01 | 0x11) | (0x21, 0x0B)
         ) || (vector, ax >> 8, dl) == (0x21, 6, 0xFF)
-            || (vector, ax) == (0x33, 3);
+            || (vector, ax) == (0x33, 3)
+            || (vector, ax, self.mouse.motion) == (0x33, 0x0B, (0, 0));
         if poll {
             let now = self.steps;
             self.idle.note_poll(now);
