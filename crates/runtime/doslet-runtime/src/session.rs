@@ -16,6 +16,7 @@ use doslet_vga::IndexedFrame;
 use doslet_x86::{CpuError, Gpr16, Registers, StepOutcome, linear_address};
 mod cdrom;
 mod clock;
+pub mod debug;
 mod idle;
 use cdrom::CdromImage;
 pub use idle::IdleLoopStats;
@@ -582,6 +583,14 @@ impl Session {
         }
         self.steps += u64::from(completed);
         completed
+    }
+    /// Live CPU throughput change; devices and accumulated guest time continue.
+    pub fn set_cpu_mhz(&mut self, mhz: u16) -> Result<(), RuntimeError> {
+        self.machine.set_cpu_mhz(mhz)?;
+        let enabled = self.idle.enabled;
+        self.set_idle_loops(false);
+        self.set_idle_loops(enabled);
+        Ok(())
     }
     /// Whether the most recent `advance` ended on INT 2Fh/1680h. Frontends
     /// should return to their event loop before starting another batch.

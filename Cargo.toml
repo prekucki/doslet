@@ -49,6 +49,8 @@ doslet-executable = { path = "crates/system/doslet-executable" }
 doslet-iso9660 = { path = "crates/system/doslet-iso9660" }
 doslet-dos = { path = "crates/system/doslet-dos" }
 doslet-runtime = { path = "crates/runtime/doslet-runtime" }
+doslet-debugger = { path = "crates/runtime/doslet-debugger" }
+doslet-mcp = { path = "crates/runtime/doslet-mcp" }
 doslet-midi-routing = { path = "crates/runtime/doslet-midi-routing" }
 doslet-midi-synth = { path = "crates/runtime/doslet-midi-synth" }
 doslet-mt32 = { path = "crates/hardware/audio/doslet-mt32" }

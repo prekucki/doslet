@@ -457,6 +457,45 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
     .spacing(14);
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let (mcp_label, mcp_action) = match app.mcp {
+            Some(address) => (format!("MCP http://{address}/mcp"), "Stop MCP"),
+            None => ("MCP disabled".into(), "Enable MCP · screen and input"),
+        };
+        body = body.push(
+            column![
+                text(mcp_label).size(12).color(MUTED),
+                small_button(mcp_action, Message::McpToggle)
+            ]
+            .spacing(8),
+        );
+        let (label, action) = match app.gdb {
+            Some((address, connected)) => (
+                format!(
+                    "GDB {address} · {}",
+                    if connected { "connected" } else { "listening" }
+                ),
+                "Stop GDB",
+            ),
+            None => ("GDB disabled".into(), "Enable GDB · 127.0.0.1:9001"),
+        };
+        body = body.push(
+            column![
+                text(label).size(12).color(MUTED),
+                small_button(action, Message::GdbToggle),
+            ]
+            .spacing(8),
+        );
+        body = body.push(
+            row![
+                text("CPU MHz · live").size(12),
+                pick_list(
+                    &[8u16, 16, 25, 33, 50, 66, 100, 132, 133, 200, 266, 500, 1000][..],
+                    Some(app.configurator.active.hardware.cpu_mhz),
+                    Message::CpuMhz,
+                ),
+            ]
+            .spacing(8),
+        );
         body = body.push(
             text(format!(
                 "Core: {} MHz · emulation lag {:.1} ms",

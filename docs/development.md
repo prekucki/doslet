@@ -3,6 +3,9 @@
 Validation commands, implementation status, headless diagnostics and
 execution-engine details. For everyday use, see [using Doslet](usage.md).
 
+For native desktop/headless remote debugging, RAM patches and mixed 16/32-bit guest
+inspection, see [debugging with GDB](debugging.md).
+
 ## Check the work
 
 ```sh

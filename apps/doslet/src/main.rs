@@ -3,6 +3,8 @@ mod app;
 #[cfg(not(target_arch = "wasm32"))]
 mod desktop;
 #[cfg(not(target_arch = "wasm32"))]
+mod native_computer;
+#[cfg(not(target_arch = "wasm32"))]
 mod native_jit;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "native_gamepad/wakeup.rs"]

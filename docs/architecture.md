@@ -169,6 +169,27 @@ maps guest nanoseconds to sample frames; MIDI timestamps currently have bounded
 batch resolution. Native CPAL owns a reserved host audio queue and shares only
 those frames with the output callback. The machine remains owned by the
 emulation thread.
+The native desktop and headless applications share the host `doslet-debugger`
+crate and its `gdbstub` TCP adapter. The desktop polls its nonblocking protocol
+state machine on the existing emulation owner, so partial packets and stopped
+guests do not block UI commands or presentation. Host storage completions remain
+queued while GDB is stopped and are applied on resume. Its generic
+`tick_mode<M: Execution>` selects ordinary batches or instruction-level GDB
+execution outside the CPU loop. The owned desktop target and borrowed headless
+target share one generic implementation, without cloning or locking a machine.
+Transport-independent `Session::debug_*`
+methods remain no_std: RAM access validates complete ordinary-memory spans and
+uses the existing page-generation/write-log path; stops do not release input or
+advance guest clocks. The adapter exposes a bus-linear PC alongside monitor
+output for architectural EIP and hidden segment state. It checks virtual address
+breakpoints before each bounded interpreter step and disables JIT, idle proofs
+and VGA polling batching during the connection. Desktop detach restores the
+previous execution settings and resets pacing; headless retains its diagnostic
+settings. Its fixed hotspot table is allocated only when sampling is enabled;
+normal execution does not allocate debugger storage. Host TCP,
+protocol formatting and paused diagnostic output stay outside emulation crates.
+See [the GDB workflow](debugging.md) for mixed-mode disassembly and limitations.
+
 The output callback and browser AudioWorklet feed the final stereo PCM into a
 fixed-buffer 1024-point FFT in `doslet-pcm`. Sixteen frequency levels with release
 decay reach the status bar as small snapshots. Analysis allocates no memory after

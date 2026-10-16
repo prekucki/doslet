@@ -61,10 +61,17 @@ pub struct Cli {
     /// Experimentally batch three Heroes timer polling loops; off by default
     #[arg(long)]
     pub experimental_heroes_timer_waits: bool,
-
     /// Use the interpreter instead of the native dynamic core
     #[arg(long)]
     pub no_dynamic_core: bool,
+
+    /// Listen for a remote GDB client; attachment stops the guest
+    #[arg(long, value_name = "IP:PORT")]
+    pub gdb: Option<std::net::SocketAddr>,
+
+    /// Enable guest screen/input tools over MCP on a loopback address
+    #[arg(long, value_name = "IP:PORT")]
+    pub mcp: Option<std::net::SocketAddr>,
 
     /// Load/save observed JIT blocks between runs (local profile, outside game data)
     #[arg(long, value_name = "FILE")]

@@ -412,6 +412,26 @@ exposes only the first-MCB pointer; a complete DOS kernel data layout is pending
 The runtime still owns one process; EXEC/AL=00, child-process restoration and
 handle inheritance remain unsupported.
 
+The native desktop and headless runners optionally accept GDB remote TCP
+connections through `--gdb IP:PORT`. Desktop also has a Session-panel toggle;
+it retains normal execution until attachment and supports reattachment. Headless
+stops before the first step or at `--gdb-after STEP`.
+The debugger runs on the machine owner thread and advances one bounded guest
+step at a time with JIT and wait accelerations disabled. Stops freeze guest time.
+Desktop protocol polling is nonblocking and bounded, including incomplete input;
+UI control remains serviced; host storage completions are applied on resume so
+stopped guest registers stay stable. Ordinary execution uses a
+separate generic mode calling the existing batch API, with no per-instruction
+debugger checks. Desktop detach restores prior accelerations and restarts host
+pacing, resuming only when the guest was running at attachment.
+GDB PC and breakpoint addresses are bus-linear, before A20; monitor output also
+reports architectural CS:EIP and cached segment descriptors. General registers,
+flags and validated PC offsets are writable, selectors and x87 state read-only.
+Whole-span ordinary RAM reads/writes reject device apertures and discontinuous
+A20 mappings; writes retain code invalidation and idle-proof tracking. Virtual
+address breakpoints do not modify instruction bytes. The fixed hotspot counter
+is observational and never skips guest work. See [debugging](debugging.md).
+
 The headless stub runner preloads its input directory into `ReadOnlyDrive` before
 execution. It supports case-insensitive C: paths and a shared table of 96 DOS
 handles with aliased open descriptions, attributes,

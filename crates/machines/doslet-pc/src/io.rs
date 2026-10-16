@@ -108,6 +108,9 @@ impl PcBus {
     }
 }
 impl PcBus {
+    pub(crate) fn set_cpu_mhz(&mut self, mhz: u16) {
+        self.config.cpu_mhz = mhz;
+    }
     pub fn hardware_config(&self) -> HardwareConfig {
         self.config
     }
@@ -204,6 +207,24 @@ impl PcBus {
             return None;
         }
         self.ram.view(range)
+    }
+    /// Side-effect-free debugger access through the current A20 mapping.
+    /// Reject a complete span crossing a device or a noncontiguous mapping.
+    pub fn debug_ram(&self, address: u32, length: u32) -> Option<&[u8]> {
+        self.ram.view(self.debug_ram_range(address, length)?)
+    }
+    /// Debugger patches use the same write generations and proof log as CPU
+    /// writes. Validate the complete span before lending any mutable bytes.
+    pub fn debug_ram_mut(&mut self, address: u32, length: u32) -> Option<&mut [u8]> {
+        let range = self.debug_ram_range(address, length)?;
+        self.ram.view_mut(range)
+    }
+    fn debug_ram_range(&self, address: u32, length: u32) -> Option<Range<usize>> {
+        address.checked_add(length)?;
+        if length > self.ram.len() as u32 || (!self.a20.enabled && length > 0x100000) {
+            return None;
+        }
+        self.wide_ram_range(address, length)
     }
     pub fn a20_enabled(&self) -> bool {
         self.a20.enabled

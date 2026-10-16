@@ -18,5 +18,6 @@ doslet-mt32.workspace = true
 doslet-executable.workspace = true
 doslet-x86.workspace = true
 doslet-dos.workspace = true
+doslet-debugger.workspace = true
 [lints]
 workspace = true

@@ -3,6 +3,7 @@ use doslet_runtime::{Session, SessionStatus};
 use doslet_x86::{Gpr16, Gpr32};
 #[cfg(test)]
 mod cache_tests;
+use doslet_debugger as debugger;
 #[path = "../../common/native_input.rs"]
 mod native_input;
 #[cfg(feature = "profiling")]
@@ -70,6 +71,68 @@ impl StepSnapshot {
         );
     }
 }
+/// Host-side output and scripted input shared by ordinary and GDB execution.
+struct RunOutput {
+    midi_log: Option<BufWriter<fs::File>>,
+    wave: Option<wave::Wave>,
+    drain_midi: bool,
+    logged_midi: u64,
+    pcm_frames: u64,
+    pcm_peak: u16,
+    midi_bytes: [u8; 1024],
+    pcm: [[i16; 2]; 128],
+    keys: std::collections::VecDeque<(u64, u8, u8)>,
+}
+impl RunOutput {
+    fn after_step(&mut self, session: &mut Session) -> Result<(), Box<dyn Error>> {
+        while self
+            .keys
+            .front()
+            .is_some_and(|event| event.0 <= session.steps())
+        {
+            let (_, scan, ascii) = self.keys.pop_front().unwrap();
+            session.push_key(scan, ascii)?;
+        }
+        if let Some(wave) = &mut self.wave {
+            wave.advance(session.emulated_nanos())?;
+        }
+        if self.drain_midi {
+            loop {
+                let count = session.drain_midi(&mut self.midi_bytes);
+                if count == 0 {
+                    break;
+                }
+                if let Some(log) = &mut self.midi_log {
+                    write!(log, "{}\t", session.emulated_nanos())?;
+                    for byte in &self.midi_bytes[..count] {
+                        write!(log, "{byte:02X}")?;
+                    }
+                    writeln!(log)?;
+                    self.logged_midi += count as u64;
+                }
+                if let Some(wave) = &mut self.wave {
+                    for byte in &self.midi_bytes[..count] {
+                        wave.timeline.push_byte(*byte)?;
+                    }
+                }
+            }
+        }
+        loop {
+            let count = session.drain_pcm(&mut self.pcm);
+            self.pcm_frames += count as u64;
+            for frame in &self.pcm[..count] {
+                for sample in frame {
+                    self.pcm_peak = self.pcm_peak.max(sample.unsigned_abs());
+                }
+            }
+            if count == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".into());
@@ -112,6 +175,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             "Doslet headless\n\n  demo [--steps N] [--frame PATH.ppm]\n  run-com PATH [--steps N] [--frame PATH.ppm]\n  run-mz PATH [--steps N] [--frame PATH.ppm]\n  run-stub PATH [--steps N] [--frame PATH.ppm] [--midi-log PATH] [--midi-wave PATH.wav] (experimental game startup)\n  inspect [PATH]  (default: PRINCE/PRINCE.EXE)\n  bench [--steps N]\n\nRunner diagnostics: --trace N, --trace-tail, --peek HEXADDRESS:DECIMALLENGTH (1..128 bytes), --find-ascii PATTERN (1..128 bytes, up to 16 extended-RAM matches), --profile-cpu (requires Cargo feature profiling), --no-vga-waits (disable VGA wait recognition/batching), --no-idle-loops (execute proven idle loops instead of skipping them), --no-decode-cache (use the reference interpreter).\nDemo runs an original COM program. PRINCE intro graphics and guest MIDI are observed; interactive sound is confirmed separately in the UI."
         );
         println!(
+            "Debugger: --gdb IP:PORT [--gdb-after STEP] stops for GDB; --cdrom ISO mounts D:; --key-at STEP:SCAN_HEX:ASCII_HEX injects a BIOS key. GDB writes affect guest RAM only."
+        );
+        println!(
             "Native core: --no-dynamic-core (cached interpreter), --core-profile FILE (load/save observed blocks outside the game directory)."
         );
         if command != "help" && command != "--help" && command != "-h" {
@@ -150,6 +216,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut core_profile: Option<PathBuf> = None;
     let mut midi_path: Option<PathBuf> = None;
     let mut wave_path: Option<PathBuf> = None;
+    let mut gdb_address = None;
+    let mut gdb_after = 0;
+    let mut keys = std::collections::VecDeque::new();
     let mut trace_remaining: u64 = 0;
     let mut trace_tail = false;
     #[cfg(feature = "profiling")]
@@ -160,6 +229,35 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut finds: Vec<Vec<u8>> = Vec::new();
     while let Some(option) = args.next() {
         match option.as_str() {
+            "--gdb" => {
+                gdb_address = Some(
+                    args.next()
+                        .ok_or("missing GDB IP:PORT")?
+                        .parse::<std::net::SocketAddr>()?,
+                )
+            }
+            "--gdb-after" => {
+                gdb_after = args
+                    .next()
+                    .ok_or("missing GDB start step")?
+                    .parse::<u64>()?
+            }
+            "--cdrom" => {
+                session = session
+                    .with_cdrom_image(b'D', fs::read(args.next().ok_or("missing ISO path")?)?)?
+            }
+            "--key-at" => {
+                let value = args.next().ok_or("missing STEP:SCAN_HEX:ASCII_HEX")?;
+                let fields: Vec<_> = value.split(':').collect();
+                if fields.len() != 3 {
+                    return Err("--key-at requires STEP:SCAN_HEX:ASCII_HEX".into());
+                }
+                keys.push_back((
+                    fields[0].parse::<u64>()?,
+                    u8::from_str_radix(fields[1], 16)?,
+                    u8::from_str_radix(fields[2], 16)?,
+                ));
+            }
             "--no-vga-waits" => session.set_vga_wait_acceleration(false),
             "--no-idle-loops" => session.set_idle_loops(false),
             "--no-decode-cache" => session.set_decode_cache(false),
@@ -207,26 +305,58 @@ fn run() -> Result<(), Box<dyn Error>> {
             _ => return Err(format!("unknown option: {option}").into()),
         }
     }
+    if gdb_after != 0 && gdb_address.is_none() {
+        return Err("--gdb-after requires --gdb IP:PORT".into());
+    }
+    if gdb_address.is_some() && gdb_after >= budget {
+        return Err("--gdb-after must be less than --steps".into());
+    }
+    #[cfg(feature = "profiling")]
+    if gdb_address.is_some() && profile.is_some() {
+        return Err("--profile-cpu cannot be combined with --gdb".into());
+    }
+    keys.make_contiguous().sort_by_key(|event| event.0);
     if let Some(path) = &core_profile {
         native_input::load_core_profile(&mut session, path);
     }
     session.start();
-    let mut midi_log = midi_path
+    let midi_log = midi_path
         .as_ref()
         .map(|path| fs::File::create(path).map(BufWriter::new))
         .transpose()?;
-    let mut midi_bytes = [0u8; 1024];
-    let mut logged_midi = 0u64;
-    let mut wave = wave_path
+    let wave = wave_path
         .as_ref()
         .map(|path| wave::Wave::new(path))
         .transpose()?;
+    #[cfg(feature = "profiling")]
+    let drain_midi =
+        midi_log.is_some() || wave.is_some() || profile.is_some() || gdb_address.is_some();
+    #[cfg(not(feature = "profiling"))]
+    let drain_midi = midi_log.is_some() || wave.is_some() || gdb_address.is_some();
+    let mut output = RunOutput {
+        midi_log,
+        wave,
+        drain_midi,
+        keys,
+        logged_midi: 0,
+        pcm_frames: 0,
+        pcm_peak: 0,
+        midi_bytes: [0; 1024],
+        pcm: [[0; 2]; 128],
+    };
     let start = Instant::now();
     let mut remaining = budget;
-    let mut pcm = [[0i16; 2]; 128];
-    let mut pcm_frames = 0u64;
-    let mut pcm_peak = 0u16;
+    output.after_step(&mut session)?;
     while remaining != 0 && session.status() == SessionStatus::Running {
+        if session.steps() >= gdb_after
+            && let Some(address) = gdb_address.take()
+        {
+            if !debugger::serve(&mut session, address, budget, &mut |s| output.after_step(s))? {
+                break;
+            }
+            remaining = budget.saturating_sub(session.steps());
+            continue;
+        }
         if trace_tail {
             tail[tail_count % tail.len()] = Some(StepSnapshot::capture(&session));
             tail_count += 1;
@@ -259,6 +389,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         } else {
             remaining.min(u64::from(batch_limit)) as u32
         };
+        let boundary =
+            output
+                .keys
+                .front()
+                .map_or(budget, |event| event.0)
+                .min(if gdb_address.is_some() {
+                    gdb_after
+                } else {
+                    budget
+                });
+        let batch = u64::from(batch).min(boundary.saturating_sub(session.steps())) as u32;
         session.prepare_dynamic(2);
         #[cfg(feature = "profiling")]
         let cpu_start = Instant::now();
@@ -269,43 +410,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             profile.frame(&session);
         }
         remaining -= u64::from(completed);
-        if let Some(wave) = &mut wave {
-            wave.advance(session.emulated_nanos())?;
-        }
-        #[cfg(feature = "profiling")]
-        let drain_midi = midi_log.is_some() || wave.is_some() || profile.is_some();
-        #[cfg(not(feature = "profiling"))]
-        let drain_midi = midi_log.is_some() || wave.is_some();
-        if drain_midi {
-            let count = session.drain_midi(&mut midi_bytes);
-            if count != 0 {
-                if let Some(log) = &mut midi_log {
-                    write!(log, "{}\t", session.emulated_nanos())?;
-                    for byte in &midi_bytes[..count] {
-                        write!(log, "{byte:02X}")?;
-                    }
-                    writeln!(log)?;
-                    logged_midi += count as u64;
-                }
-                if let Some(wave) = &mut wave {
-                    for byte in &midi_bytes[..count] {
-                        wave.timeline.push_byte(*byte)?;
-                    }
-                }
-            }
-        }
-        loop {
-            let count = session.drain_pcm(&mut pcm);
-            pcm_frames += count as u64;
-            for frame in &pcm[..count] {
-                for sample in frame {
-                    pcm_peak = pcm_peak.max(sample.unsigned_abs());
-                }
-            }
-            if count == 0 {
-                break;
-            }
-        }
+        output.after_step(&mut session)?;
     }
     let elapsed = start.elapsed();
     if let Some(path) = &core_profile {
@@ -321,7 +426,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Some(profile) = profile {
         profile.print(&session, elapsed);
     }
-    if let Some(wave) = wave {
+    if let Some(wave) = output.wave {
         println!(
             "Synthesized MIDI note-ons: {}; peak: {:.4}; nonzero samples: {}",
             wave.timeline.note_events(),
@@ -334,9 +439,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             wave_path.as_ref().unwrap().display()
         );
     }
-    if let Some(log) = &mut midi_log {
+    if let Some(log) = &mut output.midi_log {
         log.flush()?;
-        println!("Logged MIDI bytes: {logged_midi}");
+        println!("Logged MIDI bytes: {}", output.logged_midi);
     }
     for pattern in finds {
         if let Some(ram) = session.ram_view(0x100000..0x1000000) {
@@ -377,7 +482,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             session.emulated_nanos()
         );
         println!(
-            "Produced PCM frames: {pcm_frames}; peak: {pcm_peak} (drained without host playback)"
+            "Produced PCM frames: {}; peak: {} (drained without host playback)",
+            output.pcm_frames, output.pcm_peak
         );
         println!("MPU commands/bytes/UART: {:?}", session.midi_stats());
         let (opens, reads, midi) = session.file_access_stats();

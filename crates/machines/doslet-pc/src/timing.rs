@@ -66,6 +66,21 @@ impl Timing {
     }
 }
 impl PcMachine {
+    /// Change instruction throughput without resetting device clocks or guest time.
+    /// Retain the sub-nanosecond CPU phase, rounded down to the new denominator.
+    pub fn set_cpu_mhz(&mut self, mhz: u16) -> Result<(), MachineError> {
+        if !(1..=1000).contains(&mhz) {
+            return Err(MachineError::Hardware(
+                doslet_config::HardwareError::CpuClock,
+            ));
+        }
+        let fraction = self.timing.cpu.fraction * u64::from(mhz) / self.timing.cpu.mhz;
+        self.timing.cpu = StepClock::new(mhz);
+        self.timing.cpu.fraction = fraction;
+        self.bus.set_cpu_mhz(mhz);
+        Ok(())
+    }
+
     /// Functional clock: four configured nominal CPU clocks per execution/IRQ/idle
     /// step. This is deterministic across batches, not cycle-accurate timing.
     pub(crate) fn advance_hardware(&mut self) -> Result<(), MachineError> {
@@ -252,6 +267,29 @@ impl PcMachine {
 pub(crate) mod tests {
     use super::*;
     use doslet_bus::{MemoryBus, PortBus};
+    #[test]
+    fn live_clock_change_retains_machine_and_device_phase() {
+        let mut m = idle_machine(true);
+        m.advance_hardware_steps(7).unwrap();
+        let cpu = m.cpu.snapshot();
+        let time = m.time();
+        let pit = m.timing.pit_fraction;
+        let pcm = m.timing.pcm_fraction;
+        let old_fraction = m.timing.cpu.fraction;
+        assert!(m.set_cpu_mhz(0).is_err());
+        assert!(m.set_cpu_mhz(1001).is_err());
+        m.set_cpu_mhz(133).unwrap();
+        assert_eq!(m.time(), time);
+        assert!(m.cpu.matches(&cpu));
+        assert_eq!(m.timing.pit_fraction, pit);
+        assert_eq!(m.timing.pcm_fraction, pcm);
+        assert_eq!(m.timing.cpu.fraction, old_fraction * 133 / 33);
+        assert_eq!(m.hardware_config().cpu_mhz, 133);
+        // 133 steps at 133 MHz are exactly 4 us, regardless of retained phase.
+        m.advance_hardware_steps(133).unwrap();
+        assert_eq!(m.time().as_nanos() - time.as_nanos(), 4000);
+    }
+
     #[test]
     fn step_clock_matches_reference_and_deadlines_at_every_fraction() {
         for mhz in [1, 8, 25, 33, 66, 100, 132, 133, 1000] {

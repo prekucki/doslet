@@ -173,6 +173,9 @@ impl PcMachine {
         self.bus.observe_vga_status = enabled;
         self.vga_wait.candidate = None;
     }
+    pub fn vga_wait_acceleration_enabled(&self) -> bool {
+        self.vga_wait.enabled
+    }
     /// Consume empty logical steps up to the first device deadline. CPU work
     /// and eligible IRQ delivery still happen through step(). The caller owns
     /// the finite budget and accounts for the returned logical step count.
