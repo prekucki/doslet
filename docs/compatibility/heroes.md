@@ -347,3 +347,15 @@ the host can sustain every configured MHz value.
 cargo test -p doslet --release --locked \
   local_heroes_worker_pacing -- --ignored --nocapture
 ```
+
+### Background JIT validation
+
+The 40-guest-second check at 50 MHz with Rust GM synthesis passed with background
+compilation and with JIT disabled. Final general registers, CS:EIP, EFLAGS,
+ordinary-RAM hashes, visible indexed pixels and palette matched. The check used
+the local game and ISO without a window or audio output device. It does not
+establish audible playback or presentation smoothness.
+
+Timing comparisons from this run are inconclusive: the host was concurrently
+in use. Repeat `local_heroes_background_jit_pacing` on an otherwise idle host
+before drawing performance conclusions. JIT remains enabled by default.

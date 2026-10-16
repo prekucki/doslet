@@ -15,6 +15,18 @@ cargo run -p doslet-headless --release --locked -- bench --steps 5000000
 cargo run -p doslet-headless --release --locked --example bench_dynamic
 ```
 
+For the local Heroes build, this ignored test compares 40 guest seconds at
+50 MHz with background JIT and with the cached interpreter. Both retain Rust GM
+synthesis, use the ISO storage adapter, and run without a window/audio device:
+
+```sh
+cargo test -p doslet --release --locked local_heroes_background_jit_pacing -- --ignored --nocapture
+```
+
+It reports wall time per 100 ms of guest time, maximum emulation-thread JIT
+maintenance time and final RAM hashes. Run it without concurrent builds or other
+emulator instances. It does not measure audible playback or window presentation.
+
 The benchmark reports host execution steps per second, not emulated MHz or a
 game performance claim. REP iterations count as separate execution steps so a
 batch stays bounded.

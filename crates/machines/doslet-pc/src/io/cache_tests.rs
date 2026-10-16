@@ -1,5 +1,6 @@
 use super::*;
 use crate::PcMachine;
+use alloc::vec::Vec;
 use doslet_x86::{Access, Gpr32, SegmentRegister, flags};
 
 fn descriptor(bus: &mut PcBus, selector: u16, base: u32, limit: u32, code: bool, wide: bool) {
@@ -82,69 +83,93 @@ mod dynamic_tests;
 
 #[test]
 fn decoded_forms_match_reference_with_dynamic_registers_prefixes_and_faults() {
-    let mut cached = machine(true);
-    let mut reference = machine(false);
-    let mut seed = 0x12345678_u32;
-    let opcodes = [
-        0, 1, 2, 3, 4, 5, 8, 9, 0x10, 0x11, 0x18, 0x19, 0x20, 0x21, 0x28, 0x29, 0x30, 0x31, 0x38,
-        0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x40, 0x48, 0x50, 0x58, 0x68, 0x6A, 0x70, 0x74, 0x7F, 0x80,
-        0x81, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8D, 0x90, 0x97, 0xA0, 0xA1,
-        0xA2, 0xA3, 0xB0, 0xB7, 0xB8, 0xBF, 0xC2, 0xC3, 0xC6, 0xC7, 0xE8, 0xE9, 0xEB, 0xEC, 0xEE,
-        0xF7, 0x0F, 0xF3,
-    ];
-    let prefixes: &[&[u8]] = &[&[], &[0x67], &[0x64], &[0x66], &[0xF2], &[0x67, 0x3E]];
-    for opcode in opcodes {
-        for prefix in prefixes {
-            for modrm in [0_u8, 4, 5, 0x44, 0x84, 0xC0, 0xDB, 0xE8, 0xF8] {
-                let mut bytes = [0; 15];
-                for byte in &mut bytes {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 17;
-                    seed ^= seed << 5;
-                    *byte = seed as u8;
-                }
-                bytes[..prefix.len()].copy_from_slice(prefix);
-                bytes[prefix.len()] = opcode;
-                bytes[prefix.len() + 1] = modrm;
-                code(&mut cached, 0x10000, &bytes);
-                code(&mut reference, 0x10000, &bytes);
-                for round in 0..2 {
-                    for m in [&mut cached, &mut reference] {
-                        m.cpu.registers.ip = 0x10000;
-                        for (i, register) in [
-                            Gpr32::Eax,
-                            Gpr32::Ecx,
-                            Gpr32::Edx,
-                            Gpr32::Ebx,
-                            Gpr32::Esp,
-                            Gpr32::Ebp,
-                            Gpr32::Esi,
-                            Gpr32::Edi,
-                        ]
-                        .into_iter()
-                        .enumerate()
-                        {
-                            m.cpu
-                                .registers
-                                .set32(register, 0x20000 + i as u32 * 64 + round * 4);
-                        }
-                        m.cpu.flags = 2
-                            | (seed & (flags::CARRY | flags::ZERO | flags::SIGN | flags::OVERFLOW));
-                    }
-                    let a = cached.step();
-                    let b = reference.step();
-                    assert_eq!(
-                        a, b,
-                        "opcode={opcode:#x}, modrm={modrm:#x}, prefix={prefix:?}, round={round}"
-                    );
-                    state(&cached, &reference);
+    for mode in 0..3 {
+        let mut cached = machine(true);
+        let mut reference = machine(false);
+        for m in [&mut cached, &mut reference] {
+            if mode == 1 {
+                descriptor(&mut m.bus, 8, 0, 0xFFFFF, true, false);
+                m.cpu
+                    .load_segment(&mut m.bus, SegmentRegister::Cs, 8)
+                    .unwrap();
+            }
+            if mode == 2 {
+                m.cpu.control.cr0 &= !1;
+                code(m, 0x1000, &[0x90]);
+                m.cpu.step(&mut m.bus).unwrap();
+                for segment in SegmentRegister::ALL {
+                    m.cpu.load_segment(&mut m.bus, segment, 0).unwrap();
                 }
             }
         }
-        memory(&cached, &reference);
+        let mut seed = 0x12345678_u32;
+        let opcodes = [
+            0, 1, 2, 3, 4, 5, 8, 9, 0x10, 0x11, 0x18, 0x19, 0x20, 0x21, 0x28, 0x29, 0x30, 0x31,
+            0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x40, 0x48, 0x50, 0x58, 0x68, 0x6A, 0x70, 0x74,
+            0x7F, 0x80, 0x81, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8D, 0x90,
+            0x97, 0xA0, 0xA1, 0xA2, 0xA3, 0xB0, 0xB7, 0xB8, 0xBF, 0xC2, 0xC3, 0xC6, 0xC7, 0xE8,
+            0xE9, 0xEB, 0xEC, 0xEE, 0xF7, 0x0F, 0xF3, 0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3, 0xFE,
+            0xFF,
+        ];
+        let prefixes: &[&[u8]] = &[&[], &[0x67], &[0x64], &[0x66], &[0xF2], &[0x67, 0x3E]];
+        for opcode in opcodes {
+            for prefix in prefixes {
+                for modrm in [0_u8, 4, 5, 0x44, 0x84, 0xC0, 0xDB, 0xE8, 0xF8] {
+                    let mut bytes = [0; 15];
+                    for byte in &mut bytes {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        *byte = seed as u8;
+                    }
+                    bytes[..prefix.len()].copy_from_slice(prefix);
+                    bytes[prefix.len()] = opcode;
+                    bytes[prefix.len() + 1] = modrm;
+                    code(&mut cached, 0x1000, &bytes);
+                    code(&mut reference, 0x1000, &bytes);
+                    for round in 0..2 {
+                        for m in [&mut cached, &mut reference] {
+                            m.cpu.registers.ip = 0x1000;
+                            for (i, register) in [
+                                Gpr32::Eax,
+                                Gpr32::Ecx,
+                                Gpr32::Edx,
+                                Gpr32::Ebx,
+                                Gpr32::Esp,
+                                Gpr32::Ebp,
+                                Gpr32::Esi,
+                                Gpr32::Edi,
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                m.cpu
+                                    .registers
+                                    .set32(register, 0x20000 + i as u32 * 64 + round * 4);
+                            }
+                            m.cpu.flags = 2
+                                | (seed
+                                    & (flags::CARRY | flags::ZERO | flags::SIGN | flags::OVERFLOW));
+                        }
+                        let a = cached.step();
+                        let b = reference.step();
+                        assert_eq!(
+                            a, b,
+                            "opcode={opcode:#x}, modrm={modrm:#x}, prefix={prefix:?}, round={round}"
+                        );
+                        assert!(
+                            cached.cpu.snapshot() == reference.cpu.snapshot(),
+                            "mode={mode} opcode={opcode:x} modrm={modrm:x} prefix={prefix:?}"
+                        );
+                        state(&cached, &reference);
+                    }
+                }
+            }
+            memory(&cached, &reference);
+        }
+        #[cfg(feature = "profiling")]
+        assert!(cached.cpu.decode_cache_stats().hits > 1000);
     }
-    #[cfg(feature = "profiling")]
-    assert!(cached.cpu.decode_cache_stats().hits > 1000);
 }
 
 #[test]
@@ -297,7 +322,7 @@ fn an_instruction_crossing_the_a20_boundary_falls_back_without_losing_bytes() {
 #[test]
 fn profiling_distinguishes_context_discards_collisions_and_failed_probes() {
     let mut m = machine(true);
-    for address in [0x10000, 0x10201] {
+    for address in [0x10000, 0x11008] {
         code(&mut m, address, &[0x90]);
         m.step().unwrap();
     }
@@ -309,20 +334,28 @@ fn profiling_distinguishes_context_discards_collisions_and_failed_probes() {
     m.cpu
         .load_segment(&mut m.bus, SegmentRegister::Cs, 24)
         .unwrap();
-    m.cpu.registers.ip = 0x10201;
+    m.cpu.registers.ip = 0x11008;
     m.step().unwrap();
     let stats = m.cpu.decode_cache_stats();
     assert_eq!(stats.context_switches, 1);
-    assert_eq!(stats.context_invalidations, 1);
-    assert_eq!(stats.invalidations, 1);
+    assert_eq!(stats.context_invalidations, 0);
+    assert_eq!(stats.invalidations, 0);
     code(&mut m, 0x20000, &[0x66, 0xB8, 1, 0]);
     for _ in 0..2 {
         m.cpu.registers.ip = 0x20000;
         m.step().unwrap();
     }
     let stats = m.cpu.decode_cache_stats();
-    assert_eq!(stats.failed_decodes, 2);
+    assert_eq!(stats.failed_decodes, 0);
     assert_eq!(stats.fallback_hits, 0);
+    code(&mut m, 0x20010, &[0xFA]); // CLI deliberately stays outside the cache.
+    for _ in 0..2 {
+        m.cpu.registers.ip = 0x20010;
+        m.step().unwrap();
+    }
+    let stats = m.cpu.decode_cache_stats();
+    assert_eq!(stats.failed_decodes, 1);
+    assert_eq!(stats.fallback_hits, 1);
 }
 
 fn cs_fault(result: Result<doslet_x86::StepOutcome, crate::MachineError>) -> bool {
@@ -574,4 +607,178 @@ fn registers_moved_from_another_machine_resolve_their_own_cs_context() {
     a.cpu.registers.ip = 0x10000;
     a.step().unwrap();
     assert_eq!(a.cpu.registers.get32(Gpr32::Eax), 2);
+}
+
+#[test]
+fn word_byte_shifts_and_double_shifts_match_reference_for_all_counts() {
+    let mut cached = machine(true);
+    let mut reference = machine(false);
+    for word in [false, true] {
+        for opcode in [0xC0, 0xC1, 0xD2, 0xD3, 0xA4, 0xA5, 0xAC, 0xAD] {
+            for group in 0..8 {
+                for count in 0..=33 {
+                    for carry in [0, flags::CARRY] {
+                        let mut bytes = Vec::new();
+                        if word {
+                            bytes.push(0x66);
+                        }
+                        if opcode < 0xC0 {
+                            bytes.push(0x0F);
+                        }
+                        bytes.extend_from_slice(&[opcode, 0xC0 | (group << 3), count]);
+                        for m in [&mut cached, &mut reference] {
+                            code(m, 0x1000, &bytes);
+                            m.cpu.registers.set32(Gpr32::Eax, 0x81FE_8041);
+                            m.cpu
+                                .registers
+                                .set32(Gpr32::Ecx, 0xA55A_0000 | u32::from(count));
+                            m.cpu.flags = 2 | flags::OVERFLOW | flags::AUXILIARY | carry;
+                        }
+                        let a = cached.cpu.step(&mut cached.bus);
+                        let b = reference.cpu.step(&mut reference.bus);
+                        assert_eq!(
+                            a, b,
+                            "word={word} opcode={opcode:x} group={group} count={count}"
+                        );
+                        assert!(
+                            cached.cpu.snapshot() == reference.cpu.snapshot(),
+                            "word={word} opcode={opcode:x} group={group} count={count} carry={carry}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cached_batches_cover_real_and_protected_word_code_and_size_overrides() {
+    for mode in 0..3 {
+        for override_operand in [false, true] {
+            let mut cached = machine(true);
+            let mut reference = machine(false);
+            for m in [&mut cached, &mut reference] {
+                if mode == 1 {
+                    descriptor(&mut m.bus, 8, 0, 0xFFFF, true, false);
+                    m.cpu
+                        .load_segment(&mut m.bus, SegmentRegister::Cs, 8)
+                        .unwrap();
+                } else if mode == 2 {
+                    m.cpu.control.cr0 &= !1;
+                    code(m, 0x1000, &[0x90]);
+                    m.cpu.step(&mut m.bus).unwrap();
+                    for segment in SegmentRegister::ALL {
+                        m.cpu.load_segment(&mut m.bus, segment, 0).unwrap();
+                    }
+                }
+                code(m, 0x1000, &[0x90, 0x90]);
+                m.cpu.step(&mut m.bus).unwrap();
+                m.cpu.step(&mut m.bus).unwrap();
+                m.cpu.registers.set32(Gpr32::Eax, 0x1234_5678);
+                m.cpu.registers.set32(Gpr32::Ebx, 0x8000_0001);
+                m.cpu.registers.set32(Gpr32::Esp, 0x5000);
+                m.cpu.registers.set32(Gpr32::Esi, 0x1000);
+                m.cpu.flags = 0x803;
+            }
+            let mut bytes = Vec::new();
+            for instruction in [
+                &[0x50][..],
+                &[0x5A],
+                &[0x40],
+                &[0x49],
+                &[0xC1, 0xE3, 3],
+                &[0xD1, 0xD8],
+                &[0x0F, 0xAC, 0xD0, 5],
+                &[0x83, 0xC0, 3],
+                &[0xFE, 0xCC],
+            ] {
+                if override_operand {
+                    bytes.push(0x66);
+                }
+                bytes.extend_from_slice(instruction);
+            }
+            // INC/DEC memory and a memory shift use the code's address width.
+            for opcode in [0xFF, 0xFE, 0xD1] {
+                if override_operand {
+                    bytes.push(0x66);
+                }
+                bytes.push(opcode);
+                bytes.push(
+                    if mode == 0 { 0x05 } else { 0x06 } | if opcode == 0xD1 { 0x20 } else { 0 },
+                );
+                bytes.extend_from_slice(if mode == 0 {
+                    &[0, 0x20, 0, 0][..]
+                } else {
+                    &[0, 0x20][..]
+                });
+            }
+            if override_operand {
+                bytes.push(0x66);
+            }
+            bytes.extend_from_slice(&[0xFF, 0xE6]); // JMP SI/ESI back to the loop.
+            for m in [&mut cached, &mut reference] {
+                code(m, 0x1000, &bytes);
+            }
+            for budget in [2, 3, 7, 17, 255, 256] {
+                let count = if cfg!(all(
+                    feature = "dynamic-core",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )) && budget % 2 == 0
+                {
+                    cached
+                        .cpu
+                        .dynamic_batch(&mut cached.bus, budget, |_| budget)
+                } else {
+                    cached
+                        .cpu
+                        .interpret_batch(&mut cached.bus, budget, |_| budget)
+                };
+                assert_eq!(
+                    count, budget,
+                    "mode={mode}, override={override_operand}, ip={:x}",
+                    cached.cpu.registers.ip
+                );
+                for _ in 0..count {
+                    reference.cpu.step(&mut reference.bus).unwrap();
+                }
+                state(&cached, &reference);
+                memory(&cached, &reference);
+            }
+        }
+    }
+}
+
+#[test]
+fn mode_switch_at_same_linear_address_and_real_ip_wrap_do_not_reuse_wrong_decode() {
+    let mut cached = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut cached, &mut reference] {
+        code(m, 0x1000, &[0xB8, 0x34, 0x12, 0x78, 0x56]);
+    }
+    for wide in [true, false, true, false] {
+        for m in [&mut cached, &mut reference] {
+            descriptor(&mut m.bus, 8, 0, 0xFFFFF, true, wide);
+            m.cpu
+                .load_segment(&mut m.bus, SegmentRegister::Cs, 8)
+                .unwrap();
+            m.cpu.registers.ip = 0x1000;
+        }
+        cached.cpu.step(&mut cached.bus).unwrap();
+        reference.cpu.step(&mut reference.bus).unwrap();
+        state(&cached, &reference);
+        assert_eq!(cached.cpu.registers.ip, if wide { 0x1005 } else { 0x1003 });
+    }
+    for m in [&mut cached, &mut reference] {
+        m.cpu.control.cr0 &= !1;
+        code(m, 0x1000, &[0x90]);
+        m.cpu.step(&mut m.bus).unwrap();
+        m.cpu.registers.cs = 0;
+        m.bus.write_u16(0xFFFF, 0x34B8).unwrap();
+        m.bus.write_u16(0, 0x1234).unwrap();
+        m.cpu.registers.ip = 0xFFFF;
+    }
+    cached.cpu.step(&mut cached.bus).unwrap();
+    reference.cpu.step(&mut reference.bus).unwrap();
+    state(&cached, &reference);
+    assert_eq!(cached.cpu.registers.ip, 2);
 }

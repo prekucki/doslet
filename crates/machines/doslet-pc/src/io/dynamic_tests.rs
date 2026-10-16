@@ -1912,3 +1912,35 @@ fn native_batches_preserve_pit_irq_delivery_and_varied_step_budgets() {
     assert!(native.cpu.registers.get32(Gpr32::Edi) > 0);
     memory(&native, &reference);
 }
+
+#[test]
+fn delayed_compilation_keeps_executing_and_publication_rechecks_guest_code() {
+    let mut native = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut native, &mut reference] {
+        clear_shadow(m);
+        code(m, 0x10000, &[0x40, 0x43, 0xEB, 0xFC]);
+    }
+    for _ in 0..16 {
+        assert_eq!(native.cpu.dynamic_steps(&native.bus, 32), 0);
+    }
+    let job = native.cpu.take_dynamic_compilation(2).unwrap();
+    // A deliberately delayed host job cannot prevent guest progress.
+    assert_eq!(native.cpu.dynamic_batch(&mut native.bus, 256, |_| 256), 256);
+    for _ in 0..256 {
+        reference.cpu.step(&mut reference.bus).unwrap();
+    }
+    state(&native, &reference);
+    // Replace INC with DEC while the old block is being compiled.
+    for m in [&mut native, &mut reference] {
+        m.bus.write_u8(0x10000, 0x48).unwrap();
+        m.cpu.registers.ip = 0x10000;
+    }
+    assert_eq!(native.cpu.finish_dynamic_compilation(job.compile()), 1);
+    assert_eq!(native.cpu.dynamic_batch(&mut native.bus, 256, |_| 256), 256);
+    for _ in 0..256 {
+        reference.cpu.step(&mut reference.bus).unwrap();
+    }
+    state(&native, &reference);
+    assert_eq!(native.cpu.dynamic_stats().executed_steps, 0);
+}

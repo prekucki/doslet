@@ -27,3 +27,10 @@ pub const fn real_address(segment: u16, offset: u16) -> u32 {
 pub const fn linear_address(segment: u16, offset: u16) -> u32 {
     (segment as u32) * 16 + offset as u32
 }
+
+#[cfg(all(
+    feature = "dynamic-core",
+    not(target_arch = "wasm32"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub use engines::DynamicCompilation;

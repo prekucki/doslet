@@ -402,6 +402,25 @@ impl Session {
     pub fn prepare_dynamic(&mut self, limit: usize) -> usize {
         self.machine.cpu.prepare_dynamic(limit)
     }
+    #[cfg(all(
+        feature = "dynamic-core",
+        not(target_arch = "wasm32"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub fn take_dynamic_compilation(
+        &mut self,
+        limit: usize,
+    ) -> Option<doslet_x86::DynamicCompilation> {
+        self.machine.cpu.take_dynamic_compilation(limit)
+    }
+    #[cfg(all(
+        feature = "dynamic-core",
+        not(target_arch = "wasm32"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub fn finish_dynamic_compilation(&mut self, job: doslet_x86::DynamicCompilation) -> usize {
+        self.machine.cpu.finish_dynamic_compilation(job)
+    }
     pub fn load_dynamic_profile(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
         self.machine.cpu.load_dynamic_profile(bytes)
     }

@@ -56,6 +56,7 @@ pub struct Doslet {
     logged_fault: Option<RuntimeError>,
     logged_notice: Option<String>,
     dynamic_error_reported: bool,
+    jit: crate::native_jit::Worker,
     pub midi_choices: Vec<String>,
     pub midi_choice: String,
     host_midi: Option<crate::native_midi::Output>,
@@ -141,6 +142,7 @@ impl Doslet {
             logged_fault: None,
             logged_notice: None,
             dynamic_error_reported: false,
+            jit: crate::native_jit::Worker::default(),
             midi_choices: crate::native_synth::choices(),
             midi_choice: "Rust synth".into(),
             host_midi: None,
@@ -1375,7 +1377,7 @@ impl Doslet {
                 break;
             }
             if !prepared {
-                self.session.prepare_dynamic(2);
+                self.jit.maintain(&mut self.session);
                 prepared = true;
             }
             if !self.dynamic_error_reported
@@ -2353,6 +2355,113 @@ mod tests {
             app.session.steps(),
             app.session.video_mode()
         );
+    }
+
+    #[test]
+    #[ignore = "requires local HoMM and ISO; compares 40 guest seconds with Rust GM"]
+    fn local_heroes_background_jit_pacing() {
+        use clap::Parser;
+        let config =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../games/HoMnM.toml");
+        let mut expected = None;
+        for jit in [false, true] {
+            let cli = crate::cli::Cli::parse_from([
+                std::ffi::OsString::from("doslet"),
+                "--config".into(),
+                config.clone().into_os_string(),
+                "--no-audio".into(),
+                "--cpu-mhz".into(),
+                "50".into(),
+            ]);
+            let mut app = Doslet::from_cli(cli).unwrap();
+            app.session.set_dynamic_core(jit);
+            assert!(matches!(app.midi, Timeline::Rust(_)));
+            let start = Instant::now();
+            let mut worst = Duration::ZERO;
+            let mut windows_over_100ms = 0;
+            let mut maintenance = Duration::ZERO;
+            for window in 1..=400 {
+                let target = window * 100_000_000;
+                let began = Instant::now();
+                while app.session.emulated_nanos() < target {
+                    assert!(start.elapsed() < Duration::from_secs(180));
+                    if let Some(storage) = &mut app.storage {
+                        storage.service(&mut app.session).unwrap();
+                    }
+                    if app.session.storage_waiting() {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    let compile = Instant::now();
+                    app.jit.maintain(&mut app.session);
+                    maintenance = maintenance.max(compile.elapsed());
+                    let budget = ((target - app.session.emulated_nanos()) / 80).min(10000) as u32;
+                    assert!(budget > 0);
+                    app.session.advance(budget);
+                    app.process_audio().unwrap();
+                    assert_eq!(
+                        app.session.status(),
+                        SessionStatus::Running,
+                        "{:?}",
+                        app.session.fault()
+                    );
+                }
+                let elapsed = began.elapsed();
+                worst = worst.max(elapsed);
+                windows_over_100ms += usize::from(elapsed > Duration::from_millis(100));
+            }
+            let elapsed = start.elapsed();
+            let hash = |bytes: &[u8]| {
+                bytes.iter().fold(0xcbf29ce484222325_u64, |h, b| {
+                    (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+                })
+            };
+            let low_hash = hash(app.session.ram_view(0..0xA0000).unwrap());
+            let ram_hash = hash(
+                app.session
+                    .ram_view(0xC0000..app.session.hardware_config().memory_bytes())
+                    .unwrap(),
+            );
+            let frame = app.session.frame().unwrap();
+            let frame_hash = hash(frame.pixels);
+            let ip = (app.session.registers().cs, app.session.registers().ip);
+            let state = (
+                ip,
+                app.session.steps(),
+                app.session.emulated_nanos(),
+                low_hash,
+                ram_hash,
+                frame_hash,
+                hash(frame.palette.as_flattened()),
+                [
+                    doslet_x86::Gpr32::Eax,
+                    doslet_x86::Gpr32::Ecx,
+                    doslet_x86::Gpr32::Edx,
+                    doslet_x86::Gpr32::Ebx,
+                    doslet_x86::Gpr32::Esp,
+                    doslet_x86::Gpr32::Ebp,
+                    doslet_x86::Gpr32::Esi,
+                    doslet_x86::Gpr32::Edi,
+                ]
+                .map(|r| app.session.registers().get32(r)),
+                app.session.eflags(),
+            );
+            if let Some(expected) = expected {
+                assert_eq!(state, expected);
+            } else {
+                expected = Some(state);
+            }
+            println!(
+                "HoMM background_jit={jit}: total={elapsed:?} speed={:.2}x worst_100ms={worst:?} over_100ms={windows_over_100ms} max_maintenance={maintenance:?} compiled={} native_steps={} ram_hash={ram_hash:016x}",
+                40.0 / elapsed.as_secs_f64(),
+                app.session.dynamic_stats().compiled_blocks,
+                app.session.dynamic_stats().executed_steps
+            );
+            if jit {
+                assert!(app.session.dynamic_stats().compiled_blocks > 0);
+                assert!(app.session.dynamic_stats().executed_steps > 0);
+            }
+        }
     }
 
     #[test]

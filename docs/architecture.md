@@ -47,10 +47,11 @@ shim updates the BIOS key ring only when executed through the guest IVT.
 The gameport implements guest-time charge deadlines at port 201h.
 
 The native `doslet-emulation` thread creates and exclusively owns the Session,
-JIT, storage adapter and sample synthesizers. It processes at most 256 queued
+execution cache, storage adapter and sample synthesizers. It processes at most 256 queued
 commands between bounded execution turns. Each turn has a 400000-step budget,
-10000-step chunks and an 8-ms host-work check between chunks; JIT preparation
-runs once per turn and may exceed that time check. The worker continues without
+10000-step chunks and an 8-ms host-work check between chunks. Once per turn
+it polls/submits a bounded JIT job; Cranelift runs on a separate `doslet-jit`
+thread. Neither compiler completion nor a full queue blocks emulation. The worker continues without
 sleeping when behind the host clock, and waits briefly when caught up or blocked
 on audio/storage. Its guest clock remains independent of UI refresh.
 
@@ -320,8 +321,9 @@ the resulting line value through an explicit setter. The default machine owns
 that storage. Device queues and core execution remain fixed/preallocated;
 CMOS clock ticking and complete device-event scheduling are still pending.
 
-The CPU also owns a fixed 512-entry decoded-instruction cache for selected
-default-32-bit forms. `MemoryBus` optionally supplies side-effect-free code views
+The CPU also owns a fixed 4096-entry decoded-instruction cache for selected
+16-bit and 32-bit forms. The cache includes word overrides, byte/word/dword
+shifts and rotates, register/memory INC/DEC, SHLD/SHRD and indirect near JMP. `MemoryBus` optionally supplies side-effect-free code views
 and `CodeCheck` values, resolved once when an instruction is decoded. A check
 records the RAM owner and mapping generation as one code-space token, plus the
 physical 4-KiB pages touched by the instruction and their write generations; a
@@ -335,8 +337,8 @@ interpretation. A20 changes advance the mapping generation in the token.
 
 Cache entries contain operations, immediates and addressing expressions rather
 than resolved data addresses. Register-dependent addresses and segment checks
-remain execution work. Entries are keyed by linear address and hold only
-default-32-bit decodes, so they survive CS context changes; a change resolves the
+remain execution work. Entries are keyed by linear address and CS default
+width, so they survive compatible CS context changes. A change resolves the
 selector, hidden-cache, PE-mode and execute checks once, and hits validate the
 entire code span's offset range and its generation token. Decoder rejections are
 cached against the same check so the original interpreter runs without repeated
@@ -478,8 +480,18 @@ retains compiled IR by code fingerprint, with full byte comparison before reuse;
 execution-cache collisions and address changes do not discard native code.
 Pool insertion happens only during explicit preparation. Code discovery performs no
 allocation. A hot block becomes eligible after 16 observations; compilation is
-explicit host maintenance through `Session::prepare_dynamic`, capped at eight
-blocks per call (two in ordinary frontend execution). `Session::advance` never
+explicit host maintenance. `Session::prepare_dynamic` remains a synchronous
+API for headless tools and deterministic compiler tests, capped at eight blocks.
+The desktop uses `take_dynamic_compilation` and `finish_dynamic_compilation`
+instead: one job of up to two blocks is in flight through bounded single-slot
+channels. The job exclusively owns one compiler bank and address-independent IR;
+it contains no guest registers, RAM or device state. Cranelift construction,
+compilation and retired-bank reclamation run on `doslet-jit`. While a bank is
+away, its handles use interpreter fallback; other banks remain executable.
+Publication checks the originating CPU identity and exact prepared bytes before
+binding handles; execution still checks current code generations and segments.
+Reset/replacement discards old results. Closing the channels lets the compiler
+finish and reclaim its job without blocking shutdown. `Session::advance` never
 calls the compiler. Executable storage is split into at most 16 independently
 owned Cranelift modules, each holding at most 256 functions (4096 resident
 functions total). A trace and its optional register fallback reserve their two

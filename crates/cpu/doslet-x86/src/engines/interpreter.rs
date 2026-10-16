@@ -11,6 +11,12 @@ mod cache;
 ))]
 #[path = "dynamic.rs"]
 mod dynamic;
+#[cfg(all(
+    feature = "dynamic-core",
+    not(target_arch = "wasm32"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub use dynamic::DynamicCompilation;
 mod operand32;
 mod segments;
 mod x87;

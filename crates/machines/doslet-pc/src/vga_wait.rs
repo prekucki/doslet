@@ -502,18 +502,20 @@ mod tests {
             }
             // Inactive status reads fault equally; do not turn an unsupported
             // port into a wait. The last case changes only preserved high AL.
-            let result = fast.step_with_idle_budget(10000);
-            if alteration == 7 {
-                let consumed = result.unwrap().1;
-                advance(&mut reference, consumed);
-            } else {
-                assert_eq!(
-                    result.map(|(outcome, units)| {
-                        assert_eq!(units, 1);
-                        outcome
-                    }),
-                    reference.step()
-                );
+            #[cfg(feature = "profiling")]
+            let waits_before = fast.execution_stats().vga_wait_steps;
+            match fast.step_with_idle_budget(10000) {
+                Ok((outcome, consumed)) => {
+                    // Changed CS may now execute a batch of ordinary 16-bit
+                    // instructions. Only the polling shortcut must be rejected.
+                    if alteration != 7 {
+                        #[cfg(feature = "profiling")]
+                        assert_eq!(fast.execution_stats().vga_wait_steps, waits_before);
+                    }
+                    assert_eq!(outcome, doslet_x86::StepOutcome::Continue);
+                    advance(&mut reference, consumed);
+                }
+                Err(error) => assert_eq!(Err(error), reference.step()),
             }
             compare(&mut fast, &mut reference);
         }

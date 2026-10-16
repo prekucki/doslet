@@ -115,3 +115,10 @@ impl interpreter::Cpu {
         0
     }
 }
+
+#[cfg(all(
+    feature = "dynamic-core",
+    not(target_arch = "wasm32"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub use interpreter::DynamicCompilation;

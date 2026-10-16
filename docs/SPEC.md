@@ -232,16 +232,17 @@ selected VGA pixel clocks and DSP sample rates. This is deterministic across
 host batches; it is not cycle-accurate CPU/bus arbitration or complete peripheral
 timing. Timing-sensitive compatibility still needs real-run evidence.
 
-`Cpu::step` has a bounded 512-entry single-instruction cache for selected
-default-32-bit code. It caches prefix decisions, operations, immediates and
+`Cpu::step` has a bounded 4096-entry single-instruction cache for selected
+16-bit and 32-bit code, with or without operand/address-size overrides. It caches prefix decisions, operations, immediates and
 16/32-bit address expressions; effective addresses and segment permissions are
 resolved against current registers. Implemented cached forms include byte/dword
-MOV and ALU/CMP/TEST, dword INC/DEC, LEA, XCHG, NEG/NOT, selected dword stack
+MOV and ALU/CMP/TEST (also word forms), register and memory INC/DEC,
+byte/word/dword shifts and rotates, SHLD/SHRD, LEA, XCHG, NEG/NOT, selected word/dword stack
 operations, short/near relative jumps and conditional jumps, LOOP/LOOPE/LOOPNE/JECXZ,
-near CALL/RET, byte IN/OUT through DX, byte/dword MUL/IMUL/DIV/IDIV of the
+near CALL/RET and indirect JMP, byte IN/OUT through DX, byte/dword MUL/IMUL/DIV/IDIV of the
 accumulator, CWDE/CDQ, MOVZX/MOVSX into dword registers and byte/word/dword
 MOVS/STOS/LODS with or without REP. A repeated string still performs one
-iteration per step. Other word operand overrides, other instructions and buses
+iteration per step. Word MUL/DIV, other unsupported instructions and buses
 without the optional code contract use the original interpreter. A decoder
 rejection is remembered against the same code check, so the original interpreter
 runs without another decode attempt until those bytes change.
@@ -251,8 +252,9 @@ PC RAM tracks checked write generations for 4-KiB pages, including mutations
 through wide write views. A code span checks both page generations, its RAM
 owner identity and A20 mapping generation; its physical pages are resolved at
 decode time and hits do not translate the address again. Entries are keyed by
-linear address and decoded only for default-32-bit code, so they remain valid
-across CS-cache/context changes. Offset-independent CS checks are resolved
+linear address and CS default width, so they remain valid across compatible
+CS-cache/context changes. Real-mode instruction-fetch wrap retains byte fetching.
+Offset-independent CS checks are resolved
 once per context, detected through a registers lineage and CS reload version;
 hits still check the instruction's complete offset range.
 Counter exhaustion disables caching rather than wrapping.

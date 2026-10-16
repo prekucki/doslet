@@ -18,7 +18,7 @@ pub struct DecodeCacheStats {
     /// Resident entries rejected after a write, mapping or CS-context change.
     pub invalidations: u64,
     pub fallbacks: u64,
-    /// Transitions between observed default-32-bit CS contexts (not entries).
+    /// Transitions between observed CS contexts (not entries).
     pub context_switches: u64,
     /// Resident entries discarded by a context transition.
     pub context_invalidations: u64,
@@ -45,8 +45,7 @@ pub struct DecodeCacheStats {
     /// changed code generations.
     pub block_conflicts: u64,
     pub block_stale: u64,
-    /// Lookups in code whose CS is not default-32-bit; real, V86 and 16-bit
-    /// protected-mode code always use the original interpreter.
+    /// Single-instruction lookups in code whose CS is not default-32-bit.
     pub code16_lookups: u64,
 }
 
@@ -59,6 +58,7 @@ struct Context {
 #[derive(Clone, Copy)]
 struct Entry {
     address: u32,
+    code32: bool,
     check: CodeCheck,
     instruction: Instruction,
 }
@@ -75,6 +75,7 @@ struct Block {
     address: u32,
     /// Bytes covered by `check` and by the CS window test of a hit.
     length: u8,
+    code32: bool,
     count: u8,
     check: CodeCheck,
     instructions: [Instruction; BLOCK_INSTRUCTIONS],
@@ -84,6 +85,7 @@ impl Block {
         address: u32::MAX,
         length: 0,
         count: 0,
+        code32: false,
         check: CodeCheck {
             space: 0,
             pages: [0; 2],
@@ -147,8 +149,8 @@ impl Cache {
         self.code32 = false;
         self.window = None;
     }
-    /// Full context check. Entries are keyed by linear address and decoded only
-    /// for default-32-bit code, so they remain valid in every 32-bit context;
+    /// Full context check. Entries are keyed by linear address and default
+    /// operand/address mode, so they remain valid across compatible contexts;
     /// each hit still checks its offset range against the current window.
     #[inline(always)]
     fn resolve_context(&mut self, r: &Registers) {
@@ -158,7 +160,7 @@ impl Cache {
             protected: r.protected,
         };
         self.code32 = context.cs.default32;
-        if self.code32 && self.context != Some(context) {
+        if self.context != Some(context) {
             #[cfg(feature = "profiling")]
             {
                 self.stats.context_switches += u64::from(self.context.is_some());
@@ -194,9 +196,6 @@ impl Cache {
             self.resolve_context(r);
             self.key = Some(key);
         }
-        if !self.code32 {
-            return None;
-        }
         Some((self.window?, self.context?.cs))
     }
     fn instruction<B: CpuBus>(&mut self, r: &Registers, bus: &B) -> Option<Instruction> {
@@ -205,14 +204,16 @@ impl Cache {
         }
         let Some((window, _)) = self.code_context(r) else {
             #[cfg(feature = "profiling")]
-            {
-                self.stats.code16_lookups += u64::from(!self.code32);
-            }
+            {}
             return None;
         };
+        #[cfg(feature = "profiling")]
+        {
+            self.stats.code16_lookups += u64::from(!self.code32);
+        }
         self.instruction_in(window, r.ip, bus)
     }
-    /// Look up `ip` in an already resolved 32-bit code context.
+    /// Look up `ip` in an already resolved code context.
     #[inline]
     fn instruction_in<B: CpuBus>(
         &mut self,
@@ -220,10 +221,14 @@ impl Cache {
         ip: u32,
         bus: &B,
     ) -> Option<Instruction> {
+        if !self.code32 && !self.context?.protected && ip >= 0xFFF1 {
+            return None;
+        }
         let address = window.address(ip, 1)?;
         let index = ((address ^ (address >> 9)) as usize) & (CAPACITY - 1);
         if let Some(entry) = self.entries[index]
             && entry.address == address
+            && entry.code32 == self.code32
         {
             let segment_valid = window.address(ip, entry.instruction.length).is_some();
             if segment_valid && bus.code_valid(&entry.check) {
@@ -270,7 +275,7 @@ impl Cache {
         {
             self.stats.decode_attempts += 1;
         }
-        let Some(instruction) = Instruction::decode(bytes) else {
+        let Some(instruction) = Instruction::decode_mode(bytes, self.code32) else {
             #[cfg(feature = "profiling")]
             {
                 self.stats.failed_decodes += 1;
@@ -281,6 +286,7 @@ impl Cache {
             if let Some(check) = bus.code_check(address, length) {
                 self.entries[index] = Some(Entry {
                     address,
+                    code32: self.code32,
                     check,
                     instruction: Instruction::UNSUPPORTED,
                 });
@@ -297,6 +303,7 @@ impl Cache {
         }
         self.entries[index] = Some(Entry {
             address,
+            code32: self.code32,
             check,
             instruction,
         });
@@ -309,10 +316,13 @@ impl Cache {
     /// CS window and code generations. None when no batchable block starts there.
     #[inline]
     fn block_in<B: CpuBus>(&mut self, window: SegmentWindow, ip: u32, bus: &B) -> Option<usize> {
+        if !self.code32 && !self.context?.protected && ip >= 0xFFF1 {
+            return None;
+        }
         let address = window.address(ip, 1)?;
         let index = ((address ^ (address >> 10)) as usize) & (BLOCK_CAPACITY - 1);
         let block = &self.blocks[index];
-        if block.address == address && bus.code_valid(&block.check) {
+        if block.address == address && block.code32 == self.code32 && bus.code_valid(&block.check) {
             if block.count == 0 {
                 return None;
             }
@@ -348,11 +358,12 @@ impl Cache {
         let bytes = bus.code_bytes(address, u8::MAX)?;
         let mut block = Block {
             address,
+            code32: self.code32,
             ..Block::EMPTY
         };
         let mut offset = 0;
         while usize::from(block.count) < BLOCK_INSTRUCTIONS {
-            let Some(instruction) = Instruction::decode(&bytes[offset..]) else {
+            let Some(instruction) = Instruction::decode_mode(&bytes[offset..], self.code32) else {
                 break;
             };
             let end = offset + usize::from(instruction.length);
@@ -360,6 +371,9 @@ impl Cache {
                 instruction.operation,
                 Operation::Input | Operation::Output | Operation::Unsupported
             ) || end > usize::from(u8::MAX)
+                || (!self.code32
+                    && !self.context?.protected
+                    && u64::from(ip) + end as u64 >= 0x10000)
                 || window
                     .address(ip.wrapping_add(offset as u32), instruction.length)
                     .is_none()
@@ -374,6 +388,7 @@ impl Cache {
                 Operation::Branch { .. }
                     | Operation::Call(_)
                     | Operation::CallIndirect(_)
+                    | Operation::JumpIndirect(_)
                     | Operation::Return(_)
                     | Operation::Loop { .. }
             ) {
@@ -449,31 +464,19 @@ enum Value {
     Immediate(u32),
 }
 impl Value {
-    fn read<B: CpuBus>(self, cpu: &Cpu, bus: &mut B, dword: bool) -> Result<u32, CpuError> {
+    fn read<B: CpuBus>(self, cpu: &Cpu, bus: &mut B, width: u8) -> Result<u32, CpuError> {
         match self {
             Self::Immediate(value) => Ok(value),
-            Self::Operand(target) => read(target.resolve(&cpu.registers), cpu, bus, dword),
+            Self::Operand(target) => read_width(target.resolve(&cpu.registers), cpu, bus, width),
         }
     }
 }
-fn read<B: CpuBus>(target: Operand, cpu: &Cpu, bus: &mut B, dword: bool) -> Result<u32, CpuError> {
-    if dword {
-        target.read32(&cpu.registers, bus)
+fn alu_width(flags: u32, left: u32, right: u32, operation: u8, width: u8) -> (u32, u32) {
+    if width == 4 {
+        flags::alu32(flags, left, right, operation)
     } else {
-        target.read(&cpu.registers, bus, false).map(u32::from)
-    }
-}
-fn write<B: CpuBus>(
-    target: Operand,
-    cpu: &mut Cpu,
-    bus: &mut B,
-    dword: bool,
-    value: u32,
-) -> Result<(), CpuError> {
-    if dword {
-        target.write32(&mut cpu.registers, bus, value)
-    } else {
-        target.write(&mut cpu.registers, bus, false, value as u16)
+        let (value, flags) = flags::alu(flags, left as u16, right as u16, operation, width == 2);
+        (u32::from(value), flags)
     }
 }
 fn read_width<B: CpuBus>(
@@ -535,6 +538,22 @@ enum Operation {
     },
     Call(i32),
     CallIndirect(Value),
+    JumpIndirect(Value),
+    IncTarget {
+        target: Target,
+        decrement: bool,
+    },
+    Shift {
+        target: Target,
+        operation: u8,
+        count: Option<u8>,
+    },
+    DoubleShift {
+        target: Target,
+        register: u8,
+        right: bool,
+        count: Option<u8>,
+    },
     Return(u16),
     Input,
     Output,
@@ -577,6 +596,8 @@ pub(super) struct Instruction {
     /// Position before a faultable data read that precedes immediate fetching.
     read_length: u8,
     dword: bool,
+    width: u8,
+    branch32: bool,
     operation: Operation,
 }
 
@@ -587,6 +608,9 @@ pub(super) struct Instruction {
 ))]
 impl Instruction {
     pub(super) fn native_candidate(self) -> bool {
+        if self.width == 2 || !self.branch32 {
+            return false;
+        }
         match self.operation {
             Operation::Move {
                 target: Target::Register(_),
@@ -679,6 +703,9 @@ pub(super) fn native_trace_instruction(
 ) -> Option<(doslet_x86_jit::TraceInstruction, u8, u8)> {
     use doslet_x86_jit::{DwordMemoryAddress, TraceInstruction, TraceOperation as Op, TraceSource};
     let i = Instruction::decode(bytes)?;
+    if i.width == 2 || !i.branch32 {
+        return None;
+    }
     let mut segments = 0;
     let mut write_segments = 0;
     let memory = |target| match target {
@@ -969,21 +996,26 @@ impl Cpu {
         i: Instruction,
     ) -> bool {
         let r = &self.registers;
-        let length = if i.dword { 4 } else { 1 };
+        let length = i.width;
         let next = r.ip.wrapping_add(u32::from(i.length));
         let jump = |displacement: i32| {
             let target = next.wrapping_add_signed(displacement);
+            let target = if i.branch32 {
+                target
+            } else {
+                u32::from(target as u16)
+            };
             code.address(target, 1).map(|_| target)
         };
         let push_address = |windows: &mut Windows, bus: &B| {
-            let sp = self.stack_pointer().wrapping_sub(4);
+            let sp = self.stack_pointer().wrapping_sub(u32::from(length));
             let sp = if r.stack32() {
                 sp
             } else {
                 u32::from(sp as u16)
             };
             windows
-                .linear(r, bus, SegmentRegister::Ss, sp, 4, Access::Write)
+                .linear(r, bus, SegmentRegister::Ss, sp, length, Access::Write)
                 .map(|address| (sp, address))
         };
         match i.operation {
@@ -994,14 +1026,14 @@ impl Cpu {
                 let Some(target) = windows.place(r, bus, target, length, Access::Write) else {
                     return false;
                 };
-                let value = self.load_source(bus, source, i.dword);
-                self.store(bus, target, i.dword, value);
+                let value = self.load_source(bus, source, length);
+                self.store(bus, target, length, value);
             }
             Operation::Lea { register, target } => {
                 let Operand::Memory { offset, .. } = target.resolve(r) else {
                     unreachable!()
                 };
-                self.registers.set32(Gpr32::decode(register), offset);
+                self.store(bus, Place::Register(register), length, offset);
             }
             Operation::Alu {
                 target,
@@ -1022,18 +1054,12 @@ impl Cpu {
                 let Some(source) = windows.source(r, bus, source, length) else {
                     return false;
                 };
-                let left = self.load(bus, place, i.dword);
-                let right = self.load_source(bus, source, i.dword);
-                let (value, new_flags) = if i.dword {
-                    flags::alu32(self.flags, left, right, operation)
-                } else {
-                    let (value, flags) =
-                        flags::alu(self.flags, left as u16, right as u16, operation, false);
-                    (u32::from(value), flags)
-                };
+                let left = self.load(bus, place, length);
+                let right = self.load_source(bus, source, length);
+                let (value, new_flags) = alu_width(self.flags, left, right, operation, length);
                 self.flags = new_flags;
                 if store {
-                    self.store(bus, place, i.dword, value);
+                    self.store(bus, place, length, value);
                 }
             }
             Operation::Exchange { target, register } => {
@@ -1047,63 +1073,87 @@ impl Cpu {
                     return false;
                 }
                 let other = Place::Register(register);
-                let left = self.load(bus, place, i.dword);
-                let right = self.load(bus, other, i.dword);
-                self.store(bus, place, i.dword, right);
-                self.store(bus, other, i.dword, left);
+                let left = self.load(bus, place, length);
+                let right = self.load(bus, other, length);
+                self.store(bus, place, length, right);
+                self.store(bus, other, length, left);
             }
             Operation::Inc {
                 register,
                 decrement,
             } => {
-                let register = Gpr32::decode(register);
-                let (value, next_flags) = flags::alu32(
-                    self.flags,
-                    self.registers.get32(register),
-                    1,
-                    if decrement { 5 } else { 0 },
-                );
-                self.flags = (next_flags & !flags::CARRY) | (self.flags & flags::CARRY);
-                self.registers.set32(register, value);
+                let value = self.load(bus, Place::Register(register), length);
+                let (value, updated) =
+                    alu_width(self.flags, value, 1, if decrement { 5 } else { 0 }, length);
+                self.flags = (updated & !flags::CARRY) | (self.flags & flags::CARRY);
+                self.store(bus, Place::Register(register), length, value);
             }
-            Operation::Unary { target, negate } => {
-                let Some(place) = windows.place(r, bus, target, 4, Access::Read) else {
-                    return false;
+            Operation::IncTarget { target, .. }
+            | Operation::Shift { target, .. }
+            | Operation::DoubleShift { target, .. } => {
+                let count = match i.operation {
+                    Operation::Shift { count, .. } | Operation::DoubleShift { count, .. } => {
+                        count.unwrap_or(r.get_byte(1)) & 31
+                    }
+                    _ => 1,
                 };
-                if windows.place(r, bus, target, 4, Access::Write).is_none() {
+                if matches!(i.operation, Operation::DoubleShift { .. }) && length == 2 && count > 16
+                {
                     return false;
                 }
-                let value = self.load(bus, place, true);
+                if count != 0
+                    && (windows
+                        .place(r, bus, target, length, Access::Read)
+                        .is_none()
+                        || windows
+                            .place(r, bus, target, length, Access::Write)
+                            .is_none())
+                {
+                    return false;
+                }
+                return self.delegate_batched(bus, i);
+            }
+            Operation::Unary { target, negate } => {
+                let Some(place) = windows.place(r, bus, target, length, Access::Read) else {
+                    return false;
+                };
+                if windows
+                    .place(r, bus, target, length, Access::Write)
+                    .is_none()
+                {
+                    return false;
+                }
+                let value = self.load(bus, place, length);
                 let value = if negate {
-                    let (value, new_flags) = flags::alu32(self.flags, 0, value, 5);
+                    let (value, new_flags) = alu_width(self.flags, 0, value, 5, length);
                     self.flags = new_flags;
                     value
                 } else {
                     !value
                 };
-                self.store(bus, place, true, value);
+                self.store(bus, place, length, value);
             }
             Operation::Push(value) => {
-                let Some(source) = windows.source(r, bus, value, 4) else {
+                let Some(source) = windows.source(r, bus, value, length) else {
                     return false;
                 };
                 let Some((sp, address)) = push_address(windows, bus) else {
                     return false;
                 };
-                let value = self.load_source(bus, source, true);
-                self.store(bus, Place::Ram(address), true, value);
+                let value = self.load_source(bus, source, length);
+                self.store(bus, Place::Ram(address), length, value);
                 self.set_stack_pointer(sp);
             }
             Operation::Pop(register) => {
                 let sp = self.stack_pointer();
                 let Some(address) =
-                    windows.linear(r, bus, SegmentRegister::Ss, sp, 4, Access::Read)
+                    windows.linear(r, bus, SegmentRegister::Ss, sp, length, Access::Read)
                 else {
                     return false;
                 };
-                let value = self.load(bus, Place::Ram(address), true);
-                self.adjust_stack(4);
-                self.registers.set32(Gpr32::decode(register), value);
+                let value = self.load(bus, Place::Ram(address), length);
+                self.adjust_stack(u32::from(length));
+                self.store(bus, Place::Register(register), length, value);
             }
             Operation::Branch {
                 condition,
@@ -1124,23 +1174,34 @@ impl Cpu {
                 let Some((sp, address)) = push_address(windows, bus) else {
                     return false;
                 };
-                self.store(bus, Place::Ram(address), true, next);
+                self.store(bus, Place::Ram(address), length, next);
                 self.set_stack_pointer(sp);
                 self.registers.ip = target;
                 return true;
             }
+            Operation::JumpIndirect(value) => {
+                let Some(source) = windows.source(r, bus, value, length) else {
+                    return false;
+                };
+                let target = self.load_source(bus, source, length);
+                if code.address(target, 1).is_none() {
+                    return false;
+                }
+                self.registers.ip = target;
+                return true;
+            }
             Operation::CallIndirect(value) => {
-                let Some(source) = windows.source(r, bus, value, 4) else {
+                let Some(source) = windows.source(r, bus, value, length) else {
                     return false;
                 };
                 let Some((sp, address)) = push_address(windows, bus) else {
                     return false;
                 };
-                let target = self.load_source(bus, source, true);
+                let target = self.load_source(bus, source, length);
                 if code.address(target, 1).is_none() {
                     return false;
                 }
-                self.store(bus, Place::Ram(address), true, next);
+                self.store(bus, Place::Ram(address), length, next);
                 self.set_stack_pointer(sp);
                 self.registers.ip = target;
                 return true;
@@ -1148,15 +1209,15 @@ impl Cpu {
             Operation::Return(release) => {
                 let sp = self.stack_pointer();
                 let Some(address) =
-                    windows.linear(r, bus, SegmentRegister::Ss, sp, 4, Access::Read)
+                    windows.linear(r, bus, SegmentRegister::Ss, sp, length, Access::Read)
                 else {
                     return false;
                 };
-                let target = self.load(bus, Place::Ram(address), true);
+                let target = self.load(bus, Place::Ram(address), length);
                 if code.address(target, 1).is_none() {
                     return false;
                 }
-                self.adjust_stack(4);
+                self.adjust_stack(u32::from(length));
                 self.registers.ip = target;
                 self.adjust_stack(u32::from(release));
                 return true;
@@ -1244,27 +1305,37 @@ impl Cpu {
         true
     }
 
-    fn load<B: CpuBus>(&self, bus: &mut B, place: Place, dword: bool) -> u32 {
+    fn load<B: CpuBus>(&self, bus: &mut B, place: Place, width: u8) -> u32 {
         match place {
-            Place::Register(code) if dword => self.registers.get32(Gpr32::decode(code)),
+            Place::Register(code) if width == 4 => self.registers.get32(Gpr32::decode(code)),
+            Place::Register(code) if width == 2 => {
+                u32::from(self.registers.get(Gpr16::decode(code)))
+            }
             Place::Register(code) => u32::from(self.registers.get_byte(code)),
-            Place::Ram(address) if dword => bus.read_u32(address).expect(PLAIN_RAM),
+            Place::Ram(address) if width == 4 => bus.read_u32(address).expect(PLAIN_RAM),
+            Place::Ram(address) if width == 2 => u32::from(bus.read_u16(address).expect(PLAIN_RAM)),
             Place::Ram(address) => u32::from(bus.read_u8(address).expect(PLAIN_RAM)),
         }
     }
 
-    fn load_source<B: CpuBus>(&self, bus: &mut B, source: Source, dword: bool) -> u32 {
+    fn load_source<B: CpuBus>(&self, bus: &mut B, source: Source, width: u8) -> u32 {
         match source {
             Source::Immediate(value) => value,
-            Source::Place(place) => self.load(bus, place, dword),
+            Source::Place(place) => self.load(bus, place, width),
         }
     }
 
-    fn store<B: CpuBus>(&mut self, bus: &mut B, place: Place, dword: bool, value: u32) {
+    fn store<B: CpuBus>(&mut self, bus: &mut B, place: Place, width: u8, value: u32) {
         match place {
-            Place::Register(code) if dword => self.registers.set32(Gpr32::decode(code), value),
+            Place::Register(code) if width == 4 => self.registers.set32(Gpr32::decode(code), value),
+            Place::Register(code) if width == 2 => {
+                self.registers.set(Gpr16::decode(code), value as u16)
+            }
             Place::Register(code) => self.registers.set_byte(code, value as u8),
-            Place::Ram(address) if dword => bus.write_u32(address, value).expect(PLAIN_RAM),
+            Place::Ram(address) if width == 4 => bus.write_u32(address, value).expect(PLAIN_RAM),
+            Place::Ram(address) if width == 2 => {
+                bus.write_u16(address, value as u16).expect(PLAIN_RAM)
+            }
             Place::Ram(address) => bus.write_u8(address, value as u8).expect(PLAIN_RAM),
         }
     }
@@ -1300,8 +1371,7 @@ impl Cpu {
             && self.interrupt_shadow == 0
             && self.flags & (flags::TRAP | flags::RESUME | flags::VIRTUAL) == 0
             && self.control.cr0 & 0x8000_0000 == 0
-            && self.registers.protected
-            && self.protected_mode()
+            && self.registers.protected == self.protected_mode()
     }
 }
 
@@ -1326,11 +1396,11 @@ impl Reader<'_> {
             self.byte()?,
         ]))
     }
-    fn immediate(&mut self, dword: bool) -> Option<u32> {
-        if dword {
-            self.dword()
-        } else {
-            self.byte().map(u32::from)
+    fn immediate_width(&mut self, width: u8) -> Option<u32> {
+        match width {
+            4 => self.dword(),
+            2 => self.word().map(u32::from),
+            _ => self.byte().map(u32::from),
         }
     }
     fn target(
@@ -1425,19 +1495,30 @@ impl Instruction {
         length: 1,
         read_length: 1,
         dword: false,
+        width: 1,
+        branch32: true,
         operation: Operation::Unsupported,
     };
 
+    #[cfg(all(
+        feature = "dynamic-core",
+        not(target_arch = "wasm32"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn decode(bytes: &[u8]) -> Option<Self> {
+        Self::decode_mode(bytes, true)
+    }
+
+    fn decode_mode(bytes: &[u8], code32: bool) -> Option<Self> {
         let mut r = Reader { bytes, position: 0 };
-        let mut operand32 = true;
-        let mut address32 = true;
+        let mut operand32 = code32;
+        let mut address32 = code32;
         let mut segment = None;
         let mut repeat = false;
         let opcode = loop {
             match r.byte()? {
-                0x66 => operand32 = false,
-                0x67 => address32 = false,
+                0x66 => operand32 = !code32,
+                0x67 => address32 = !code32,
                 0xF2 | 0xF3 => repeat = true,
                 byte @ (0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) => {
                     segment = Some(match byte {
@@ -1468,6 +1549,8 @@ impl Instruction {
                 length: r.position as u8,
                 read_length: r.position as u8,
                 dword: width == 4,
+                width,
+                branch32: code32,
                 operation: Operation::String {
                     kind: opcode & 0xFE,
                     width,
@@ -1477,11 +1560,8 @@ impl Instruction {
                 },
             });
         }
-        // Other word operands retain the reference path.
-        if !operand32 {
-            return None;
-        }
         let mut dword = opcode & 1 != 0;
+        let mut branch32 = operand32;
         let mut read_length = None;
         let operation = match opcode {
             0x88..=0x8B | 0x8D | 0xC6 | 0xC7 | 0x80 | 0x81 | 0x83 | 0x84..=0x87 => {
@@ -1500,15 +1580,23 @@ impl Instruction {
                     }
                     0xC6 | 0xC7 if register == 0 => Operation::Move {
                         target,
-                        source: Value::Immediate(r.immediate(dword)?),
+                        source: Value::Immediate(r.immediate_width(if dword {
+                            if operand32 { 4 } else { 2 }
+                        } else {
+                            1
+                        })?),
                     },
                     0x86 | 0x87 => Operation::Exchange { target, register },
                     0x80 | 0x81 | 0x83 | 0x84 | 0x85 => {
-                        if matches!(opcode, 0x81 | 0x83) {
+                        if operand32 && matches!(opcode, 0x81 | 0x83) {
                             read_length = Some(r.position as u8);
                         }
                         let source = match opcode {
-                            0x80 | 0x81 => Value::Immediate(r.immediate(dword)?),
+                            0x80 | 0x81 => Value::Immediate(r.immediate_width(if dword {
+                                if operand32 { 4 } else { 2 }
+                            } else {
+                                1
+                            })?),
                             0x83 => Value::Immediate(r.byte()? as i8 as i32 as u32),
                             _ => source,
                         };
@@ -1526,7 +1614,14 @@ impl Instruction {
             code if code <= 0x3D && code & 7 <= 5 => {
                 let operation = code >> 3;
                 let (target, source) = if code & 7 >= 4 {
-                    (Target::Register(0), Value::Immediate(r.immediate(dword)?))
+                    (
+                        Target::Register(0),
+                        Value::Immediate(r.immediate_width(if dword {
+                            if operand32 { 4 } else { 2 }
+                        } else {
+                            1
+                        })?),
+                    )
                 } else {
                     let modrm = r.byte()?;
                     let rm = r.target(modrm, address32, segment)?;
@@ -1544,6 +1639,20 @@ impl Instruction {
                     store: operation != 7,
                 }
             }
+            0xC0 | 0xC1 | 0xD0..=0xD3 => {
+                let modrm = r.byte()?;
+                let target = r.target(modrm, address32, segment)?;
+                let count = match opcode {
+                    0xC0 | 0xC1 => Some(r.byte()?),
+                    0xD2 | 0xD3 => None,
+                    _ => Some(1),
+                };
+                Operation::Shift {
+                    target,
+                    operation: (modrm >> 3) & 7,
+                    count,
+                }
+            }
             0x40..=0x4F => {
                 dword = true;
                 Operation::Inc {
@@ -1553,7 +1662,11 @@ impl Instruction {
             }
             0x50..=0x57 => Operation::Push(Value::Operand(Target::Register(opcode & 7))),
             0x58..=0x5F => Operation::Pop(opcode & 7),
-            0x68 => Operation::Push(Value::Immediate(r.dword()?)),
+            0x68 => Operation::Push(Value::Immediate(r.immediate_width(if operand32 {
+                4
+            } else {
+                2
+            })?)),
             0x6A => Operation::Push(Value::Immediate(r.byte()? as i8 as i32 as u32)),
             0x90..=0x97 => {
                 dword = true;
@@ -1585,7 +1698,11 @@ impl Instruction {
             }
             0xA8 | 0xA9 => Operation::Alu {
                 target: Target::Register(0),
-                source: Value::Immediate(r.immediate(dword)?),
+                source: Value::Immediate(r.immediate_width(if dword {
+                    if operand32 { 4 } else { 2 }
+                } else {
+                    1
+                })?),
                 operation: 4,
                 store: false,
             },
@@ -1593,17 +1710,24 @@ impl Instruction {
                 dword = opcode >= 0xB8;
                 Operation::Move {
                     target: Target::Register(opcode & 7),
-                    source: Value::Immediate(r.immediate(dword)?),
+                    source: Value::Immediate(r.immediate_width(if dword {
+                        if operand32 { 4 } else { 2 }
+                    } else {
+                        1
+                    })?),
                 }
             }
-            0x70..=0x7F | 0xEB => Operation::Branch {
-                condition: if opcode == 0xEB {
-                    None
-                } else {
-                    Some(opcode & 15)
-                },
-                displacement: i32::from(r.byte()? as i8),
-            },
+            0x70..=0x7F | 0xEB => {
+                branch32 = code32;
+                Operation::Branch {
+                    condition: if opcode == 0xEB {
+                        None
+                    } else {
+                        Some(opcode & 15)
+                    },
+                    displacement: i32::from(r.byte()? as i8),
+                }
+            }
             0x0F => {
                 let second = r.byte()?;
                 if matches!(second, 0xB6 | 0xB7 | 0xBE | 0xBF) {
@@ -1615,39 +1739,66 @@ impl Instruction {
                         word: second & 1 != 0,
                         signed: second & 8 != 0,
                     }
+                } else if matches!(second, 0xA4 | 0xA5 | 0xAC | 0xAD) {
+                    let modrm = r.byte()?;
+                    let target = r.target(modrm, address32, segment)?;
+                    let count = if second & 1 == 0 {
+                        Some(r.byte()?)
+                    } else {
+                        None
+                    };
+                    // Undefined word counts retain the reference error and its exact IP.
+                    if !operand32 && count.is_some_and(|c| c & 31 > 16) {
+                        return None;
+                    }
+                    dword = true;
+                    Operation::DoubleShift {
+                        target,
+                        register: (modrm >> 3) & 7,
+                        right: second & 8 != 0,
+                        count,
+                    }
                 } else if (0x80..=0x8F).contains(&second) {
                     Operation::Branch {
                         condition: Some(second & 15),
-                        displacement: r.dword()? as i32,
+                        displacement: r.immediate_width(if operand32 { 4 } else { 2 })? as i32,
                     }
                 } else {
                     return None;
                 }
             }
-            0xE0..=0xE3 => Operation::Loop {
-                kind: opcode & 3,
-                displacement: i32::from(r.byte()? as i8),
-                address32,
-            },
+            0xE0..=0xE3 => {
+                branch32 = code32;
+                Operation::Loop {
+                    kind: opcode & 3,
+                    displacement: i32::from(r.byte()? as i8),
+                    address32,
+                }
+            }
             0x98 | 0x99 => {
                 dword = true;
                 Operation::Extend {
                     cdq: opcode == 0x99,
                 }
             }
-            0xE8 => Operation::Call(r.dword()? as i32),
+            0xE8 => Operation::Call(r.immediate_width(if operand32 { 4 } else { 2 })? as i32),
             0xE9 => Operation::Branch {
                 condition: None,
-                displacement: r.dword()? as i32,
+                displacement: r.immediate_width(if operand32 { 4 } else { 2 })? as i32,
             },
             0xC2 => Operation::Return(r.word()?),
             0xC3 => Operation::Return(0),
-            0xFF => {
+            0xFE | 0xFF => {
                 let modrm = r.byte()?;
                 let target = r.target(modrm, address32, segment)?;
                 match (modrm >> 3) & 7 {
-                    2 => Operation::CallIndirect(Value::Operand(target)),
-                    6 => Operation::Push(Value::Operand(target)),
+                    op @ 0..=1 => Operation::IncTarget {
+                        target,
+                        decrement: op == 1,
+                    },
+                    4 if opcode == 0xFF => Operation::JumpIndirect(Value::Operand(target)),
+                    2 if opcode == 0xFF => Operation::CallIndirect(Value::Operand(target)),
+                    6 if opcode == 0xFF => Operation::Push(Value::Operand(target)),
                     _ => return None,
                 }
             }
@@ -1659,7 +1810,11 @@ impl Instruction {
                         read_length = Some(r.position as u8);
                         Operation::Alu {
                             target,
-                            source: Value::Immediate(r.immediate(dword)?),
+                            source: Value::Immediate(r.immediate_width(if dword {
+                                if operand32 { 4 } else { 2 }
+                            } else {
+                                1
+                            })?),
                             operation: 4,
                             store: false,
                         }
@@ -1668,7 +1823,9 @@ impl Instruction {
                         target,
                         negate: modrm & 0x38 == 0x18,
                     },
-                    operation @ 4..=7 => Operation::MulDiv { target, operation },
+                    operation @ 4..=7 if !dword || operand32 => {
+                        Operation::MulDiv { target, operation }
+                    }
                     _ => return None,
                 }
             }
@@ -1679,10 +1836,30 @@ impl Instruction {
         if r.position > 15 {
             return None;
         }
+        if matches!(
+            operation,
+            Operation::Push(_)
+                | Operation::Pop(_)
+                | Operation::Call(_)
+                | Operation::CallIndirect(_)
+                | Operation::JumpIndirect(_)
+                | Operation::Return(_)
+                | Operation::MoveExtend { .. }
+                | Operation::Extend { .. }
+        ) {
+            dword = true;
+        }
+        let width = if dword {
+            if operand32 { 4 } else { 2 }
+        } else {
+            1
+        };
         Some(Self {
             length: r.position as u8,
             read_length: read_length.unwrap_or(r.position as u8),
-            dword,
+            dword: width == 4,
+            width,
+            branch32,
             operation,
         })
     }
@@ -1701,6 +1878,9 @@ pub(super) fn native_instruction(
 ) -> Option<doslet_x86_jit::Instruction> {
     use doslet_x86_jit::{Instruction as Native, Operation as Op, Source};
     let i = Instruction::decode(bytes)?;
+    if i.width == 2 || !i.branch32 {
+        return None;
+    }
     // Branches have no byte/dword data operand. For short Jcc the decoder's
     // generic width bit follows opcode bit 0, so both values must be accepted.
     // The shared decoder has already rejected operand-size override 66h.
@@ -1767,6 +1947,12 @@ impl Cpu {
         bus: &mut B,
     ) -> Option<Result<StepOutcome, CpuError>> {
         let instruction = self.decode_cache.instruction(&self.registers, bus)?;
+        if let Operation::DoubleShift { count, .. } = instruction.operation
+            && instruction.width == 2
+            && count.unwrap_or(self.registers.get_byte(1)) & 31 > 16
+        {
+            return None;
+        }
         Some(self.execute_cached(bus, instruction))
     }
     fn execute_cached<B: CpuBus>(
@@ -1778,16 +1964,25 @@ impl Cpu {
         let next = ip.wrapping_add(u32::from(instruction.length));
         self.registers.ip = ip.wrapping_add(u32::from(instruction.read_length));
         let dword = instruction.dword;
+        let width = instruction.width;
+        let jump = |displacement: i32| {
+            let target = next.wrapping_add_signed(displacement);
+            if instruction.branch32 {
+                target
+            } else {
+                u32::from(target as u16)
+            }
+        };
         match instruction.operation {
             Operation::Move { target, source } => {
-                let value = source.read(self, bus, dword)?;
-                write(target.resolve(&self.registers), self, bus, dword, value)?;
+                let value = source.read(self, bus, width)?;
+                write_width(target.resolve(&self.registers), self, bus, width, value)?;
             }
             Operation::Lea { register, target } => {
                 let Operand::Memory { offset, .. } = target.resolve(&self.registers) else {
                     unreachable!()
                 };
-                self.registers.set32(Gpr32::decode(register), offset);
+                write_width(Operand::Register(register), self, bus, width, offset)?;
             }
             Operation::Alu {
                 target,
@@ -1796,84 +1991,154 @@ impl Cpu {
                 store,
             } => {
                 let target = target.resolve(&self.registers);
-                let left = read(target, self, bus, dword)?;
+                let left = read_width(target, self, bus, width)?;
                 self.registers.ip = next;
-                let right = source.read(self, bus, dword)?;
-                let (value, new_flags) = if dword {
-                    flags::alu32(self.flags, left, right, operation)
-                } else {
-                    let (value, flags) =
-                        flags::alu(self.flags, left as u16, right as u16, operation, false);
-                    (u32::from(value), flags)
-                };
+                let right = source.read(self, bus, width)?;
+                let (value, new_flags) = alu_width(self.flags, left, right, operation, width);
                 self.flags = new_flags;
                 if store {
-                    write(target, self, bus, dword, value)?;
+                    write_width(target, self, bus, width, value)?;
                 }
             }
             Operation::Exchange { target, register } => {
                 let target = target.resolve(&self.registers);
                 let source = Operand::Register(register);
-                let left = read(target, self, bus, dword)?;
-                let right = read(source, self, bus, dword)?;
-                write(target, self, bus, dword, right)?;
-                write(source, self, bus, dword, left)?;
+                let left = read_width(target, self, bus, width)?;
+                let right = read_width(source, self, bus, width)?;
+                write_width(target, self, bus, width, right)?;
+                write_width(source, self, bus, width, left)?;
             }
             Operation::Inc {
                 register,
                 decrement,
             } => {
-                let register = Gpr32::decode(register);
-                let (value, next_flags) = flags::alu32(
-                    self.flags,
-                    self.registers.get32(register),
-                    1,
-                    if decrement { 5 } else { 0 },
-                );
-                self.flags = (next_flags & !flags::CARRY) | (self.flags & flags::CARRY);
-                self.registers.set32(register, value);
+                self.cached_inc(bus, Operand::Register(register), decrement, width)?;
+            }
+            Operation::IncTarget { target, decrement } => {
+                self.cached_inc(bus, target.resolve(&self.registers), decrement, width)?;
+            }
+            Operation::Shift {
+                target,
+                operation,
+                count,
+            } => {
+                self.cached_shift(
+                    bus,
+                    target.resolve(&self.registers),
+                    operation,
+                    count.unwrap_or(self.registers.get_byte(1)) & 31,
+                    width,
+                )?;
+            }
+            Operation::DoubleShift {
+                target,
+                register,
+                right,
+                count,
+            } => {
+                let count = count.unwrap_or(self.registers.get_byte(1)) & 31;
+                if count != 0 {
+                    let target = target.resolve(&self.registers);
+                    let original = read_width(target, self, bus, width)?;
+                    let source = read_width(Operand::Register(register), self, bus, width)?;
+                    let bits = width * 8;
+                    let mask = if width == 4 { u32::MAX } else { 0xFFFF };
+                    let (value, carry) = if right {
+                        (
+                            (((u64::from(source) << bits) | u64::from(original)) >> count) as u32
+                                & mask,
+                            (original >> (count - 1)) & 1,
+                        )
+                    } else {
+                        (
+                            ((((u64::from(original) << bits) | u64::from(source)) << count) >> bits)
+                                as u32
+                                & mask,
+                            (original >> (bits - count)) & 1,
+                        )
+                    };
+                    let mut updated = alu_width(self.flags, value, 0, 1, width).1;
+                    updated = (updated & !(flags::CARRY | flags::AUXILIARY | flags::OVERFLOW))
+                        | carry
+                        | (self.flags & (flags::AUXILIARY | flags::OVERFLOW));
+                    if count == 1 {
+                        updated = (updated & !flags::OVERFLOW)
+                            | if (original ^ value) & (1 << (bits - 1)) != 0 {
+                                flags::OVERFLOW
+                            } else {
+                                0
+                            };
+                    }
+                    write_width(target, self, bus, width, value)?;
+                    self.flags = updated;
+                }
             }
             Operation::Unary { target, negate } => {
                 let target = target.resolve(&self.registers);
-                let value = read(target, self, bus, true)?;
+                let value = read_width(target, self, bus, width)?;
                 let value = if negate {
-                    let (value, new_flags) = flags::alu32(self.flags, 0, value, 5);
+                    let (value, new_flags) = alu_width(self.flags, 0, value, 5, width);
                     self.flags = new_flags;
                     value
                 } else {
                     !value
                 };
-                write(target, self, bus, true, value)?;
+                write_width(target, self, bus, width, value)?;
             }
             Operation::Push(value) => {
-                let value = value.read(self, bus, true)?;
-                self.push32(bus, value)?;
+                let value = value.read(self, bus, width)?;
+                if dword {
+                    self.push32(bus, value)?;
+                } else {
+                    self.push(bus, value as u16)?;
+                }
             }
             Operation::Pop(register) => {
-                let value = self.pop32(bus)?;
-                self.registers.set32(Gpr32::decode(register), value);
+                let value = if dword {
+                    self.pop32(bus)?
+                } else {
+                    u32::from(self.pop(bus)?)
+                };
+                write_width(Operand::Register(register), self, bus, width, value)?;
             }
             Operation::Branch {
                 condition,
                 displacement,
             } => {
                 if condition.is_none_or(|condition| flags::condition(self.flags, condition)) {
-                    self.near_jump(next.wrapping_add_signed(displacement))?;
+                    self.near_jump(jump(displacement))?;
                 }
             }
             Operation::Call(displacement) => {
-                self.near_jump(next.wrapping_add_signed(displacement))?;
-                self.push32(bus, next)?;
+                if dword {
+                    self.near_jump(jump(displacement))?;
+                    self.push32(bus, next)?;
+                } else {
+                    self.push(bus, next as u16)?;
+                    self.near_jump(jump(displacement))?;
+                }
+            }
+            Operation::JumpIndirect(target) => {
+                let target = target.read(self, bus, width)?;
+                self.near_jump(target)?;
             }
             Operation::CallIndirect(target) => {
                 // FF /2 reads the target before pushing, and validates the
                 // destination after the push, matching the reference's faults.
-                let target = target.read(self, bus, true)?;
-                self.push32(bus, next)?;
+                let target = target.read(self, bus, width)?;
+                if dword {
+                    self.push32(bus, next)?;
+                } else {
+                    self.push(bus, next as u16)?;
+                }
                 self.near_jump(target)?;
             }
             Operation::Return(release) => {
-                let target = self.pop32(bus)?;
+                let target = if dword {
+                    self.pop32(bus)?
+                } else {
+                    u32::from(self.pop(bus)?)
+                };
                 self.near_jump(target)?;
                 self.adjust_stack(u32::from(release));
             }
@@ -1900,7 +2165,7 @@ impl Cpu {
                     count != 0 && (kind == 2 || (self.flags & flags::ZERO != 0) == (kind == 1))
                 };
                 if take {
-                    self.near_jump(next.wrapping_add_signed(displacement))?;
+                    self.near_jump(jump(displacement))?;
                 }
             }
             Operation::String {
@@ -1960,12 +2225,26 @@ impl Cpu {
             }
             Operation::MulDiv { target, operation } => {
                 self.registers.ip = next;
-                let value = read(target.resolve(&self.registers), self, bus, dword)?;
+                let value = read_width(target.resolve(&self.registers), self, bus, width)?;
                 self.multiply_divide(operation, value, dword, ip)?;
             }
             Operation::Extend { cdq } => {
                 self.registers.ip = next;
-                if cdq {
+                if !dword {
+                    if cdq {
+                        self.registers.set(
+                            Gpr16::Dx,
+                            if self.registers.get(Gpr16::Ax) & 0x8000 != 0 {
+                                u16::MAX
+                            } else {
+                                0
+                            },
+                        );
+                    } else {
+                        self.registers
+                            .set(Gpr16::Ax, self.registers.get_byte(0) as i8 as i16 as u16);
+                    }
+                } else if cdq {
                     let sign = self.registers.get32(Gpr32::Eax) & 0x8000_0000 != 0;
                     self.registers
                         .set32(Gpr32::Edx, if sign { u32::MAX } else { 0 });
@@ -1989,11 +2268,86 @@ impl Cpu {
                     (true, false) => value as u8 as i8 as i32 as u32,
                     _ => u32::from(value),
                 };
-                self.registers.set32(Gpr32::decode(register), value);
+                write_width(Operand::Register(register), self, bus, width, value)?;
             }
             Operation::Unsupported => unreachable!("lookups return None for rejections"),
         }
         Ok(StepOutcome::Continue)
+    }
+
+    fn cached_inc<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        target: Operand,
+        decrement: bool,
+        width: u8,
+    ) -> Result<(), CpuError> {
+        let value = read_width(target, self, bus, width)?;
+        let (value, updated) =
+            alu_width(self.flags, value, 1, if decrement { 5 } else { 0 }, width);
+        self.flags = (updated & !flags::CARRY) | (self.flags & flags::CARRY);
+        write_width(target, self, bus, width, value)
+    }
+
+    fn cached_shift<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        target: Operand,
+        operation: u8,
+        count: u8,
+        width: u8,
+    ) -> Result<(), CpuError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let bits = width * 8;
+        let sign = 1 << (bits - 1);
+        let mask = u32::MAX >> (32 - bits);
+        let original = read_width(target, self, bus, width)?;
+        let mut value = original;
+        let mut carry = self.flags & flags::CARRY != 0;
+        for _ in 0..count {
+            let old_carry = carry;
+            if matches!(operation, 0 | 2 | 4 | 6) {
+                carry = value & sign != 0;
+                value = (value << 1) & mask;
+                if operation == 0 {
+                    value |= u32::from(carry);
+                }
+                if operation == 2 {
+                    value |= u32::from(old_carry);
+                }
+            } else {
+                carry = value & 1 != 0;
+                let high = value & sign;
+                value >>= 1;
+                if operation == 1 {
+                    value |= u32::from(carry) << (bits - 1);
+                }
+                if operation == 3 {
+                    value |= u32::from(old_carry) << (bits - 1);
+                }
+                if operation == 7 {
+                    value |= high;
+                }
+            }
+        }
+        if operation >= 4 {
+            self.flags =
+                alu_width(self.flags, value, 0, 1, width).1 | (self.flags & flags::OVERFLOW);
+        }
+        self.flags = (self.flags & !flags::CARRY) | u32::from(carry);
+        if count == 1 {
+            let overflow = match operation {
+                0 | 2 | 4 | 6 => (value & sign != 0) != carry,
+                1 | 3 => ((value >> (bits - 1)) ^ (value >> (bits - 2))) & 1 != 0,
+                5 => original & sign != 0,
+                _ => false,
+            };
+            self.flags =
+                (self.flags & !flags::OVERFLOW) | if overflow { flags::OVERFLOW } else { 0 };
+        }
+        write_width(target, self, bus, width, value)
     }
 
     /// F6/F7 /4-/7 on AL/AX or EAX, as the byte and dword reference paths.
