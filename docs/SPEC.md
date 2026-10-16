@@ -312,8 +312,18 @@ and CS windows are resolved once per slice, because batched instructions cannot
 load segment registers. Each instruction validates every operand, stack slot and
 branch target as plain RAM or a valid CS offset before its first effect, then
 performs the accesses at those linear addresses; a failed check ends the slice
-before that instruction and the original interpreter handles it. A divide error
-leaves only IP changed, which the slice restores before handing over.
+before that instruction and the original interpreter handles it. Decoding also
+prepares 16-byte block operands and a dense code selecting a const-generic
+handler for the concrete bus. MOV and ALU/CMP/TEST register/immediate/memory
+forms, register/memory INC/DEC, LEA, register PUSH/POP, relative near CALL/JMP/Jcc,
+RET, shifts/rotates by immediate/CL and decoded MOVZX/MOVSX forms specialize
+width and 16/32-bit effective addressing at compile time. Shared arithmetic,
+shift and extension helpers preserve cached execution semantics. Rare forms
+use a separate setup-allocated decoded array and the existing batch validator.
+Native slices use the same representation, with native eligibility recorded
+at decode; both native decoders retain their word/non-32-bit-branch exclusions.
+Step counts, code validation, slice limits and IRQ/timing boundaries are unchanged.
+A divide error leaves only IP changed, which the slice restores before handing over.
 
 Discovery and native execution allocate nothing. Explicit host preparation between
 batches may allocate and request executable memory through `doslet-x86-jit`, the

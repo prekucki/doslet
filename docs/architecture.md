@@ -369,6 +369,31 @@ stores into the block's pages return to lookup. A block that cannot start is
 remembered as a rejection. The native core's slices use the same blocks and try
 a native block before each candidate instruction.
 
+Block entries use a 16-byte prepared instruction: a dense handler code, byte
+length, native eligibility bit, register operands, immediate and one packed
+16/32-bit effective-address expression. Decode selects const-generic handlers
+for MOV and ALU/CMP/TEST across register/register, register/immediate,
+register/memory, memory/register and memory/immediate forms; register/memory
+INC/DEC; LEA; register PUSH/POP; relative near CALL/JMP/Jcc, RET/RET imm16;
+byte/word/dword shifts/rotates with immediate/CL counts; and the decoded
+MOVZX/MOVSX forms. Unencodable forms are not added to the decoder.
+Widths and effective-address sizes are compile-time handler parameters. The
+handler code indexes a compiler-owned constant function table monomorphized
+for the concrete bus, without trait-object bus calls. Native eligibility is
+computed by the existing predicate during preparation; native decoders still
+reject word operands and non-32-bit branches.
+
+Rare forms retain `try_batched` and decoded `Instruction` in a separate fixed
+cold array, indexed by block slot and position. Only those steps copy the full
+IR. Both arrays are allocated at CPU setup. On x86-64, a hot block occupies
+168 bytes instead of 328; the separate cold array costs 1152 KiB, increasing
+total block storage by 512 KiB while reducing the frequently accessed table
+from 1312 to 672 KiB. No execution-time allocation or guest-buffer copy is
+introduced. ALU, increment, shift and sign/zero-extension calculations are
+shared with `execute_cached`; ordinary bus reads/writes retain page generations
+and idle-proof tracking. See [the Linux measurement report](compatibility/interpreter-handlers.md)
+for validation, workload boundaries and host-specific results.
+
 The CPU owns hidden segment caches, descriptor-table state and optional x87
 state. Its decoder selects 16/32-bit addressing and validates cache permissions
 before emitting linear bus addresses. The independent `doslet-x87` crate owns
