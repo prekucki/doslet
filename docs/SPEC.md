@@ -239,11 +239,14 @@ resolved against current registers. Implemented cached forms include byte/dword
 MOV and ALU/CMP/TEST (also word forms), register and memory INC/DEC,
 byte/word/dword shifts and rotates, SHLD/SHRD, LEA, XCHG, NEG/NOT, selected word/dword stack
 operations, short/near relative jumps and conditional jumps, LOOP/LOOPE/LOOPNE/JECXZ,
-near CALL/RET and indirect JMP, byte IN/OUT through DX, byte/dword MUL/IMUL/DIV/IDIV of the
-accumulator, CWDE/CDQ, MOVZX/MOVSX into dword registers and byte/word/dword
-MOVS/STOS/LODS with or without REP. A repeated string still performs one
-iteration per step. Word MUL/DIV, other unsupported instructions and buses
-without the optional code contract use the original interpreter. A decoder
+near CALL/RET and indirect JMP, byte IN/OUT through DX, byte/word/dword
+MUL/IMUL/DIV/IDIV of the accumulator, CWDE/CDQ, MOVZX/MOVSX into dword registers,
+byte/word/dword MOVS/STOS/LODS with or without REP, MOV r/m from a segment
+register, PUSH of ES/CS/SS/DS/FS/GS, POP r/m, LEAVE, ENTER with nesting level 0
+and BT/BTS/BTR/BTC with an immediate bit. A repeated string still performs one
+iteration per step. Segment-register loads, far transfers, other unsupported
+instructions and buses without the optional code contract use the original
+interpreter. A decoder
 rejection is remembered against the same code check, so the original interpreter
 runs without another decode attempt until those bytes change.
 Both paths consume one scheduling step and preserve the existing IRQ boundaries.

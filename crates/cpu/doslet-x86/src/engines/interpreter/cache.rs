@@ -674,6 +674,25 @@ enum Operation {
         word: bool,
         signed: bool,
     },
+    /// MOV r/m, Sreg (8C): a full-width register or a word in memory.
+    StoreSegment {
+        target: Target,
+        segment: SegmentRegister,
+    },
+    /// PUSH ES/CS/SS/DS/FS/GS, zero-extended to the operand width.
+    PushSegment(SegmentRegister),
+    /// POP r/m (8F /0); the address uses the registers before the pop.
+    PopTarget(Target),
+    /// LEAVE (C9).
+    Leave,
+    /// ENTER imm16, 0 (C8); other nesting levels use the reference path.
+    Enter(u16),
+    /// BT/BTS/BTR/BTC r/m, imm8 (0F BA /4-/7).
+    BitTest {
+        target: Target,
+        operation: u8,
+        bit: u8,
+    },
     /// A remembered decoder rejection; never executed from the cache.
     Unsupported,
 }
@@ -1379,6 +1398,63 @@ impl Cpu {
                 }
                 return self.delegate_batched(bus, i);
             }
+            Operation::StoreSegment { target, .. } => {
+                if matches!(target, Target::Memory { .. })
+                    && windows.place(r, bus, target, 2, Access::Write).is_none()
+                {
+                    return false;
+                }
+                return self.delegate_batched(bus, i);
+            }
+            Operation::PushSegment(_) | Operation::Enter(_) => {
+                if push_address(windows, bus).is_none() {
+                    return false;
+                }
+                return self.delegate_batched(bus, i);
+            }
+            Operation::PopTarget(target) => {
+                let sp = self.stack_pointer();
+                if windows
+                    .linear(r, bus, SegmentRegister::Ss, sp, length, Access::Read)
+                    .is_none()
+                    || windows
+                        .place(r, bus, target, length, Access::Write)
+                        .is_none()
+                {
+                    return false;
+                }
+                return self.delegate_batched(bus, i);
+            }
+            Operation::Leave => {
+                let ebp = r.get32(Gpr32::Ebp);
+                let sp = if r.stack32() {
+                    ebp
+                } else {
+                    u32::from(ebp as u16)
+                };
+                if windows
+                    .linear(r, bus, SegmentRegister::Ss, sp, length, Access::Read)
+                    .is_none()
+                {
+                    return false;
+                }
+                return self.delegate_batched(bus, i);
+            }
+            Operation::BitTest {
+                target, operation, ..
+            } => {
+                if windows
+                    .place(r, bus, target, length, Access::Read)
+                    .is_none()
+                    || (operation != 4
+                        && windows
+                            .place(r, bus, target, length, Access::Write)
+                            .is_none())
+                {
+                    return false;
+                }
+                return self.delegate_batched(bus, i);
+            }
             Operation::Input | Operation::Output | Operation::Unsupported => return false,
         }
         self.registers.ip = next;
@@ -1865,9 +1941,75 @@ impl Instruction {
                         condition: Some(second & 15),
                         displacement: r.immediate_width(if operand32 { 4 } else { 2 })? as i32,
                     }
+                } else if matches!(second, 0xA0 | 0xA8) {
+                    dword = true;
+                    Operation::PushSegment(if second == 0xA0 {
+                        SegmentRegister::Fs
+                    } else {
+                        SegmentRegister::Gs
+                    })
+                } else if second == 0xBA {
+                    let modrm = r.byte()?;
+                    let target = r.target(modrm, address32, segment)?;
+                    let operation = (modrm >> 3) & 7;
+                    if operation < 4 {
+                        return None;
+                    }
+                    dword = true;
+                    Operation::BitTest {
+                        target,
+                        operation,
+                        bit: r.byte()?,
+                    }
                 } else {
                     return None;
                 }
+            }
+            0x8C | 0x8F => {
+                let modrm = r.byte()?;
+                let target = r.target(modrm, address32, segment)?;
+                let register = (modrm >> 3) & 7;
+                dword = true;
+                if opcode == 0x8F {
+                    if register != 0 {
+                        return None;
+                    }
+                    Operation::PopTarget(target)
+                } else {
+                    Operation::StoreSegment {
+                        target,
+                        segment: match register {
+                            0 => SegmentRegister::Es,
+                            1 => SegmentRegister::Cs,
+                            2 => SegmentRegister::Ss,
+                            3 => SegmentRegister::Ds,
+                            4 => SegmentRegister::Fs,
+                            5 => SegmentRegister::Gs,
+                            _ => return None,
+                        },
+                    }
+                }
+            }
+            0x06 | 0x0E | 0x16 | 0x1E => {
+                dword = true;
+                Operation::PushSegment(match opcode {
+                    0x06 => SegmentRegister::Es,
+                    0x0E => SegmentRegister::Cs,
+                    0x16 => SegmentRegister::Ss,
+                    _ => SegmentRegister::Ds,
+                })
+            }
+            0xC9 => {
+                dword = true;
+                Operation::Leave
+            }
+            0xC8 => {
+                let allocation = r.word()?;
+                if r.byte()? & 31 != 0 {
+                    return None;
+                }
+                dword = true;
+                Operation::Enter(allocation)
             }
             0xE0..=0xE3 => {
                 branch32 = code32;
@@ -1925,9 +2067,7 @@ impl Instruction {
                         target,
                         negate: modrm & 0x38 == 0x18,
                     },
-                    operation @ 4..=7 if !dword || operand32 => {
-                        Operation::MulDiv { target, operation }
-                    }
+                    operation @ 4..=7 => Operation::MulDiv { target, operation },
                     _ => return None,
                 }
             }
@@ -2328,7 +2468,7 @@ impl Cpu {
             Operation::MulDiv { target, operation } => {
                 self.registers.ip = next;
                 let value = read_width(target.resolve(&self.registers), self, bus, width)?;
-                self.multiply_divide(operation, value, dword, ip)?;
+                self.multiply_divide(operation, value, width, ip)?;
             }
             Operation::Extend { cdq } => {
                 self.registers.ip = next;
@@ -2367,6 +2507,89 @@ impl Cpu {
                     .read(&self.registers, bus, word)?;
                 let value = extend_result(u32::from(value), word, signed);
                 write_width(Operand::Register(register), self, bus, width, value)?;
+            }
+            Operation::StoreSegment { target, segment } => {
+                self.registers.ip = next;
+                let value = self.registers.selector(segment);
+                let target = target.resolve(&self.registers);
+                if matches!(target, Operand::Register(_)) {
+                    write_width(target, self, bus, width, u32::from(value))?;
+                } else {
+                    target.write(&mut self.registers, bus, true, value)?;
+                }
+            }
+            Operation::PushSegment(segment) => {
+                self.registers.ip = next;
+                let value = self.registers.selector(segment);
+                if dword {
+                    self.push32(bus, u32::from(value))?;
+                } else {
+                    self.push(bus, value)?;
+                }
+            }
+            Operation::PopTarget(target) => {
+                self.registers.ip = next;
+                let target = target.resolve(&self.registers);
+                let value = if dword {
+                    self.pop32(bus)?
+                } else {
+                    u32::from(self.pop(bus)?)
+                };
+                write_width(target, self, bus, width, value)?;
+            }
+            Operation::Leave => {
+                self.registers.ip = next;
+                if dword {
+                    self.set_stack_pointer(self.registers.get32(Gpr32::Ebp));
+                    let value = self.pop32(bus)?;
+                    self.registers.set32(Gpr32::Ebp, value);
+                } else {
+                    self.set_stack_pointer(if self.registers.stack32() {
+                        self.registers.get32(Gpr32::Ebp)
+                    } else {
+                        u32::from(self.registers.get(Gpr16::Bp))
+                    });
+                    let value = self.pop(bus)?;
+                    self.registers.set(Gpr16::Bp, value);
+                }
+            }
+            Operation::Enter(allocation) => {
+                self.registers.ip = next;
+                if dword {
+                    let original = self.registers.get32(Gpr32::Ebp);
+                    self.push32(bus, original)?;
+                    let frame = self.stack_pointer();
+                    self.registers.set32(Gpr32::Ebp, frame);
+                    self.adjust_stack(u32::from(allocation).wrapping_neg());
+                } else {
+                    let original = self.registers.get(Gpr16::Bp);
+                    self.push(bus, original)?;
+                    let frame = self.registers.get(Gpr16::Sp);
+                    self.registers.set(Gpr16::Bp, frame);
+                    self.registers
+                        .set(Gpr16::Sp, frame.wrapping_sub(allocation));
+                }
+            }
+            Operation::BitTest {
+                target,
+                operation,
+                bit,
+            } => {
+                self.registers.ip = next;
+                let target = target.resolve(&self.registers);
+                let bit = bit & if dword { 31 } else { 15 };
+                let value = read_width(target, self, bus, width)?;
+                let mask = 1 << bit;
+                self.flags = (self.flags & !flags::CARRY) | u32::from(value & mask != 0);
+                let value = match operation {
+                    5 => value | mask,
+                    6 => value & !mask,
+                    7 => value ^ mask,
+                    _ => value,
+                };
+                if operation != 4 {
+                    write_width(target, self, bus, width, value)?;
+                }
             }
             Operation::Unsupported => unreachable!("lookups return None for rejections"),
         }
@@ -2408,14 +2631,57 @@ impl Cpu {
         &mut self,
         operation: u8,
         value: u32,
-        dword: bool,
+        width: u8,
         ip: u32,
     ) -> Result<(), CpuError> {
         let divide_error = CpuError::DivideError {
             cs: self.registers.cs,
             ip,
         };
-        if dword {
+        if width == 2 {
+            // The word reference path: DX:AX, as F7 without an operand override.
+            let ax = self.registers.get(Gpr16::Ax);
+            let value = value as u16;
+            if operation < 6 {
+                let product = if operation == 4 {
+                    u32::from(ax) * u32::from(value)
+                } else {
+                    (i32::from(ax as i16) * i32::from(value as i16)) as u32
+                };
+                let overflow = if operation == 4 {
+                    product > 0xFFFF
+                } else {
+                    product as i32 != i32::from(product as i16)
+                };
+                self.registers.set(Gpr16::Ax, product as u16);
+                self.registers.set(Gpr16::Dx, (product >> 16) as u16);
+                self.set_multiply_overflow(overflow);
+                return Ok(());
+            }
+            let raw = (u32::from(self.registers.get(Gpr16::Dx)) << 16) | u32::from(ax);
+            let (dividend, divisor) = if operation == 7 {
+                (i64::from(raw as i32), i64::from(value as i16))
+            } else {
+                (i64::from(raw), i64::from(value))
+            };
+            if divisor == 0 {
+                return Err(divide_error);
+            }
+            let quotient = dividend / divisor;
+            let remainder = dividend % divisor;
+            let range = if operation == 7 {
+                -32768..=32767
+            } else {
+                0..=65535
+            };
+            if !range.contains(&quotient) {
+                return Err(divide_error);
+            }
+            self.registers.set(Gpr16::Ax, quotient as u16);
+            self.registers.set(Gpr16::Dx, remainder as u16);
+            return Ok(());
+        }
+        if width == 4 {
             if operation < 6 {
                 let accumulator = self.registers.get32(Gpr32::Eax);
                 let (product, overflow) = if operation == 4 {

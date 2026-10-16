@@ -1073,6 +1073,102 @@ fn prepared_control_stack_lea_inc_and_extensions_match_both_references() {
     memory(&batch, &cached);
 }
 
+/// Run `program` (ending in CLI) as one batch and as reference steps.
+fn segment_stack_case(program: &[u8], stack32: bool, steps: u32, bx: u32) {
+    let mut batch = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut batch, &mut reference] {
+        if !stack32 {
+            descriptor(&mut m.bus, 24, 0, 0xFFFF, false, false);
+            m.cpu
+                .load_segment(&mut m.bus, SegmentRegister::Ss, 24)
+                .unwrap();
+        }
+        code(m, 0x1000, &[0x90, 0x90]);
+        m.cpu.step(&mut m.bus).unwrap();
+        m.cpu.step(&mut m.bus).unwrap();
+        for offset in 0..0x400 {
+            m.bus
+                .write_u8(0x2F00 + offset, (offset * 7 + 3) as u8)
+                .unwrap();
+            m.bus
+                .write_u8(0x4E00 + offset, (offset * 5 + 1) as u8)
+                .unwrap();
+            m.bus
+                .write_u8(0x5E00 + offset, (offset * 3 + 2) as u8)
+                .unwrap();
+        }
+        code(m, 0x1000, program);
+        m.cpu.registers.set32(Gpr32::Eax, 0x1234_8765);
+        m.cpu.registers.set32(Gpr32::Ebx, bx);
+        m.cpu.registers.set32(Gpr32::Ecx, 0x5555_AAAA);
+        m.cpu.registers.set32(Gpr32::Edx, 0x0000_0002);
+        m.cpu.registers.set32(Gpr32::Ebp, 0x0002_6000);
+        m.cpu.registers.set32(Gpr32::Esp, 0x0001_5000);
+        m.cpu.flags = 0x8C3;
+    }
+    let before = batch.cpu.snapshot();
+    let completed = batch.cpu.interpret_batch(&mut batch.bus, 256, |_| 256);
+    assert_eq!(completed, steps, "{program:02X?} stack32={stack32}");
+    if steps == 0 {
+        assert!(batch.cpu.snapshot() == before);
+        assert!(reference.cpu.step(&mut reference.bus).is_err());
+        return;
+    }
+    for _ in 0..steps {
+        reference.cpu.step(&mut reference.bus).unwrap();
+    }
+    state(&batch, &reference);
+    memory(&batch, &reference);
+}
+
+#[test]
+fn batches_handle_segment_stack_bit_and_word_multiply_forms_like_the_reference() {
+    let cases: &[(&[u8], u32)] = &[
+        (&[0x8C, 0xD8, 0xFA], 1),                   // MOV EAX,DS
+        (&[0x66, 0x8C, 0xC3, 0xFA], 1),             // MOV BX,ES
+        (&[0x8C, 0x1D, 0x00, 0x30, 0, 0, 0xFA], 1), // MOV [3000h],DS
+        (&[0x06, 0x0E, 0x16, 0x1E, 0x0F, 0xA0, 0x0F, 0xA8, 0xFA], 6),
+        (&[0x66, 0x06, 0x66, 0x1E, 0x66, 0x0F, 0xA8, 0xFA], 3),
+        (&[0x8F, 0x05, 0x00, 0x30, 0, 0, 0xFA], 1), // POP [3000h]
+        (&[0x8F, 0xC4, 0xFA], 1),                   // POP ESP
+        (&[0x66, 0x8F, 0xC1, 0xFA], 1),             // POP CX
+        (&[0xC9, 0xFA], 1),
+        (&[0x66, 0xC9, 0xFA], 1),
+        (&[0xC8, 0x10, 0x00, 0x00, 0xFA], 1),
+        (&[0x66, 0xC8, 0x10, 0x01, 0x00, 0xFA], 1),
+        (&[0x0F, 0xBA, 0xE0, 0x05, 0xFA], 1), // BT EAX,5
+        (&[0x0F, 0xBA, 0xE8, 0x25, 0xFA], 1), // BTS EAX,37 (masked)
+        (&[0x0F, 0xBA, 0xF0, 0x03, 0xFA], 1), // BTR EAX,3
+        (&[0x0F, 0xBA, 0xF8, 0x1F, 0xFA], 1), // BTC EAX,31
+        (&[0x0F, 0xBA, 0x2D, 0x00, 0x30, 0, 0, 0x07, 0xFA], 1), // BTS [3000h],7
+        (&[0x66, 0x0F, 0xBA, 0x35, 0x00, 0x30, 0, 0, 0x13, 0xFA], 1), // BTR word,19
+        (&[0x66, 0xF7, 0xE3, 0xFA], 1),       // MUL BX
+        (&[0x66, 0xF7, 0xEB, 0xFA], 1),       // IMUL BX
+        (&[0x66, 0xF7, 0xF3, 0xFA], 1),       // DIV BX
+        (&[0x66, 0xF7, 0xFB, 0xFA], 1),       // IDIV BX
+        (&[0x66, 0xF7, 0x35, 0x00, 0x30, 0, 0, 0xFA], 1), // DIV word [3000h]
+    ];
+    for stack32 in [true, false] {
+        for (program, steps) in cases {
+            segment_stack_case(program, stack32, *steps, 0x0000_0103);
+        }
+    }
+    // ESP-based operands: within the flat 32-bit stack, and beyond the limit
+    // of a 16-bit stack segment, where the reference faults and batches refuse.
+    for (program, steps) in [
+        (&[0x8C, 0x4C, 0x24, 0x02, 0xFA][..], 1), // MOV [ESP+2],CS
+        (&[0x8F, 0x44, 0x24, 0x04, 0xFA], 1),     // POP [ESP+4], pre-pop ESP
+    ] {
+        segment_stack_case(program, true, steps, 0x0000_0103);
+        segment_stack_case(program, false, 0, 0x0000_0103);
+    }
+    // Word DIV by zero and quotient overflow refuse without any effect.
+    segment_stack_case(&[0x66, 0xF7, 0xF3, 0xFA], true, 0, 0);
+    segment_stack_case(&[0x66, 0xF7, 0xF3, 0xFA], true, 0, 1);
+    segment_stack_case(&[0x66, 0xF7, 0xFB, 0xFA], true, 0, 0xFFFF);
+}
+
 #[test]
 fn batches_access_vga_memory_like_the_reference() {
     for bank in [0u16, 3] {
