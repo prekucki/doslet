@@ -18,12 +18,20 @@ const PROOF_STEPS: u32 = 4096;
 /// Steps between attempts at arbitrary points, doubling after each failure.
 const BACKOFF_MIN: u64 = 20_000;
 const BACKOFF_MAX: u64 = 2_000_000;
+/// A skip at least this long shows that proofs pay for themselves here.
+/// Device events such as digital-audio samples can bound every skip to a few
+/// hundred steps; then a successful proof must not reset the backoff.
+const USEFUL_SKIP: u32 = 4096;
 
 /// Counters for diagnostics; they do not affect guest state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IdleLoopStats {
     pub proofs: u64,
     pub failures: u64,
+    /// Failures by what started the proof: a known loop head, an empty
+    /// input poll, or the periodic backoff.
+    pub head_failures: u64,
+    pub poll_failures: u64,
     pub skips: u64,
     pub skipped_steps: u64,
     pub last_failure: &'static str,
@@ -43,6 +51,8 @@ struct InputState {
 struct Proof {
     /// Started at the last proven loop head rather than an arbitrary point.
     at_head: bool,
+    /// Started right after an empty keyboard or mouse poll.
+    from_poll: bool,
     cpu: CpuSnapshot,
     input: InputState,
     mark: IdleProofMark,
@@ -67,6 +77,11 @@ pub(super) struct IdleLoops {
     head: Option<(u16, u32)>,
     next_attempt: u64,
     backoff: u64,
+    /// Polls in loops too long or busy to prove must not retry each frame:
+    /// poll-triggered attempts have their own backoff.
+    poll_attempt: u64,
+    poll_backoff: u64,
+    poll_pending: bool,
     pub(super) stats: IdleLoopStats,
 }
 
@@ -79,6 +94,9 @@ impl Default for IdleLoops {
             head: None,
             next_attempt: 0,
             backoff: BACKOFF_MIN,
+            poll_attempt: 0,
+            poll_backoff: BACKOFF_MIN,
+            poll_pending: false,
             stats: IdleLoopStats::default(),
         }
     }
@@ -98,8 +116,8 @@ impl IdleLoops {
 
     /// A keyboard or mouse query found nothing: the caller probably waits.
     pub(super) fn note_poll(&mut self, now: u64) {
-        if self.proof.is_none() && self.backoff < BACKOFF_MAX {
-            self.next_attempt = self.next_attempt.min(now);
+        if self.proof.is_none() && now >= self.poll_attempt {
+            self.poll_pending = true;
         }
     }
 }
@@ -161,6 +179,19 @@ impl Session {
         if self.idle.proof.as_ref().is_some_and(|proof| proof.at_head) {
             self.idle.head = None;
         }
+        if let Some(proof) = &self.idle.proof {
+            self.idle.stats.head_failures += u64::from(proof.at_head);
+            self.idle.stats.poll_failures += u64::from(proof.from_poll);
+        }
+        if self
+            .idle
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.from_poll)
+        {
+            self.idle.poll_attempt = now + self.idle.poll_backoff;
+            self.idle.poll_backoff = (self.idle.poll_backoff * 2).min(BACKOFF_MAX);
+        }
         self.idle_abandon();
         self.idle.stats.failures += 1;
         self.idle.stats.last_failure = reason;
@@ -189,6 +220,9 @@ impl Session {
                 {
                     let skipped = self.machine.skip_idle_passes(proven.pass, budget)?;
                     if skipped != 0 {
+                        if skipped >= USEFUL_SKIP {
+                            self.idle.backoff = BACKOFF_MIN;
+                        }
                         self.idle.stats.skips += 1;
                         self.idle.stats.skipped_steps += u64::from(skipped);
                         return Ok(Some(skipped));
@@ -197,12 +231,13 @@ impl Session {
                 // The next pass crosses an event or follows a change: prove it
                 // again as it runs instead of executing it unobserved.
                 self.idle.proven = None;
-                self.idle_start(true);
+                self.idle_start(true, false);
             } else {
                 let r = &self.machine.cpu.registers;
                 let at_head = self.idle.head == Some((r.cs, r.ip));
-                if at_head || now >= self.idle.next_attempt {
-                    self.idle_start(at_head);
+                let from_poll = core::mem::take(&mut self.idle.poll_pending);
+                if at_head || from_poll || now >= self.idle.next_attempt {
+                    self.idle_start(at_head, from_poll);
                 }
             }
         }
@@ -235,10 +270,15 @@ impl Session {
                     device_accesses: self.machine.device_accesses(),
                 });
                 self.idle.stats.proofs += 1;
-                self.idle.backoff = BACKOFF_MIN;
-                self.idle.next_attempt = now + BACKOFF_MIN;
+                if proof.from_poll {
+                    self.idle.poll_backoff = BACKOFF_MIN;
+                }
+                self.idle.next_attempt = now + self.idle.backoff;
                 None
             } else {
+                // Keep the proof so the failure applies to its trigger; the
+                // write log has already ended and ending it again is a no-op.
+                self.idle.proof = Some(proof);
                 Some("changed")
             }
         } else if proof.steps >= PROOF_STEPS {
@@ -252,12 +292,13 @@ impl Session {
         Ok(Some(consumed))
     }
 
-    fn idle_start(&mut self, at_head: bool) {
+    fn idle_start(&mut self, at_head: bool, from_poll: bool) {
         if self.machine.interrupt_pending() || self.machine.cpu.is_halted() {
             return;
         }
         self.idle.proof = Some(Proof {
             at_head,
+            from_poll,
             cpu: self.machine.cpu.snapshot(),
             input: self.input_state(),
             mark: self.machine.begin_idle_proof(),
