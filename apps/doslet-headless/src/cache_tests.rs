@@ -99,7 +99,18 @@ fn compare_local_prince(dynamic: bool) {
         assert_eq!(count, reference.drain_pcm(&mut pcm_b));
         assert_eq!(&pcm_a[..count], &pcm_b[..count]);
         #[cfg(feature = "profiling")]
-        assert_eq!(cached.execution_stats(), reference.execution_stats());
+        {
+            let a = cached.execution_stats();
+            let b = reference.execution_stats();
+            // VGA recognition may combine different numbers of equivalent
+            // polling iterations at single-step versus slice boundaries.
+            // Dispatched port reads and acceleration counters describe that
+            // implementation work, not architectural guest progress.
+            assert_eq!(
+                (a.cpu_steps, a.idle_steps, a.irq_entries),
+                (b.cpu_steps, b.idle_steps, b.irq_entries),
+            );
+        }
         if batches % 1024 == 0 {
             compare_buffers(&cached, &reference);
         }
@@ -112,7 +123,7 @@ fn compare_local_prince(dynamic: bool) {
     {
         let stats = cached.decode_cache_stats();
         if !dynamic {
-            assert!(stats.hits > 100_000_000);
+            assert!(stats.hits + stats.batched_steps > 100_000_000);
         }
         println!("{stats:?}");
     }

@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let path = args
         .first()
-        .ok_or("usage: bench_interpreter_game EXE STEPS [ISO] [reference]")?;
+        .ok_or("usage: bench_interpreter_game EXE STEPS [ISO|-] [reference|cached] [KEYS]")?;
     let steps: u64 = args.get(1).ok_or("missing STEPS")?.parse()?;
     let settings = native_input::LaunchSettings {
         hardware: doslet_config::HardwareConfig {
@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         session.set_decode_cache(false);
     }
     session.start();
+    let mut keys = args.get(4).map_or("", String::as_str).bytes();
     let mut midi = [0; 4096];
     let mut pcm = [[0; 2]; 4096];
     let mut midi_hash = 0xcbf29ce484222325_u64;
@@ -51,6 +52,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         while session.drain_pcm(&mut pcm) != 0 {}
+        if session.waiting_for_key() {
+            let pointers = session.ram_view(0x41A..0x41E).unwrap();
+            if pointers[..2] == pointers[2..]
+                && let Some(key) = keys.next()
+            {
+                let ascii = if key == b'|' { 13 } else { key };
+                session.push_key(if ascii == 13 { 0x1C } else { 0 }, ascii)?;
+            }
+        }
     }
     let elapsed = start.elapsed();
     eprintln!(
@@ -86,7 +96,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         hash(session.ram_view(0..0xA0000).unwrap()),
         hash(
             session
-                .ram_view(0xC0000..session.hardware_config().memory_bytes())
+                .ram_view(
+                    0xC0000..if session.a20_enabled() {
+                        session.hardware_config().memory_bytes()
+                    } else {
+                        0x100000
+                    }
+                )
                 .unwrap()
         ),
         hash(session.vram_view())

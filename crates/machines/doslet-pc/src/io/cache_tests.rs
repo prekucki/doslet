@@ -782,3 +782,418 @@ fn mode_switch_at_same_linear_address_and_real_ip_wrap_do_not_reuse_wrong_decode
     state(&cached, &reference);
     assert_eq!(cached.cpu.registers.ip, 2);
 }
+
+/// Every prepared binary form runs through a real batch, cached single step and
+/// byte-fetching reference. SIB/16-bit addressing and high byte aliases vary at
+/// execution time; a terminal CLI makes the completed-step count unambiguous.
+#[test]
+fn prepared_binary_forms_match_both_references() {
+    let mut batch = machine(true);
+    let mut cached = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut batch, &mut cached, &mut reference] {
+        code(m, 0x1000, &[0x90, 0x90]);
+        m.cpu.step(&mut m.bus).unwrap();
+        m.cpu.step(&mut m.bus).unwrap();
+    }
+    for width in [1, 2, 4] {
+        for address32 in [false, true] {
+            for operation in 0..10 {
+                for form in 0..5 {
+                    // x86 has no TEST reg,mem direction bit; its mem,reg form
+                    // exercises the same commutative operation and flags.
+                    if operation == 9 && form == 2 {
+                        continue;
+                    }
+                    let mut bytes = Vec::new();
+                    if width == 2 {
+                        bytes.push(0x66);
+                    }
+                    if !address32 {
+                        bytes.push(0x67);
+                    }
+                    let wide = u8::from(width != 1);
+                    let immediate = form == 1 || form == 4;
+                    let memory = form >= 2;
+                    let opcode = if operation == 0 {
+                        if immediate {
+                            0xC6 + wide
+                        } else {
+                            0x88 + wide + if form == 2 { 2 } else { 0 }
+                        }
+                    } else if operation == 9 {
+                        if immediate { 0xF6 + wide } else { 0x84 + wide }
+                    } else if immediate {
+                        0x80 + wide
+                    } else {
+                        (operation - 1) * 8 + wide + if form == 2 { 2 } else { 0 }
+                    };
+                    bytes.push(opcode);
+                    let group = if immediate && (1..9).contains(&operation) {
+                        operation - 1
+                    } else {
+                        0
+                    };
+                    if memory {
+                        bytes.push((group << 3) | if address32 { 0x44 } else { 0x40 });
+                        if address32 {
+                            bytes.extend_from_slice(&[0x73, 0xD0]);
+                        } else {
+                            bytes.push(0xF0);
+                        }
+                    } else {
+                        bytes.push(0xC4 | (group << 3));
+                    } // AH or SP/ESP target
+                    if immediate {
+                        bytes.extend_from_slice(&0x81FE_80FF_u32.to_le_bytes()[..width as usize]);
+                    }
+                    bytes.push(0xFA);
+                    for carry in [0, flags::CARRY] {
+                        for m in [&mut batch, &mut cached, &mut reference] {
+                            code(m, 0x1000, &bytes);
+                            for (reg, value) in [
+                                (Gpr32::Eax, 0x807F_80FF),
+                                (Gpr32::Ebx, 0x3FF0),
+                                (Gpr32::Esi, 0x20),
+                                (Gpr32::Esp, 0x5000),
+                            ] {
+                                m.cpu.registers.set32(reg, value);
+                            }
+                            m.cpu.flags = 2 | flags::OVERFLOW | flags::AUXILIARY | carry;
+                            m.bus.write_u32(0x4000, 0xFE01_7F80).unwrap();
+                        }
+                        let count = batch.cpu.interpret_batch(&mut batch.bus, 2, |_| 2);
+                        assert_eq!(
+                            count, 1,
+                            "width={width} address32={address32} operation={operation} form={form} bytes={bytes:x?}"
+                        );
+                        cached.cpu.step(&mut cached.bus).unwrap();
+                        reference.cpu.step(&mut reference.bus).unwrap();
+                        state(&batch, &reference);
+                        state(&batch, &cached);
+                        assert_eq!(
+                            batch.bus.ram.view(0x4000..0x4004),
+                            reference.bus.ram.view(0x4000..0x4004)
+                        );
+                        assert_eq!(
+                            batch.bus.ram.view(0x4000..0x4004),
+                            cached.bus.ram.view(0x4000..0x4004)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    memory(&batch, &reference);
+    memory(&batch, &cached);
+}
+
+#[test]
+fn prepared_shifts_validate_before_effects_and_match_all_counts() {
+    let mut batch = machine(true);
+    let mut cached = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut batch, &mut cached, &mut reference] {
+        code(m, 0x1000, &[0x90, 0x90]);
+        m.cpu.step(&mut m.bus).unwrap();
+        m.cpu.step(&mut m.bus).unwrap();
+    }
+    for width in [1, 2, 4] {
+        for address32 in [false, true] {
+            for operation in 0..8 {
+                for mem in [false, true] {
+                    for cl in [false, true] {
+                        for count in 0..=33_u8 {
+                            let mut bytes = Vec::new();
+                            if width == 2 {
+                                bytes.push(0x66);
+                            }
+                            if !address32 {
+                                bytes.push(0x67);
+                            }
+                            bytes.push(if cl { 0xD2 } else { 0xC0 } + u8::from(width != 1));
+                            bytes.push(
+                                (operation << 3)
+                                    | if mem {
+                                        if address32 { 5 } else { 6 }
+                                    } else {
+                                        0xC4
+                                    },
+                            );
+                            if mem {
+                                bytes.extend_from_slice(
+                                    &0x4000_u32.to_le_bytes()[..if address32 { 4 } else { 2 }],
+                                );
+                            }
+                            if !cl {
+                                bytes.push(count);
+                            }
+                            bytes.push(0xFA);
+                            for m in [&mut batch, &mut cached, &mut reference] {
+                                code(m, 0x1000, &bytes);
+                                m.cpu.registers.set32(Gpr32::Eax, 0x81FE_8041);
+                                m.cpu.registers.set32(Gpr32::Esp, 0x81FE_8041);
+                                m.cpu.registers.set32(Gpr32::Ecx, u32::from(count));
+                                m.cpu.flags = 2 | flags::CARRY | flags::OVERFLOW | flags::AUXILIARY;
+                                m.bus.write_u32(0x4000, 0x81FE_8041).unwrap();
+                            }
+                            assert_eq!(batch.cpu.interpret_batch(&mut batch.bus, 2, |_| 2), 1);
+                            cached.cpu.step(&mut cached.bus).unwrap();
+                            reference.cpu.step(&mut reference.bus).unwrap();
+                            state(&batch, &reference);
+                            state(&batch, &cached);
+                            assert_eq!(
+                                batch.bus.ram.view(0x4000..0x4004),
+                                reference.bus.ram.view(0x4000..0x4004)
+                            );
+                            assert_eq!(
+                                batch.bus.ram.view(0x4000..0x4004),
+                                cached.bus.ram.view(0x4000..0x4004)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_control_stack_lea_inc_and_extensions_match_both_references() {
+    let mut batch = machine(true);
+    let mut cached = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut batch, &mut cached, &mut reference] {
+        code(m, 0x1000, &[0x90, 0x90]);
+        m.cpu.step(&mut m.bus).unwrap();
+        m.cpu.step(&mut m.bus).unwrap();
+    }
+    for word in [false, true] {
+        for address32 in [false, true] {
+            let mut cases: Vec<Vec<u8>> = Vec::new();
+            for register in 0..8 {
+                for opcode in [0x40, 0x48, 0x50, 0x58] {
+                    cases.push(alloc::vec![opcode + register]);
+                }
+            }
+            for decrement in [false, true] {
+                for byte in [false, true] {
+                    let mut bytes = alloc::vec![
+                        if byte { 0xFE } else { 0xFF },
+                        if address32 { 5 } else { 6 } | (u8::from(decrement) << 3)
+                    ];
+                    bytes.extend_from_slice(
+                        &0x4000_u32.to_le_bytes()[..if address32 { 4 } else { 2 }],
+                    );
+                    cases.push(bytes);
+                }
+            }
+            let mut lea = alloc::vec![0x8D, if address32 { 0x44 } else { 0x40 }];
+            if address32 {
+                lea.extend_from_slice(&[0x73, 0xD0]);
+            } else {
+                lea.push(0xF0);
+            }
+            cases.push(lea);
+            for opcode in [0xB6, 0xB7, 0xBE, 0xBF] {
+                cases.push(alloc::vec![0x0F, opcode, 0xC4]); // AH or SP source
+                let mut bytes = alloc::vec![0x0F, opcode, if address32 { 5 } else { 6 }];
+                bytes.extend_from_slice(&0x4000_u32.to_le_bytes()[..if address32 { 4 } else { 2 }]);
+                cases.push(bytes);
+            }
+            for opcode in [0xE8, 0xE9] {
+                let mut bytes = alloc::vec![opcode];
+                bytes.extend_from_slice(&0x20_u32.to_le_bytes()[..if word { 2 } else { 4 }]);
+                cases.push(bytes);
+            }
+            cases.push(alloc::vec![0xEB, 0x20]);
+            cases.push(alloc::vec![0xC3]);
+            cases.push(alloc::vec![0xC2, 0x10, 0]);
+            for cc in 0..16 {
+                cases.push(alloc::vec![0x70 + cc, 0x20]);
+                let mut bytes = alloc::vec![0x0F, 0x80 + cc];
+                bytes.extend_from_slice(&0x20_u32.to_le_bytes()[..if word { 2 } else { 4 }]);
+                cases.push(bytes);
+            }
+            for instruction in cases {
+                // The decoder intentionally leaves MOVZX/SX with a word
+                // destination to the reference interpreter.
+                if word && instruction[0] == 0x0F && instruction[1] >= 0xB6 {
+                    continue;
+                }
+                let mut bytes = Vec::new();
+                if word {
+                    bytes.push(0x66);
+                }
+                if !address32 {
+                    bytes.push(0x67);
+                }
+                bytes.extend_from_slice(&instruction);
+                bytes.resize(0x40, 0xFA); // Both branch successors stop at CLI.
+                for initial_flags in [
+                    2,
+                    2 | flags::CARRY | flags::ZERO | flags::SIGN | flags::PARITY | flags::OVERFLOW,
+                ] {
+                    for m in [&mut batch, &mut cached, &mut reference] {
+                        code(m, 0x1000, &bytes);
+                        m.cpu.registers.set32(Gpr32::Eax, 0xFF80_7FFF);
+                        m.cpu.registers.set32(Gpr32::Ebx, 0x3FF0);
+                        m.cpu.registers.set32(Gpr32::Esi, 0x20);
+                        m.cpu.registers.set32(Gpr32::Esp, 0x5000);
+                        m.cpu.flags = initial_flags;
+                        m.bus.write_u32(0x4000, 0x81FE_80FF).unwrap();
+                        m.bus.write_u32(0x5000, 0x1020).unwrap();
+                    }
+                    assert_eq!(
+                        batch.cpu.interpret_batch(&mut batch.bus, 2, |_| 2),
+                        1,
+                        "word={word} bytes={bytes:x?}"
+                    );
+                    cached.cpu.step(&mut cached.bus).unwrap();
+                    reference.cpu.step(&mut reference.bus).unwrap();
+                    state(&batch, &reference);
+                    state(&batch, &cached);
+                    for range in [0x4000..0x4004, 0x4FFC..0x5004] {
+                        assert_eq!(
+                            batch.bus.ram.view(range.clone()),
+                            reference.bus.ram.view(range.clone())
+                        );
+                        assert_eq!(
+                            batch.bus.ram.view(range.clone()),
+                            cached.bus.ram.view(range)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    memory(&batch, &reference);
+    memory(&batch, &cached);
+}
+
+#[test]
+fn prepared_guards_have_no_effect_and_self_modification_redecodes() {
+    let mut batch = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut batch, &mut reference] {
+        code(m, 0x1000, &[0x90, 0x90]);
+        m.cpu.step(&mut m.bus).unwrap();
+        m.cpu.step(&mut m.bus).unwrap();
+    }
+    // Both ends of VGA, an unmapped MMIO address, and a DS-limit crossing.
+    for address in [0x9FFFF_u32, 0xA0000, 0xAFFFF, 0x1000000, 0xFFFFF] {
+        for prefix in [
+            &[0x8B, 0x05][..],
+            &[0x89, 0x05],
+            &[0x81, 0x05],
+            &[0xFF, 0x05],
+            &[0xC1, 0x25],
+            &[0x0F, 0xBF, 0x05],
+        ] {
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(&address.to_le_bytes());
+            bytes.extend_from_slice(&[1, 0, 0, 0, 0xFA]);
+            for m in [&mut batch, &mut reference] {
+                code(m, 0x1000, &bytes);
+                m.cpu.registers.set32(Gpr32::Eax, 0x1234_5678);
+                m.cpu.flags = 0x803;
+            }
+            let before = batch.cpu.snapshot();
+            assert_eq!(batch.cpu.interpret_batch(&mut batch.bus, 2, |_| 2), 0);
+            assert!(batch.cpu.snapshot() == before);
+            memory(&batch, &reference);
+            assert_eq!(
+                batch.cpu.step(&mut batch.bus),
+                reference.cpu.step(&mut reference.bus)
+            );
+            state(&batch, &reference);
+            memory(&batch, &reference);
+        }
+    }
+    // An invalid CALL target must not push a return address or change SP.
+    for m in [&mut batch, &mut reference] {
+        code(m, 0x1000, &[0xE8, 0, 0, 0x10, 0]);
+        m.cpu.registers.set32(Gpr32::Esp, 0x5000);
+    }
+    let before = batch.cpu.snapshot();
+    assert_eq!(batch.cpu.interpret_batch(&mut batch.bus, 2, |_| 2), 0);
+    assert!(batch.cpu.snapshot() == before);
+    memory(&batch, &reference);
+    // Rewrite the next decoded instruction on the active page.
+    for m in [&mut batch, &mut reference] {
+        code(
+            m,
+            0x1000,
+            &[0xC6, 0x05, 7, 0x10, 0, 0, 0x48, 0x40, 0x41, 0xFA],
+        );
+        m.cpu.registers.set32(Gpr32::Eax, 10);
+        m.cpu.registers.set32(Gpr32::Ecx, 20);
+    }
+    assert_eq!(batch.cpu.interpret_batch(&mut batch.bus, 256, |_| 256), 3);
+    for _ in 0..3 {
+        reference.cpu.step(&mut reference.bus).unwrap();
+    }
+    assert_eq!(batch.cpu.registers.get32(Gpr32::Eax), 9);
+    state(&batch, &reference);
+    memory(&batch, &reference);
+}
+
+#[test]
+fn prepared_effective_addresses_branch_targets_and_stacks_wrap_at_16_bits() {
+    let mut batch = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut batch, &mut reference] {
+        code(m, 0x1000, &[0x90, 0x90]);
+        m.cpu.step(&mut m.bus).unwrap();
+        m.cpu.step(&mut m.bus).unwrap();
+        // BX + SI + disp8 wraps to 4000h and ignores both high halves.
+        m.cpu.registers.set32(Gpr32::Ebx, 0xABCD_FFF0);
+        m.cpu.registers.set32(Gpr32::Esi, 0x9876_4010);
+        m.bus.write_u32(0x4000, 0x1234_5678).unwrap();
+        code(m, 0x1000, &[0x67, 0x8B, 0x40, 0, 0xFA]);
+    }
+    assert_eq!(batch.cpu.interpret_batch(&mut batch.bus, 2, |_| 2), 1);
+    reference.cpu.step(&mut reference.bus).unwrap();
+    state(&batch, &reference);
+    assert_eq!(batch.cpu.registers.get32(Gpr32::Eax), 0x1234_5678);
+    for m in [&mut batch, &mut reference] {
+        descriptor(&mut m.bus, 8, 0, 0xFFFF, true, false);
+        descriptor(&mut m.bus, 16, 0, 0xFFFF, false, false);
+        m.cpu
+            .load_segment(&mut m.bus, SegmentRegister::Cs, 8)
+            .unwrap();
+        m.cpu
+            .load_segment(&mut m.bus, SegmentRegister::Ss, 16)
+            .unwrap();
+        code(m, 0x1000, &[0x90, 0x90]);
+        m.cpu.step(&mut m.bus).unwrap();
+        m.cpu.step(&mut m.bus).unwrap();
+        code(m, 0x12, &[0xFA]);
+        code(m, 0xFFF0, &[0xEB, 0x20]);
+    }
+    assert_eq!(batch.cpu.interpret_batch(&mut batch.bus, 2, |_| 2), 1);
+    reference.cpu.step(&mut reference.bus).unwrap();
+    state(&batch, &reference);
+    assert_eq!(batch.cpu.registers.ip, 0x12);
+    for sp in [0xABCD_0000, 0xABCD_0001] {
+        for m in [&mut batch, &mut reference] {
+            code(m, 0x1000, &[0x54, 0xFA]); // PUSH SP, whose old value must be read.
+            m.cpu.registers.set32(Gpr32::Esp, sp);
+        }
+        let before = batch.cpu.snapshot();
+        let count = batch.cpu.interpret_batch(&mut batch.bus, 2, |_| 2);
+        if sp & 1 == 0 {
+            assert_eq!(count, 1);
+            reference.cpu.step(&mut reference.bus).unwrap();
+        } else {
+            assert_eq!(count, 0); // FFFFh + word exceeds the SS limit.
+            assert!(batch.cpu.snapshot() == before);
+            assert_eq!(
+                batch.cpu.step(&mut batch.bus),
+                reference.cpu.step(&mut reference.bus)
+            );
+        }
+        state(&batch, &reference);
+        memory(&batch, &reference);
+    }
+}

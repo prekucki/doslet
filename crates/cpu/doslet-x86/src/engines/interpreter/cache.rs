@@ -7,6 +7,10 @@ use crate::{
 use alloc::boxed::Box;
 use doslet_bus::{CodeCheck, CpuBus};
 
+#[path = "prepared.rs"]
+mod prepared;
+use prepared::Prepared;
+
 const CAPACITY: usize = 4096;
 const NO_REGISTER: u8 = 8;
 
@@ -64,7 +68,7 @@ struct Entry {
 }
 
 const BLOCK_CAPACITY: usize = 4096;
-const BLOCK_INSTRUCTIONS: usize = 8;
+pub(super) const BLOCK_INSTRUCTIONS: usize = 8;
 
 /// Consecutive decoded instructions up to the first control transfer, validated
 /// once per lookup. A block starting with an instruction that cannot be batched
@@ -78,7 +82,7 @@ struct Block {
     code32: bool,
     count: u8,
     check: CodeCheck,
-    instructions: [Instruction; BLOCK_INSTRUCTIONS],
+    instructions: [Prepared; BLOCK_INSTRUCTIONS],
 }
 impl Block {
     const EMPTY: Self = Self {
@@ -91,7 +95,7 @@ impl Block {
             pages: [0; 2],
             generations: [0; 2],
         },
-        instructions: [Instruction::UNSUPPORTED; BLOCK_INSTRUCTIONS],
+        instructions: [Prepared::EMPTY; BLOCK_INSTRUCTIONS],
     };
 }
 pub(super) struct Cache {
@@ -100,6 +104,8 @@ pub(super) struct Cache {
     entries: Box<[Option<Entry>; CAPACITY]>,
     /// Basic blocks for batched execution, reserved once at setup.
     blocks: Box<[Block; BLOCK_CAPACITY]>,
+    /// Cold decoded forms, indexed by block slot and instruction position.
+    fallback: Box<[Instruction]>,
     context: Option<Context>,
     /// Registers lineage, CS version, selector and PE mode under which
     /// `code32` and `context` were last resolved.
@@ -122,6 +128,8 @@ impl Default for Cache {
                 .into_boxed_slice()
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("the vector has BLOCK_CAPACITY blocks")),
+            fallback: alloc::vec![Instruction::UNSUPPORTED; BLOCK_CAPACITY * BLOCK_INSTRUCTIONS]
+                .into_boxed_slice(),
             context: None,
             key: None,
             code32: false,
@@ -380,7 +388,12 @@ impl Cache {
             {
                 break;
             }
-            block.instructions[usize::from(block.count)] = instruction;
+            let position = usize::from(block.count);
+            let prepared = Prepared::new(instruction);
+            if prepared.is_fallback() {
+                self.fallback[index * BLOCK_INSTRUCTIONS + position] = instruction;
+            }
+            block.instructions[position] = prepared;
             block.count += 1;
             offset = end;
             if matches!(
@@ -471,6 +484,7 @@ impl Value {
         }
     }
 }
+#[inline(always)]
 fn alu_width(flags: u32, left: u32, right: u32, operation: u8, width: u8) -> (u32, u32) {
     if width == 4 {
         flags::alu32(flags, left, right, operation)
@@ -479,6 +493,79 @@ fn alu_width(flags: u32, left: u32, right: u32, operation: u8, width: u8) -> (u3
         (u32::from(value), flags)
     }
 }
+#[inline(always)]
+fn increment_result(previous: u32, value: u32, decrement: bool, width: u8) -> (u32, u32) {
+    let (value, updated) = alu_width(previous, value, 1, if decrement { 5 } else { 0 }, width);
+    (value, (updated & !flags::CARRY) | (previous & flags::CARRY))
+}
+
+#[inline(always)]
+fn extend_result(value: u32, word: bool, signed: bool) -> u32 {
+    match (signed, word) {
+        (true, true) => value as i16 as i32 as u32,
+        (true, false) => value as u8 as i8 as i32 as u32,
+        _ => value,
+    }
+}
+
+/// Shared by cached reference execution and prepared shift handlers.
+#[inline(always)]
+fn shift_result(
+    mut updated_flags: u32,
+    original: u32,
+    operation: u8,
+    count: u8,
+    width: u8,
+) -> (u32, u32) {
+    let bits = width * 8;
+    let sign = 1 << (bits - 1);
+    let mask = u32::MAX >> (32 - bits);
+    let mut value = original;
+    let mut carry = updated_flags & flags::CARRY != 0;
+    for _ in 0..count {
+        let old_carry = carry;
+        if matches!(operation, 0 | 2 | 4 | 6) {
+            carry = value & sign != 0;
+            value = (value << 1) & mask;
+            if operation == 0 {
+                value |= u32::from(carry);
+            }
+            if operation == 2 {
+                value |= u32::from(old_carry);
+            }
+        } else {
+            carry = value & 1 != 0;
+            let high = value & sign;
+            value >>= 1;
+            if operation == 1 {
+                value |= u32::from(carry) << (bits - 1);
+            }
+            if operation == 3 {
+                value |= u32::from(old_carry) << (bits - 1);
+            }
+            if operation == 7 {
+                value |= high;
+            }
+        }
+    }
+    if operation >= 4 {
+        updated_flags =
+            alu_width(updated_flags, value, 0, 1, width).1 | (updated_flags & flags::OVERFLOW);
+    }
+    updated_flags = (updated_flags & !flags::CARRY) | u32::from(carry);
+    if count == 1 {
+        let overflow = match operation {
+            0 | 2 | 4 | 6 => (value & sign != 0) != carry,
+            1 | 3 => ((value >> (bits - 1)) ^ (value >> (bits - 2))) & 1 != 0,
+            5 => original & sign != 0,
+            _ => false,
+        };
+        updated_flags =
+            (updated_flags & !flags::OVERFLOW) | if overflow { flags::OVERFLOW } else { 0 };
+    }
+    (value, updated_flags)
+}
+
 fn read_width<B: CpuBus>(
     target: Operand,
     cpu: &Cpu,
@@ -964,8 +1051,14 @@ impl Cpu {
                 let next = self
                     .registers
                     .ip
-                    .wrapping_add(u32::from(instruction.length));
-                if !self.try_batched(bus, &mut windows, code, instruction) {
+                    .wrapping_add(u32::from(instruction.length()));
+                if !self.try_prepared(
+                    bus,
+                    &mut windows,
+                    code,
+                    instruction,
+                    index * BLOCK_INSTRUCTIONS + position,
+                ) {
                     break 'blocks;
                 }
                 completed += 1;
@@ -1083,9 +1176,8 @@ impl Cpu {
                 decrement,
             } => {
                 let value = self.load(bus, Place::Register(register), length);
-                let (value, updated) =
-                    alu_width(self.flags, value, 1, if decrement { 5 } else { 0 }, length);
-                self.flags = (updated & !flags::CARRY) | (self.flags & flags::CARRY);
+                let (value, updated) = increment_result(self.flags, value, decrement, length);
+                self.flags = updated;
                 self.store(bus, Place::Register(register), length, value);
             }
             Operation::IncTarget { target, .. }
@@ -1305,6 +1397,7 @@ impl Cpu {
         true
     }
 
+    #[inline(always)]
     fn load<B: CpuBus>(&self, bus: &mut B, place: Place, width: u8) -> u32 {
         match place {
             Place::Register(code) if width == 4 => self.registers.get32(Gpr32::decode(code)),
@@ -1325,6 +1418,7 @@ impl Cpu {
         }
     }
 
+    #[inline(always)]
     fn store<B: CpuBus>(&mut self, bus: &mut B, place: Place, width: u8, value: u32) {
         match place {
             Place::Register(code) if width == 4 => self.registers.set32(Gpr32::decode(code), value),
@@ -1354,8 +1448,25 @@ impl Cpu {
     }
 
     #[inline]
-    pub(super) fn block_instruction(&self, index: usize, position: usize) -> Instruction {
+    pub(super) fn block_instruction(&self, index: usize, position: usize) -> Prepared {
         self.decode_cache.blocks[index].instructions[position]
+    }
+
+    /// The common interpreter/JIT batch dispatch. Only rare forms copy decoded IR.
+    #[inline(always)]
+    pub(super) fn try_prepared<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        windows: &mut Windows,
+        code: SegmentWindow,
+        instruction: Prepared,
+        slot: usize,
+    ) -> bool {
+        if instruction.is_fallback() {
+            self.try_batched(bus, windows, code, self.decode_cache.fallback[slot])
+        } else {
+            instruction.execute(self, bus, windows, code)
+        }
     }
 
     /// The CS execute window and empty data windows for one slice.
@@ -1481,15 +1592,6 @@ impl Reader<'_> {
     }
 }
 impl Instruction {
-    #[cfg(all(
-        feature = "dynamic-core",
-        not(target_arch = "wasm32"),
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    pub(super) fn length(self) -> u8 {
-        self.length
-    }
-
     /// One byte of offset range: the reference path reports its own faults.
     const UNSUPPORTED: Self = Self {
         length: 1,
@@ -2263,11 +2365,7 @@ impl Cpu {
                 let value = source
                     .resolve(&self.registers)
                     .read(&self.registers, bus, word)?;
-                let value = match (signed, word) {
-                    (true, true) => value as i16 as i32 as u32,
-                    (true, false) => value as u8 as i8 as i32 as u32,
-                    _ => u32::from(value),
-                };
+                let value = extend_result(u32::from(value), word, signed);
                 write_width(Operand::Register(register), self, bus, width, value)?;
             }
             Operation::Unsupported => unreachable!("lookups return None for rejections"),
@@ -2283,9 +2381,8 @@ impl Cpu {
         width: u8,
     ) -> Result<(), CpuError> {
         let value = read_width(target, self, bus, width)?;
-        let (value, updated) =
-            alu_width(self.flags, value, 1, if decrement { 5 } else { 0 }, width);
-        self.flags = (updated & !flags::CARRY) | (self.flags & flags::CARRY);
+        let (value, updated) = increment_result(self.flags, value, decrement, width);
+        self.flags = updated;
         write_width(target, self, bus, width, value)
     }
 
@@ -2300,53 +2397,9 @@ impl Cpu {
         if count == 0 {
             return Ok(());
         }
-        let bits = width * 8;
-        let sign = 1 << (bits - 1);
-        let mask = u32::MAX >> (32 - bits);
         let original = read_width(target, self, bus, width)?;
-        let mut value = original;
-        let mut carry = self.flags & flags::CARRY != 0;
-        for _ in 0..count {
-            let old_carry = carry;
-            if matches!(operation, 0 | 2 | 4 | 6) {
-                carry = value & sign != 0;
-                value = (value << 1) & mask;
-                if operation == 0 {
-                    value |= u32::from(carry);
-                }
-                if operation == 2 {
-                    value |= u32::from(old_carry);
-                }
-            } else {
-                carry = value & 1 != 0;
-                let high = value & sign;
-                value >>= 1;
-                if operation == 1 {
-                    value |= u32::from(carry) << (bits - 1);
-                }
-                if operation == 3 {
-                    value |= u32::from(old_carry) << (bits - 1);
-                }
-                if operation == 7 {
-                    value |= high;
-                }
-            }
-        }
-        if operation >= 4 {
-            self.flags =
-                alu_width(self.flags, value, 0, 1, width).1 | (self.flags & flags::OVERFLOW);
-        }
-        self.flags = (self.flags & !flags::CARRY) | u32::from(carry);
-        if count == 1 {
-            let overflow = match operation {
-                0 | 2 | 4 | 6 => (value & sign != 0) != carry,
-                1 | 3 => ((value >> (bits - 1)) ^ (value >> (bits - 2))) & 1 != 0,
-                5 => original & sign != 0,
-                _ => false,
-            };
-            self.flags =
-                (self.flags & !flags::OVERFLOW) | if overflow { flags::OVERFLOW } else { 0 };
-        }
+        let (value, updated) = shift_result(self.flags, original, operation, count, width);
+        self.flags = updated;
         write_width(target, self, bus, width, value)
     }
 
@@ -2451,6 +2504,36 @@ mod tests {
     use super::*;
     use crate::Gpr32;
     use doslet_bus::{BusError, MemoryBus, PortBus};
+
+    #[test]
+    fn compact_blocks_keep_decoded_ir_off_the_hot_table() {
+        assert_eq!(core::mem::size_of::<Prepared>(), 16);
+        // Include both the hot block and the explicitly reserved cold IR in
+        // the architecture's storage accounting (64-bit hosts and WASM32).
+        assert_eq!(core::mem::size_of::<Block>(), 168);
+        assert_eq!(core::mem::size_of::<Instruction>(), 36);
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "dynamic-core",
+        not(target_arch = "wasm32"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn prepared_native_eligibility_keeps_word_and_branch_guards() {
+        for bytes in [
+            &[0x66, 0xB8, 1, 0][..],
+            &[0x66, 0xE8, 0, 0],
+            &[0x66, 0xE9, 0, 0],
+            &[0x66, 0x0F, 0x84, 0, 0],
+        ] {
+            let i = Instruction::decode(bytes).unwrap();
+            assert!(i.width == 2 || !i.branch32);
+            assert!(!Prepared::new(i).native_candidate());
+            assert!(native_instruction(bytes, 0).is_none());
+            assert!(native_trace_instruction(bytes, 0).is_none());
+        }
+    }
 
     /// Flat RAM whose single write generation validates every code span.
     struct Flat {

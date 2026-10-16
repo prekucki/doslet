@@ -60,6 +60,7 @@ pub(crate) fn sub(previous: u32, left: u16, right: u16) -> (u16, u32) {
 }
 
 /// x86 ALU group encoding: ADD, OR, ADC, SBB, AND, SUB, XOR, CMP.
+#[inline(always)]
 pub(crate) fn alu(previous: u32, left: u16, right: u16, operation: u8, word: bool) -> (u16, u32) {
     let mask = if word { 0xFFFF } else { 0xFF };
     let sign = if word { 0x8000 } else { 0x80 };
@@ -102,6 +103,7 @@ pub(crate) fn alu(previous: u32, left: u16, right: u16, operation: u8, word: boo
     (value, result)
 }
 
+#[inline]
 pub(crate) fn condition(flags: u32, code: u8) -> bool {
     let carry = flags & CARRY != 0;
     let zero = flags & ZERO != 0;
@@ -119,6 +121,7 @@ pub(crate) fn condition(flags: u32, code: u8) -> bool {
     positive != (code & 1 != 0)
 }
 
+#[inline(always)]
 pub(crate) fn alu32(previous: u32, left: u32, right: u32, operation: u8) -> (u32, u32) {
     let carry = u64::from(previous & CARRY != 0 && matches!(operation, 2 | 3));
     let subtract = matches!(operation, 3 | 5 | 7);

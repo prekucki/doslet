@@ -1017,7 +1017,13 @@ impl Cpu {
                     .registers
                     .ip
                     .wrapping_add(u32::from(instruction.length()));
-                if !self.try_batched(bus, &mut windows, code, instruction) {
+                if !self.try_prepared(
+                    bus,
+                    &mut windows,
+                    code,
+                    instruction,
+                    index * super::cache::BLOCK_INSTRUCTIONS + position,
+                ) {
                     break 'blocks;
                 }
                 completed += 1;
