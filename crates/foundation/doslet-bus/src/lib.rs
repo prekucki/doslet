@@ -109,6 +109,16 @@ pub trait MemoryBus {
         false
     }
 
+    /// Optional batching contract that also admits device memory whose
+    /// accesses neither depend on guest time nor raise hardware events, such
+    /// as a frame-buffer window. True guarantees byte/word/dword accesses
+    /// within the span succeed through the ordinary byte paths and cannot
+    /// change mappings; their device effects are the same as unbatched
+    /// accesses. The guarantee lasts until the next port access.
+    fn is_batch_memory(&self, address: u32, length: u8) -> bool {
+        self.is_plain_ram(address, length)
+    }
+
     /// Optional read-only native execution view. Implementations may expose a
     /// conservative subset of RAM, or decline entirely. Generated code must
     /// check every complete access against the span and exclusion, and never

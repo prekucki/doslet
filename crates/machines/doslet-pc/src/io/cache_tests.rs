@@ -72,6 +72,8 @@ fn memory(a: &PcMachine, b: &PcMachine) {
         a.bus.vga.frame().map(|f| f.pixels),
         b.bus.vga.frame().map(|f| f.pixels)
     );
+    assert_eq!(a.bus.vga.vram_view(), b.bus.vga.vram_view());
+    assert_eq!(a.bus.vga.bank(), b.bus.vga.bank());
 }
 
 #[cfg(all(
@@ -1072,6 +1074,100 @@ fn prepared_control_stack_lea_inc_and_extensions_match_both_references() {
 }
 
 #[test]
+fn batches_access_vga_memory_like_the_reference() {
+    for bank in [0u16, 3] {
+        let mut batch = machine(true);
+        let mut reference = machine(false);
+        for m in [&mut batch, &mut reference] {
+            if bank != 0 {
+                m.bus.vga.set_vbe_101h(false);
+                assert!(m.bus.vga.set_bank(bank));
+            }
+            code(m, 0x1000, &[0x90, 0x90]);
+            m.cpu.step(&mut m.bus).unwrap();
+            m.cpu.step(&mut m.bus).unwrap();
+            for offset in 0..64 {
+                m.bus
+                    .write_u8(0xA0000 + offset, offset as u8 ^ 0x5A)
+                    .unwrap();
+                m.bus
+                    .write_u8(0xAFFC0 + offset, offset as u8 ^ 0xA5)
+                    .unwrap();
+            }
+        }
+        // Prepared MOV/ALU/INC/shift/MOVSX forms on both ends inside the window.
+        for address in [0xA0000_u32, 0xAFFFC] {
+            for prefix in [
+                &[0x8B, 0x05][..],
+                &[0x89, 0x05],
+                &[0x81, 0x05],
+                &[0xFF, 0x05],
+                &[0xC1, 0x25],
+                &[0x0F, 0xBF, 0x05],
+            ] {
+                let mut bytes = prefix.to_vec();
+                bytes.extend_from_slice(&address.to_le_bytes());
+                bytes.extend_from_slice(&[1, 0, 0, 0, 0xFA]);
+                for m in [&mut batch, &mut reference] {
+                    code(m, 0x1000, &bytes);
+                    m.cpu.registers.set32(Gpr32::Eax, 0x1234_5678);
+                    m.cpu.flags = 0x803;
+                }
+                assert_eq!(batch.cpu.interpret_batch(&mut batch.bus, 2, |_| 2), 1);
+                reference.cpu.step(&mut reference.bus).unwrap();
+                state(&batch, &reference);
+                memory(&batch, &reference);
+            }
+        }
+        // REP MOVSD RAM->VGA, REP MOVSB VGA->RAM and REP STOSB into VGA,
+        // one iteration per step, then CLI ends the slice.
+        for (program, esi, edi, ecx, steps) in [
+            (
+                &[0xF3, 0xA5, 0xFA][..],
+                0x2_0000_u32,
+                0xA_0010_u32,
+                6_u32,
+                6_u32,
+            ),
+            (&[0xF3, 0xA4, 0xFA], 0xA_FFF0, 0x2_1000, 16, 16),
+            (&[0xF3, 0xAA, 0xFA], 0, 0xA_8000, 5, 5),
+        ] {
+            for m in [&mut batch, &mut reference] {
+                code(m, 0x1000, program);
+                for offset in 0..32 {
+                    m.bus.write_u8(0x2_0000 + offset, offset as u8 + 1).unwrap();
+                }
+                m.cpu.registers.set32(Gpr32::Esi, esi);
+                m.cpu.registers.set32(Gpr32::Edi, edi);
+                m.cpu.registers.set32(Gpr32::Ecx, ecx);
+                m.cpu.registers.set32(Gpr32::Eax, 0x99);
+                m.cpu.flags = 2;
+            }
+            assert_eq!(
+                batch.cpu.interpret_batch(&mut batch.bus, 256, |_| 256),
+                steps
+            );
+            for _ in 0..steps {
+                reference.cpu.step(&mut reference.bus).unwrap();
+            }
+            state(&batch, &reference);
+            memory(&batch, &reference);
+        }
+        // A string iteration whose dword would leave the window still stops.
+        for m in [&mut batch, &mut reference] {
+            code(m, 0x1000, &[0xF3, 0xA5, 0xFA]);
+            m.cpu.registers.set32(Gpr32::Esi, 0x2_0000);
+            m.cpu.registers.set32(Gpr32::Edi, 0xA_FFFE);
+            m.cpu.registers.set32(Gpr32::Ecx, 2);
+        }
+        let before = batch.cpu.snapshot();
+        assert_eq!(batch.cpu.interpret_batch(&mut batch.bus, 256, |_| 256), 0);
+        assert!(batch.cpu.snapshot() == before);
+        memory(&batch, &reference);
+    }
+}
+
+#[test]
 fn prepared_guards_have_no_effect_and_self_modification_redecodes() {
     let mut batch = machine(true);
     let mut reference = machine(false);
@@ -1080,8 +1176,9 @@ fn prepared_guards_have_no_effect_and_self_modification_redecodes() {
         m.cpu.step(&mut m.bus).unwrap();
         m.cpu.step(&mut m.bus).unwrap();
     }
-    // Both ends of VGA, an unmapped MMIO address, and a DS-limit crossing.
-    for address in [0x9FFFF_u32, 0xA0000, 0xAFFFF, 0x1000000, 0xFFFFF] {
+    // Spans crossing either end of VGA, an unmapped address and a DS-limit
+    // crossing. Spans entirely inside VGA are batchable (see below).
+    for address in [0x9FFFF_u32, 0xAFFFF, 0x1000000, 0xFFFFF] {
         for prefix in [
             &[0x8B, 0x05][..],
             &[0x89, 0x05],

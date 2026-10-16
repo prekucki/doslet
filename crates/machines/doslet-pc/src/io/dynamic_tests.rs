@@ -1475,7 +1475,7 @@ fn batches_stop_before_if_changes_ports_mmio_and_faults() {
         &[0x9D][..],                // POPFD
         &[0xEC][..],                // IN AL,DX
         &[0xEE][..],                // OUT DX,AL
-        &[0xA1, 0, 0, 0x0A, 0][..], // VGA aperture
+        &[0xA1, 0, 0, 0, 1][..],    // Unmapped memory above RAM
         &[0xA1, 0, 0, 0x10, 0][..], // Outside the DS limit
         &[0x8E, 0xD0][..],          // MOV SS,AX
         &[0xF3, 0xA6][..],          // REPE CMPSB stays uncached

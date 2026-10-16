@@ -301,8 +301,9 @@ reusing compiled code. Debug flags, paging, interrupt shadows and budgets that
 cannot accommodate the whole register block retain ordinary stepping. The machine ends
 execution slices strictly before hardware deadlines and delivers eligible IRQs first.
 Each slice combines native blocks with validated decoded ordinary-RAM/near-branch
-work for at most 256 steps. MMIO, I/O, faults, mode/IF changes and unsupported
-instructions remain boundaries. Hardware clocks and execution counters advance
+work for at most 256 steps. Other MMIO, I/O, faults, mode/IF changes and
+unsupported instructions remain boundaries; accesses entirely inside the VGA
+aperture are batchable (see below). Hardware clocks and execution counters advance
 once per slice; RAM writes still invalidate code immediately. The bus must opt
 into the ordinary-RAM batching contract, which defaults to disabled.
 
@@ -310,9 +311,16 @@ Without the native core, including WASM and `--no-dynamic-core`, the machine
 uses the same slice boundaries for cached interpreter instructions. Data-segment
 and CS windows are resolved once per slice, because batched instructions cannot
 load segment registers. Each instruction validates every operand, stack slot and
-branch target as plain RAM or a valid CS offset before its first effect, then
+branch target as batch memory or a valid CS offset before its first effect, then
 performs the accesses at those linear addresses; a failed check ends the slice
-before that instruction and the original interpreter handles it. Decoding also
+before that instruction and the original interpreter handles it. Batch memory is
+plain RAM or, through `MemoryBus::is_batch_memory`, device memory whose accesses
+depend on no guest time, raise no event and cannot change mappings. The PC admits
+spans entirely inside the VGA aperture while the current bank lies in VRAM: VGA
+memory is linear banked VRAM, and only port or BIOS operations change the bank or
+mode. Such accesses use the ordinary byte paths, so VRAM revisions and idle-proof
+device counters see them as unbatched accesses would. Spans crossing an aperture
+end remain boundaries. Decoding also
 prepares 16-byte block operands and a dense code selecting a const-generic
 handler for the concrete bus. MOV and ALU/CMP/TEST register/immediate/memory
 forms, register/memory INC/DEC, LEA, register PUSH/POP, relative near CALL/JMP/Jcc,

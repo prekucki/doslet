@@ -988,7 +988,7 @@ impl Windows {
         let slot = &mut self.0[segment as usize][usize::from(access == Access::Write)];
         let window = *slot.get_or_insert_with(|| r.window(segment, access));
         let address = window?.address(offset, length)?;
-        bus.is_plain_ram(address, length).then_some(address)
+        bus.is_batch_memory(address, length).then_some(address)
     }
     #[inline]
     fn place<B: CpuBus>(

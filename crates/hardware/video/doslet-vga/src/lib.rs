@@ -106,6 +106,12 @@ impl Vga {
             .get(usize::from(self.bank) * APERTURE_LEN + offset)
             .copied()
     }
+    /// Whether `read_memory` and `write_memory` succeed for this aperture
+    /// offset under the current bank. Only mode and bank changes, which are
+    /// port or BIOS operations, change the answer.
+    pub fn memory_available(&self, offset: usize) -> bool {
+        offset < APERTURE_LEN && usize::from(self.bank) * APERTURE_LEN + offset < self.memory.len()
+    }
     pub fn write_memory(&mut self, offset: usize, value: u8) -> bool {
         if offset >= APERTURE_LEN {
             return false;

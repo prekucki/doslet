@@ -292,6 +292,21 @@ impl MemoryBus for PcBus {
     fn is_plain_ram(&self, address: u32, length: u8) -> bool {
         length != 0 && self.wide_ram_range(address, u32::from(length)).is_some()
     }
+    /// Plain RAM, or a span entirely inside the VGA aperture. VGA memory is
+    /// linear banked VRAM: accesses depend on no guest time, raise no event
+    /// and only port/BIOS operations change the bank or mode.
+    #[inline]
+    fn is_batch_memory(&self, address: u32, length: u8) -> bool {
+        self.is_plain_ram(address, length)
+            || (length != 0
+                && (0..u32::from(length)).all(|byte| {
+                    let mapped = self.a20.address(address.wrapping_add(byte));
+                    matches!(self.memory_routes.endpoint(mapped), MemoryEndpoint::Vga)
+                        && self
+                            .vga
+                            .memory_available(mapped.wrapping_sub(APERTURE_START) as usize)
+                }))
+    }
     fn code_check(&self, address: u32, length: u8) -> Option<doslet_bus::CodeCheck> {
         if length == 0 {
             return None;

@@ -355,9 +355,11 @@ existing path. The optional native core below uses a separate block cache.
 the machine's IRQ check and its next hardware deadline, at most 256 steps, so
 the PC advances clocks and counters once per slice instead of once per
 instruction. Segment windows are resolved once per slice. Each instruction
-validates all of its plain-RAM operands, stack slots and branch targets before
+validates all of its batch-memory operands, stack slots and branch targets before
 its first effect and then accesses those linear addresses directly; a failed
-check ends the slice before that instruction.
+check ends the slice before that instruction. Batch memory is plain RAM or a span
+entirely inside the VGA aperture under a bank that lies in VRAM, which keeps
+banked frame-buffer copies such as REP MOVSD in the slice.
 
 Slices fetch from a separate fixed cache of 4096 basic blocks, each holding up
 to 8 decoded instructions through the first control transfer and stopping
