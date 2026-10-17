@@ -112,7 +112,7 @@ cargo run -p doslet --release --locked -- --game path/to/GAME.EXE
 ```
 
 The game's directory becomes drive C:. Click the picture to capture the mouse,
-and press **Esc** to release it. `--help` lists the audio, MIDI, MT-32 and
+and press **Ctrl+Esc** to release it. `--help` lists the audio, MIDI, MT-32 and
 machine options.
 
 ### In the browser

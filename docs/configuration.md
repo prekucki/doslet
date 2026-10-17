@@ -59,8 +59,9 @@ and an existing lock is released. `input.capture = false` disables capture; leav
 it enabled for relative-input games. `input.hide_cursor = true` hides the host
 cursor over a running game using absolute input. The cursor remains visible in
 application panels, while paused, and while relative input is waiting for capture.
-Esc releases an active capture. `hide_cursor` defaults to false. Browser input
-retains explicit capture selection: `capture = false` selects absolute movement.
+Ctrl+Esc releases an active native capture; plain Esc reaches the game.
+`hide_cursor` defaults to false. Browser input retains explicit capture selection:
+`capture = false` selects absolute movement.
 
 Native controllers use gilrs; browser controllers use the Gamepad API. The Input
 page lists available controller identities. A stable ID is optional; leave it

@@ -150,7 +150,7 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
             text(if let Some(progress) = progress {
                 progress
             } else if app.has_mouse_capture() {
-                "Esc to release mouse"
+                "Ctrl+Esc to release mouse"
             } else {
                 ""
             })

@@ -733,8 +733,9 @@ preserving full general registers, segment registers and FLAGS. Raw PS/2
 mouse-controller protocol and IRQ timing remain pending.
 Native pointer capture uses a local iced runtime/winit patch: Locked with
 Confined fallback, relative device motion and captured button events. A bounded
-128-event stream releases capture on overflow/disconnection. Esc is consumed
-to release capture; focus loss, pause, reset and termination release it too.
+128-event stream releases capture on overflow/disconnection. Ctrl+Esc is consumed
+to release capture; plain Esc reaches the guest. Focus loss, pause, reset and
+termination release it too.
 Capture generations reject delayed events from a previous session. Native and
 browser profiles independently support `input.hide_cursor` over the running
 game image; disabling capture preserves absolute movement and passes Esc to DOS.

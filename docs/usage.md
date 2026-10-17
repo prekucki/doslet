@@ -56,8 +56,9 @@ selects relative input for one emulated second after the latest read. Absolute
 reads during that interval do not cancel it. Hover movement is blocked until you
 click the guest display to capture the mouse. After one second without relative
 reads, capture is released automatically and absolute movement resumes. Absolute
-input does not require capture. **Esc** releases capture; a subsequent Esc reaches
-the game. Focus loss, pause, reset and game termination also release capture.
+input does not require capture. **Ctrl+Esc** releases capture; **Esc** reaches
+the game even while the mouse is captured. Focus loss, pause, reset and game
+termination also release capture.
 The host cursor stays visible while relative input is waiting for capture.
 **Hide cursor over the game** controls visibility during uncaptured absolute input.
 Leave **Capture mouse on click** enabled for games using relative counters.

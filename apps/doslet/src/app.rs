@@ -772,8 +772,9 @@ impl Doslet {
                         &event,
                         iced::keyboard::Event::KeyPressed {
                             key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                            modifiers,
                             ..
-                        }
+                        } if modifiers.control()
                     )
                 {
                     return self.release_mouse();
@@ -2857,45 +2858,121 @@ enabled = false
         );
     }
     #[test]
-    fn uncaptured_hidden_cursor_keeps_absolute_motion_and_passes_escape_to_dos() {
-        let mut app = Doslet::new();
-        // Read the mouse, then one BIOS key and store AX at DS:0200h.
-        app.session = Session::new(&[
-            0xB8, 3, 0, 0xCD, 0x33, 0xB4, 0, 0xCD, 0x16, 0xA3, 0, 2, 0xEB, 0xFE,
-        ])
-        .unwrap()
-        .into();
-        app.configurator.active.input.capture = false;
-        app.configurator.active.input.hide_cursor = true;
-        app.session.start();
-        assert!(!app.hide_host_cursor());
-        app.session.advance(100);
-        assert!(app.session.waiting_for_key());
-        assert!(app.hide_host_cursor());
-        let _ = app.update(Message::PointerMoved(123, 45));
-        let _ = app.update(Message::PointerButton(0, true));
-        assert_eq!(app.session.pointer_position(), (123, 45));
-        assert!(app.mouse_capture.is_none());
-        assert!(!app.mouse_capture_pending);
-        let escape = iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape);
-        let _ = app.update(Message::Keyboard(iced::keyboard::Event::KeyPressed {
-            key: escape.clone(),
-            modified_key: escape,
-            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Escape),
-            location: iced::keyboard::Location::Standard,
-            modifiers: iced::keyboard::Modifiers::empty(),
-            text: None,
-            repeat: false,
-        }));
-        // The BIOS keyboard wait resumes at the next guest timer interrupt.
-        app.session.advance(1_000_000);
-        assert_eq!(app.session.ram_view(0x10200..0x10202).unwrap(), &[0x1B, 1]);
-        assert!(app.hide_host_cursor());
-        app.workspace.panel = Some(crate::ui::Panel::Audio);
-        assert!(!app.hide_host_cursor());
-        app.workspace.panel = None;
-        app.session.pause();
-        assert!(!app.hide_host_cursor());
+    fn uncaptured_escape_reaches_dos_for_both_keyboard_and_capture_modes() {
+        for keyboard in [
+            doslet_config::KeyboardMode::Bios,
+            doslet_config::KeyboardMode::At,
+        ] {
+            for capture in [false, true] {
+                let mut app = Doslet::new();
+                // Read the mouse, then one BIOS key and store AX at DS:0200h.
+                let hardware = doslet_config::HardwareConfig {
+                    keyboard,
+                    ..Default::default()
+                };
+                app.configurator.active.hardware = hardware;
+                app.session = Session::new_configured(
+                    &[
+                        0xB8, 3, 0, 0xCD, 0x33, 0xB4, 0, 0xCD, 0x16, 0xA3, 0, 2, 0xEB, 0xFE,
+                    ],
+                    hardware,
+                )
+                .unwrap()
+                .into();
+                app.configurator.active.input.capture = capture;
+                app.configurator.active.input.hide_cursor = true;
+                app.session.start();
+                assert!(!app.hide_host_cursor());
+                app.session.advance(100);
+                assert!(app.session.waiting_for_key());
+                assert!(app.hide_host_cursor());
+                let _ = app.update(Message::PointerMoved(123, 45));
+                let _ = app.update(Message::PointerButton(0, true));
+                assert_eq!(app.session.pointer_position(), (123, 45));
+                assert!(app.mouse_capture.is_none());
+                assert!(!app.mouse_capture_pending);
+                let escape = iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape);
+                let _ = app.update(Message::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: escape.clone(),
+                    modified_key: escape,
+                    physical_key: iced::keyboard::key::Physical::Code(
+                        iced::keyboard::key::Code::Escape,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: iced::keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }));
+                // The BIOS keyboard wait resumes at the next guest timer interrupt.
+                app.session.advance(1_000_000);
+                assert_eq!(app.session.ram_view(0x10200..0x10202).unwrap(), &[0x1B, 1]);
+                assert!(app.hide_host_cursor());
+                app.workspace.panel = Some(crate::ui::Panel::Audio);
+                assert!(!app.hide_host_cursor());
+                app.workspace.panel = None;
+                app.session.pause();
+                assert!(!app.hide_host_cursor());
+            }
+        }
+    }
+
+    #[test]
+    fn captured_escape_reaches_dos_but_ctrl_escape_only_releases_mouse() {
+        for keyboard in [
+            doslet_config::KeyboardMode::Bios,
+            doslet_config::KeyboardMode::At,
+        ] {
+            for pending in [false, true] {
+                let mut app = Doslet::new();
+                let hardware = doslet_config::HardwareConfig {
+                    keyboard,
+                    ..Default::default()
+                };
+                app.configurator.active.hardware = hardware;
+                // Select relative mouse input, store the first key, then wait for another.
+                app.session = Session::new_configured(
+                    &[
+                        0xB8, 0x0B, 0, 0xCD, 0x33, 0xB4, 0, 0xCD, 0x16, 0xA3, 0, 2, 0xB4, 0, 0xCD,
+                        0x16, 0xA3, 2, 2, 0xEB, 0xFE,
+                    ],
+                    hardware,
+                )
+                .unwrap()
+                .into();
+                app.session.start();
+                app.session.advance(100);
+                assert!(app.session.waiting_for_key());
+                app.mouse_capture = Some(iced::window::Id::unique());
+                app.mouse_capture_pending = pending;
+                let escape = |modifiers| {
+                    let key = iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape);
+                    Message::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: key.clone(),
+                        modified_key: key,
+                        physical_key: iced::keyboard::key::Physical::Code(
+                            iced::keyboard::key::Code::Escape,
+                        ),
+                        location: iced::keyboard::Location::Standard,
+                        modifiers,
+                        text: None,
+                        repeat: false,
+                    })
+                };
+                let _ = app.update(escape(iced::keyboard::Modifiers::empty()));
+                assert!(app.mouse_capture.is_some());
+                assert_eq!(app.mouse_capture_pending, pending);
+                app.session.advance(1_000_000);
+                assert_eq!(app.session.ram_view(0x10200..0x10202).unwrap(), &[0x1B, 1]);
+                assert!(app.session.waiting_for_key());
+
+                let _ = app.update(escape(iced::keyboard::Modifiers::CTRL));
+                assert!(app.mouse_capture.is_none());
+                assert!(!app.mouse_capture_pending);
+                app.session.advance(1_000_000);
+                assert!(app.session.waiting_for_key());
+                assert_eq!(app.session.ram_view(0x10202..0x10204).unwrap(), &[0, 0]);
+            }
+        }
     }
 
     #[test]
@@ -2954,7 +3031,7 @@ enabled = false
     }
 
     #[test]
-    fn mouse_capture_uses_relative_motion_releases_on_escape_and_ignores_stale_events() {
+    fn mouse_capture_uses_relative_motion_releases_on_ctrl_escape_and_ignores_stale_events() {
         use iced::window::MouseCaptureEvent;
         let mut app = Doslet::new();
         app.session = Session::new(&[0xb8, 0x0b, 0, 0xcd, 0x33, 0xEB, 0xFE])
@@ -2995,7 +3072,7 @@ enabled = false
             modified_key: escape,
             physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Escape),
             location: iced::keyboard::Location::Standard,
-            modifiers: iced::keyboard::Modifiers::empty(),
+            modifiers: iced::keyboard::Modifiers::CTRL,
             text: None,
             repeat: false,
         }));

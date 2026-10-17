@@ -1103,7 +1103,7 @@ async fn run_instance<P>(
                                 } if event.logical_key
                                     == winit::keyboard::Key::Named(
                                         winit::keyboard::NamedKey::Escape,
-                                    ) =>
+                                    ) && window.state.modifiers().control_key() =>
                                 {
                                     if event.state
                                         == event::ElementState::Pressed
