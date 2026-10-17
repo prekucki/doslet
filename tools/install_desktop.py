@@ -43,7 +43,12 @@ def main() -> None:
     desktop = data_home / "applications" / f"{APP_ID}.desktop"
     icon = data_home / "icons/hicolor/scalable/apps" / f"{APP_ID}.svg"
     template = (REPO / "packaging/linux" / f"{APP_ID}.desktop").read_text(encoding="utf-8")
-    contents = template.replace("Exec=doslet\n", f"Exec={desktop_exec(binary)}\n")
+    # Preserve action arguments while resolving every launcher to this binary.
+    contents = "\n".join(
+        "Exec=" + desktop_exec(binary) + line[len("Exec=doslet"):]
+        if line == "Exec=doslet" or line.startswith("Exec=doslet ") else line
+        for line in template.splitlines()
+    ) + "\n"
 
     # Install only launcher metadata; the binary stays at the selected path.
     icon.parent.mkdir(parents=True, exist_ok=True)

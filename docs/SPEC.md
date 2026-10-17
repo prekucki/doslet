@@ -528,8 +528,10 @@ handling remain pending.
 
 BIOS extended-memory queries match installed RAM, and A20 enable/disable/query
 services reflect the actual gate. Other unavailable INT 15h functions return
-AH=86h/CF=1. By default DPMI, XMS and VCPI installation probes report absence
-through their defined status registers. An opt-in runtime DPMI host supports
+AH=86h/CF=1. XMS and VCPI installation probes report absence through their
+defined status registers. Runtime sessions without a DPMI host also report
+its absence. Native desktop launches enable direct DPMI dispatch by default;
+`--experimental-dpmi off` retains the guest extender path. The runtime host supports
 the experimental DOS/4GW service and allocation subset documented in
 [DPMI host](compatibility/dpmi-host.md); it is not a general-purpose DPMI server.
 Their explicit IVT
@@ -707,7 +709,19 @@ shared memory.
 The native CLI uses clap derive: `--game EXE` starts a session with the containing
 directory preloaded as C: and a 1-MiB RAM write overlay; no arguments retain the
 demo. Invalid arguments and game-load errors exit before opening a window.
-`--no-audio` disables host audio. The browser imports a local ZIP through a file
+`--no-audio` disables host audio. Native `--audio-backend cpal|pulse|auto` defaults
+to CPAL; Linux `pulse` uses a Rust PulseAudio protocol client and one mixed
+48-kHz stereo f32 stream. It advertises Doslet metadata to the system mixer.
+Runtime reconnection is limited to three attempts per output lifetime. On
+exhaustion, `auto` pauses and attempts CPAL; explicit `pulse` reports failure.
+Linux `--audio-mixer application|system` defaults to application mixing. The
+experimental system option selects the Rust PulseAudio adapter with separate
+stereo streams for SB16 PCM at the DSP rate, FM at 48 kHz and MIDI at 48 kHz. The Audio panel can switch mixers
+while pausing the session; failure retains the previous output. Queue capacity
+and pacing are bounded by the slower stream. PCM samples reach the server without application-side resampling; FM and MIDI
+retain existing engine conversions. PCM rate changes drain and recreate the
+server stream and can introduce gaps. Sample-exact alignment is not guaranteed.
+The browser imports a local ZIP through a file
 picker and lets the user select an EXE/COM. The program's containing directory
 is mounted as C:, preserving subdirectories; stored/Deflate entries are expanded
 only during session setup. Original compressed data remains owned by the

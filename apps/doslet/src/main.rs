@@ -112,7 +112,7 @@ fn run(
     };
 
     iced::application(boot, frontend::Doslet::update, frontend::Doslet::view)
-        .title("Doslet · A little DOS")
+        .title(|app: &frontend::Doslet| format!("{} — Doslet", app.name))
         .theme(frontend::Doslet::theme)
         .subscription(frontend::Doslet::subscription)
         .window(window)

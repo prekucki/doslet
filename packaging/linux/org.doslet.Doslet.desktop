@@ -2,8 +2,22 @@
 Type=Application
 Name=Doslet
 Comment=A modular DOS emulator
+Comment[pl]=Emulator gier i programów DOS
 Exec=doslet
 Icon=org.doslet.Doslet
 Terminal=false
 Categories=Game;Emulator;
 StartupWMClass=org.doslet.Doslet
+Keywords=DOS;retro;games;emulator;Sound Blaster;MIDI;
+Keywords[pl]=DOS;retro;gry;emulator;Sound Blaster;MIDI;
+Actions=SystemMixer;Silent;
+
+[Desktop Action SystemMixer]
+Name=Start with system audio mixer
+Name[pl]=Uruchom z mikserem systemowym
+Exec=doslet --audio-backend pulse --audio-mixer system
+
+[Desktop Action Silent]
+Name=Start without audio
+Name[pl]=Uruchom bez dźwięku
+Exec=doslet --no-audio

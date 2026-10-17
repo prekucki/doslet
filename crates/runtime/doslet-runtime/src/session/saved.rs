@@ -39,12 +39,16 @@ pub struct WorkingState {
     wire: super::saved_state::RuntimeSession,
     drive: ReadOnlyDrive,
     cdrom: Option<CdromImage>,
+    // Runtime-owned guest metadata has no portable representation yet, but
+    // diagnostic replays must retain descriptors, allocations and active frames.
+    dpmi: Option<Box<dpmi::Host>>,
 }
 impl WorkingState {
     pub fn restore(&self) -> Result<Session, InvalidState> {
         let mut session = Session::load_wire(self.wire.clone())?;
         session.drive = self.drive.clone();
         session.cdrom = self.cdrom.as_ref().map(|cd| cd.fork_local().unwrap());
+        session.dpmi = self.dpmi.clone();
         // Diagnostic copies start without native code, tier timing or learned proofs.
         session.set_dynamic_core(false);
         Ok(session)
@@ -67,15 +71,11 @@ impl Session {
             wire: self.save_wire_media(false),
             drive: self.drive.clone(),
             cdrom: self.cdrom.as_ref().map(|cd| cd.fork_local().unwrap()),
+            dpmi: self.dpmi.clone(),
         })
     }
 
     fn check_snapshot_boundary(&self) -> Result<(), InvalidState> {
-        if self.dpmi.is_some() {
-            return Err(InvalidState(
-                "save states do not yet support the experimental DPMI host",
-            ));
-        }
         if self.fault.is_some() || self.status == SessionStatus::Faulted {
             return Err(InvalidState("cannot save a faulted session"));
         }
@@ -93,6 +93,11 @@ impl Session {
     /// contents are external typed references; overlays and handle positions are
     /// saved. No host paths, leases, native code or analyzer proofs enter it.
     pub fn save_state(&self) -> Result<Vec<u8>, InvalidState> {
+        if self.dpmi.is_some() {
+            return Err(InvalidState(
+                "save states do not yet support the experimental DPMI host",
+            ));
+        }
         self.check_snapshot_boundary()?;
         let file = SavedSession {
             format: "doslet-state".into(),

@@ -378,6 +378,16 @@ impl Session {
     pub fn drain_pcm_timed(&mut self, output: &mut [doslet_pcm::Frame]) -> usize {
         self.machine.drain_pcm_timed(output)
     }
+    pub fn capture_audio_sources(&mut self, enabled: bool) {
+        self.machine.capture_audio_sources(enabled);
+    }
+    pub fn drain_audio_source(
+        &mut self,
+        fm: bool,
+        output: &mut [doslet_pcm::SourceFrame],
+    ) -> usize {
+        self.machine.drain_audio_source(fm, output)
+    }
     pub fn audio_status(&self) -> doslet_pc::AudioStatus {
         self.machine.audio_status()
     }

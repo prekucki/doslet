@@ -85,6 +85,9 @@ pub struct Doslet {
     anchor: Option<(Instant, u64)>,
     audio_engine: AudioEngine,
     mt32_rom_dir: Option<std::path::PathBuf>,
+    audio_backend: crate::audio::Backend,
+    audio_mixer: crate::audio::Mixer,
+    audio_fallback_used: bool,
     midi_bytes: [u8; 1024],
     pcm: [doslet_pcm::Frame; 128],
     mouse_capture: Option<iced::window::Id>,
@@ -131,6 +134,8 @@ pub enum Message {
     ExitRequested,
     RefreshMidi,
     MidiSelected(String),
+    #[cfg(target_os = "linux")]
+    AudioMixerSelected(crate::audio::Mixer),
     MidiModeSelected(Mode),
     MidiOutputModeSelected(Mode),
     #[cfg(test)]
@@ -189,6 +194,9 @@ impl Doslet {
             anchor: None,
             audio_engine: AudioEngine::new(),
             mt32_rom_dir: None,
+            audio_backend: crate::audio::Backend::default(),
+            audio_mixer: crate::audio::Mixer::default(),
+            audio_fallback_used: false,
             midi_bytes: [0; 1024],
             pcm: [doslet_pcm::EMPTY; 128],
             mouse_capture: None,
@@ -206,6 +214,8 @@ impl Doslet {
     pub fn from_cli(cli: crate::cli::Cli) -> Result<Box<Self>, Box<dyn std::error::Error>> {
         let cli = cli.resolve()?;
         let mut app = Box::new(Self::new());
+        app.audio_backend = cli.audio_backend;
+        app.audio_mixer = cli.audio_mixer;
         app.gamepads = Some(crate::native_gamepad::NativeGamepads::new());
         app.midi_mode = cli.midi_mode.unwrap_or_default().into();
         app.midi_output_mode = cli.midi_output_mode.unwrap_or_default().into();
@@ -283,7 +293,7 @@ impl Doslet {
                 app.name = name;
             }
             if !cli.no_audio && cli.midi_output.is_none() && cli.mt32_rom_dir.is_none() {
-                match crate::audio::Output::new() {
+                match crate::audio::Output::new(app.audio_backend, app.audio_mixer) {
                     Ok(audio) => {
                         let config = app.audio_config("Rust synth", audio.rate, false)?;
                         match app.audio_engine.configure(config, Some(audio.writer())) {
@@ -298,6 +308,15 @@ impl Doslet {
         if let Some(directory) = cli.mt32_rom_dir {
             app.mt32_rom_dir = Some(directory);
             app.midi_choices.push("CM-32L / MT-32".into());
+        }
+        if !cli.no_audio
+            && let Ok(ports) = crate::native_midi::ports()
+        {
+            for name in ports.names {
+                if !app.midi_choices.contains(&name) {
+                    app.midi_choices.push(name);
+                }
+            }
         }
         if let Some(selection) = cli.midi_output {
             let selection = match selection.as_str() {
@@ -851,6 +870,12 @@ impl Doslet {
                     self.notice = Some(error);
                 }
             }
+            #[cfg(target_os = "linux")]
+            Message::AudioMixerSelected(mixer) => {
+                if let Err(error) = self.select_audio_mixer(mixer) {
+                    self.notice = Some(format!("Audio mixer: {error}"));
+                }
+            }
             #[cfg(test)]
             Message::ArchiveLoaded(result) => match result {
                 Ok(Some(bytes)) => match crate::archive::GameArchive::new(bytes) {
@@ -920,6 +945,11 @@ impl Doslet {
                 if self.configurator.pending {
                     return Task::none();
                 }
+                self.session.capture_audio_sources(
+                    self.audio
+                        .as_ref()
+                        .is_some_and(|a| a.mixer() == crate::audio::Mixer::System),
+                );
                 match self.audio_engine.ready() {
                     Ok(true) => {
                         self.session.single_step();
@@ -1029,8 +1059,14 @@ impl Doslet {
             }
         }
     }
-    fn prepare_output(spec: &doslet_config::MachineSpec) -> Result<PreparedOutput, String> {
+    fn prepare_output(
+        spec: &doslet_config::MachineSpec,
+        backend: crate::audio::Backend,
+        mixer: crate::audio::Mixer,
+    ) -> Result<PreparedOutput, String> {
         let mut output = Self::new();
+        output.audio_backend = backend;
+        output.audio_mixer = mixer;
         output.midi_mode = if spec.output.game_midi == "mt32" {
             Mode::Mt32
         } else {
@@ -1113,7 +1149,7 @@ impl Doslet {
             self.configurator.message = Some(e.to_string());
             return Task::none();
         }
-        let output = match Self::prepare_output(&spec) {
+        let output = match Self::prepare_output(&spec, self.audio_backend, self.audio_mixer) {
             Ok(output) => output,
             Err(e) => {
                 self.configurator.message = Some(e);
@@ -1830,6 +1866,11 @@ impl Doslet {
             {
                 break;
             }
+            self.session.capture_audio_sources(
+                self.audio
+                    .as_ref()
+                    .is_some_and(|a| a.mixer() == crate::audio::Mixer::System),
+            );
             match self.audio_engine.ready() {
                 Ok(true) => {}
                 Ok(false) => break,
@@ -1908,7 +1949,29 @@ impl Doslet {
             if count == 0 {
                 break;
             }
-            self.audio_engine.receive_pcm(&self.pcm[..count])?;
+            if self
+                .audio
+                .as_ref()
+                .is_none_or(|a| a.mixer() != crate::audio::Mixer::System)
+            {
+                self.audio_engine.receive_pcm(&self.pcm[..count])?;
+            }
+        }
+        if self
+            .audio
+            .as_ref()
+            .is_some_and(|a| a.mixer() == crate::audio::Mixer::System)
+        {
+            let mut frames = [doslet_pcm::SourceFrame::default(); 128];
+            for fm in [false, true] {
+                loop {
+                    let count = self.session.drain_audio_source(fm, &mut frames);
+                    if count == 0 {
+                        break;
+                    }
+                    self.audio_engine.receive_source(fm, &frames[..count])?;
+                }
+            }
         }
         self.audio_engine
             .render_until(self.session.emulated_nanos(), self.host_midi.is_some())?;
@@ -2034,16 +2097,70 @@ impl Doslet {
             replay,
         })
     }
+    #[cfg(target_os = "linux")]
+    fn select_audio_mixer(&mut self, mixer: crate::audio::Mixer) -> Result<(), String> {
+        if self.audio_mixer == mixer && self.audio.as_ref().is_some_and(|a| a.check().is_ok()) {
+            return Ok(());
+        }
+        self.session.pause();
+        self.anchor = None;
+        if let Some(audio) = &self.audio {
+            audio.set_active(false);
+        }
+        // Prepare the complete replacement before discarding the old output.
+        // A failed connection leaves the previous mixer selected and paused.
+        let audio = crate::audio::Output::new(self.audio_backend, mixer)?;
+        audio.set_active(false);
+        let config = self.audio_config(&self.midi_choice, audio.rate, true)?;
+        let mut engine = AudioEngine::new();
+        engine.configure(config, Some(audio.writer()))?;
+        self.audio_engine = engine;
+        self.audio = Some(audio);
+        self.audio_mixer = mixer;
+        self.audio_fallback_used = false;
+        self.notice = Some(format!("{mixer} mixer selected; resume to continue."));
+        Ok(())
+    }
     fn poll_audio_error(&mut self) {
-        let result = self
-            .audio_engine
-            .check()
-            .and_then(|()| self.audio.as_ref().map_or(Ok(()), |a| a.check()));
+        let output_result = self.audio.as_ref().map_or(Ok(()), |a| a.check());
+        let output_failed = output_result.is_err();
+        let result = self.audio_engine.check().and(output_result);
         if let Err(error) = result {
-            self.notice = Some(error);
             self.session.pause();
             if let Some(audio) = &self.audio {
                 audio.set_active(false);
+            }
+            if self.audio_backend == crate::audio::Backend::Auto
+                && output_failed
+                && !self.audio_fallback_used
+                && self.audio.as_ref().is_some_and(|audio| audio.is_pulse())
+            {
+                self.audio_fallback_used = true;
+                let replacement = crate::audio::Output::new(
+                    crate::audio::Backend::Cpal,
+                    crate::audio::Mixer::Application,
+                )
+                .and_then(|audio| {
+                    audio.set_active(false);
+                    let config = self.audio_config(&self.midi_choice, audio.rate, true)?;
+                    let mut engine = AudioEngine::new();
+                    engine.configure(config, Some(audio.writer()))?;
+                    Ok((audio, engine))
+                });
+                match replacement {
+                    Ok((audio, engine)) => {
+                        self.audio_mixer = crate::audio::Mixer::Application;
+                        self.audio_engine = engine;
+                        self.audio = Some(audio);
+                        self.notice =
+                            Some(format!("{error}. Switched to CPAL; resume to continue."));
+                    }
+                    Err(fallback) => {
+                        self.notice = Some(format!("{error}; CPAL fallback: {fallback}"))
+                    }
+                }
+            } else {
+                self.notice = Some(error);
             }
         }
     }
@@ -2081,7 +2198,10 @@ impl Doslet {
             // A MIDI dialect/synth change does not require reopening CPAL.
             // Keep the current stream until the replacement synth is ready.
             let new_audio = if self.audio.is_none() {
-                Some(crate::audio::Output::new()?)
+                Some(crate::audio::Output::new(
+                    self.audio_backend,
+                    self.audio_mixer,
+                )?)
             } else {
                 None
             };
@@ -2122,7 +2242,7 @@ impl Doslet {
             });
             output.push(self.session.emulated_nanos(), &replay)?;
             if self.audio.is_none() {
-                match crate::audio::Output::new() {
+                match crate::audio::Output::new(self.audio_backend, self.audio_mixer) {
                     Ok(audio) => self.audio = Some(audio),
                     Err(error) => {
                         eprintln!("[WARN doslet] Sound Blaster output unavailable: {error}")
@@ -2342,6 +2462,8 @@ impl Doslet {
             notice: self.notice.clone(),
             midi_choices: self.midi_choices.clone(),
             midi_choice: self.midi_choice.clone(),
+            #[cfg(target_os = "linux")]
+            audio_mixer: self.audio_mixer,
             midi_mode: self.midi_mode,
             midi_output_mode: self.midi_output_mode,
             midi_activity: self.midi_activity.clone(),
@@ -2377,6 +2499,37 @@ impl Doslet {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires PULSE_SINK=doslet-audio-probe-output, a dedicated null sink"]
+    fn mixer_selection_prepares_both_outputs_and_rolls_back_failed_switch() {
+        use crate::audio::{Backend, Mixer};
+        assert_eq!(
+            std::env::var("PULSE_SINK").unwrap(),
+            "doslet-audio-probe-output"
+        );
+        let mut app = Doslet::new();
+        app.audio_backend = Backend::Pulse;
+        app.session.start();
+        app.select_audio_mixer(Mixer::System).unwrap();
+        assert_eq!(app.session.status(), SessionStatus::Paused);
+        assert_eq!(app.audio_mixer, Mixer::System);
+        assert_eq!(app.audio.as_ref().unwrap().mixer(), Mixer::System);
+        app.audio.as_ref().unwrap().check().unwrap();
+
+        app.midi_choice = "CM-32L / MT-32".into();
+        assert!(app.select_audio_mixer(Mixer::Application).is_err());
+        assert_eq!(app.audio_mixer, Mixer::System);
+        assert_eq!(app.audio.as_ref().unwrap().mixer(), Mixer::System);
+        assert_eq!(app.session.status(), SessionStatus::Paused);
+        app.audio_engine.check().unwrap();
+
+        app.midi_choice = "Rust synth".into();
+        app.select_audio_mixer(Mixer::Application).unwrap();
+        assert_eq!(app.audio_mixer, Mixer::Application);
+        assert_eq!(app.audio.as_ref().unwrap().mixer(), Mixer::Application);
+        assert_eq!(app.session.status(), SessionStatus::Paused);
+    }
 
     #[test]
     fn learned_profiles_activate_by_executable_with_saved_rates_and_can_be_disabled() {
@@ -2794,7 +2947,14 @@ enabled = false
         app.dynamic_error_reported = true;
         let candidate = Doslet::prepare_candidate(spec.clone(), settings, None, None);
         assert!(candidate.result.is_ok());
-        app.pending_output = Some(Box::new(Doslet::prepare_output(&spec).unwrap()));
+        app.pending_output = Some(Box::new(
+            Doslet::prepare_output(
+                &spec,
+                crate::audio::Backend::Cpal,
+                crate::audio::Mixer::Application,
+            )
+            .unwrap(),
+        ));
         app.configurator.pending = true;
         app.finish_preparation(Ok(std::sync::Arc::new(std::sync::Mutex::new(Some(
             candidate,

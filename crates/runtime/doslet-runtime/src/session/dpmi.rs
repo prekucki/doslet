@@ -42,7 +42,7 @@ pub enum Mode {
     Direct,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub entered: bool,
     pub calls: u64,
@@ -55,6 +55,7 @@ pub struct Stats {
     pub memory: MemoryStats,
 }
 
+#[derive(Clone)]
 struct Frame {
     context: CpuContext,
     structure: Option<u32>,
@@ -70,6 +71,7 @@ struct Callback {
     structure: u32,
 }
 
+#[derive(Clone)]
 pub(super) struct Host {
     pub(super) mode: Mode,
     stats: Stats,
@@ -86,7 +88,7 @@ pub(super) struct Host {
 }
 
 impl Session {
-    /// Setup-only experiment; the original extender remains the default.
+    /// Setup-only host installation; callers select whether to expose DPMI.
     pub fn enable_dpmi(&mut self, mode: Mode) -> Result<(), RuntimeError> {
         if self.status != SessionStatus::Ready || self.dpmi.is_some() {
             return Err(RuntimeError::InvalidLaunch);
@@ -906,7 +908,6 @@ impl Session {
         });
         if !far_return
             && self.dpmi.as_ref().unwrap().mode == Mode::Direct
-            && !self.machine.cpu.execution_labels_enabled()
             && structure.is_some()
             && let Some(service) = service
         {

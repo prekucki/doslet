@@ -387,6 +387,22 @@ fn audio_panel(app: &Doslet) -> Element<'_, Message> {
         small_button("Refresh outputs", Message::RefreshMidi),
     ]
     .spacing(18);
+    #[cfg(target_os = "linux")]
+    let body = body.push(field(
+        "Mixer",
+        pick_list(
+            [
+                crate::audio::Mixer::Application,
+                crate::audio::Mixer::System,
+            ],
+            Some(app.audio_mixer),
+            Message::AudioMixerSelected,
+        )
+        .width(Fill)
+        .text_size(14)
+        .padding(8)
+        .into(),
+    ));
     #[cfg(target_arch = "wasm32")]
     let body = body.push(
         button(text(app.audio_button_label()).size(13))

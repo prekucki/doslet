@@ -24,14 +24,17 @@ pub enum DriveMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum DpmiMode {
+    Off,
     Reflect,
     Direct,
 }
-impl From<DpmiMode> for doslet_runtime::session::dpmi::Mode {
-    fn from(mode: DpmiMode) -> Self {
-        match mode {
-            DpmiMode::Reflect => Self::Reflect,
-            DpmiMode::Direct => Self::Direct,
+impl DpmiMode {
+    pub fn host_mode(self) -> Option<doslet_runtime::session::dpmi::Mode> {
+        use doslet_runtime::session::dpmi::Mode;
+        match self {
+            Self::Off => None,
+            Self::Reflect => Some(Mode::Reflect),
+            Self::Direct => Some(Mode::Direct),
         }
     }
 }
@@ -71,6 +74,14 @@ pub struct Cli {
     /// Run without opening an audio output device
     #[arg(long, conflicts_with = "midi_output")]
     pub no_audio: bool,
+
+    /// Host audio adapter; PulseAudio uses a Rust protocol client on Linux
+    #[arg(long, value_enum, default_value = "cpal")]
+    pub audio_backend: crate::audio::Backend,
+
+    /// Mixer; experimental system mixing selects PulseAudio on Linux
+    #[arg(long, value_enum, default_value = "application")]
+    pub audio_mixer: crate::audio::Mixer,
 
     /// Experimentally batch three Heroes timer polling loops; off by default
     #[arg(long)]
@@ -120,8 +131,8 @@ pub struct Cli {
     /// Use the interpreter instead of the native dynamic core
     #[arg(long)]
     pub no_dynamic_core: bool,
-    /// Opt in to the experimental DPMI host; direct avoids eligible BIOS/DOS mode switches
-    #[arg(long, value_enum)]
+    /// DPMI host mode; direct avoids eligible BIOS/DOS switches, off uses the guest extender
+    #[arg(long, value_enum, default_value = "direct")]
     pub experimental_dpmi: Option<DpmiMode>,
 
     /// Listen for a remote GDB client; attachment stops the guest
@@ -136,7 +147,7 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub core_profile: Option<PathBuf>,
 
-    /// MIDI port index/name, rust, apple (macOS), or moont
+    /// MIDI port index/name, timidity, rust, apple (macOS), or moont
     #[arg(long, value_name = "PORT")]
     pub midi_output: Option<String>,
 
@@ -166,6 +177,23 @@ pub struct Cli {
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+    #[test]
+    fn application_mixing_is_default_and_system_is_explicit() {
+        let cli = Cli::try_parse_from(["doslet"]).unwrap();
+        assert_eq!(cli.audio_mixer, crate::audio::Mixer::Application);
+        assert_eq!(cli.audio_backend, crate::audio::Backend::Cpal);
+        let cli = Cli::try_parse_from([
+            "doslet",
+            "--audio-mixer",
+            "system",
+            "--audio-backend",
+            "pulse",
+        ])
+        .unwrap();
+        assert_eq!(cli.audio_mixer, crate::audio::Mixer::System);
+        assert_eq!(cli.audio_backend, crate::audio::Backend::Pulse);
+        assert!(Cli::try_parse_from(["doslet", "--audio-mixer", "unknown"]).is_err());
+    }
     #[test]
     fn speed_tiers_and_snapshot_options_are_explicit() {
         let cli = Cli::try_parse_from([
@@ -258,6 +286,24 @@ mod tests {
                 .launch
                 .no_dynamic_core
         );
+    }
+
+    #[test]
+    fn dpmi_defaults_to_direct_and_supports_reflect_and_off() {
+        use doslet_runtime::session::dpmi::Mode;
+        let cli = Cli::try_parse_from(["doslet"]).unwrap().resolve().unwrap();
+        assert_eq!(cli.launch.dpmi, Some(Mode::Direct));
+        assert_eq!(
+            Cli::default().resolve().unwrap().launch.dpmi,
+            Some(Mode::Direct)
+        );
+        for (argument, expected) in [("reflect", Some(Mode::Reflect)), ("off", None)] {
+            let cli = Cli::try_parse_from(["doslet", "--experimental-dpmi", argument])
+                .unwrap()
+                .resolve()
+                .unwrap();
+            assert_eq!(cli.launch.dpmi, expected);
+        }
     }
 
     #[test]
