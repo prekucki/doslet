@@ -483,7 +483,7 @@ impl PortBus for PcBus {
             Endpoint::KeyboardCommand => Ok(self.keyboard.status()),
             Endpoint::A20 => Ok(if self.a20.enabled { 2 } else { 0 }),
             Endpoint::MidiData => Ok(self.mpu.read_data()),
-            Endpoint::MidiCommand => Ok(self.mpu.status()),
+            Endpoint::MidiCommand => Ok(self.mpu.status(self.guest_nanos)),
             Endpoint::PicCommand => Ok(self.pic.read_command()),
             Endpoint::PicData => Ok(self.pic.read_data()),
             Endpoint::SlavePicCommand => Ok(self.slave_pic.read_command()),
@@ -581,7 +581,7 @@ impl PortBus for PcBus {
             }
             Endpoint::MidiData => self
                 .mpu
-                .write_data(value)
+                .write_data(value, self.guest_nanos)
                 .map_err(|_| BusError::UnmappedPort(port))?,
             Endpoint::MidiCommand => self
                 .mpu

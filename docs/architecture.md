@@ -203,7 +203,14 @@ the host filesystem or allocate during execution.
 
 The MPU-401 crate owns UART state and a fixed output queue independently of
 the CPU, machine and audio host. PC ports 330h/331h route to it. The runtime can
-drain MIDI into caller-provided storage. The independent no_std MIDI synthesizer
+drain MIDI into caller-provided storage. Each accepted data byte holds status
+bit 6 busy for 320 µs of guest time (31,250 bit/s, including start and stop bits).
+The PC supplies its clock on port accesses; host draining cannot shorten that
+deadline. A full output queue also asserts busy. Writes while busy fail explicitly.
+The deadline survives reset and save/restore along with accepted bytes; older
+states without the deadline restore ready. Accepted bytes retain frontend batch
+resolution rather than separate timestamps at the end of each serial byte.
+The independent no_std MIDI synthesizer
 receives those wire bytes and renders into supplied stereo buffers. Its timeline
 maps guest nanoseconds to sample frames; MIDI timestamps currently have bounded
 batch resolution. Native CPAL owns a reserved host audio queue and shares only

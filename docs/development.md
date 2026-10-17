@@ -529,6 +529,18 @@ progress before the next CPU chunk and that asynchronous errors reach the notice
 while paused. These are synthetic scheduling/correctness checks, not measurements
 of game performance, audible quality, CM-32L ROM playback or macOS Audio Units.
 
+With local CM-32L ROMs, exercise a guest driver sending 6000 expression changes
+through MPU-401 write-ready polling, both inline and on the synthesis worker:
+
+```sh
+DOSLET_MT32_ROM_DIR=/path/to/roms cargo test -p doslet --release --locked local_moont_expression_flood_obeys_uart_backpressure -- --ignored --nocapture
+```
+
+This synthetic reproduction covers the rapid `CC 11` traffic observed while
+entering PRINCE's Doge's Palace. It checks that draining MIDI does not bypass
+the guest UART rate and that notes still reach CM-32L after the flood. It does
+not establish interactive palace compatibility or audible quality.
+
 Display filter and upload-order tests run with
 `cargo test -p doslet --locked presentation::`. On a host with a working wgpu
 adapter, also run the opt-in renderer regression:
@@ -630,7 +642,7 @@ Tasks that use your own game files belong in an untracked `mise.local.toml`.
 | PIT | Binary modes 0/2/3, latches, gates, channel-2 output at 61h, fractional guest clock input and IRQ0 | Modes 1/4/5, read-back, BCD and precise periodic load timing |
 | VGA/VBE | Mode-13h and banked 640×480×8 pixels, palette writes, borrowed scanout, configuration readback, selected VBE 1.2 BIOS calls | Text/planar modes, register rendering effects, raster timing, more SVGA modes |
 | DOS/BIOS | COM/MZ/overlay setup, bounded memory arena, immutable input files/directories, optional sparse RAM writes, timer/user-hook shims | Full DOS kernel, extender compatibility, raw mouse hardware, persistent storage |
-| MPU-401 / MIDI | UART setup, bounded output at 330h/331h; independent procedural synth, guest-timed WAV, native and Web Audio output | General MIDI instrument fidelity, serial timing, IRQs and intelligent mode |
+| MPU-401 / MIDI | UART setup, guest-time transmit-busy handshake (320 µs/byte), bounded output at 330h/331h; independent procedural synth, guest-timed WAV, native and Web Audio output | General MIDI instrument fidelity, receive-side serial timing, IRQs and intelligent mode |
 | Sound Blaster 16 / AdLib | Independent DSP/mixer and Nuked OPL3 FM, selected DMA PCM playback, guest-clock OPL timers, stereo FM/DMA mixing, auto-init/pause/resume, block IRQs and bounded output queue | More DSP commands, precise timing, digital-PCM mixer gain and real-game FM audio acceptance |
 | Frontends | Shared iced desktop/web view, native emulation thread, browser Worker/AudioWorklet, ZIP mount/program selection, optional system MIDI on both platforms, headless CLI | Further presentation-copy reduction |
 | Executable inspector | Borrowed MZ metadata/relocations and LE/LX header detection | LE/LX loading and execution |

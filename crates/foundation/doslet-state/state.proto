@@ -182,6 +182,7 @@ message MpuMpu401 {
   MpuQueue output = 3;
   uint64 commands = 4;
   uint64 transmitted = 5;
+  uint64 transmit_ready_nanos = 6;
 }
 
 message PcmFrame {

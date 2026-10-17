@@ -48,6 +48,8 @@ pub struct MpuMpu401 {
     commands: u64,
     #[prost(uint64, tag = "5")]
     transmitted: u64,
+    #[prost(uint64, tag = "6")]
+    transmit_ready_nanos: u64,
 }
 impl State for Mpu401 {
     type Wire = MpuMpu401;
@@ -58,6 +60,7 @@ impl State for Mpu401 {
             output: Some(State::save(&self.output)),
             commands: self.commands,
             transmitted: self.transmitted,
+            transmit_ready_nanos: self.transmit_ready_nanos,
         }
     }
     fn load(w: Self::Wire) -> Result<Self, InvalidState> {
@@ -75,7 +78,33 @@ impl State for Mpu401 {
             )?)?,
             commands: w.commands,
             transmitted: w.transmitted,
+            transmit_ready_nanos: w.transmit_ready_nanos,
         };
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restoration_preserves_transmit_busy_and_old_states_default_to_ready() {
+        let mut mpu = Mpu401::new();
+        mpu.write_command(0x3F).unwrap();
+        mpu.write_data(0x90, 10_000_000).unwrap();
+        let mut restored = Mpu401::load(mpu.save()).unwrap();
+        assert_eq!(restored.status(10_319_999) & 0x40, 0x40);
+        assert_eq!(
+            restored.write_data(60, 10_319_999),
+            Err(MpuError::TransmitBusy)
+        );
+        restored.write_data(60, 10_320_000).unwrap();
+        let mut bytes = [0; 2];
+        assert_eq!(restored.drain(&mut bytes), 2);
+        assert_eq!(bytes, [0x90, 60]);
+        let mut legacy = mpu.save();
+        legacy.transmit_ready_nanos = 0; // Absent field in older Protobuf states.
+        assert_eq!(Mpu401::load(legacy).unwrap().status(10_000_000) & 0x40, 0);
     }
 }

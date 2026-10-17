@@ -1,5 +1,35 @@
 # Machiavelli the Prince: compatibility target
 
+## MIDI overflow when entering Doge's Palace
+
+On 2026-10-17, clicking **Doge's Palace / Politics** from Venice immediately
+paused the native frontend with `CM-32L MIDI queue full`. The live instance used
+`--no-dynamic-core`; JIT was not required to reproduce the failure. MCP showed
+the Venice panel still visible at guest 224112664916 ns and 509099392 steps.
+
+Guest GDB inspection stopped at `00203c8f`, returning from the MIDI sender.
+The caller at `001f5b81` constructs expression changes (`CC 11`), and the fade
+loop at `001e3a90` repeatedly updates all sixteen channels until its timer expires.
+The active MPU sender at `0020bcab` checks bit 6 at port `331h` before every byte.
+These addresses describe this local executable only; no game address is used
+by the fix.
+
+MPU previously reported write-ready whenever its host-drained queue had room.
+It now retains a 320-µs guest-time transmit deadline per byte. Draining output
+does not clear busy, so the driver's existing polling loop limits transmission.
+The [local ROM regression](../development.md#check-the-work) sends 6000 `CC 11`
+messages through guest port polling and checks both native audio paths. Restoring
+the old unpaced behavior makes that test fail with `CM-32L MIDI queue full` at
+guest 408 ms. With the deadline, both paths deliver all 18009 bytes and reach
+guest 6147 ms without overflow.
+
+After rebuilding and restarting with `games/PRINCE.toml --no-dynamic-core`,
+an interactive replay reached the Doge's Palace politics screen. MCP showed
+`Running` at guest 79774954216 ns and 206553216 steps, and the user confirmed
+that the transition worked. A separate ten-minute local PRINCE run reached
+guest 600001 ms with 5726 note events and no queue overflow. These checks cover
+this transition and the automated run, not a complete campaign.
+
 ## New-game startup after memory and controller fixes
 
 Local PRINCE.EXE is an external test input. Its files were read without changes.

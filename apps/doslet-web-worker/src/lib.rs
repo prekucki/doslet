@@ -639,6 +639,7 @@ fn parse_mode(mode: &str) -> Result<Mode, String> {
 
 #[cfg(test)]
 mod tests {
+    include!("../../../tests/fixtures/midi.rs");
     use super::*;
     include!("../../../tests/fixtures/sb16_pcm.rs");
     #[test]
@@ -703,12 +704,14 @@ mod tests {
         ];
         let mut program = vec![0xBA, 0x31, 3, 0xB0, 0x3F, 0xEE, 0xBA, 0x30, 3];
         for byte in message {
-            program.extend_from_slice(&[0xB0, byte, 0xEE]);
+            append_midi_byte(&mut program, byte);
         }
         program.extend_from_slice(&[0xEB, 0xFE]);
         engine.session = Session::new(&program).unwrap();
         engine.start();
-        engine.advance(1000);
+        for _ in 0..4 {
+            engine.advance(10000);
+        }
         let count = engine.drain_midi().unwrap();
         assert_eq!(engine.midi_mode(), "mt32");
         assert!(engine.midi_upgraded());

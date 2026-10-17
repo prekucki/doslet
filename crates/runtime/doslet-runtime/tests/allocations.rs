@@ -5,6 +5,7 @@ include!("../../../../tests/fixtures/relocated_mz.rs");
 include!("../../../../tests/fixtures/protected_graphics.rs");
 include!("../../../../tests/fixtures/iso9660.rs");
 include!("../../../../tests/fixtures/opl3.rs");
+include!("../../../../tests/fixtures/midi.rs");
 
 #[test]
 fn opl3_guest_io_synthesis_and_pcm_drain_allocate_nothing_after_setup() {
@@ -360,11 +361,14 @@ fn executing_a_relocated_mz_including_console_output_allocates_nothing() {
 #[test]
 fn reading_a_mounted_file_and_sending_midi_allocate_nothing_after_setup() {
     let mut program = vec![0; 0x100];
-    let code = [
+    let mut code = vec![
         0xBA, 0x80, 1, 0xB8, 0, 0x3D, 0xCD, 0x21, 0x89, 0xC3, 0xB9, 5, 0, 0xBA, 0x90, 1, 0xB4,
-        0x3F, 0xCD, 0x21, 0xBA, 0x31, 3, 0xB0, 0x3F, 0xEE, 0xBA, 0x30, 3, 0xEC, 0xB0, 0x90, 0xEE,
-        0xB0, 60, 0xEE, 0xB0, 100, 0xEE, 0xB8, 0, 0x4C, 0xCD, 0x21,
+        0x3F, 0xCD, 0x21, 0xBA, 0x31, 3, 0xB0, 0x3F, 0xEE, 0xBA, 0x30, 3, 0xEC,
     ];
+    for byte in [0x90, 60, 100] {
+        append_midi_byte(&mut code, byte);
+    }
+    code.extend_from_slice(&[0xB8, 0, 0x4C, 0xCD, 0x21]);
     program[..code.len()].copy_from_slice(&code);
     program[0x80..0x89].copy_from_slice(b"TEST.BIN\0");
     let mut drive = doslet_dos::files::ReadOnlyDrive::new();
@@ -373,7 +377,7 @@ fn reading_a_mounted_file_and_sending_midi_allocate_nothing_after_setup() {
     session.start();
     let mut midi = [0; 16];
     let measured = allocation_counter::measure(|| {
-        session.advance(100);
+        session.advance(10000);
         assert_eq!(session.drain_midi(&mut midi), 3);
     });
     assert_eq!(session.status(), SessionStatus::Exited(0));

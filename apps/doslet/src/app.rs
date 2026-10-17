@@ -2376,6 +2376,7 @@ impl Doslet {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    include!("../../../tests/fixtures/midi.rs");
     use super::*;
 
     #[test]
@@ -3491,12 +3492,12 @@ enabled = false
         for byte in [
             0xF0, 0x41, 0x10, 0x16, 0x12, 0x20, 0, 0, b'A', 0x1F, 0xF7, 0x91, 60, 100,
         ] {
-            program.extend_from_slice(&[0xB0, byte, 0xEE]);
+            append_midi_byte(&mut program, byte);
         }
         program.extend_from_slice(&[0xEB, 0xFE]);
         app.session = Session::new(&program).unwrap().into();
         app.session.start();
-        app.session.advance(1000);
+        app.session.advance(40000);
         app.process_audio().unwrap();
         assert_eq!(app.midi_mode, Mode::Mt32);
         assert_eq!(app.routing.translator().stats().sysex, 1);
@@ -3575,12 +3576,12 @@ enabled = false
         for byte in [
             0xF0, 0x41, 0x10, 0x16, 0x12, 0x20, 0, 0, b'A', 0x1F, 0xF7, 0x91, 60, 100,
         ] {
-            program.extend_from_slice(&[0xB0, byte, 0xEE]);
+            append_midi_byte(&mut program, byte);
         }
         program.extend_from_slice(&[0xEB, 0xFE]);
         app.session = Session::new(&program).unwrap().into();
         app.session.start();
-        app.session.advance(1000);
+        app.session.advance(40000);
         app.process_audio().unwrap();
         assert_eq!(app.midi_mode, Mode::Mt32);
         assert_eq!(app.output_dialect(), Mode::Gm);
@@ -4289,6 +4290,83 @@ enabled = false
     #[ignore = "requires the user's local PRINCE installation; run from repository root"]
     fn local_prince_moont_queue_survives_repeated_restoration() {
         check_local_prince_moont_queue(121_000_000_000, true);
+    }
+
+    #[test]
+    #[ignore = "requires DOSLET_MT32_ROM_DIR with local CM-32L ROMs"]
+    fn local_moont_expression_flood_obeys_uart_backpressure() {
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("DOSLET_MT32_ROM_DIR").expect("set DOSLET_MT32_ROM_DIR"),
+        );
+        // A guest driver that sends CC 11 as fast as write-ready permits, like
+        // PRINCE's music fade at Doge's Palace. More than moont's 4096 events.
+        let mut program = vec![0xBA, 0x31, 3, 0xB0, 0x3F, 0xEE];
+        for byte in [0x90, 60, 100] {
+            append_midi_byte(&mut program, byte);
+        }
+        program.extend_from_slice(&[0xB9, 0x70, 0x17]); // CX = 6000 messages.
+        let start = program.len();
+        for byte in [0xB0, 11, 63] {
+            append_midi_byte(&mut program, byte);
+        }
+        let jump = (start as isize - program.len() as isize - 2) as i8;
+        program.extend_from_slice(&[0xE2, jump as u8]);
+        for byte in [0x80, 60, 0, 0x90, 64, 100] {
+            append_midi_byte(&mut program, byte);
+        }
+        program.extend_from_slice(&[0xB8, 0, 0x4C, 0xCD, 0x21]);
+        for threaded in [false, true] {
+            let mut app = Doslet::new();
+            app.session = Session::new(&program).unwrap().into();
+            app.session.set_cpu_mhz(1).unwrap();
+            let output = crate::audio::Writer::mock(48000);
+            app.audio_engine
+                .configure(
+                    crate::native_audio::Config {
+                        source: crate::native_audio::Source::Mt32 {
+                            directory: directory.clone(),
+                            mode: Mode::Gm,
+                        },
+                        rate: 48000,
+                        nanos: 0,
+                        replay: Vec::new(),
+                    },
+                    threaded.then(|| output.clone()),
+                )
+                .unwrap();
+            app.session.start();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while app.session.status() == SessionStatus::Running {
+                output.consume(512);
+                assert!(Instant::now() < deadline, "audio worker made no progress");
+                if !app.audio_engine.ready().unwrap() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                app.session.advance(256);
+                app.process_audio().unwrap();
+            }
+            while app.audio_engine.pending_nanos() != 0 {
+                output.consume(512);
+                app.audio_engine.check().unwrap();
+                assert!(Instant::now() < deadline, "audio worker did not finish");
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                app.session.status(),
+                SessionStatus::Exited(0),
+                "{:?}",
+                app.session.fault()
+            );
+            assert_eq!(app.session.midi_stats().1, 18_009);
+            assert_eq!(app.audio_engine.stats().notes, 2);
+            assert!(app.session.emulated_nanos() >= 18_008 * 320_000);
+            eprintln!(
+                "CM-32L CC11 flood: threaded={threaded}, bytes={}, guest={} ms",
+                app.session.midi_stats().1,
+                app.session.emulated_nanos() / 1_000_000
+            );
+        }
     }
 
     #[test]
