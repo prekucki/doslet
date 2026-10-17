@@ -96,6 +96,17 @@ impl Session {
     }
     pub(super) fn dispatch_mouse(&mut self) -> Result<(), RuntimeError> {
         if self.machine.cpu.protected_mode() {
+            // Our DPMI host reflects IRQ 74h through the real-mode mouse
+            // wrapper. Dispatch its host trampoline before executing IRET.
+            if self.dpmi_stats().is_some_and(|stats| stats.entered)
+                && !self.mouse.callback_active
+                && self.mouse.pending & self.mouse.callback.0 != 0
+                && self.machine.cpu.accepts_maskable_interrupt()
+            {
+                self.machine.cpu.interrupt(&mut self.machine.bus, 0x74)?;
+                self.mouse.callback_active = true;
+                self.dpmi_dispatch()?;
+            }
             return Ok(());
         }
         let r = &self.machine.cpu.registers;

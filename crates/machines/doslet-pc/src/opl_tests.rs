@@ -69,6 +69,7 @@ fn absent_pas_filter_probe_does_not_touch_opl_bank_one_or_hide_other_ports() {
 fn simultaneous_fm_and_dma_are_summed_on_one_ordered_pcm_timeline() {
     let mut fm = PcMachine::default();
     let mut mixed = PcMachine::default();
+    mixed.capture_audio_sources(true);
     // Existing DMA fixture emits one signed mono sample (1234h) at 1 kHz.
     for m in [&mut fm, &mut mixed] {
         full_volume(m);
@@ -113,6 +114,24 @@ fn simultaneous_fm_and_dma_are_summed_on_one_ordered_pcm_timeline() {
     }
     assert_eq!(digital_samples, 48);
     assert!(b[..count].windows(2).all(|p| p[0].nanos < p[1].nanos));
+    let mut sources = [doslet_pcm::SourceFrame::default(); 256];
+    let pcm_count = mixed.drain_audio_source(false, &mut sources);
+    assert_eq!(pcm_count, 1);
+    assert_eq!(sources[0].rate, 1000);
+    assert_eq!(sources[0].samples, [0x1234; 2]);
+    let fm_count = mixed.drain_audio_source(true, &mut sources);
+    assert!(fm_count >= count);
+    for frame in &sources[..fm_count] {
+        assert_eq!(frame.rate, doslet_opl3::SAMPLE_RATE);
+        if let Some(expected) = a[..count].iter().find(|f| f.nanos == frame.nanos) {
+            assert_eq!(
+                frame.samples, expected.samples,
+                "FM tap must not contain DMA PCM"
+            );
+        } else {
+            assert_eq!(frame.samples, [0; 2]);
+        }
+    }
 }
 
 #[test]

@@ -406,7 +406,10 @@ impl Cli {
         self.launch.analyze_synchronization = self.analyze_synchronization || self.adaptive_cpu;
         self.launch.adaptive_cpu = self.adaptive_cpu;
         self.launch.no_dynamic_core = self.no_dynamic_core;
-        self.launch.dpmi = self.experimental_dpmi.map(Into::into);
+        self.launch.dpmi = self
+            .experimental_dpmi
+            .unwrap_or(crate::cli::DpmiMode::Direct)
+            .host_mode();
         self.launch.core_profile = self.core_profile.clone();
         if let Some(mode) = self.drive_mode {
             self.launch.writable = mode != DriveMode::Ro;

@@ -283,8 +283,7 @@ fn debugger_uses_reflection_and_restores_direct_dispatch_on_detach() {
     assert_eq!(s.dpmi_stats().unwrap().direct, 1);
 }
 
-#[test]
-fn guest_callback_returns_through_nested_real_and_protected_frames() {
+fn callback_session() -> Session {
     let mut s = prepared(Mode::Direct);
     let code = s.registers().cs;
     s.machine
@@ -331,6 +330,12 @@ fn guest_callback_returns_through_nested_real_and_protected_frames() {
     rm.write(&mut s.machine.bus, 0x30000).unwrap();
     s.machine.cpu.registers.set(Gpr16::Cx, 0);
     s.machine.cpu.registers.set32(Gpr32::Edi, 0x30000);
+    s
+}
+
+#[test]
+fn guest_callback_returns_through_nested_real_and_protected_frames() {
+    let mut s = callback_session();
     call(&mut s, 0x302);
     assert_eq!(s.machine.bus.read_u32(0x3001C).unwrap(), 0x12345678);
     assert_eq!(s.dpmi.as_ref().unwrap().depth, 0);
@@ -358,31 +363,167 @@ fn observed_call_uses_real_instruction_without_changing_configured_mode() {
 }
 
 #[test]
-fn labelled_execution_retains_reflected_service_timing() {
-    let mut s = prepared(Mode::Direct);
-    s.set_execution_tiers(
-        Some(alloc::vec::Vec::new()),
-        [Some(100), Some(50), Some(25)],
-    )
-    .unwrap();
-    simulated(&mut s, 0x16, 0x0100);
-    assert_eq!(s.dpmi_stats().unwrap().direct, 0);
-    assert_eq!(s.dpmi_stats().unwrap().reflected, 1);
+fn direct_services_charge_the_dispatch_label_with_weighted_timing() {
+    for tier in 0..4 {
+        let mut direct = prepared(Mode::Direct);
+        let mut reference = prepared(Mode::Reflect);
+        for s in [&mut direct, &mut reference] {
+            // Equivalent labels for the protected dispatcher and real IRET
+            // allow comparison at different HOT/COLD/GREY/IRQ rates, including MAX.
+            let labels = [
+                (bios::SHIM_BASE + PM_BASE + 0x31 * 8, true),
+                (bios::SHIM_BASE + 0x16, false),
+            ]
+            .map(|(address, code32)| doslet_x86::ExecutionLabel {
+                address,
+                code32,
+                bytes: s
+                    .ram_view(address as usize..address as usize + 15)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                tier,
+            })
+            .to_vec();
+            s.set_execution_tiers(Some(labels), [None, Some(8), Some(133)])
+                .unwrap();
+        }
+        for _ in 0..8 {
+            assert_eq!(
+                simulated(&mut direct, 0x16, 0x0100),
+                simulated(&mut reference, 0x16, 0x0100)
+            );
+            assert_eq!(direct.registers(), reference.registers());
+            assert_eq!(direct.eflags(), reference.eflags());
+            assert_eq!(direct.steps(), reference.steps());
+            assert_eq!(direct.emulated_nanos(), reference.emulated_nanos());
+            assert_eq!(
+                direct.execution_tier_stats(),
+                reference.execution_tier_stats()
+            );
+            assert_eq!(direct.ram_view(0..0x90000), reference.ram_view(0..0x90000));
+        }
+        let mut expected = [0, 0, 8, 0]; // One guest INT 31h per call.
+        expected[usize::from(tier)] += 16; // Synthetic real IRET and protected IRET.
+        assert_eq!(direct.executed_tier_counts(), expected);
+        assert_eq!(direct.dpmi_stats().unwrap().direct, 8);
+        assert_eq!(direct.dpmi_stats().unwrap().reflected, 0);
+        assert_eq!(reference.dpmi_stats().unwrap().reflected, 8);
+    }
 }
 
 #[cfg(feature = "save-state")]
 #[test]
-fn portable_and_working_states_reject_an_unserialized_dpmi_host() {
+fn portable_states_reject_an_unserialized_dpmi_host() {
     let s = prepared(Mode::Direct);
     assert_eq!(
         s.save_state().err().unwrap().0,
         "save states do not yet support the experimental DPMI host"
     );
-    assert_eq!(
-        s.capture_working_state().err().unwrap().0,
-        "save states do not yet support the experimental DPMI host"
-    );
     let original = Session::new(&[0x90]).unwrap();
     let restored = Session::load_state(&original.save_state().unwrap()).unwrap();
     assert!(restored.dpmi_stats().is_none());
+}
+
+#[cfg(feature = "save-state")]
+#[path = "working_state_tests.rs"]
+mod working_states;
+
+#[test]
+fn mouse_callback_is_delivered_while_dpmi_client_runs_protected_code() {
+    for mode in [Mode::Direct, Mode::Reflect] {
+        let mut s = prepared(mode);
+        // Real callback records event/position through CS and returns far.
+        for (i, byte) in [
+            0x2E, 0xA3, 0x00, 0x01, 0x2E, 0x89, 0x0E, 0x02, 0x01, 0x2E, 0x89, 0x16, 0x04, 0x01,
+            0xCB,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.machine.bus.write_u8(0x60000 + i as u32, byte).unwrap();
+        }
+        s.mouse.callback = (7, 0x6000, 0);
+        s.machine.bus.write_u16(0xF0409, 0).unwrap();
+        s.machine.bus.write_u16(0xF040B, 0x6000).unwrap();
+        s.machine.bus.write_u8(0x20000, 0xEB).unwrap();
+        s.machine.bus.write_u8(0x20001, 0xFE).unwrap();
+        let before = RealRegisters::from_cpu(&s.machine.cpu);
+        let ip = s.registers().ip;
+        let flags = s.eflags();
+        s.pointer_move(42, 34);
+        s.pointer_button(0, true);
+        for _ in 0..200 {
+            s.advance(1);
+            assert_eq!(s.fault(), None);
+            if s.machine.bus.read_u16(0x60100).unwrap() == 3
+                && !s.mouse.callback_active
+                && s.registers().cs == before.segments[Seg::Cs as usize]
+                && s.registers().ip == ip
+            {
+                break;
+            }
+        }
+        assert_eq!(s.machine.bus.read_u16(0x60100).unwrap(), 3);
+        assert_eq!(s.machine.bus.read_u16(0x60102).unwrap(), 42);
+        assert_eq!(s.machine.bus.read_u16(0x60104).unwrap(), 34);
+        assert_eq!(
+            RealRegisters::from_cpu(&s.machine.cpu).general,
+            before.general
+        );
+        assert_eq!(
+            RealRegisters::from_cpu(&s.machine.cpu).segments,
+            before.segments
+        );
+        assert_eq!(s.eflags(), flags);
+        assert!(!s.mouse.callback_active);
+    }
+}
+
+#[test]
+fn mouse_irq_invokes_registered_protected_callback_and_returns_to_client() {
+    let mut s = callback_session();
+    s.mouse.callback = (7, bios::SHIM_SEGMENT, CB_BASE as u16);
+    s.machine.bus.write_u16(0xF0409, CB_BASE as u16).unwrap();
+    s.machine
+        .bus
+        .write_u16(0xF040B, bios::SHIM_SEGMENT)
+        .unwrap();
+    s.machine.bus.write_u8(0x20000, 0xEB).unwrap();
+    s.machine.bus.write_u8(0x20001, 0xFE).unwrap();
+    s.machine.cpu.registers.ip = 0x20000;
+    let before = RealRegisters::from_cpu(&s.machine.cpu);
+    let flags = s.eflags();
+    // IF=0 defers delivery without consuming the pending movement.
+    s.machine.cpu.flags &= !0x200;
+    s.pointer_move(42, 34);
+    s.advance(20);
+    assert!(!s.mouse.callback_active);
+    assert_ne!(s.mouse.pending, 0);
+    s.machine.cpu.flags = flags;
+    for _ in 0..200 {
+        s.advance(1);
+        assert_eq!(s.fault(), None);
+        if s.mouse.pending == 0
+            && !s.mouse.callback_active
+            && s.registers().cs == before.segments[Seg::Cs as usize]
+            && s.registers().ip == 0x20000
+        {
+            break;
+        }
+    }
+    assert_eq!(s.machine.bus.read_u32(0x3011C).unwrap(), 0x12345678);
+    assert_eq!(s.machine.bus.read_u16(0x30118).unwrap(), 42);
+    assert_eq!(s.machine.bus.read_u16(0x30114).unwrap(), 34);
+    assert_eq!(
+        RealRegisters::from_cpu(&s.machine.cpu).general,
+        before.general
+    );
+    assert_eq!(
+        RealRegisters::from_cpu(&s.machine.cpu).segments,
+        before.segments
+    );
+    assert_eq!(s.eflags(), flags);
+    assert_eq!(s.dpmi.as_ref().unwrap().depth, 0);
+    assert!(!s.mouse.callback_active);
 }

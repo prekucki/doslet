@@ -243,7 +243,19 @@ impl PcMachine {
     }
     /// Account for one instruction replaced by a runtime service. The caller
     /// must preserve its CPU effects and the interrupt boundary separately.
+    /// Execution labels classify it at the current CS:IP, just like a CPU step.
     pub fn advance_service_step(&mut self) -> Result<(), MachineError> {
+        if self.cpu.execution_labels_enabled() {
+            let r = &self.cpu.registers;
+            let address = r
+                .segment_cache(doslet_x86::SegmentRegister::Cs)
+                .base
+                .wrapping_add(r.ip);
+            let tier = self.cpu.execution_tier_at(&self.bus, address);
+            let mut counts = [0; 4];
+            counts[usize::from(tier)] = 1;
+            self.cpu.account_execution(counts);
+        }
         self.advance_hardware_steps(1)?;
         #[cfg(feature = "profiling")]
         {
@@ -411,6 +423,24 @@ impl PcMachine {
     }
     pub fn drain_pcm_timed(&mut self, output: &mut [doslet_pcm::Frame]) -> usize {
         self.bus.pcm.drain_timed(output)
+    }
+    /// Configure host-only source taps at a control boundary, before execution.
+    pub fn capture_audio_sources(&mut self, enabled: bool) {
+        if enabled && self.bus.audio_sources.is_none() {
+            self.bus.audio_sources = Some(core::array::from_fn(|_| Default::default()));
+        } else if !enabled {
+            self.bus.audio_sources = None;
+        }
+    }
+    pub fn drain_audio_source(
+        &mut self,
+        fm: bool,
+        output: &mut [doslet_pcm::SourceFrame],
+    ) -> usize {
+        self.bus
+            .audio_sources
+            .as_mut()
+            .map_or(0, |sources| sources[usize::from(fm)].drain(output))
     }
     pub fn audio_status(&self) -> AudioStatus {
         let (pcm_frames, pcm_nonzero) = self.bus.pcm.stats();

@@ -48,7 +48,12 @@ cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE
 The game starts automatically. Its containing directory is preloaded as C:;
 guest writes use an in-memory overlay and do not modify your installation.
 Keep the executable alongside its original DOS4GW and data files. DOS text
-screens now render during startup; the recorded PRINCE HDI logo appears around
+screens render during startup. Native launches use the experimental DPMI host
+in `direct` mode, including background speed-tier profiling. Select
+`--experimental-dpmi reflect` for reflected services or `--experimental-dpmi off`
+for the guest extender path. Portable emulator save files require the host to
+be off; in-process profiling copies support both host modes.
+The recorded PRINCE HDI logo appears around
 7.3 seconds of emulated time. Host speed may affect how long startup takes.
 BIOS/DOS keyboard input is available. DOS mouse input includes position, buttons, ranges, a graphics cursor and guest callbacks.
 On native builds, a guest read of relative motion counters (INT 33h, AX=000Bh)
@@ -85,6 +90,61 @@ can be opened, a message appears and graphics continue. To disable audio:
 cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE --no-audio
 cargo run -p doslet --release --locked -- --help
 ```
+
+### Linux audio output
+
+Native audio defaults to CPAL. On Linux, `--audio-backend pulse` selects an
+experimental Rust implementation of the PulseAudio protocol, usable with
+PulseAudio or PipeWire's `pipewire-pulse` service. COSMIC is not required.
+
+```sh
+cargo run -p doslet --release --locked -- --audio-backend pulse
+```
+
+The system mixer receives a source-specific name (**Doslet — Sound Blaster PCM**, **Doslet — AdLib / OPL FM**, **Doslet — MIDI**, or **Doslet — Mixed audio**), icon identifier
+`org.doslet.Doslet`, and media role `game`. The new adapter uses the `pulseaudio`
+Rust crate without adding libpulse/libpipewire bindings or development packages.
+The existing CPAL and MIDI dependencies still use native system libraries; this
+does not make the entire application free of FFI. MIDI rendering and forwarding
+retain their existing controls.
+
+With application mixing, `--audio-backend auto` tries the Rust adapter first and falls back to CPAL if
+opening it fails. A running PulseAudio output has three reconnection attempts
+over its lifetime. After exhaustion, `auto` pauses the game and attempts CPAL;
+resume after the notice confirms the switch. Explicit `pulse` reports failure
+without switching backends. `cpal` selects the previous path directly.
+
+Choose **Info → Audio… → Mixer** on Linux, or pass `--audio-mixer application|system`.
+**Application** is the default and combines sources inside Doslet. **System
+(experimental)** sends three independent stereo float streams to the
+PulseAudio-compatible server: **Sound Blaster PCM** at the guest DSP rate,
+**AdLib / OPL FM** at 48 kHz, and **MIDI synthesizer** at 48 kHz.
+PCM is decoded and converted to float without application-side resampling.
+The existing FM and MIDI engines retain their internal rate conversion.
+Changing the PCM rate drains and recreates its server stream; a brief gap is
+possible. External MIDI ports retain their separate
+routing, with silence in the local MIDI stream.
+
+```sh
+cargo run -p doslet --release --locked -- --audio-backend pulse --audio-mixer system
+```
+
+System mixing requires the Rust PulseAudio adapter regardless of the backend
+selected for application mixing. Initial setup failure is reported without
+silently selecting a different mixer. With `--audio-backend auto`, exhaustion
+of any stream's three-attempt recovery budget pauses and attempts CPAL with
+application mixing. Switching in the UI pauses the game; resume after the
+success notice. A failed switch retains the previous output, paused. The choice
+survives game resets and machine changes in this process, but is not saved in
+TOML launch profiles or save states.
+
+Exact sample alignment is not promised. A prior ten-minute, multi-rate probe
+lost marker correspondence; long-run timing and audible quality still need
+evaluation. The spectrum shows the maximum band level of the three submitted
+sources, not the server's final mix or its volume adjustments.
+Server buffering adds latency beyond Doslet's local queue. Validation on
+PipeWire used a virtual monitor, not a listening test or a real PulseAudio daemon.
+See [the audio probe procedure](development.md#linux-pulseaudio-protocol-probes).
 
 ### Workspace controls and display
 
@@ -207,8 +267,15 @@ native macOS app; other platforms and the browser report an unsupported output.
 
 ### External MIDI synthesizers
 
-To use an external or system MIDI synthesizer, click **Find MIDI outputs** in
-the UI and select its port under **MIDI OUTPUT**. **Rust synth** restores the
+A running TiMidity ALSA sequencer port appears among the native MIDI outputs.
+`--midi-output timidity` selects the first port whose name contains TiMidity
+(case-insensitive); select an exact name or index when several ports exist.
+Doslet neither installs nor launches TiMidity, and an installed executable alone
+does not expose a MIDI output. This uses the existing MIDI adapter without a new
+dependency. TiMidity owns its sound bank, effects and audio output.
+
+Native startup discovers available system MIDI ports. To refresh them, click
+**Find MIDI outputs** in the UI and select a port under **MIDI OUTPUT**. **Rust synth** restores the
 built-in synthesizer. The CLI supports the same choice:
 
 ```sh
@@ -218,7 +285,7 @@ cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE --midi-output
 
 Replace `0` with the index or exact name of your synthesizer's output port.
 Selecting a port skips internal MIDI sample generation; Sound Blaster PCM still
-uses CPAL. `--midi-output` conflicts with `--no-audio`. A MIDI forwarding port
+uses the selected audio backend. `--midi-output` conflicts with `--no-audio`. A MIDI forwarding port
 alone does not generate sound. Linux host
 MIDI requires an available ALSA sequencer device. A dedicated native MIDI thread
 sends complete messages at deadlines derived from guest time. Execution runs up
@@ -303,6 +370,10 @@ Install the launcher and icon for COSMIC and other Linux desktops:
 ```sh
 mise run desktop-install
 ```
+
+The launcher includes System Mixer and Silent actions. Window titles include
+the game name; audio streams advertise the `org.doslet.Doslet` application ID.
+Run the installer again after updating to refresh desktop entries.
 
 This builds the release binary and uses Python 3's standard library to install
 `org.doslet.Doslet.desktop` and the SVG icon under `$XDG_DATA_HOME` (default:

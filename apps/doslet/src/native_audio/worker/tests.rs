@@ -27,6 +27,58 @@ fn complete(worker: &Worker, nanos: u64) {
 }
 
 #[test]
+fn native_pcm_keeps_hardware_sample_count_and_values() {
+    let (output, pcm, midi) = Writer::mock_separate(48000);
+    let mut worker = Worker::new(config(48000), output).unwrap();
+    let frames: Vec<_> = (0..2205_u64)
+        .map(|i| doslet_pcm::SourceFrame {
+            nanos: i * 1_000_000_000 / 22050,
+            rate: 22050,
+            samples: [(i as i16 % 127) * 100, -1000],
+        })
+        .collect();
+    assert!(worker.ready().unwrap());
+    worker.receive_source(false, &frames).unwrap();
+    worker.render_until(100_000_000).unwrap();
+    worker.submit().unwrap();
+    complete(&worker, 100_000_000);
+    assert_eq!(pcm.available(), 16384 - 2205);
+    assert_eq!(midi.available(), 16384 - 4800);
+    assert_eq!(
+        pcm.consume(2205),
+        frames
+            .iter()
+            .map(|f| f.samples.map(|v| f32::from(v) / 32768.0))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(worker.stats().received, 2205);
+}
+
+#[test]
+fn separate_streams_backpressure_pause_and_reset_together() {
+    let (output, pcm, midi) = Writer::mock_separate(48000);
+    let mut worker = Worker::new(config(48000), output.clone()).unwrap();
+    output.set_active(false);
+    midi.push(&vec![[0.25; 2]; midi.available()]).unwrap();
+    assert_eq!(output.available(), 0);
+    assert_eq!(output.refill_nanos(), 0);
+    assert!(worker.ready().unwrap());
+    worker.render_until(10_000_000).unwrap();
+    worker.push_midi(&[0x90, 60, 100]).unwrap();
+    worker.submit().unwrap();
+    worker.configure(config(48000)).unwrap();
+    assert_eq!(pcm.available(), 16384);
+    assert_eq!(midi.available(), 16384);
+    assert_eq!(worker.stats(), Stats::default());
+    output.push_sources(&[[0.2; 2]; 8], &[[0.3; 2]; 8]).unwrap();
+    assert_eq!(pcm.consume(8), [[0.0; 2]; 8]);
+    assert_eq!(midi.consume(8), [[0.0; 2]; 8]);
+    output.set_active(true);
+    assert_eq!(pcm.consume(8), [[0.2; 2]; 8]);
+    assert_eq!(midi.consume(8), [[0.3; 2]; 8]);
+}
+
+#[test]
 fn threaded_midi_and_pcm_match_inline_samples_at_both_device_rates() {
     for rate in [44100, 48000] {
         let output = Writer::mock(rate);

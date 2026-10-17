@@ -14,6 +14,8 @@ const MAX_PENDING_NANOS: u64 = 80_000_000;
 struct Batch {
     pcm: Box<[doslet_pcm::Frame]>,
     pcm_len: usize,
+    sources: [Box<[doslet_pcm::SourceFrame]>; 2],
+    source_len: [usize; 2],
     midi: Box<[u8]>,
     midi_len: usize,
     nanos: u64,
@@ -23,6 +25,10 @@ impl Batch {
         Self {
             pcm: vec![doslet_pcm::EMPTY; 4096].into_boxed_slice(),
             pcm_len: 0,
+            sources: std::array::from_fn(|_| {
+                vec![doslet_pcm::SourceFrame::default(); 4096].into_boxed_slice()
+            }),
+            source_len: [0; 2],
             midi: vec![0; 16384].into_boxed_slice(),
             midi_len: 0,
             nanos: 0,
@@ -90,15 +96,21 @@ impl Worker {
             .spawn(move || {
                 // Apple Audio Units, ROMs, synth voices and resampler are created,
                 // used and dropped here. No Send promise for a synth is necessary.
-                let renderer = match Renderer::new(&config) {
+                let mut renderer = match Renderer::new(&config) {
                     Ok(renderer) => renderer,
                     Err(error) => {
                         let _ = ready.send(Err(error));
                         return;
                     }
                 };
+                if output.mixer() == crate::audio::Mixer::System {
+                    renderer.enable_sources(config.nanos);
+                }
                 state.publish(&renderer, config.nanos);
-                output.clear();
+                if let Err(error) = output.clear() {
+                    let _ = ready.send(Err(error));
+                    return;
+                }
                 if ready.send(Ok(())).is_err() {
                     return;
                 }
@@ -161,6 +173,7 @@ impl Worker {
         // acknowledging. This owner cannot enqueue across that boundary.
         if let Some(batch) = &mut self.staging {
             batch.pcm_len = 0;
+            batch.source_len = [0; 2];
             batch.midi_len = 0;
             batch.nanos = nanos;
         }
@@ -178,6 +191,7 @@ impl Worker {
             match self.recycled.try_recv() {
                 Ok(mut batch) => {
                     batch.pcm_len = 0;
+                    batch.source_len = [0; 2];
                     batch.midi_len = 0;
                     batch.nanos = self.submitted_nanos;
                     self.staging = Some(batch);
@@ -200,6 +214,21 @@ impl Worker {
         }
         batch.pcm[batch.pcm_len..batch.pcm_len + frames.len()].copy_from_slice(frames);
         batch.pcm_len += frames.len();
+        Ok(())
+    }
+    pub fn receive_source(
+        &mut self,
+        fm: bool,
+        frames: &[doslet_pcm::SourceFrame],
+    ) -> Result<(), String> {
+        let batch = self.batch()?;
+        let index = usize::from(fm);
+        let len = batch.source_len[index];
+        if frames.len() > batch.sources[index].len() - len {
+            return Err("Native audio source batch full".into());
+        }
+        batch.sources[index][len..len + frames.len()].copy_from_slice(frames);
+        batch.source_len[index] += frames.len();
         Ok(())
     }
     pub fn render_until(&mut self, nanos: u64) -> Result<(), String> {
@@ -265,7 +294,10 @@ fn run(
         // never waits for queued sound to be played.
         if let Ok(command) = controls.try_recv() {
             match Renderer::new(&command.config) {
-                Ok(replacement) => {
+                Ok(mut replacement) => {
+                    if output.mixer() == crate::audio::Mixer::System {
+                        replacement.enable_sources(command.config.nanos);
+                    }
                     renderer = replacement;
                     if let Some(batch) = current.take() {
                         let _ = recycle.try_send(batch);
@@ -273,7 +305,11 @@ fn run(
                     while let Ok(batch) = pending.try_recv() {
                         let _ = recycle.try_send(batch);
                     }
-                    output.clear();
+                    if let Err(error) = output.clear() {
+                        shared.fail(error.clone(), &output);
+                        let _ = command.reply.send(Err(error));
+                        continue;
+                    }
                     *shared.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     shared.failed.store(false, Ordering::Release);
                     shared.publish(&renderer, command.config.nanos);
@@ -295,7 +331,15 @@ fn run(
         if current.is_none() {
             match pending.try_recv() {
                 Ok(batch) => {
-                    if let Err(error) = renderer.mixer.receive(&batch.pcm[..batch.pcm_len]) {
+                    if let Some(sources) = &mut renderer.sources {
+                        for (i, source) in sources.iter_mut().enumerate() {
+                            if let Err(error) =
+                                source.receive(&batch.sources[i][..batch.source_len[i]])
+                            {
+                                shared.fail(error, &output);
+                            }
+                        }
+                    } else if let Err(error) = renderer.mixer.receive(&batch.pcm[..batch.pcm_len]) {
                         shared.fail(error.to_string(), &output);
                     }
                     current = Some(batch);
@@ -317,13 +361,30 @@ fn run(
             continue;
         }
         let batch = current.as_ref().unwrap();
-        let result = renderer.render(batch.nanos).and_then(|count| {
-            if count == 0 {
+        let separate = output.mixer() == crate::audio::Mixer::System;
+        let rendered = if separate {
+            renderer.render_midi(batch.nanos)
+        } else {
+            renderer.render(batch.nanos)
+        };
+        let result = rendered.and_then(|count| {
+            let mut produced = count;
+            if let Some(sources) = &mut renderer.sources {
+                let mut samples = [[0.0; 2]; 512];
+                for (i, source) in sources.iter_mut().enumerate() {
+                    let (n, rate) = source.render(batch.nanos, &mut samples);
+                    if n != 0 {
+                        output.push_hardware(i == 1, rate, &samples[..n])?;
+                    }
+                    produced += n;
+                }
+            }
+            if produced == 0 {
                 renderer.push_midi(batch.nanos, &batch.midi[..batch.midi_len])?;
-            } else {
+            } else if count != 0 {
                 output.push(&renderer.samples[..count])?;
             }
-            Ok(count)
+            Ok(produced)
         });
         match result {
             Ok(0) => {

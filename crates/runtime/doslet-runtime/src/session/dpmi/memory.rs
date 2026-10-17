@@ -21,6 +21,7 @@ pub struct MemoryStats {
     pub failures: u64,
 }
 
+#[derive(Clone)]
 pub(super) struct Memory {
     pub blocks: [Block; 512],
     pub stats: MemoryStats,

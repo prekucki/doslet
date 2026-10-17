@@ -239,6 +239,42 @@ renderer synchronously. OPL/DSP register behavior, DMA, IRQs and source PCM
 generation remain with the machine. Thread priorities and the CPAL frame-queue
 mutex are unchanged; synthesis occurs outside that mutex and outside the callback.
 
+Linux can select `--audio-backend pulse` while CPAL remains the default. The host
+`doslet-pulse` crate uses the Rust `pulseaudio` protocol client, with no libpulse
+or libpipewire bindings. The existing synthesis owner and reserved frame queue
+feed one 48-kHz stereo f32 stream. A `doslet-pulse` control thread handles stream
+creation, corking, reset acknowledgement and bounded recovery; the library's
+reactor consumes queued PCM. No machine state crosses into either thread.
+Reset increments a queue generation, rejects callbacks from older generations,
+and deletes/recreates the server stream before acknowledging the clear. This
+also discards bytes already queued in the client reactor. Pause retains samples.
+Control requests have a two-second deadline; reset acknowledgement has a
+three-second deadline. A failed reset stops the worker and reports the error.
+
+The server buffer requests a 30-ms target and 100-ms maximum; these are separate
+from the local queue and do not guarantee end-to-end device latency. Spectrum
+and consumed-frame counters measure submission, ahead of audible playback.
+Underrun telemetry samples server intervals every 100 ms and may miss shorter
+gaps. Recovery allows three attempts per output lifetime, including connections
+that succeed briefly. `auto` can then pause and replace the output with CPAL.
+Linux `--audio-mixer system` selects three Rust protocol outputs: Sound Blaster
+PCM at the DSP rate, FM at 48 kHz, and locally rendered MIDI at 48 kHz.
+Application mixing remains the default. Optional bounded host-only source taps
+preserve timestamped PCM and FM before their legacy mix; these queues are not
+serialized. The legacy mixed path remains available. The synthesis worker
+copies PCM samples without interpolation, converts i16 to stereo float, and
+fills guest-time gaps with silence. FM and MIDI keep existing engine conversions.
+A rate boundary ends a playback segment; the control thread drains and recreates
+the server stream. Pause and reset can interrupt this process. Recreation can
+introduce a gap. Queue capacity and refill pacing account for all three outputs.
+Pause, reset and error checks cover all outputs. Each has a finite reconnection
+budget; exhausted recovery pauses the group, with application/CPAL fallback only
+under `auto`. No per-sample synchronization is required. This remains experimental
+without a long-run drift or audible-quality guarantee.
+UI changes prepare the replacement before dropping the old output and leave the
+session paused. Spectrum bands report the maximum level across sources;
+consumed frames track MIDI, while underrun sample counts are summed across rates.
+
 The native desktop and headless applications share the host `doslet-debugger`
 crate and its `gdbstub` TCP adapter. The desktop polls its nonblocking protocol
 state machine on the existing emulation owner, so partial packets and stopped
@@ -903,7 +939,10 @@ allocator. The CPU only exposes integer context save/restore and explicit mode
 setup; it has no dependency on DPMI or BIOS. Eligible unchanged service shims can
 be dispatched in protected mode while preserving the reflected path's memory
 effects and logical time. The PC supplies one bounded timing step for a replaced
-IRET. The original guest extender remains the default execution path.
+IRET, charged to the protected dispatcher label when speed tiers are active.
+Native desktop launches select direct dispatch by default, including profiling
+copies; `--experimental-dpmi off` selects the original guest extender. Bus-observed
+analyzer steps and debugger attachment retain reflection for instruction tracing.
 
 The CPU implements ordinary INT and IRET stack/vector behavior. The runtime
 installs BIOS/DOS shims in guest memory and checks arrival at those addresses.

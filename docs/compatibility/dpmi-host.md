@@ -2,8 +2,9 @@
 
 Doslet can provide a DOS Protected Mode Interface (DPMI) host to DOS/4GW.
 The extender discovers it through INT 2Fh/AX=1687h and delegates descriptor,
-memory and real-mode services to the runtime. Enable it explicitly; ordinary
-launches continue to use the guest extender's own host.
+memory and real-mode services to the runtime. Native desktop launches enable
+the host in `direct` mode by default. Use `--experimental-dpmi off` to select
+the guest extender's own host.
 
 The experiment has two modes:
 
@@ -24,9 +25,9 @@ cargo run -p doslet --release --locked -- \
   --game /path/to/PRINCE.EXE --experimental-dpmi direct
 ```
 
-Use `--experimental-dpmi reflect` for the reference host. Omit the option for
-the original extender path. The setting is a native launch option, not a saved
-machine-profile field or a browser UI option. Native JIT and its interpreter
+Use `--experimental-dpmi reflect` for the reference host and
+`--experimental-dpmi off` for the original extender path. The setting is a native
+launch option, not a saved machine-profile field or a browser UI option. Native JIT and its interpreter
 fallback retain their existing controls.
 
 The headless example prints live blocks, requested/committed bytes, peaks,
@@ -64,6 +65,18 @@ compiler or browser execution. The optional key string uses `|` for Enter.
 All example runs keep guest writes in the existing RAM overlay. They neither
 persist saves nor open a window/audio output device.
 
+To check background speed-tier learning against local game assets:
+
+```sh
+RUST_MIN_STACK=16777216 DOSLET_DPMI_GAME=/path/to/PRINCE.EXE \
+  cargo test -p doslet --locked local_dpmi_game_learning -- --ignored --nocapture
+```
+
+For a CD game, also set `DOSLET_DPMI_CD=/path/to/image.iso`. This test profiles
+startup and active-DPMI working copies for 100 ms of guest time at 10 and 30 MHz,
+requires learned labels, and checks that the live step count and DPMI statistics
+remain unchanged. It does not open a window or validate interactive gameplay.
+
 ## What the memory counters mean
 
 `Session::dpmi_stats()` reports current and peak bytes requested through DPMI
@@ -98,20 +111,39 @@ execution budget. A replaced real-mode IRET consumes one machine timing step;
 the protected-mode IRET still executes normally.
 Debugger attachment selects reflection for subsequent calls and restores the
 selected mode on detach.
-Observed analyzer steps and execution with address-specific speed labels also
-use reflection so the real instruction remains visible to tracing and timing.
+Observed analyzer steps use reflection to retain the actual bus transactions.
+Address-specific speed labels support direct dispatch: its replacement step
+is charged to the current protected-mode dispatcher address and code width.
+The following protected IRET is charged separately at that same address.
+Changed or missing code labels retain the existing GREY fallback. Reflected
+execution charges the real IRET at its real-mode address; comparisons with
+different labels at those two addresses can therefore have different timing.
+Background speed-tier learning supports both modes. Its working copy retains
+the DPMI host, allocation metadata and pending callback/return frames, and uses
+the captured dispatch mode. The native default is direct in both the live game
+and its profiling copies.
 
 The CPU exposes a small integer context save/restore boundary without depending
 on DOS, BIOS or the runtime. The runtime owns host state. Context restoration
 reloads hidden segment caches and invalidates code-context hints even when the
 numeric selector is unchanged. Floating-point state remains owned by the CPU.
 
+Mouse events received while the client executes protected code are delivered
+through vector 74h and the host's real-mode reflection path. The driver wrapper
+can call a registered DPMI callback and then restore the interrupted client.
+Regression tests cover direct/reflect delivery, event coordinates, masked-interrupt
+deferral, nested callback return, and preservation of registers, flags and stack.
+The reported PRINCE regression was observed live: driver coordinates changed
+while the menu cursor remained stationary; disabling the host restored movement
+according to the user. The corrected binary still requires a fresh game run.
+
 This is an experimental subset, not a conforming general-purpose DPMI server:
 
-- Portable save states and diagnostic working-state capture reject sessions
-  with this host enabled: its descriptors, allocation metadata and pending
-  callback contexts do not yet have a portable state representation. Ordinary
-  sessions keep their existing save/restore support.
+- Portable save states reject sessions with this host enabled: its descriptors,
+  allocation metadata and pending callback contexts do not yet have a portable
+  state representation. In-process diagnostic working copies preserve these
+  fields independently. Ordinary sessions keep their existing file save/restore
+  support.
 
 - Paging, demand commitment, VM86 and privilege-changing gates remain absent.
   Clients execute at CPL 3 with IOPL 3 under the existing CPU model.

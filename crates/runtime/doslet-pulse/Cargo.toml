@@ -1,0 +1,15 @@
+[package]
+name = "doslet-pulse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pulseaudio = "0.3.2"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+futures = "0.3"
+
+[lints]
+workspace = true

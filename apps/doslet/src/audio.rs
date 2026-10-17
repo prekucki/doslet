@@ -2,9 +2,37 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "linux")]
+mod pulse;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Backend {
+    Auto,
+    #[default]
+    Cpal,
+    Pulse,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Mixer {
+    #[default]
+    Application,
+    System,
+}
+impl std::fmt::Display for Mixer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Application => "Application",
+            Self::System => "System (experimental)",
+        })
+    }
+}
+
 const CAPACITY: usize = 16384;
 struct Queue {
     frames: Box<[[f32; 2]]>,
+    rates: Box<[u32]>,
+    sample_rate: u32,
     head: usize,
     len: usize,
     active: bool,
@@ -15,6 +43,8 @@ struct Queue {
     peak: f32,
     spectrum: doslet_pcm::spectrum::Spectrum,
     error: Option<String>,
+    generation: u64,
+    waker: Option<std::task::Waker>,
 }
 impl Queue {
     fn refill_nanos(&mut self, sample_rate: u32) -> u64 {
@@ -57,15 +87,32 @@ impl Queue {
     }
 }
 pub struct Output {
-    _stream: cpal::Stream,
+    _stream: Stream,
     writer: Writer,
+}
+enum Stream {
+    #[cfg(target_os = "linux")]
+    System {
+        _outputs: [Box<Output>; 3],
+    },
+    Cpal {
+        _stream: cpal::Stream,
+    },
+    #[cfg(target_os = "linux")]
+    Pulse {
+        _driver: pulse::Driver,
+    },
 }
 /// The synthesis owner shares frames and playback telemetry, never the device
 /// handle or a synthesizer, with CPAL. Stream creation/disposal stays on its owner.
 #[derive(Clone)]
 pub struct Writer {
     queue: Arc<Mutex<Queue>>,
+    secondary: Option<Box<Writer>>,
+    fm: Option<Box<Writer>>,
     pub rate: u32,
+    #[cfg(target_os = "linux")]
+    pulse: Option<Arc<pulse::Control>>,
 }
 impl std::ops::Deref for Output {
     type Target = Writer;
@@ -74,7 +121,44 @@ impl std::ops::Deref for Output {
     }
 }
 impl Output {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(backend: Backend, mixer: Mixer) -> Result<Self, String> {
+        if mixer == Mixer::System {
+            #[cfg(target_os = "linux")]
+            {
+                let pcm = pulse::open_at_rate(c"Doslet — Sound Blaster PCM", 22050)?;
+                let fm = pulse::open_at_rate(c"Doslet — AdLib / OPL FM", 48000)?;
+                let midi = pulse::open_named(c"Doslet — MIDI")?;
+                let mut writer = midi.writer();
+                writer.secondary = Some(Box::new(pcm.writer()));
+                writer.fm = Some(Box::new(fm.writer()));
+                return Ok(Self {
+                    _stream: Stream::System {
+                        _outputs: [Box::new(pcm), Box::new(midi), Box::new(fm)],
+                    },
+                    writer,
+                });
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err("System mixing is available only on Linux".into());
+        }
+        #[cfg(target_os = "linux")]
+        if backend != Backend::Cpal {
+            match pulse::open() {
+                Ok(output) => return Ok(output),
+                Err(error) if backend == Backend::Auto => {
+                    eprintln!("[WARN doslet] {error}; using CPAL audio")
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        if backend == Backend::Pulse {
+            return Err("PulseAudio output is available only on Linux".into());
+        }
+        Self::cpal()
+    }
+
+    fn cpal() -> Result<Self, String> {
         let device = cpal::default_host()
             .default_output_device()
             .ok_or("No audio output device")?;
@@ -87,6 +171,8 @@ impl Output {
         }
         let queue = Arc::new(Mutex::new(Queue {
             frames: vec![[0.0; 2]; CAPACITY].into_boxed_slice(),
+            rates: vec![rate; CAPACITY].into_boxed_slice(),
+            sample_rate: rate,
             head: 0,
             len: 0,
             active: true,
@@ -97,6 +183,8 @@ impl Output {
             peak: 0.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
             error: None,
+            generation: 0,
+            waker: None,
         }));
         let config = supported.config();
         eprintln!(
@@ -117,20 +205,57 @@ impl Output {
         }?;
         stream.play().map_err(|error| error.to_string())?;
         Ok(Self {
-            _stream: stream,
-            writer: Writer { queue, rate },
+            _stream: Stream::Cpal { _stream: stream },
+            writer: Writer {
+                queue,
+                secondary: None,
+                fm: None,
+                rate,
+                #[cfg(target_os = "linux")]
+                pulse: None,
+            },
         })
     }
     pub fn writer(&self) -> Writer {
         self.writer.clone()
     }
+    pub fn is_pulse(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.writer.pulse.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
 }
 impl Writer {
     #[cfg(test)]
+    pub fn mock_separate(rate: u32) -> (Self, Self, Self) {
+        let pcm = Self::mock(rate);
+        let midi = Self::mock(rate);
+        let mut output = midi.clone();
+        output.secondary = Some(Box::new(pcm.clone()));
+        output.fm = Some(Box::new(Self::mock(48000)));
+        (output, pcm, midi)
+    }
+    pub fn mixer(&self) -> Mixer {
+        if self.secondary.is_some() {
+            Mixer::System
+        } else {
+            Mixer::Application
+        }
+    }
+    #[cfg(test)]
     pub fn mock(rate: u32) -> Self {
         Self {
+            secondary: None,
+            fm: None,
             queue: Arc::new(Mutex::new(Queue {
                 frames: vec![[0.0; 2]; CAPACITY].into_boxed_slice(),
+                rates: vec![rate; CAPACITY].into_boxed_slice(),
+                sample_rate: rate,
                 head: 0,
                 len: 0,
                 active: true,
@@ -141,8 +266,12 @@ impl Writer {
                 peak: 0.0,
                 spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
                 error: None,
+                generation: 0,
+                waker: None,
             })),
             rate,
+            #[cfg(target_os = "linux")]
+            pulse: None,
         }
     }
     #[cfg(test)]
@@ -151,23 +280,74 @@ impl Writer {
         (0..count).map(|_| queue.next()).collect()
     }
     pub fn check(&self) -> Result<(), String> {
+        if let Some(fm) = &self.fm {
+            fm.check()?;
+        }
+        if let Some(secondary) = &self.secondary {
+            secondary.check()?;
+        }
         let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.error.clone().map_or(Ok(()), Err)
     }
     pub fn available(&self) -> usize {
         let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        CAPACITY - q.len
+        let available = CAPACITY - q.len;
+        drop(q);
+        let available = self
+            .fm
+            .as_ref()
+            .map_or(available, |s| available.min(s.available()));
+        self.secondary
+            .as_ref()
+            .map_or(available, |s| available.min(s.available()))
     }
     /// Refill below two callback blocks, with margin, until the high watermark.
     /// Bounded by the reserved queue and 80 ms; no audio-device reconfiguration.
     pub fn refill_nanos(&self) -> u64 {
-        self.queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .refill_nanos(self.rate)
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let rate = q.sample_rate;
+        let nanos = q.refill_nanos(rate);
+        drop(q);
+        let nanos = self
+            .fm
+            .as_ref()
+            .map_or(nanos, |s| nanos.min(s.refill_nanos()));
+        self.secondary
+            .as_ref()
+            .map_or(nanos, |s| nanos.min(s.refill_nanos()))
+    }
+
+    /// The synthesis owner is the sole producer. Both queues must have space
+    /// before either source is published; callbacks can only free that space.
+    #[cfg(test)]
+    pub fn push_sources(&self, pcm: &[[f32; 2]], midi: &[[f32; 2]]) -> Result<(), String> {
+        let secondary = self
+            .secondary
+            .as_ref()
+            .ok_or("Separate audio sources require system mixing")?;
+        self.check()?;
+        if pcm.len() != midi.len() || pcm.len() > self.available() {
+            return Err("Separate audio source lengths or capacity mismatch".into());
+        }
+        secondary.push_at_rate(self.rate, pcm)?;
+        self.push(midi)
+    }
+
+    pub fn push_hardware(&self, fm: bool, rate: u32, samples: &[[f32; 2]]) -> Result<(), String> {
+        let output = if fm { &self.fm } else { &self.secondary };
+        output
+            .as_ref()
+            .ok_or("Hardware sources require system mixing")?
+            .push_at_rate(rate, samples)
     }
 
     pub fn push(&self, frames: &[[f32; 2]]) -> Result<(), String> {
+        self.push_at_rate(self.rate, frames)
+    }
+    fn push_at_rate(&self, rate: u32, frames: &[[f32; 2]]) -> Result<(), String> {
+        if !(1000..=192000).contains(&rate) {
+            return Err(format!("Unsupported native audio rate: {rate}"));
+        }
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(error) = &q.error {
             return Err(error.clone());
@@ -178,18 +358,45 @@ impl Writer {
         for frame in frames {
             let index = (q.head + q.len) % CAPACITY;
             q.frames[index] = *frame;
+            q.rates[index] = rate;
             q.len += 1;
+        }
+        let waker = q.waker.take();
+        drop(q);
+        if let Some(waker) = waker {
+            waker.wake();
         }
         Ok(())
     }
     pub fn set_active(&self, active: bool) {
+        if let Some(fm) = &self.fm {
+            fm.set_active(active);
+        }
+        if let Some(secondary) = &self.secondary {
+            secondary.set_active(active);
+        }
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.active = active;
         if !active {
             q.spectrum.reset();
         }
+        let waker = q.waker.take();
+        drop(q);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(control) = &self.pulse {
+            control.wake();
+        }
     }
-    pub fn clear(&self) {
+    pub fn clear(&self) -> Result<(), String> {
+        if let Some(fm) = &self.fm {
+            fm.clear()?;
+        }
+        if let Some(secondary) = &self.secondary {
+            secondary.clear()?;
+        }
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.head = 0;
         q.len = 0;
@@ -198,17 +405,45 @@ impl Writer {
         q.refilling = true;
         q.peak = 0.0;
         q.spectrum.reset();
+        q.generation += 1;
+        #[cfg(target_os = "linux")]
+        let generation = q.generation;
+        drop(q);
+        #[cfg(target_os = "linux")]
+        if let Some(control) = &self.pulse {
+            control.wake();
+            control.wait_for(generation)?;
+        }
+        Ok(())
     }
     pub fn spectrum(&self) -> [f32; doslet_pcm::spectrum::BANDS] {
-        self.queue
+        let mut levels = self
+            .queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spectrum
-            .levels()
+            .levels();
+        for source in [&self.secondary, &self.fm].into_iter().flatten() {
+            for (level, other) in levels.iter_mut().zip(source.spectrum()) {
+                *level = level.max(other);
+            }
+        }
+        levels
     }
     pub fn stats(&self) -> (u64, u64, f32) {
         let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        (q.consumed, q.underruns, q.peak)
+        let (consumed, underruns, peak) = (q.consumed, q.underruns, q.peak);
+        drop(q);
+        let mut underruns = underruns;
+        let mut peak = peak;
+        for source in [&self.secondary, &self.fm].into_iter().flatten() {
+            let (_, other_underruns, other_peak) = source.stats();
+            underruns = underruns.saturating_add(other_underruns);
+            peak = peak.max(other_peak);
+        }
+        // Hardware sample counts have different units; keep MIDI/output-clock
+        // frames as the common progress indicator instead of taking their min.
+        (consumed, underruns, peak)
     }
 }
 fn build<T: cpal::SizedSample + Copy + Send + 'static>(
@@ -251,6 +486,8 @@ mod tests {
     #[test]
     fn refill_watermarks_keep_reserve_without_chattering_or_unbounded_lead() {
         let mut queue = Queue {
+            rates: vec![48000; CAPACITY].into_boxed_slice(),
+            sample_rate: 48000,
             frames: vec![[0.0; 2]; CAPACITY].into_boxed_slice(),
             head: 0,
             len: 0,
@@ -262,6 +499,8 @@ mod tests {
             peak: 0.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(48000),
             error: None,
+            generation: 0,
+            waker: None,
         };
         assert_eq!(queue.refill_nanos(48000), 30_000_000);
         queue.len = 1000;
@@ -282,6 +521,8 @@ mod tests {
     #[test]
     fn spectrum_tracks_consumed_frames_and_fades_on_output_underrun() {
         let mut queue = Queue {
+            rates: vec![48000; CAPACITY].into_boxed_slice(),
+            sample_rate: 48000,
             frames: vec![[0.0; 2]; CAPACITY].into_boxed_slice(),
             head: 0,
             len: 1024,
@@ -293,6 +534,8 @@ mod tests {
             peak: 0.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(48000),
             error: None,
+            generation: 0,
+            waker: None,
         };
         for (i, frame) in queue.frames[..1024].iter_mut().enumerate() {
             *frame = [(i as f32 * std::f32::consts::TAU * 2000.0 / 48000.0).sin(); 2];

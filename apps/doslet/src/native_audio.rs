@@ -1,5 +1,6 @@
 //! Desktop synthesis lives on one owner, apart from both the PC and CPAL.
 //! Headless/no-device runs retain the same renderer synchronously.
+mod source;
 mod worker;
 use crate::native_synth::Timeline;
 use doslet_midi_routing::Mode;
@@ -34,6 +35,7 @@ pub struct Renderer {
     pub mt32: Option<doslet_mt32::Timeline>,
     pub mixer: doslet_pcm::Mixer,
     pub samples: [[f32; 2]; 512],
+    sources: Option<[source::Timeline; 2]>,
     external: bool,
 }
 impl Renderer {
@@ -72,6 +74,7 @@ impl Renderer {
             mt32,
             mixer,
             samples: [[0.0; 2]; 512],
+            sources: None,
             external: matches!(config.source, Source::External),
         })
     }
@@ -91,6 +94,25 @@ impl Renderer {
             self.mixer.mix(&mut self.samples[..count]);
             Ok(count)
         }
+    }
+    fn enable_sources(&mut self, nanos: u64) {
+        self.sources = Some([
+            source::Timeline::new(22050, nanos),
+            source::Timeline::new(48000, nanos),
+        ]);
+    }
+    fn render_midi(&mut self, nanos: u64) -> Result<usize, String> {
+        let count = if let Some(synth) = &mut self.mt32 {
+            synth
+                .render_until(nanos, &mut self.samples)
+                .map_err(|e| e.to_string())?
+        } else {
+            self.midi.render_until(nanos, &mut self.samples)?
+        };
+        if self.external {
+            self.samples[..count].fill([0.0; 2]);
+        }
+        Ok(count)
     }
     fn push_midi(&mut self, nanos: u64, bytes: &[u8]) -> Result<(), String> {
         for &byte in bytes {
@@ -116,8 +138,14 @@ impl Renderer {
                 .as_ref()
                 .map_or_else(|| self.midi.note_events(), |s| s.note_events()),
             sysex: self.mt32.as_ref().map_or(0, |s| s.sysex_messages()),
-            received: self.mixer.received(),
-            nonzero: self.mixer.nonzero(),
+            received: self.sources.as_ref().map_or_else(
+                || self.mixer.received(),
+                |s| s.iter().map(|s| s.received).sum(),
+            ),
+            nonzero: self.sources.as_ref().map_or_else(
+                || self.mixer.nonzero(),
+                |s| s.iter().map(|s| s.nonzero).sum(),
+            ),
         }
     }
 }
@@ -175,6 +203,16 @@ impl Engine {
         match self {
             Self::Inline(r) => r.mixer.receive(frames).map_err(|e| e.to_string()),
             Self::Threaded(w) => w.receive_pcm(frames),
+        }
+    }
+    pub fn receive_source(
+        &mut self,
+        fm: bool,
+        frames: &[doslet_pcm::SourceFrame],
+    ) -> Result<(), String> {
+        match self {
+            Self::Threaded(w) => w.receive_source(fm, frames),
+            Self::Inline(_) => Err("Native source capture requires a host output".into()),
         }
     }
     pub fn render_until(&mut self, nanos: u64, external: bool) -> Result<(), String> {

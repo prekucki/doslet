@@ -156,6 +156,9 @@ independent guest on the profiling thread. It has no live input, output sink,
 storage lease, native code or learned execution policy. Writable overlays and
 handle positions are copied, not shared. This in-process representation is
 separate from the portable Protobuf file format.
+Working copies also retain an enabled experimental DPMI host, including its
+allocator, registered callbacks and active return frames. Speed-tier learning
+can replay these copies even though portable DPMI save files remain unsupported.
 
 Headless `heroes_states`, `state_graph_trace`, `state_speed_tiers` and
 `bench_weighted_tiers` accept `--config FILE` to resolve version-2 references.

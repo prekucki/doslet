@@ -541,6 +541,71 @@ entering PRINCE's Doge's Palace. It checks that draining MIDI does not bypass
 the guest UART rate and that notes still reach CM-32L after the flood. It does
 not establish interactive palace compatibility or audible quality.
 
+### Linux PulseAudio protocol probes
+
+These opt-in tests require `pactl` and a running PulseAudio-compatible server.
+Create dedicated null sinks; never use the physical default sink. Save each
+returned module ID and unload those modules when finished. Do not change the
+system default output.
+
+```sh
+pactl load-module module-null-sink sink_name=doslet-audio-probe channels=4 channel_map=front-left,front-right,rear-left,rear-right rate=48000
+pactl load-module module-null-sink sink_name=doslet-audio-probe-output channels=2 rate=48000
+cargo run -p doslet-pulse --locked --example synchronization -- doslet-audio-probe 600 controls
+PULSE_SINK=doslet-audio-probe-output RUST_MIN_STACK=8388608 cargo test -p doslet --locked pulse_loopback_pause_and_reset_discard_old_server_audio -- --ignored --nocapture
+PULSE_SINK=doslet-audio-probe-output RUST_MIN_STACK=8388608 cargo test -p doslet --locked system_mixer_loopback -- --ignored --nocapture
+PULSE_SINK=doslet-audio-probe-output RUST_MIN_STACK=8388608 cargo test -p doslet --locked mixer_selection_prepares -- --ignored --nocapture
+# Replace each placeholder with the ID returned by load-module:
+pactl unload-module FOUR_CHANNEL_MODULE_ID
+pactl unload-module TWO_CHANNEL_MODULE_ID
+```
+
+The synchronization probe captures only the null sink monitor. Four mono streams
+at 11025, 22050, 32000 and 48000 Hz carry periodic markers to separate channels
+of a 48-kHz capture. `controls` corks/uncorks the group every two seconds, with a
+100-ms pause. Without it, playback runs continuously. Ordinal marker offsets
+must remain within 1 ms, and counts must agree. Missing markers can invalidate
+ordinal pairing; a reported offset is not necessarily a measured phase drift.
+The diagnostic retains up to about 463 MB for a ten-minute capture.
+
+On 2026-10-17, PipeWire 1.6.8 (`PulseAudio (on PipeWire 1.6.8)`) passed a
+10-second steady run and a 30-second grouped-control run, with endpoint offsets
+within one capture frame (21 microseconds). Sequential stream control failed
+the 30-second test by about 5.3 ms. The grouped 600-second run, while builds/tests
+also ran, failed marker correspondence: the first/last ordinal offsets were
+1/-101632, 0/-154751 and -1/47233 frames relative to channel zero (570 paired
+markers). This exceeded the original strict 1-ms threshold; it does not identify
+whether lost markers or phase drift caused the mismatch. That threshold is not
+an acceptance requirement for the optional system mixer. The current option
+uses guest-rate PCM plus 48-kHz FM and MIDI streams.
+
+The single-stream adapter's loopback test passed pause/queue retention and reset
+discard of previously buffered positive samples before negative replacement
+samples. It also disconnected only its own playback client four times: three
+reconnections succeeded, then the lifetime retry budget was exhausted. These
+results do not establish audible game quality, physical-device latency, a
+standalone PulseAudio daemon's behavior, or successful runtime CPAL fallback.
+Long-run rate changes and induced underruns remain unaccepted.
+
+The optional two-stream mixer passed a separate virtual-monitor test on the same
+PipeWire server: distinguishable stereo PCM and MIDI inputs summed to the
+expected levels for at least 100 ms, paused without consuming queued samples,
+and resumed after reset with only the replacement samples. Device-free worker
+tests retain application-mixer equivalence at 44.1/48 kHz and verify exact native
+PCM sample counts, saturation of one source, and group pause/reset.
+An application-level test also switched between both modes and verified that a
+failed synthesizer setup retained the old mixer and paused session.
+These checks do not establish long-run clock stability or audible game quality.
+
+The native-rate loopback test sends approximately 100-ms segments at 11025,
+22050 and 32000 Hz. A 48-kHz PipeWire monitor captured 4794, 4794 and 4793 stable
+samples respectively, and reset interrupted a paused rate transition. The test
+uses the dedicated `doslet-audio-probe-output` null sink and test-only media role
+to isolate saved server mute settings. This is synthetic evidence, not a
+real-game listening test.
+
+### Display validation
+
 Display filter and upload-order tests run with
 `cargo test -p doslet --locked presentation::`. On a host with a working wgpu
 adapter, also run the opt-in renderer regression:

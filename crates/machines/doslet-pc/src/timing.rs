@@ -387,7 +387,13 @@ impl PcMachine {
             return Ok(());
         }
         self.timing.pcm_fraction -= 1_000_000_000;
-        if !self.bus.opl.started() && self.bus.pcm.is_full() {
+        if (!self.bus.opl.started() && self.bus.pcm.is_full())
+            || self
+                .bus
+                .audio_sources
+                .as_ref()
+                .is_some_and(|s| s[0].is_full())
+        {
             return Err(MachineError::AudioQueueFull);
         }
         let channel = self
@@ -422,6 +428,13 @@ impl PcMachine {
                 };
                 self.bus.digital_pcm[0] = self.bus.digital_pcm[1];
                 self.bus.digital_pcm[1] = frame;
+                if let Some(sources) = &mut self.bus.audio_sources {
+                    sources[0].push(doslet_pcm::SourceFrame {
+                        nanos: end,
+                        rate: rate as u32,
+                        samples,
+                    });
+                }
                 if !self.bus.opl.started() {
                     self.bus.pcm.push(frame);
                 }
@@ -448,6 +461,15 @@ impl PcMachine {
         let mut full = false;
         bus.opl.advance(nanos as u32, bus.guest_nanos, |time, fm| {
             let fm = bus.mixer.fm_samples(fm);
+            if let Some(sources) = &mut bus.audio_sources
+                && !sources[1].push(doslet_pcm::SourceFrame {
+                    nanos: time,
+                    rate: doslet_opl3::SAMPLE_RATE,
+                    samples: fm,
+                })
+            {
+                full = true;
+            }
             let digital = bus.digital_pcm.iter().rev().find(|frame| {
                 frame.duration != 0
                     && frame.nanos <= time

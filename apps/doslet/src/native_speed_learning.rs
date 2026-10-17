@@ -28,6 +28,8 @@ pub(super) struct ResultSet {
     epoch: u64,
     pub nodes: BTreeMap<Key, Node>,
     pub seconds: f64,
+    #[cfg(test)]
+    direct_calls: [u64; 2],
 }
 struct Job {
     cancel: Arc<AtomicBool>,
@@ -229,6 +231,8 @@ struct TraceNode {
 #[derive(Default)]
 struct Trace {
     nodes: HashMap<Key, TraceNode>,
+    #[cfg(test)]
+    direct_calls: u64,
 }
 impl Trace {
     fn irq_nodes(&self) -> BTreeSet<Key> {
@@ -305,9 +309,14 @@ fn trace(
     start: Instant,
 ) -> Result<Trace, String> {
     let mut s = snapshot.restore().map_err(|e| e.to_string())?;
-    s.debug_disable_accelerations();
+    // WorkingState already drops native code and analyzer/controller proofs.
+    // Keep the captured DPMI dispatch mode so learning follows live execution.
+    s.set_idle_loops(false);
+    s.set_vga_wait_acceleration(false);
     s.set_cpu_mhz(mhz).map_err(|e| e.to_string())?;
     s.start();
+    #[cfg(test)]
+    let direct_before = s.dpmi_stats().map_or(0, |stats| stats.direct);
     let deadline = s.emulated_nanos().saturating_add(nanos);
     let misses = s.audio_status().dsp.block_irq_deadline_misses;
     let mut trace = Trace::default();
@@ -407,6 +416,10 @@ fn trace(
     if s.audio_status().dsp.block_irq_deadline_misses > misses {
         return Err("replay missed an SB16 service deadline".into());
     }
+    #[cfg(test)]
+    {
+        trace.direct_calls = s.dpmi_stats().map_or(0, |stats| stats.direct) - direct_before;
+    }
     Ok(trace)
 }
 fn profile_pair(
@@ -421,6 +434,8 @@ fn profile_pair(
     let a = trace(&snapshot, low, nanos, cancel, start)?;
     let b = trace(&snapshot, high, nanos, cancel, start)?;
     Ok(ResultSet {
+        #[cfg(test)]
+        direct_calls: [a.direct_calls, b.direct_calls],
         epoch,
         nodes: merge_traces(a, b),
         seconds: start.elapsed().as_secs_f64(),
@@ -689,6 +704,151 @@ mod tests {
         .unwrap();
         assert!(t.nodes[&(s.debug_pc(), false)].count > 32);
         assert!(t.nodes.values().all(|n| !n.irq));
+    }
+
+    #[test]
+    fn paired_learning_enters_dpmi_without_mutating_the_live_host() {
+        use doslet_runtime::session::dpmi::Mode;
+        let program = [
+            0xb8, 0x87, 0x16, // MOV AX,1687h
+            0xcd, 0x2f, // Discover the DPMI entry point in ES:DI.
+            0x89, 0x3e, 0x00, 0x02, // MOV [0200h],DI
+            0x8c, 0x06, 0x02, 0x02, // MOV [0202h],ES
+            0xb8, 0x00, 0x80, 0x8e, 0xc0, // Private real-mode stack at ES=8000h.
+            0xb8, 0x01, 0x00, // Select a 32-bit client.
+            0xff, 0x1e, 0x00, 0x02, // CALL FAR [0200h]
+            0x8c, 0xd8, 0x8e, 0xc0, // ES=DS: structure at selector-relative 0300h.
+            0xb8, 0x00, 0x03, // AX=0300h: simulate a real-mode interrupt.
+            0xbb, 0x16, 0x00, // BX=16h: nonblocking keyboard query.
+            0x31, 0xc9, // No stack arguments.
+            0x66, 0xbf, 0x00, 0x03, 0x00, 0x00, // EDI=0300h.
+            0xcd, 0x31, 0xeb, 0xee, // Repeat INT 31h in protected 16-bit code.
+        ];
+        for mode in [Mode::Direct, Mode::Reflect] {
+            let mut live = Session::new(&program).unwrap();
+            live.enable_dpmi(mode).unwrap();
+            assert!(live.debug_write_memory(0x1031c, &[0x00, 0x01]));
+            assert!(live.debug_write_memory(0x10320, &[0x02, 0x02]));
+            let snapshot = live.capture_working_state().unwrap();
+            let mut probe = snapshot.restore().unwrap();
+            probe.start();
+            assert_eq!(probe.advance(64), 64);
+            assert_eq!(probe.status(), SessionStatus::Running);
+            assert!(probe.dpmi_stats().unwrap().entered);
+            assert_ne!(probe.control_registers().cr0 & 1, 0);
+
+            let result = profile_pair(
+                snapshot,
+                live.epoch(),
+                1,
+                3,
+                4_000_000,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let loop_pc = live.debug_pc() + program.len() as u32 - 18;
+            assert_eq!(result.epoch, live.epoch());
+            assert!(result.nodes[&(loop_pc, false)].tier == Tier::Slow);
+            match mode {
+                Mode::Direct => assert!(result.direct_calls.iter().all(|n| *n > 32)),
+                Mode::Reflect => assert_eq!(result.direct_calls, [0; 2]),
+            }
+            // Installing learned labels must retain the selected service path.
+            let labels = result
+                .nodes
+                .iter()
+                .map(|(&(address, code32), node)| doslet_x86::ExecutionLabel {
+                    address,
+                    code32,
+                    bytes: node.code,
+                    tier: match node.tier {
+                        Tier::Fast => 0,
+                        Tier::Slow => 1,
+                        Tier::Grey => 2,
+                        Tier::Irq => 3,
+                    },
+                })
+                .collect();
+            let mut labelled = live.capture_working_state().unwrap().restore().unwrap();
+            labelled.set_idle_loops(false);
+            labelled.set_vga_wait_acceleration(false);
+            labelled
+                .set_execution_tiers(Some(labels), [None, Some(8), Some(133)])
+                .unwrap();
+            labelled.start();
+            assert_eq!(labelled.advance(1000), 1000);
+            assert_eq!(labelled.status(), SessionStatus::Running);
+            assert_eq!(labelled.executed_tier_counts().iter().sum::<u64>(), 1000);
+            match mode {
+                Mode::Direct => assert!(labelled.dpmi_stats().unwrap().direct > 32),
+                Mode::Reflect => assert_eq!(labelled.dpmi_stats().unwrap().direct, 0),
+            }
+            assert_eq!(live.steps(), 0);
+            assert_eq!(live.status(), SessionStatus::Ready);
+            assert!(!live.dpmi_stats().unwrap().entered);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DOSLET_DPMI_GAME and optional DOSLET_DPMI_CD local game assets"]
+    fn local_dpmi_game_learning() {
+        let executable = std::env::var("DOSLET_DPMI_GAME").unwrap();
+        let settings = crate::native_input::LaunchSettings {
+            no_dynamic_core: true,
+            preload_local_media: true,
+            dpmi: Some(doslet_runtime::session::dpmi::Mode::Direct),
+            cdrom: std::env::var_os("DOSLET_DPMI_CD").map(|path| (b'D', path.into())),
+            ..Default::default()
+        };
+        let mut live = crate::native_input::load_game_with_settings(
+            std::path::Path::new(&executable),
+            &settings,
+        )
+        .unwrap();
+        let startup = live.capture_working_state().unwrap();
+        live.start();
+        let mut pcm = [doslet_pcm::EMPTY; 1024];
+        let mut midi = [0; 1024];
+        for _ in 0..1000 {
+            live.advance(10_000);
+            assert_eq!(live.status(), SessionStatus::Running, "{:?}", live.fault());
+            while live.drain_pcm_timed(&mut pcm) != 0 {}
+            while live.drain_midi(&mut midi) != 0 {}
+            if live.dpmi_stats().unwrap().entered {
+                break;
+            }
+        }
+        assert!(live.dpmi_stats().unwrap().entered);
+        let stats = live.dpmi_stats();
+        let steps = live.steps();
+        for (stage, snapshot) in [
+            ("startup", startup),
+            ("active", live.capture_working_state().unwrap()),
+        ] {
+            let result = profile_pair(
+                snapshot,
+                live.epoch(),
+                10,
+                30,
+                100_000_000,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let coloured = result
+                .nodes
+                .values()
+                .filter(|n| n.tier != Tier::Grey)
+                .count();
+            assert!(coloured > 0, "{stage}: no learned labels");
+            eprintln!(
+                "DPMI {stage}: {} nodes, {coloured} coloured, direct calls {:?}, {:.2}s host time",
+                result.nodes.len(),
+                result.direct_calls,
+                result.seconds
+            );
+        }
+        assert_eq!(live.steps(), steps);
+        assert_eq!(live.dpmi_stats(), stats);
     }
     #[test]
     fn transient_snapshot_queue_is_bounded_and_cancelled_with_epoch() {
