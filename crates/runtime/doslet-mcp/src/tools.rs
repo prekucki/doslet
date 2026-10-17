@@ -31,6 +31,9 @@ impl ComputerTools {
         };
         match result {
             Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error)])),
+            Ok(Response::Exiting) => Ok(CallToolResult::structured(
+                serde_json::json!({"status": "Exiting"}),
+            )),
             Ok(Response::Status(status)) => Ok(CallToolResult::structured(
                 serde_json::to_value(status).unwrap(),
             )),
@@ -65,8 +68,17 @@ impl ComputerTools {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Position {
-    x: u32,
-    y: u32,
+    x: Option<u32>,
+    y: Option<u32>,
+    dx: Option<i16>,
+    dy: Option<i16>,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SynchronizationMode {
+    enabled: bool,
+    #[serde(default)]
+    adaptive: bool,
 }
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -76,8 +88,8 @@ struct CpuClock {
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Click {
-    x: u32,
-    y: u32,
+    x: Option<u32>,
+    y: Option<u32>,
     button: Option<String>,
     hold_ms: Option<u16>,
 }
@@ -102,6 +114,22 @@ struct Wait {
 fn invalid(error: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(error.into(), None)
 }
+fn position(x: Option<u32>, y: Option<u32>) -> Result<Option<(u32, u32)>, ErrorData> {
+    match (x, y) {
+        (Some(x), Some(y)) => Ok(Some((x, y))),
+        (None, None) => Ok(None),
+        _ => Err(invalid("Supply both x and y, or neither")),
+    }
+}
+impl Position {
+    fn action(self) -> Result<Action, ErrorData> {
+        match (position(self.x, self.y)?, self.dx, self.dy) {
+            (Some((x, y)), None, None) => Ok(Action::Move { x, y }),
+            (None, Some(dx), Some(dy)) => Ok(Action::MoveRelative { dx, dy }),
+            _ => Err(invalid("Supply exactly x/y (absolute) or dx/dy (relative)")),
+        }
+    }
+}
 fn duration(value: Option<u16>) -> Result<u16, ErrorData> {
     let value = value.unwrap_or(80);
     if !(10..=1000).contains(&value) {
@@ -111,6 +139,23 @@ fn duration(value: Option<u16>) -> Result<u16, ErrorData> {
 }
 #[tool_router]
 impl ComputerTools {
+    #[tool(
+        description = "Enable bounded synchronization diagnostics or its experimental adaptive CPU controller. Resets evidence and disables competing heuristic waits. Disabled mode restores the configured MHz ceiling.",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn set_synchronization_analysis(
+        &self,
+        Parameters(p): Parameters<SynchronizationMode>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if p.adaptive && !p.enabled {
+            return Err(invalid("adaptive requires enabled"));
+        }
+        self.perform(Action::Synchronization {
+            enabled: p.enabled,
+            adaptive: p.adaptive,
+        })
+        .await
+    }
     #[tool(
         description = "Change guest CPU MHz (1..1000) live without resetting the game or device clocks. Returns status; refused while GDB is connected.",
         annotations(destructive_hint = false, open_world_hint = false)
@@ -139,17 +184,24 @@ impl ComputerTools {
         self.perform(Action::Status).await
     }
     #[tool(
-        description = "Move the guest mouse to native screenshot pixel coordinates and return a screenshot.",
+        description = "Close Doslet through normal desktop shutdown, saving the JIT profile and joining its workers. Returns Exiting when accepted; the MCP connection then closes. Works while paused or under GDB. Does not save unsaved game progress.",
+        annotations(destructive_hint = true, open_world_hint = false)
+    )]
+    async fn exit(&self) -> Result<CallToolResult, ErrorData> {
+        self.perform(Action::Exit).await
+    }
+    #[tool(
+        description = "Move the guest mouse, wait 250 guest ms and return a fresh screenshot. Supply x/y for absolute native screenshot coordinates OR dx/dy for relative raw mouse motion (positive right/down). Games with their own cursor, such as Heroes, may ignore the driver's absolute position: use small dx/dy moves, inspect the returned cursor, then click with x/y omitted. Relative units are guest motion counts; game sensitivity can differ from pixels.",
         annotations(destructive_hint = false, open_world_hint = false)
     )]
     async fn move_mouse(
         &self,
         Parameters(p): Parameters<Position>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.perform(Action::Move { x: p.x, y: p.y }).await
+        self.perform(p.action()?).await
     }
     #[tool(
-        description = "Click at native screenshot coordinates. button is left/right/middle (default left). Hold for 10..1000 guest milliseconds, then release, settle and return a screenshot. Requires a running guest.",
+        description = "Click the current guest cursor when x/y are omitted (recommended after relative movement). With both x/y, first move the DOS driver pointer to native screenshot coordinates and wait 250 guest ms before pressing. button is left/right/middle (default left). Hold for 10..1000 guest ms, release, wait 250 guest ms and return a screenshot. For games with an independent cursor, use move_mouse dx/dy and inspect before clicking without coordinates. Requires a running guest.",
         annotations(destructive_hint = false, open_world_hint = false)
     )]
     async fn click(&self, Parameters(p): Parameters<Click>) -> Result<CallToolResult, ErrorData> {
@@ -160,10 +212,9 @@ impl ComputerTools {
             _ => return Err(invalid("button must be left, right or middle")),
         };
         self.perform(Action::Click {
-            x: p.x,
-            y: p.y,
+            position: position(p.x, p.y)?,
             button,
-            hold_ms: duration(p.hold_ms)?,
+            hold_ms: duration(Some(p.hold_ms.unwrap_or(250)))?,
         })
         .await
     }
@@ -227,5 +278,34 @@ impl ServerHandler for ComputerTools {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Control only the running Doslet guest, not the host desktop. Read screenshot/status first; use native screenshot pixel coordinates. Input gestures are finite and advance with guest time. Mutations can affect game state and saves under its configured drive policy. GDB owns execution when connected: screenshots/status remain available, but resume through GDB. Ask the user before changing their goal or starting unrelated gameplay."
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_modes_are_exclusive_and_old_coordinates_remain_supported() {
+        let parse = |s| serde_json::from_str::<Position>(s).unwrap().action();
+        assert!(matches!(
+            parse(r#"{"x":12,"y":34}"#),
+            Ok(Action::Move { x: 12, y: 34 })
+        ));
+        assert!(matches!(
+            parse(r#"{"dx":-12,"dy":34}"#),
+            Ok(Action::MoveRelative { dx: -12, dy: 34 })
+        ));
+        for input in [
+            r#"{}"#,
+            r#"{"x":12}"#,
+            r#"{"dx":12}"#,
+            r#"{"x":1,"y":2,"dx":3,"dy":4}"#,
+        ] {
+            assert!(parse(input).is_err(), "{input}");
+        }
+        let click: Click = serde_json::from_str("{}").unwrap();
+        assert_eq!(position(click.x, click.y).unwrap(), None);
+        assert!(position(Some(1), None).is_err());
     }
 }

@@ -57,3 +57,7 @@ impl PcmQueue {
         (self.generated, self.nonzero)
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "audio_saved.rs"]
+mod saved_state;

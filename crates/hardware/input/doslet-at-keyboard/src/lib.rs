@@ -407,3 +407,7 @@ mod tests {
         assert_eq!(k.scan_set(), 1);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

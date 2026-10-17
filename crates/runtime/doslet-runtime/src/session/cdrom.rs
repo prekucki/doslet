@@ -2,6 +2,8 @@ use super::RuntimeError;
 use alloc::{boxed::Box, vec::Vec};
 use doslet_iso9660::{Entry, Image, Provider, ProviderEntry};
 use doslet_storage::{CachedSource, HostCompletion, HostRequest, StorageError};
+#[cfg(feature = "save-state")]
+mod saved;
 pub(super) const HANDLE_BASE: u16 = 5 + doslet_dos::files::HANDLE_COUNT as u16;
 const HANDLES: usize = 96;
 pub(super) const PENDING: u16 = 0xFFFF;
@@ -10,6 +12,7 @@ enum FileEntry {
     Local(Entry),
     Remote(ProviderEntry),
 }
+#[derive(Clone)]
 struct Handle {
     entry: FileEntry,
     position: u32,
@@ -103,9 +106,7 @@ impl CdromImage {
             .ok_or(6)
     }
     pub fn close_all(&mut self) {
-        for handle in &mut self.handles {
-            *handle = None;
-        }
+        self.handles.fill(None);
     }
     pub fn close(&mut self, handle: u16) -> Result<(), u16> {
         self.handle(handle)?;
@@ -190,5 +191,19 @@ fn error(error: doslet_iso9660::Error) -> u16 {
         doslet_iso9660::Error::Storage(StorageError::Pending) => PENDING,
         doslet_iso9660::Error::NotFound => 2,
         _ => 21,
+    }
+}
+
+#[cfg(feature = "save-state")]
+impl CdromImage {
+    pub(super) fn fork_local(&self) -> Option<Self> {
+        let Media::Local(image) = &self.image else {
+            return None;
+        };
+        Some(Self {
+            drive: self.drive,
+            image: Media::Local(image.clone()),
+            handles: self.handles.clone(),
+        })
     }
 }

@@ -104,7 +104,7 @@ sudo apt install build-essential pkg-config libasound2-dev libudev-dev
 ### On the desktop
 
 ```sh
-# Open the workspace, then press Run to start the built-in demo
+# Open the workspace, then press the play icon to start the built-in demo
 cargo run -p doslet --release --locked
 
 # Start your own game directly
@@ -135,6 +135,7 @@ cargo run -p doslet-headless --locked -- inspect path/to/GAME.EXE
 
 The [user guide](docs/usage.md) covers launch profiles, saves, MIDI routing,
 MT-32 ROMs and the Linux desktop launcher.
+For reusable headless scene tests, see [portable guest states](docs/save-states.md).
 
 ## Under the hood
 
@@ -183,7 +184,7 @@ describe these design rules in detail.
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+RUST_MIN_STACK=8388608 cargo test --workspace --locked
 cargo check -p doslet -p doslet-time -p doslet-executable --target wasm32-unknown-unknown --locked
 cargo check -p doslet-web-worker -p doslet-web-audio --target wasm32-unknown-unknown --locked
 ```

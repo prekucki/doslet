@@ -1,4 +1,5 @@
 //! Single-instruction cache. Unsupported forms use the original interpreter.
+pub mod analysis;
 use super::{Cpu, CpuError, StepOutcome};
 use crate::state::SegmentWindow;
 use crate::{
@@ -114,6 +115,7 @@ pub(super) struct Cache {
     /// Execute window of `context`; None leaves its faults to the interpreter.
     window: Option<SegmentWindow>,
     pub enabled: bool,
+    pub(super) profile: Option<crate::execution_tiers::ExecutionProfile>,
     #[cfg(feature = "profiling")]
     pub stats: DecodeCacheStats,
 }
@@ -135,6 +137,7 @@ impl Default for Cache {
             code32: false,
             window: None,
             enabled: true,
+            profile: None,
             #[cfg(feature = "profiling")]
             stats: DecodeCacheStats::default(),
         }
@@ -389,7 +392,14 @@ impl Cache {
                 break;
             }
             let position = usize::from(block.count);
-            let prepared = Prepared::new(instruction);
+            let mut prepared = Prepared::new(instruction);
+            if let Some(profile) = &self.profile {
+                prepared.set_tier(profile.classify(
+                    address.wrapping_add(offset as u32),
+                    self.code32,
+                    &bytes[offset..end],
+                ));
+            }
             if prepared.is_fallback() {
                 self.fallback[index * BLOCK_INSTRUCTIONS + position] = instruction;
             }
@@ -1053,6 +1063,47 @@ impl Cpu {
         budget: u32,
         limit: impl FnOnce(&B) -> u32,
     ) -> u32 {
+        if self.execution_labels_enabled() {
+            self.interpret_batch_mode::<B, false, true>(bus, budget, limit, [0; 2])
+        } else {
+            self.interpret_batch_mode::<B, false, false>(bus, budget, limit, [0; 2])
+        }
+    }
+
+    /// Yield on arrival at a selected instruction after doing work, including
+    /// inside a cached block. The ordinary specialization has no comparison.
+    pub fn interpret_batch_until_block<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        head: u32,
+    ) -> u32 {
+        self.interpret_batch_until_blocks(bus, budget, limit, [head; 2])
+    }
+
+    /// Optional scheduler hints for two selected block heads.
+    pub fn interpret_batch_until_blocks<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        heads: [u32; 2],
+    ) -> u32 {
+        if self.execution_labels_enabled() {
+            self.interpret_batch_mode::<B, true, true>(bus, budget, limit, heads)
+        } else {
+            self.interpret_batch_mode::<B, true, false>(bus, budget, limit, heads)
+        }
+    }
+
+    fn interpret_batch_mode<B: CpuBus, const YIELD: bool, const COUNT: bool>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        heads: [u32; 2],
+    ) -> u32 {
         if budget < 2 || !self.batch_ready() || !self.decode_cache.enabled {
             return 0;
         }
@@ -1062,10 +1113,16 @@ impl Cpu {
         let budget = budget.min(BATCH_STEPS).min(limit(bus));
         let mut completed = 0;
         'blocks: while completed < budget {
+            if YIELD && completed != 0 && heads.contains(&self.registers.ip) {
+                break;
+            }
             let Some((index, count, check)) = self.batch_block(code, bus) else {
                 break;
             };
             for position in 0..count {
+                if YIELD && completed != 0 && heads.contains(&self.registers.ip) {
+                    break 'blocks;
+                }
                 let instruction = self.block_instruction(index, position);
                 let next = self
                     .registers
@@ -1079,6 +1136,9 @@ impl Cpu {
                     index * BLOCK_INSTRUCTIONS + position,
                 ) {
                     break 'blocks;
+                }
+                if COUNT {
+                    self.execution_counts[instruction.tier()] += 1;
                 }
                 completed += 1;
                 // A taken branch, a repeated string or the budget ends the run;

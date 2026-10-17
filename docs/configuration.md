@@ -1,17 +1,20 @@
 # Configure a machine
 
-Open **Settings** in the desktop or browser toolbar. Edit the draft,
+Open **Info → Settings…** in the desktop or browser workspace. Edit the draft,
 select **Validate**, then **Apply & restart** to construct a new session.
 Changing hardware restarts the guest. Closing the editor retains the draft;
 **Revert** restores the active settings. **Restart** uses the active
 configuration. Failed source preparation preserves the old session and its
 reset settings.
 
-The display fills the workspace. **Audio** opens live output controls, **Info**
-opens diagnostics, and **1:1 / Fit** selects the display scale. Settings use
+The display fills the workspace. The toolbar has play/pause and restart icons;
+hover over an icon to see its action. **Info** opens diagnostics and provides
+access to **Audio…** and **Settings…**. **Pixel perfect / Fit** selects the display
+scale, and the adjacent selector switches **Nearest / Sharp Bilinear / HQ2x**
+filtering. Settings use
 horizontal tabs with a fixed action bar. **Close** or Escape returns to the
 display; a successful Apply also closes settings. On narrow windows, additional
-tabs scroll horizontally and **Restart** is available under **Info**.
+tabs scroll horizontally. The restart icon remains available in the toolbar.
 
 The native application prepares folders, images and HTTPS sources on a separate
 thread during Apply. The workspace remains responsive while preparation runs.
@@ -49,11 +52,15 @@ retains scan-code/ASCII injection. Text entered in application controls stays
 out of the guest. Pause, focus/capture loss and disconnect release guest input;
 held controls require a physical release before they can act again.
 
-Mouse capture and cursor visibility are independent. Set `input.capture = false`
-and `input.hide_cursor = true` to use absolute pointer movement, hide the host
-cursor over the running game and pass Esc through to DOS. The cursor remains
-visible in application panels and while paused. With capture enabled, Esc still
-releases capture. `hide_cursor` defaults to false.
+Native mouse capture follows guest reads: relative motion counters keep relative
+input active for one emulated second after the latest read, blocking hover movement
+until capture. Without recent relative reads, absolute input works without locking
+and an existing lock is released. `input.capture = false` disables capture; leave
+it enabled for relative-input games. `input.hide_cursor = true` hides the host
+cursor over a running game using absolute input. The cursor remains visible in
+application panels, while paused, and while relative input is waiting for capture.
+Esc releases an active capture. `hide_cursor` defaults to false. Browser input
+retains explicit capture selection: `capture = false` selects absolute movement.
 
 Native controllers use gilrs; browser controllers use the Gamepad API. The Input
 page lists available controller identities. A stable ID is optional; leave it

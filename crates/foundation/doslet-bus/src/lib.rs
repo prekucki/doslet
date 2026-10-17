@@ -1,5 +1,6 @@
 //! Bus contracts shared by processors and machine adapters.
 #![no_std]
+pub mod observation;
 
 use core::fmt;
 use core::sync::atomic::{AtomicU32, Ordering};

@@ -1,0 +1,17 @@
+{
+  "description": "Offline cooperative experiment for the recorded Vulcania fixture only. Exact repeated foreground path, no work entries or interrupted intervals. Guarded work is released by IRQ callbacks. Not an instruction-equivalence proof or a production detector.",
+  "head": 2202906,
+  "backedge": 2203023,
+  "cs": 384,
+  "work_pcs": [2048465, 2206789, 2219784],
+  "guards": [
+    {"address": 2625684, "width": 4, "nonzero": true},
+    {"address": 2636909, "width": 1, "nonzero": false},
+    {"address": 2506742, "width": 1, "nonzero": false}
+  ],
+  "tick_pc": 2203536,
+  "release_pc": 2203563,
+  "completion_pc": 2048489,
+  "counter": 2625684,
+  "max_idle_ns": 25000
+}

@@ -8,3 +8,11 @@
 __pycache__/
 /docs/HANDOFF.md
 /mise.local.toml
+
+# Local tool credentials and account-linked design exports
+/.codex/
+/design/stitch/
+
+# Guest memory and learned code profiles stay local
+*.pb.gz
+*.core-profile

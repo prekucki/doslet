@@ -14,6 +14,7 @@ struct Length {
     base_visible: u32,
     dirty: bool,
 }
+#[derive(Clone)]
 pub struct OverlayFs {
     bytes: Box<[u8]>,
     used: usize,
@@ -473,3 +474,7 @@ impl OverlayFs {
         }
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "sparse_saved.rs"]
+mod saved_state;

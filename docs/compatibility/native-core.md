@@ -12,9 +12,8 @@ The native feature remains enabled by default; `--no-dynamic-core` retains the
 cached interpreter with ordinary scheduling. Scope and fallback are described in the
 [architecture](../architecture.md#native-dynamic-core).
 
-Measurements below were collected on 2026-10-15 on Linux x86-64, Intel Core
-i9-14900HX, before integration with the configurable-machine changes on `main`,
-using the Cargo `release` profile with `profiling` enabled and
+Measurements below use the native x86-64 target before integration with the
+configurable-machine changes on `main`, using the Cargo `release` profile with `profiling` enabled and
 Cranelift 0.132.3. They are headless measurements, not desktop FPS, AArch64 or
 browser performance results. Both paths retain the existing decode cache and
 VGA wait acceleration. The reference disables only the dynamic core.

@@ -1,11 +1,24 @@
 //! CMOS configuration-register foundation; RTC ticking and interrupts are pending.
 #![no_std]
 
+/// Small register state for diagnostics; taking it has no read side effects.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Snapshot {
+    registers: [u8; 128],
+    selected: u8,
+}
+
 pub struct Cmos {
     registers: [u8; 128],
     selected: u8,
 }
 impl Cmos {
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            registers: self.registers,
+            selected: self.selected,
+        }
+    }
     pub fn new(base_kib: u16, extended_kib: u16) -> Self {
         let mut registers = [0; 128];
         // Initial guest clock: 2026-10-14 12:00:00, BCD, 24-hour mode.
@@ -52,6 +65,19 @@ impl Cmos {
 mod tests {
     use super::*;
     #[test]
+    fn snapshot_includes_selection_and_does_not_acknowledge_status() {
+        let mut cmos = Cmos::new(640, 15360);
+        cmos.registers[0x0c] = 0x80;
+        cmos.select(0x0c);
+        let before = cmos.snapshot();
+        assert_eq!(cmos.snapshot(), before);
+        assert_eq!(cmos.read(), 0x80);
+        assert_ne!(cmos.snapshot(), before);
+        let acknowledged = cmos.snapshot();
+        cmos.select(0x8c);
+        assert_ne!(cmos.snapshot(), acknowledged);
+    }
+    #[test]
     fn memory_configuration_and_index_nmi_bit_do_not_overlap() {
         let mut cmos = Cmos::new(640, 15360);
         for (index, expected) in [
@@ -71,3 +97,7 @@ mod tests {
         assert_eq!(cmos.read(), 0x80);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

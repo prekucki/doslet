@@ -6,6 +6,8 @@ mod idle_loop;
 pub mod io;
 pub mod memory;
 mod memory_wait;
+mod recurrence;
+pub use recurrence::RecurrenceMark;
 pub mod resources;
 mod timing;
 mod vga_wait;
@@ -13,6 +15,7 @@ pub use memory_wait::MemoryWaitSites;
 
 use core::fmt;
 use doslet_bus::BusError;
+pub use doslet_mc146818::Snapshot as CmosSnapshot;
 use doslet_x86::{Cpu, CpuError, StepOutcome};
 pub use idle_loop::IdleProofMark;
 pub use io::PcBus;
@@ -105,6 +108,16 @@ impl fmt::Display for MachineError {
 }
 impl core::error::Error for MachineError {}
 
+/// Per-instruction diagnostics, collected only by the observed specialization.
+#[derive(Default)]
+pub struct StepObservation {
+    pub trace: doslet_bus::observation::Trace,
+    pub irq: Option<u8>,
+    pub device_writes_unobserved: bool,
+    pub service_writes_unobserved: bool,
+    pub service_device_accesses_unobserved: bool,
+}
+
 pub struct PcMachine {
     pub cpu: Cpu,
     pub bus: PcBus,
@@ -112,6 +125,8 @@ pub struct PcMachine {
     vga_wait: vga_wait::WaitState,
     memory_wait_sites: Option<MemoryWaitSites>,
     memory_wait_steps: u64,
+    batch_yield_ip: Option<[u32; 2]>,
+    interrupt_entries: u64,
 }
 impl Default for PcMachine {
     fn default() -> Self {
@@ -119,6 +134,15 @@ impl Default for PcMachine {
     }
 }
 impl PcMachine {
+    /// Attempt only the existing strict VGA proof. A failed attempt executes
+    /// nothing; diagnostics can retain validated ordinary wait batching.
+    pub fn try_vga_wait_batch(&mut self, budget: u32) -> Result<Option<u32>, MachineError> {
+        if self.vga_wait.ready(budget) {
+            self.advance_vga_wait(budget)
+        } else {
+            Ok(None)
+        }
+    }
     pub fn from_config(config: doslet_config::HardwareConfig) -> Result<Self, MachineError> {
         let mut bus = PcBus::from_config(config)?;
         bus.cmos.select(0x14);
@@ -135,10 +159,19 @@ impl PcMachine {
             vga_wait: vga_wait::WaitState::default(),
             memory_wait_sites: None,
             memory_wait_steps: 0,
+            batch_yield_ip: None,
+            interrupt_entries: 0,
         })
     }
 }
 impl PcMachine {
+    /// Optional instruction-boundary scheduling hints; ordinary execution has none.
+    pub fn set_batch_yield_ips(&mut self, ips: Option<[u32; 2]>) {
+        self.batch_yield_ip = ips;
+    }
+    pub fn set_batch_yield_ip(&mut self, ip: Option<u32>) {
+        self.batch_yield_ip = ip.map(|ip| [ip; 2]);
+    }
     pub fn hardware_config(&self) -> doslet_config::HardwareConfig {
         self.bus.hardware_config()
     }
@@ -201,6 +234,10 @@ impl PcMachine {
     pub fn execution_stats(&self) -> ExecutionStats {
         self.bus.stats
     }
+    /// IRQ sequence already maintained for recurrence invalidation; no profiler required.
+    pub fn interrupt_entries(&self) -> u64 {
+        self.interrupt_entries
+    }
     pub fn step(&mut self) -> Result<StepOutcome, MachineError> {
         self.step_with_idle_budget(1).map(|(outcome, _)| outcome)
     }
@@ -210,19 +247,38 @@ impl PcMachine {
         &mut self,
         budget: u32,
     ) -> Result<(StepOutcome, u32), MachineError> {
-        if self
-            .memory_wait_sites
-            .is_some_and(|sites| sites.starts.contains(&self.cpu.registers.ip))
+        self.step_mode::<false>(budget, None)
+    }
+    /// Execute one scheduling unit with actual bus transactions and IRQ entry.
+    /// No JIT or wait batching can bypass this bounded trace.
+    pub fn step_observed(
+        &mut self,
+        observation: &mut StepObservation,
+    ) -> Result<(StepOutcome, u32), MachineError> {
+        *observation = StepObservation::default();
+        self.step_mode::<true>(1, Some(observation))
+    }
+    fn step_mode<const OBSERVE: bool>(
+        &mut self,
+        budget: u32,
+        mut observation: Option<&mut StepObservation>,
+    ) -> Result<(StepOutcome, u32), MachineError> {
+        if !OBSERVE
+            && self
+                .memory_wait_sites
+                .is_some_and(|sites| sites.starts.contains(&self.cpu.registers.ip))
             && let Some(consumed) = self.advance_memory_wait(budget)?
         {
             return Ok((StepOutcome::Continue, consumed));
         }
-        if self.vga_wait.ready(budget)
+        if !OBSERVE
+            && self.vga_wait.ready(budget)
             && let Some(consumed) = self.advance_vga_wait(budget)?
         {
             return Ok((StepOutcome::Continue, consumed));
         }
-        if budget > 1
+        if !OBSERVE
+            && budget > 1
             && self.vga_wait.candidate.is_none()
             && self.memory_wait_sites.is_none()
             && !(self.cpu.accepts_maskable_interrupt() && self.bus.pic.has_interrupt())
@@ -237,7 +293,20 @@ impl PcMachine {
                     .saturating_sub(1)
                     .min(budget)
             };
-            let consumed = if self.cpu.dynamic_core_enabled() {
+            // A valid recurrence journal requires decoded stores. Select that
+            // batch path once instead of repeatedly attempting writable native
+            // traces which cannot obtain RAM. Overflow and completed intervals
+            // immediately restore the ordinary native path.
+            let native = self.cpu.dynamic_core_enabled() && !self.bus.ram.recurrence_recording();
+            let consumed = if let Some(head) = self.batch_yield_ip {
+                if native {
+                    self.cpu
+                        .dynamic_batch_until_blocks(&mut self.bus, budget, limit, head)
+                } else {
+                    self.cpu
+                        .interpret_batch_until_blocks(&mut self.bus, budget, limit, head)
+                }
+            } else if native {
                 self.cpu.dynamic_batch(&mut self.bus, budget, limit)
             } else {
                 self.cpu.interpret_batch(&mut self.bus, budget, limit)
@@ -262,7 +331,11 @@ impl PcMachine {
         }
         let outcome = if self.cpu.accepts_maskable_interrupt() {
             if let Some(vector) = self.bus.pic.acknowledge() {
+                self.interrupt_entries = self.interrupt_entries.wrapping_add(1);
                 interrupted = true;
+                if OBSERVE {
+                    observation.as_mut().unwrap().irq = Some(vector);
+                }
                 #[cfg(feature = "profiling")]
                 {
                     self.bus.stats.irq_entries += 1;
@@ -272,15 +345,44 @@ impl PcMachine {
                         self.bus.stats.cpu_steps -= 1;
                     }
                 }
-                self.cpu.interrupt(&mut self.bus, vector)?;
+                if OBSERVE {
+                    let mut bus = doslet_bus::observation::Observed {
+                        bus: &mut self.bus,
+                        trace: &mut observation.as_mut().unwrap().trace,
+                    };
+                    self.cpu.interrupt(&mut bus, vector)?;
+                } else {
+                    self.cpu.interrupt(&mut self.bus, vector)?;
+                }
                 StepOutcome::Continue
+            } else {
+                if OBSERVE {
+                    let mut bus = doslet_bus::observation::Observed {
+                        bus: &mut self.bus,
+                        trace: &mut observation.as_mut().unwrap().trace,
+                    };
+                    self.cpu.step(&mut bus)?
+                } else {
+                    self.cpu.step(&mut self.bus)?
+                }
+            }
+        } else {
+            if OBSERVE {
+                let mut bus = doslet_bus::observation::Observed {
+                    bus: &mut self.bus,
+                    trace: &mut observation.as_mut().unwrap().trace,
+                };
+                self.cpu.step(&mut bus)?
             } else {
                 self.cpu.step(&mut self.bus)?
             }
-        } else {
-            self.cpu.step(&mut self.bus)?
         };
+        let before_writes = if OBSERVE { self.bus.ram_writes() } else { 0 };
         self.advance_hardware()?;
+        if OBSERVE {
+            observation.as_mut().unwrap().device_writes_unobserved =
+                before_writes != self.bus.ram_writes();
+        }
         self.observe_vga_wait(
             candidate_valid,
             interrupted,
@@ -340,3 +442,45 @@ impl PcMachine {
         self.bus.pit.advance(2, ticks).unwrap();
     }
 }
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    #[test]
+    fn observed_irq_and_device_steps_preserve_guest_state_and_pcm() {
+        for dma in [false, true] {
+            let mut observed = timing::tests::idle_machine(dma);
+            let mut reference = timing::tests::idle_machine(dma);
+            let mut irqs = 0;
+            for _ in 0..10000 {
+                let mut trace = StepObservation::default();
+                assert_eq!(
+                    observed.step_observed(&mut trace).unwrap(),
+                    reference.step_with_idle_budget(1).unwrap()
+                );
+                irqs += usize::from(trace.irq.is_some());
+                assert!(!trace.trace.incomplete);
+                assert!(observed.cpu.matches(&reference.cpu.snapshot()));
+                assert_eq!(observed.time(), reference.time());
+                assert_eq!(
+                    observed.bus.pic.read_command(),
+                    reference.bus.pic.read_command()
+                );
+                let mut a = [[0; 2]; 8];
+                let mut b = [[0; 2]; 8];
+                assert_eq!(observed.drain_pcm(&mut a), reference.drain_pcm(&mut b));
+                assert_eq!(a, b);
+            }
+            assert!(irqs > 0);
+            assert_eq!(
+                observed.bus.ram_view(0..0xa0000),
+                reference.bus.ram_view(0..0xa0000)
+            );
+            assert_eq!(observed.bus.vga.vram_view(), reference.bus.vga.vram_view());
+        }
+    }
+}
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

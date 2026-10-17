@@ -1,0 +1,6 @@
+{
+  "description": "Offline intro fixture: completed banked-image-copy return, including partial image updates. Hash the displayed frame at each return; this is not a generic deadline detector.",
+  "pcs": [2172791],
+  "frame_pcs": [2172791],
+  "memory": []
+}

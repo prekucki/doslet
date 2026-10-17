@@ -1,6 +1,6 @@
 //! Preloaded guest directory tree with stable file nodes and a sparse upper.
 //! Host acquisition remains in platform adapters; DOS names use ASCII folding.
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 mod overlay;
 pub mod search;
 
@@ -77,9 +77,25 @@ impl Name {
     }
 }
 
+// Empty files created by the guest must not allocate an Arc after setup.
+#[derive(Clone, Default)]
+struct FileBytes(Option<Arc<Vec<u8>>>);
+impl From<Vec<u8>> for FileBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self((!bytes.is_empty()).then(|| Arc::new(bytes)))
+    }
+}
+impl core::ops::Deref for FileBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.0.as_ref().map_or(&[], |bytes| bytes.as_slice())
+    }
+}
+
+#[derive(Clone)]
 struct File {
     name: Name,
-    bytes: Vec<u8>,
+    bytes: FileBytes,
     base_name: Name,
     deleted: bool,
     directory: bool,
@@ -91,6 +107,7 @@ struct Handle {
     mode: u8,
 }
 
+#[derive(Clone)]
 pub struct DirectoryTree {
     files: Vec<File>,
     handles: [Option<usize>; HANDLE_COUNT],
@@ -186,7 +203,7 @@ impl DirectoryTree {
                 base_name: Name::ROOT,
                 deleted: false,
                 directory: false,
-                bytes: Vec::new(),
+                bytes: FileBytes::default(),
             });
             index
         };
@@ -231,7 +248,7 @@ impl DirectoryTree {
             base_name: name,
             deleted: false,
             directory: false,
-            bytes,
+            bytes: FileBytes::from(bytes),
         });
         Ok(())
     }
@@ -814,7 +831,7 @@ impl DirectoryTree {
             base_name: Name::ROOT,
             deleted: false,
             directory: true,
-            bytes: Vec::new(),
+            bytes: FileBytes::default(),
         });
         self.namespace_dirty = true;
         Ok(())
@@ -971,7 +988,7 @@ impl DirectoryTree {
                     base_name: Name::ROOT,
                     deleted,
                     directory,
-                    bytes: Vec::new(),
+                    bytes: FileBytes::default(),
                 });
             } else {
                 self.files[index].name = name;
@@ -1201,3 +1218,7 @@ mod import_compatibility_tests {
         );
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "tree_saved.rs"]
+mod saved_state;

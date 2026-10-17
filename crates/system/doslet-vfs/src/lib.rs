@@ -195,3 +195,7 @@ mod sparse;
 pub use sparse::OverlayFs;
 
 pub mod tree;
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

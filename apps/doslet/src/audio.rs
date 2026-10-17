@@ -10,11 +10,34 @@ struct Queue {
     active: bool,
     consumed: u64,
     underruns: u64,
+    callback_frames: usize,
+    refilling: bool,
     peak: f32,
     spectrum: doslet_pcm::spectrum::Spectrum,
     error: Option<String>,
 }
 impl Queue {
+    fn refill_nanos(&mut self, sample_rate: u32) -> u64 {
+        let rate = sample_rate as usize;
+        let high = (self.callback_frames.saturating_mul(3) + rate / 125)
+            .max(rate * 30 / 1000)
+            .min(rate * 80 / 1000)
+            .min(CAPACITY - 512);
+        let low = (self.callback_frames.saturating_mul(2) + rate / 250)
+            .max(rate * 15 / 1000)
+            .min(high * 2 / 3);
+        if self.len < low {
+            self.refilling = true;
+        }
+        if self.len >= high {
+            self.refilling = false;
+        }
+        if self.active && self.refilling {
+            (high.saturating_sub(self.len) as u64 * 1_000_000_000).div_ceil(u64::from(sample_rate))
+        } else {
+            0
+        }
+    }
     fn next(&mut self) -> [f32; 2] {
         if !self.active {
             return [0.0; 2];
@@ -35,8 +58,20 @@ impl Queue {
 }
 pub struct Output {
     _stream: cpal::Stream,
+    writer: Writer,
+}
+/// The synthesis owner shares frames and playback telemetry, never the device
+/// handle or a synthesizer, with CPAL. Stream creation/disposal stays on its owner.
+#[derive(Clone)]
+pub struct Writer {
     queue: Arc<Mutex<Queue>>,
     pub rate: u32,
+}
+impl std::ops::Deref for Output {
+    type Target = Writer;
+    fn deref(&self) -> &Writer {
+        &self.writer
+    }
 }
 impl Output {
     pub fn new() -> Result<Self, String> {
@@ -57,6 +92,8 @@ impl Output {
             active: true,
             consumed: 0,
             underruns: 0,
+            callback_frames: 0,
+            refilling: true,
             peak: 0.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
             error: None,
@@ -81,14 +118,55 @@ impl Output {
         stream.play().map_err(|error| error.to_string())?;
         Ok(Self {
             _stream: stream,
-            queue,
-            rate,
+            writer: Writer { queue, rate },
         })
+    }
+    pub fn writer(&self) -> Writer {
+        self.writer.clone()
+    }
+}
+impl Writer {
+    #[cfg(test)]
+    pub fn mock(rate: u32) -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(Queue {
+                frames: vec![[0.0; 2]; CAPACITY].into_boxed_slice(),
+                head: 0,
+                len: 0,
+                active: true,
+                consumed: 0,
+                underruns: 0,
+                callback_frames: 256,
+                refilling: true,
+                peak: 0.0,
+                spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
+                error: None,
+            })),
+            rate,
+        }
+    }
+    #[cfg(test)]
+    pub fn consume(&self, count: usize) -> Vec<[f32; 2]> {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        (0..count).map(|_| queue.next()).collect()
+    }
+    pub fn check(&self) -> Result<(), String> {
+        let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.error.clone().map_or(Ok(()), Err)
     }
     pub fn available(&self) -> usize {
         let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         CAPACITY - q.len
     }
+    /// Refill below two callback blocks, with margin, until the high watermark.
+    /// Bounded by the reserved queue and 80 ms; no audio-device reconfiguration.
+    pub fn refill_nanos(&self) -> u64 {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .refill_nanos(self.rate)
+    }
+
     pub fn push(&self, frames: &[[f32; 2]]) -> Result<(), String> {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(error) = &q.error {
@@ -117,6 +195,7 @@ impl Output {
         q.len = 0;
         q.consumed = 0;
         q.underruns = 0;
+        q.refilling = true;
         q.peak = 0.0;
         q.spectrum.reset();
     }
@@ -145,6 +224,7 @@ fn build<T: cpal::SizedSample + Copy + Send + 'static>(
             config,
             move |data: &mut [T], _| {
                 let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                q.callback_frames = q.callback_frames.max(data.len() / channels);
                 for frame in data.chunks_mut(channels) {
                     let value = q.next();
                     for (index, sample) in frame.iter_mut().enumerate() {
@@ -169,6 +249,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn refill_watermarks_keep_reserve_without_chattering_or_unbounded_lead() {
+        let mut queue = Queue {
+            frames: vec![[0.0; 2]; CAPACITY].into_boxed_slice(),
+            head: 0,
+            len: 0,
+            active: true,
+            consumed: 0,
+            underruns: 0,
+            callback_frames: 256,
+            refilling: true,
+            peak: 0.0,
+            spectrum: doslet_pcm::spectrum::Spectrum::new(48000),
+            error: None,
+        };
+        assert_eq!(queue.refill_nanos(48000), 30_000_000);
+        queue.len = 1000;
+        assert!(queue.refill_nanos(48000) > 0);
+        queue.len = 1440;
+        assert_eq!(queue.refill_nanos(48000), 0);
+        queue.len = 1000;
+        assert_eq!(queue.refill_nanos(48000), 0);
+        queue.len = 700;
+        assert!(queue.refill_nanos(48000) > 0);
+        queue.callback_frames = 4096;
+        queue.len = 0;
+        assert_eq!(queue.refill_nanos(48000), 80_000_000);
+        queue.active = false;
+        assert_eq!(queue.refill_nanos(48000), 0);
+    }
+
+    #[test]
     fn spectrum_tracks_consumed_frames_and_fades_on_output_underrun() {
         let mut queue = Queue {
             frames: vec![[0.0; 2]; CAPACITY].into_boxed_slice(),
@@ -177,6 +288,8 @@ mod tests {
             active: true,
             consumed: 0,
             underruns: 0,
+            callback_frames: 0,
+            refilling: true,
             peak: 0.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(48000),
             error: None,

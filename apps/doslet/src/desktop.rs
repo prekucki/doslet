@@ -59,6 +59,14 @@ impl SessionSnapshot {
     }
 }
 pub struct Snapshot {
+    pub(crate) speed_tiers: Option<crate::native_speed_tiers::Stats>,
+    pub analysis: doslet_runtime::session::AnalyzerStats,
+    pub host_audio_underruns: Option<u64>,
+    pub synchronization: doslet_runtime::session::SynchronizationStats,
+    pub idle_observation: doslet_runtime::session::IdleObservation,
+    pub adaptive_idle_percent: u8,
+    pub learned_idle: bool,
+    pub menu_idle: (bool, u64, u64),
     pub mcp: Option<std::net::SocketAddr>,
     pub gdb: Option<(std::net::SocketAddr, bool)>,
     pub session: SessionSnapshot,
@@ -393,6 +401,61 @@ mod tests {
     }
 
     #[test]
+    fn mcp_exit_acknowledges_and_requests_shutdown_even_when_paused() {
+        for running in [true, false] {
+            let (worker, initial) = Worker::spawn_with(move || {
+                let mut engine = Box::new(crate::app::Doslet::new());
+                engine.session = doslet_runtime::Session::new(&[0x40, 0xEB, 0xFD])
+                    .unwrap()
+                    .into();
+                engine.session.start();
+                if !running {
+                    engine.session.pause();
+                }
+                engine
+                    .enable_mcp("127.0.0.1:0".parse().unwrap())
+                    .map_err(|e| e.to_string())?;
+                Ok(engine)
+            })
+            .unwrap();
+            let address = initial.mcp.unwrap();
+            let tools = mcp_rpc(address, "tools/list", serde_json::json!({}));
+            assert!(
+                tools["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| {
+                        t["name"] == "exit" && t["annotations"]["destructiveHint"] == true
+                    })
+            );
+            let exiting = mcp_tool(address, "exit", serde_json::json!({}));
+            assert_ne!(exiting["isError"], true, "{exiting}");
+            assert_eq!(exiting["structuredContent"]["status"], "Exiting");
+            let packet = wait_for(&worker, |s| s.session.status() == SessionStatus::Paused);
+            use iced::futures::{StreamExt, executor::block_on};
+            let mut actions = iced_runtime::task::into_stream(packet.effects).unwrap();
+            assert!(
+                block_on(async {
+                    while let Some(action) = actions.next().await {
+                        if matches!(action, iced_runtime::Action::Exit) {
+                            return true;
+                        }
+                    }
+                    false
+                }),
+                "shutdown must reach the UI"
+            );
+            let rejected = mcp_tool(address, "resume", serde_json::json!({}));
+            assert_eq!(rejected["isError"], true);
+            let began = Instant::now();
+            drop(worker);
+            assert!(began.elapsed() < Duration::from_secs(5));
+            assert!(std::net::TcpStream::connect(address).is_err());
+        }
+    }
+
+    #[test]
     fn bounded_input_overflow_pauses_the_machine() {
         let (worker, _) = worker(true);
         worker.overflow.store(true, Ordering::Release);
@@ -475,6 +538,7 @@ mod tests {
             configurator,
             display_sizing: DisplaySizing::default(),
             config_sequence: 0,
+            tier_meter: crate::speed_tier_meter::Meter::default(),
         };
         let _ = app.update(Message::Config(crate::configurator::Edit::Name(
             "New name".into(),
@@ -785,6 +849,7 @@ pub struct Doslet {
     pub configurator: crate::configurator::ConfiguratorState,
     pub display_sizing: DisplaySizing,
     config_sequence: u64,
+    pub(crate) tier_meter: crate::speed_tier_meter::Meter,
 }
 impl std::ops::Deref for Doslet {
     type Target = Snapshot;
@@ -802,6 +867,7 @@ impl Doslet {
             configurator,
             display_sizing: DisplaySizing::default(),
             config_sequence: 0,
+            tier_meter: crate::speed_tier_meter::Meter::default(),
         }))
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -827,7 +893,18 @@ impl Doslet {
                     self.configurator = configurator;
                 }
                 self.state = packet.snapshot;
-                packet.effects
+                self.tier_meter.sample(
+                    std::time::Instant::now(),
+                    self.state.speed_tiers,
+                    self.state.session.status == SessionStatus::Running
+                        && !self.state.gdb.is_some_and(|(_, connected)| connected),
+                );
+                Task::batch([
+                    packet.effects,
+                    self.display_sizing
+                        .refresh(&self.state.display)
+                        .map(Message::DisplaySizing),
+                ])
             } else {
                 Task::none()
             };

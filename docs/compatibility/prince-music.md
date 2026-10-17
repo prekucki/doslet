@@ -83,7 +83,7 @@ for this installation. No SoundFonts were downloaded or compared here.
 
 | Playback mode | Starting choice | Reason and limit |
 | --- | --- | --- |
-| GM through the user's current TiMidity | FluidR3 GM | Established complete GM bank; a useful baseline after verifying GM selection. It does not reproduce the MT-32 preset map. |
+| GM through TiMidity | FluidR3 GM | Established complete GM bank; a useful baseline after verifying GM selection. It does not reproduce the MT-32 preset map. |
 | GM/GS through FluidSynth | GeneralUser GS 2.0.3 | Preferred candidate for its compact bank and careful instrument programming; the author recommends a compliant synth, including FluidSynth 2.3 or later. |
 | GeneralUser through an older/less complete SF2 player | GeneralUser GS SoftSynth 1.44 | The author's compatibility fallback; do not assume modern 2.x modulators render correctly in an unverified TiMidity build. |
 | A different GM interpretation | Arachno | A complete GM/GS bank with a different sample palette; try only after establishing the program map. |
@@ -94,8 +94,6 @@ Primary references: [FluidSynth's known-working banks](https://www.fluidsynth.or
 [Arachno author](https://www.arachnosoft.com/main/soundfont.php),
 and [Munt project](https://github.com/munt/munt).
 
-The user's native TiMidity audio became substantially smoother with
-`PULSE_LATENCY_MSEC=100 timidity -iA`, after Libao ignored `-B` and the direct
-TiMidity ALSA output attempt crashed. That listening result supports a host
-buffering explanation for the breakup; it does not identify the original synth
-or establish instrument fidelity.
+Host buffering can affect native MIDI continuity independently of the guest's
+program map. Compare buffering settings on the target system and assess audio
+by listening; counters alone do not establish instrument fidelity.

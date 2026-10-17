@@ -728,11 +728,10 @@ impl NativeStorage {
                 }
                 store = Some(selected);
             }
-            if let Some(mount) = spec
-                .mounts
-                .iter()
-                .find(|mount| matches!(mount.kind, SourceKind::LocalIso | SourceKind::HttpsIso))
-            {
+            if let Some(mount) = spec.mounts.iter().find(|mount| {
+                matches!(mount.kind, SourceKind::LocalIso | SourceKind::HttpsIso)
+                    && !(mount.kind == SourceKind::LocalIso && settings.preload_local_media)
+            }) {
                 let media = match mount.kind {
                     SourceKind::HttpsIso => {
                         MediaSource::Https(HttpSource::open(spec.binding(&mount.source))?)

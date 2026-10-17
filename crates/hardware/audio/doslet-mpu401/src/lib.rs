@@ -182,3 +182,7 @@ mod tests {
         assert_eq!(mpu.read_data(), 0xFE);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

@@ -201,3 +201,7 @@ mod tests {
         assert_eq!(arena.allocate(1, 0x1000).unwrap_err().code, 8);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "memory_saved.rs"]
+mod saved_state;

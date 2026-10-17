@@ -5,9 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [features]
+save-state = ["dep:doslet-state", "dep:prost", "doslet-config/save-state", "doslet-dos/save-state", "doslet-input/save-state", "doslet-pc/save-state", "doslet-pcm/save-state", "doslet-vfs/save-state", "doslet-vga/save-state", "doslet-x86/save-state"]
 dynamic-core = ["doslet-pc/dynamic-core", "doslet-x86/dynamic-core"]
 profiling = ["doslet-pc/profiling"]
 [dependencies]
+prost = { workspace = true, optional = true }
+doslet-state = { workspace = true, optional = true }
 doslet-storage.workspace = true
 doslet-vfs.workspace = true
 doslet-config.workspace = true

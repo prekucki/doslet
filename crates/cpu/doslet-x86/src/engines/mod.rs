@@ -111,6 +111,24 @@ impl interpreter::Cpu {
     pub fn load_dynamic_profile(&mut self, _bytes: &[u8]) -> Result<(), &'static str> {
         Err("native dynamic core unavailable")
     }
+    pub fn dynamic_batch_until_block<B: doslet_bus::CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        head: u32,
+    ) -> u32 {
+        self.interpret_batch_until_block(bus, budget, limit, head)
+    }
+    pub fn dynamic_batch_until_blocks<B: doslet_bus::CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        heads: [u32; 2],
+    ) -> u32 {
+        self.interpret_batch_until_blocks(bus, budget, limit, heads)
+    }
     pub fn write_dynamic_profile(&self, _output: &mut [u8]) -> usize {
         0
     }

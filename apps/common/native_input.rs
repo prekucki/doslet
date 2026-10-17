@@ -16,8 +16,14 @@ pub struct LaunchSettings {
     pub root: Option<PathBuf>,
     pub writable: bool,
     pub persist: bool,
+    pub preload_local_media: bool,
     pub cdrom: Option<(u8, PathBuf)>,
     pub heroes_timer_waits: bool,
+    pub heroes_menu_idle: bool,
+    pub observe_idle: bool,
+    pub analyze_synchronization: bool,
+    pub adaptive_cpu: bool,
+    pub adaptive_idle: bool,
     pub no_dynamic_core: bool,
     pub core_profile: Option<PathBuf>,
 }
@@ -31,8 +37,14 @@ impl Default for LaunchSettings {
             root: None,
             writable: true,
             persist: false,
+            preload_local_media: false,
             cdrom: None,
             heroes_timer_waits: false,
+            heroes_menu_idle: false,
+            observe_idle: false,
+            analyze_synchronization: false,
+            adaptive_cpu: false,
+            adaptive_idle: false,
             no_dynamic_core: false,
             core_profile: None,
         }
@@ -90,13 +102,22 @@ pub fn load_game_with_settings(
         settings.hardware,
     )?
     .with_drive(drive);
-    if settings.machine_spec.is_none()
+    if (settings.machine_spec.is_none() || settings.preload_local_media)
         && let Some((letter, image)) = &settings.cdrom
     {
         session = session.with_cdrom_image(*letter, fs::read(image)?)?;
     }
     session.configure_launch(&settings.command_tail, &settings.working_directory)?;
     session.set_dynamic_core(!settings.no_dynamic_core);
+    set_heroes_menu_idle(&mut session, settings.heroes_menu_idle);
+    session.set_idle_observation(settings.observe_idle);
+    if settings.adaptive_idle {
+        session.set_adaptive_idle(true);
+    }
+    session.set_synchronization_analysis(settings.analyze_synchronization);
+    if settings.adaptive_cpu {
+        session.set_adaptive_cpu(true);
+    }
     if let Some(path) = &settings.core_profile {
         load_core_profile(&mut session, path);
     }
@@ -107,6 +128,25 @@ pub fn load_game_with_settings(
         );
     }
     Ok(session)
+}
+pub fn set_heroes_menu_idle(session: &mut Session, enabled: bool) {
+    session.set_menu_idle_site(enabled.then_some(doslet_runtime::session::MenuIdleSite {
+        head: 0x217da2,
+        call: 0x206fc0,
+        backedge: 0x217f09,
+        event_offset: 0x10,
+        callback_offset: 0x28,
+        callback: 0x2092dc,
+        timer: 0x2810a8,
+        guard: 0x2832c0,
+    }));
+    session.set_event_idle_site(enabled.then_some(doslet_runtime::session::EventIdleSite {
+        head: 0x219d1a,
+        call: 0x213f4c,
+        backedge: 0x219d8f,
+        queue: 0x2832f0,
+        context: 0x2832c4,
+    }));
 }
 /// Optional preparation hints; malformed input cannot prevent interpretation.
 pub fn load_core_profile(session: &mut Session, path: &Path) {

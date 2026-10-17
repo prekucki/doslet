@@ -1,4 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
+mod adaptive_meter;
+#[cfg(not(target_arch = "wasm32"))]
 mod app;
 #[cfg(not(target_arch = "wasm32"))]
 mod desktop;
@@ -6,6 +8,16 @@ mod desktop;
 mod native_computer;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_jit;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_speed_tiers;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_state;
+#[cfg(not(target_arch = "wasm32"))]
+mod speed_tier_meter;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/speed_tiers.rs"]
+#[allow(dead_code)] // Legacy offline planner remains shared with replay experiments.
+mod speed_tiers;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "native_gamepad/wakeup.rs"]
 mod wakeup;
@@ -31,6 +43,8 @@ mod keyboard;
 #[path = "../../common/machine_profile.rs"]
 mod machine_profile;
 mod midi_activity;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_audio;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_gamepad;
 #[cfg(not(target_arch = "wasm32"))]
