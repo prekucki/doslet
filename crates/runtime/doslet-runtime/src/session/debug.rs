@@ -8,7 +8,13 @@ pub struct ExecutionSettings {
     idle: bool,
     vga: bool,
     dpmi: Option<super::dpmi::Mode>,
+    analysis: bool,
+    adaptive_cpu: bool,
 }
+
+/// Owner/mapping/page identity for an immutable diagnostic code span.
+#[derive(Clone, Copy)]
+pub struct CodeVersion(doslet_bus::CodeCheck);
 
 pub const GENERAL: [Gpr32; 8] = [
     Gpr32::Eax,
@@ -22,13 +28,92 @@ pub const GENERAL: [Gpr32; 8] = [
 ];
 
 impl Session {
-    pub fn debug_disable_accelerations(&mut self) -> ExecutionSettings {
-        let settings = ExecutionSettings {
+    pub fn debug_code_version(&self, address: u32, length: u8) -> Option<CodeVersion> {
+        use doslet_bus::MemoryBus;
+        self.machine
+            .bus
+            .code_check(address, length)
+            .map(CodeVersion)
+    }
+
+    pub fn debug_code_valid(&self, version: &CodeVersion) -> bool {
+        use doslet_bus::MemoryBus;
+        self.machine.bus.code_valid(&version.0)
+    }
+
+    /// Experimental bounded CPU execution with device time charged separately.
+    /// The host adapter supplies elapsed time through `debug_advance_device_time`.
+    /// Other execution policies must be disabled before using this interface.
+    pub fn debug_external_advance(&mut self, budget: u32) -> u32 {
+        if self.analyzer.enabled || self.menu_idle_enabled() || self.idle.enabled {
+            return 0;
+        }
+        self.machine.debug_external_cpu_clock(true);
+        let completed = self.advance(budget.min(64));
+        self.machine.debug_external_cpu_clock(false);
+        completed
+    }
+
+    pub fn debug_irq_pending(&self) -> bool {
+        self.machine.interrupt_pending()
+    }
+
+    pub fn debug_irq_entries(&self) -> u64 {
+        self.machine.interrupt_entries()
+    }
+
+    /// Diagnostic elapsed execution time, not a grant to skip guest work.
+    pub fn debug_advance_device_time(&mut self, nanos: u64) -> Result<u64, super::RuntimeError> {
+        Ok(self.machine.debug_advance_device_time(nanos)?)
+    }
+
+    /// Diagnostic only: this horizon is not permission to omit guest work.
+    pub fn debug_service_horizon(&self) -> Option<u64> {
+        self.machine.diagnostic_service_horizon().0
+    }
+
+    /// Explicit cooperative experiment, with at most 250 us and 256 device slices.
+    /// Leaves the CPU at the same PC, stops for an eligible IRQ, and advances
+    /// audio/timers normally. The caller must qualify a wait boundary; this is
+    /// not an instruction-equivalent optimization or a host sleep operation.
+    pub fn debug_cooperative_idle(&mut self, nanos: u64) -> Result<u64, super::RuntimeError> {
+        if self.status != SessionStatus::Running
+            || self.analyzer.enabled
+            || self.menu_idle_enabled()
+            || self.idle.enabled
+        {
+            return Ok(0);
+        }
+        let start = self.emulated_nanos();
+        let end = start.saturating_add(nanos.min(250_000));
+        for _ in 0..256 {
+            let now = self.emulated_nanos();
+            if now >= end {
+                break;
+            }
+            let steps = self.machine.advance_cooperative_idle(100_000, end - now)?;
+            if steps == 0 {
+                break;
+            }
+            self.steps += u64::from(steps);
+        }
+        Ok(self.emulated_nanos() - start)
+    }
+
+    pub fn debug_execution_settings(&self) -> ExecutionSettings {
+        ExecutionSettings {
             dynamic: self.dynamic_core_enabled(),
             idle: self.idle.enabled,
             vga: self.machine.vga_wait_acceleration_enabled(),
             dpmi: self.dpmi.as_ref().map(|h| h.mode),
-        };
+            analysis: self.analyzer.enabled,
+            adaptive_cpu: self.analyzer.controller,
+        }
+    }
+
+    pub fn debug_disable_accelerations(&mut self) -> ExecutionSettings {
+        let settings = self.debug_execution_settings();
+        self.set_synchronization_analysis(false);
         self.set_dynamic_core(false);
         self.set_idle_loops(false);
         self.set_vga_wait_acceleration(false);
@@ -39,6 +124,10 @@ impl Session {
     }
 
     pub fn debug_restore_accelerations(&mut self, settings: ExecutionSettings) {
+        self.set_synchronization_analysis(settings.analysis);
+        if settings.adaptive_cpu {
+            self.set_adaptive_cpu(true);
+        }
         self.set_dynamic_core(settings.dynamic);
         self.set_idle_loops(settings.idle);
         self.set_vga_wait_acceleration(settings.vga);
@@ -126,6 +215,56 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_execution_is_bounded_and_restores_ordinary_clock() {
+        let mut s = Session::new(&[0x40, 0xEB, 0xFD]).unwrap();
+        s.debug_disable_accelerations();
+        assert_eq!(s.debug_external_advance(1), 0);
+        s.start();
+        let before = s.emulated_nanos();
+        let eax = s.registers().get32(Gpr32::Eax);
+        assert_eq!(s.debug_external_advance(u32::MAX), 64);
+        assert_eq!(s.emulated_nanos(), before);
+        assert_eq!(s.registers().get32(Gpr32::Eax), eax + 32);
+        assert_eq!(s.debug_advance_device_time(1000).unwrap(), 1000);
+        assert_eq!(s.advance(1), 1);
+        assert!(s.emulated_nanos() > before + 1000);
+        s.set_adaptive_cpu(true);
+        let cpu = s.machine.cpu.snapshot();
+        assert_eq!(s.debug_external_advance(1), 0);
+        assert!(s.machine.cpu.matches(&cpu));
+    }
+
+    #[test]
+    fn explicit_cooperative_idle_preserves_cpu_and_stops_for_pending_irq() {
+        let mut s = Session::new(&[0x90, 0xEB, 0xFD]).unwrap();
+        s.start();
+        s.debug_disable_accelerations();
+        let before = s.machine.cpu.snapshot();
+        let mhz = s.hardware_config().cpu_mhz;
+        let elapsed = s.debug_cooperative_idle(u64::MAX).unwrap();
+        assert!(elapsed > 0 && elapsed <= 250_000 + 4000 / u64::from(mhz));
+        assert!(s.machine.cpu.matches(&before));
+        assert_eq!(s.hardware_config().cpu_mhz, mhz);
+        s.machine.bus.pic.raise_edge(0);
+        let now = s.emulated_nanos();
+        assert_eq!(s.debug_cooperative_idle(100_000).unwrap(), 0);
+        assert_eq!(s.emulated_nanos(), now);
+    }
+
+    #[test]
+    fn cooperative_debug_wait_refuses_paused_disabled_irq_and_competing_policy() {
+        let mut s = Session::new(&[0x90]).unwrap();
+        s.debug_disable_accelerations();
+        assert_eq!(s.debug_cooperative_idle(100_000).unwrap(), 0);
+        s.start();
+        s.machine.cpu.flags &= !doslet_x86::flags::INTERRUPT;
+        assert_eq!(s.debug_cooperative_idle(100_000).unwrap(), 0);
+        s.machine.cpu.flags |= doslet_x86::flags::INTERRUPT;
+        s.set_adaptive_cpu(true);
+        assert_eq!(s.debug_cooperative_idle(100_000).unwrap(), 0);
+    }
 
     #[test]
     fn reads_and_stops_do_not_advance_time_or_modify_input_or_guest_state() {

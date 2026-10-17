@@ -6,10 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
+save-state = ["dep:doslet-state", "dep:prost", "doslet-x87/save-state"]
 profiling = []
 dynamic-core = ["dep:doslet-x86-jit"]
 
 [dependencies]
+prost = { workspace = true, optional = true }
+doslet-state = { workspace = true, optional = true }
 doslet-bus.workspace = true
 doslet-x87.workspace = true
 

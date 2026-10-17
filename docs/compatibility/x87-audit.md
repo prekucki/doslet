@@ -1,8 +1,7 @@
 # x87 implementation audit
 
-Updated 2026-10-15 after comparison with the local DOSBox Staging FPU routing
-and generic/native backends, Intel's 387 instruction contract and captured
-native x86-64 x87 results. The target is i386 plus optional 387. This report
+This audit covers Intel's 387 instruction contract and captured native x86-64
+x87 results. The target is i386 plus optional 387. This report
 separates opcode execution coverage, tested numerical behavior and remaining
 architectural limits; it does not certify full x87 or game compatibility.
 
@@ -21,19 +20,11 @@ constants, FYL2X, F2XM1 and FSCALE. Missing opcode handlers are no longer the
 main compatibility boundary. Stack faults, exception signaling and some
 nonfinite numerical domains remain incomplete.
 
-## Comparison with DOSBox Staging
+## Implementation boundary
 
-The local reference is `../dosbox-staging/src/fpu/fpu.cpp` and
-`fpu_instructions.h` / `fpu_instructions_x86.h`. Their opcode routing, operand
-widths, stack effects and environment operations guided the implementation.
-Intel's architectural contract takes precedence where the generic reference
-has deliberate simplifications or TODOs.
-
-DOSBox Staging's generic backend stores `double` values; its x86 backend uses
-host x87 assembly. Neither is a suitable direct replacement for Doslet's
-portable no_std arithmetic with retained 64-bit significands. Doslet therefore
-uses independent fixed-width integer kernels and fixed local arrays. Runtime
-code has no new dependencies, unsafe blocks, host math calls or allocations.
+Doslet uses portable `no_std` arithmetic with retained 64-bit significands,
+independent fixed-width integer kernels and fixed local arrays. Runtime code
+has no new dependencies, unsafe blocks, host math calls or allocations.
 Native assembly is confined to the standalone reference generator; it is not
 linked to any emulator or WASM target.
 
@@ -154,5 +145,3 @@ cargo check -p doslet -p doslet-web-worker -p doslet-web-audio --target wasm32-u
 
 - [Intel SDM Volume 1, chapters 4 and 8](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-1-manual.pdf)
 - [Intel instruction reference](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
-- Local DOSBox Staging: `src/fpu/fpu.cpp`, `fpu.h`,
-  `fpu_instructions.h`, `fpu_instructions_x86.h`.

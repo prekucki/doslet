@@ -79,6 +79,10 @@ fn direct_and_reflected_calls_return_identical_register_frames() {
         assert_eq!(direct.registers(), reference.registers());
         assert_eq!(direct.eflags(), reference.eflags());
         assert_eq!(direct.steps(), reference.steps());
+        assert_eq!(
+            direct.execution_tier_stats(),
+            reference.execution_tier_stats()
+        );
         assert_eq!(direct.emulated_nanos(), reference.emulated_nanos());
         assert_eq!(direct.ram_view(0..0x90000), reference.ram_view(0..0x90000));
     }
@@ -331,4 +335,54 @@ fn guest_callback_returns_through_nested_real_and_protected_frames() {
     assert_eq!(s.machine.bus.read_u32(0x3001C).unwrap(), 0x12345678);
     assert_eq!(s.dpmi.as_ref().unwrap().depth, 0);
     assert_eq!(s.registers().get32(Gpr32::Esp), 0x70000);
+}
+
+#[test]
+fn observed_call_uses_real_instruction_without_changing_configured_mode() {
+    let mut s = prepared(Mode::Direct);
+    s.machine.bus.write_u16(0x3001C, 0x0100).unwrap();
+    s.machine.bus.write_u16(0x30020, 0x202).unwrap();
+    s.machine.cpu.registers.set(Gpr16::Ax, 0x300);
+    s.machine.cpu.registers.set(Gpr16::Bx, 0x16);
+    s.machine.cpu.registers.set(Gpr16::Cx, 0);
+    s.machine.cpu.registers.set32(Gpr32::Edi, 0x30000);
+    let mut observation = doslet_pc::StepObservation::default();
+    s.execute_step_observed(&mut observation).unwrap(); // INT 31h.
+    s.execute_step_observed(&mut observation).unwrap(); // Reflected real IRET.
+    assert_eq!(s.dpmi_stats().unwrap().direct, 0);
+    assert_eq!(s.dpmi_stats().unwrap().reflected, 1);
+    assert_eq!(s.dpmi.as_ref().unwrap().mode, Mode::Direct);
+    assert_eq!(s.registers().cs, bios::SHIM_SEGMENT);
+    assert_eq!(s.registers().ip, RM_RETURN);
+    assert!(observation.service_writes_unobserved);
+}
+
+#[test]
+fn labelled_execution_retains_reflected_service_timing() {
+    let mut s = prepared(Mode::Direct);
+    s.set_execution_tiers(
+        Some(alloc::vec::Vec::new()),
+        [Some(100), Some(50), Some(25)],
+    )
+    .unwrap();
+    simulated(&mut s, 0x16, 0x0100);
+    assert_eq!(s.dpmi_stats().unwrap().direct, 0);
+    assert_eq!(s.dpmi_stats().unwrap().reflected, 1);
+}
+
+#[cfg(feature = "save-state")]
+#[test]
+fn portable_and_working_states_reject_an_unserialized_dpmi_host() {
+    let s = prepared(Mode::Direct);
+    assert_eq!(
+        s.save_state().err().unwrap().0,
+        "save states do not yet support the experimental DPMI host"
+    );
+    assert_eq!(
+        s.capture_working_state().err().unwrap().0,
+        "save states do not yet support the experimental DPMI host"
+    );
+    let original = Session::new(&[0x90]).unwrap();
+    let restored = Session::load_state(&original.save_state().unwrap()).unwrap();
+    assert!(restored.dpmi_stats().is_none());
 }

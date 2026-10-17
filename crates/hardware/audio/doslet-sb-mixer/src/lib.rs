@@ -203,3 +203,7 @@ mod tests {
         assert_eq!(mixer.write(0), Err(UnsupportedRegister(0xFF)));
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

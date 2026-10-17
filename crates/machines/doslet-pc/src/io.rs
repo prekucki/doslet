@@ -32,10 +32,13 @@ pub struct PcBus {
     /// Port and device-memory accesses, for idle proofs to reject passes
     /// whose results could depend on device state.
     pub(crate) device_accesses: u64,
+    /// Writes to the CMOS shutdown-status scratch register (no live device
+    /// effect). Used only to classify actually executed recurring intervals.
+    pub(crate) cmos_scratch_writes: u64,
     pub(crate) observe_vga_status: bool,
     #[cfg(feature = "profiling")]
     pub(crate) stats: crate::ExecutionStats,
-    ram: Ram,
+    pub(crate) ram: Ram,
     pub vga: Vga,
     pub pic: Pic,
     pub slave_pic: Pic,
@@ -79,6 +82,7 @@ impl PcBus {
             keyboard_irq_line: false,
             vga_status_read_generation: 0,
             device_accesses: 0,
+            cmos_scratch_writes: 0,
             observe_vga_status: true,
             #[cfg(feature = "profiling")]
             stats: crate::ExecutionStats::default(),
@@ -538,8 +542,18 @@ impl PortBus for PcBus {
                 .dsp
                 .write_command(value)
                 .map_err(|_| BusError::UnmappedPort(port))?,
-            Endpoint::CmosIndex => self.cmos.select(value),
-            Endpoint::CmosData => self.cmos.write(value),
+            Endpoint::CmosIndex => {
+                if value == 0x0f {
+                    self.cmos_scratch_writes = self.cmos_scratch_writes.wrapping_add(1);
+                }
+                self.cmos.select(value);
+            }
+            Endpoint::CmosData => {
+                if self.cmos.selected() == 0x0f {
+                    self.cmos_scratch_writes = self.cmos_scratch_writes.wrapping_add(1);
+                }
+                self.cmos.write(value);
+            }
             Endpoint::KeyboardData => {
                 if let Some(lines) = self
                     .keyboard
@@ -827,3 +841,7 @@ mod tests {
         assert!(machine.bus.write_port_u8(0xFFFF, 0).is_err());
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "io_saved.rs"]
+mod saved_state;

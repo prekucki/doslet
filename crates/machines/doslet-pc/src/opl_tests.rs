@@ -116,6 +116,31 @@ fn simultaneous_fm_and_dma_are_summed_on_one_ordered_pcm_timeline() {
 }
 
 #[test]
+fn external_device_slices_preserve_fm_samples_and_timestamps() {
+    let mut single = PcMachine::default();
+    let mut external = PcMachine::default();
+    for m in [&mut single, &mut external] {
+        tone(m);
+    }
+    for _ in 0..30 {
+        for _ in 0..8250 {
+            single.advance_hardware_steps(1).unwrap();
+        }
+        assert_eq!(
+            external.debug_advance_device_time(1_000_000).unwrap(),
+            1_000_000
+        );
+    }
+    let mut a = [doslet_pcm::EMPTY; 2048];
+    let mut b = a;
+    let count = single.drain_pcm_timed(&mut a);
+    assert_eq!(count, external.drain_pcm_timed(&mut b));
+    assert_eq!(a, b);
+    assert!(count > 1000);
+    assert!(a[..count].iter().any(|frame| frame.samples != [0; 2]));
+}
+
+#[test]
 fn fm_idle_batches_match_single_steps_and_queue_overflow_is_explicit() {
     let mut single = PcMachine::default();
     let mut batched = PcMachine::default();

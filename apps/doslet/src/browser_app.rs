@@ -1,5 +1,5 @@
 //! Window state contains snapshots and pixels, never an emulation Session.
-use crate::presentation::DisplayFrame;
+use crate::presentation::{DisplayFrame, DisplaySizing, SizingMessage};
 use doslet_midi_routing::Mode;
 use doslet_runtime::SessionStatus;
 use doslet_x86::{Gpr16, Registers};
@@ -80,7 +80,6 @@ extern "C" {
     ) -> Result<js_sys::Promise, JsValue>;
 }
 pub struct Graphics {
-    pub width: usize,
     pub height: usize,
 }
 pub struct Snapshot {
@@ -128,6 +127,7 @@ pub struct Doslet {
     pub workspace: crate::ui::Workspace,
     pub configurator: crate::configurator::ConfiguratorState,
     pub display: DisplayFrame,
+    pub display_sizing: DisplaySizing,
     pub name: String,
     pub notice: Option<String>,
     pub archive: Option<Archive>,
@@ -156,6 +156,7 @@ pub struct Doslet {
 }
 #[derive(Clone, Debug)]
 pub enum Message {
+    DisplaySizing(SizingMessage),
     Ui(crate::ui::Action),
     Config(crate::configurator::Edit),
     ProfilePicked(Result<Option<String>, String>),
@@ -203,6 +204,7 @@ impl Doslet {
                 pointer_in_use: false,
             },
             display: DisplayFrame::default(),
+            display_sizing: DisplaySizing::default(),
             name: "Color bars".into(),
             notice,
             archive: None,
@@ -291,7 +293,6 @@ impl Doslet {
                     self.configurator.open = false;
                 }
                 crate::ui::Action::DismissNotice => self.notice = None,
-                crate::ui::Action::ActualSize(actual) => self.workspace.actual_size = actual,
             },
             Message::Config(edit) => {
                 use crate::configurator::Edit;
@@ -524,11 +525,21 @@ impl Doslet {
                 }
                 Err(error) => self.notice = Some(error),
             },
+            Message::DisplaySizing(message) => {
+                return self
+                    .display_sizing
+                    .update(message, &self.display)
+                    .map(Message::DisplaySizing);
+            }
             Message::Tick => {
                 if let Some(bridge) = &self.bridge {
                     bridge.input_capture(!self.configurator.open && self.workspace.panel.is_none());
                 }
                 self.poll();
+                return self
+                    .display_sizing
+                    .refresh(&self.display)
+                    .map(Message::DisplaySizing);
             }
             Message::RunPause => {
                 self.command(
@@ -764,7 +775,6 @@ impl Doslet {
                 width, height, pixels,
             ));
             self.session.graphics = Some(Graphics {
-                width: width as usize,
                 height: height as usize,
             });
             bridge.release_frame();

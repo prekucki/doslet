@@ -3,7 +3,10 @@
 #![no_std]
 extern crate alloc;
 
+pub use engines::interpreter::analysis;
 mod decode;
+mod execution_tiers;
+pub use execution_tiers::ExecutionLabel;
 pub mod engines;
 pub mod flags;
 pub mod state;

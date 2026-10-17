@@ -57,6 +57,13 @@ impl Prepared {
         self.length & 128 != 0
     }
 
+    pub(super) fn set_tier(&mut self, tier: u8) {
+        self.length = (self.length & !0x30) | (tier << 4);
+    }
+    pub(in crate::engines) fn tier(self) -> usize {
+        usize::from((self.length >> 4) & 3)
+    }
+
     pub(super) fn is_fallback(self) -> bool {
         self.handler == 0
     }

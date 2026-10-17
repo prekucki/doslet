@@ -400,6 +400,11 @@ impl Cli {
         }
         self.midi_mode.get_or_insert(MidiMode::Gm);
         self.launch.heroes_timer_waits = self.experimental_heroes_timer_waits;
+        self.launch.heroes_menu_idle = self.experimental_heroes_menu_idle;
+        self.launch.observe_idle = self.observe_idle || self.adaptive_idle;
+        self.launch.adaptive_idle = self.adaptive_idle;
+        self.launch.analyze_synchronization = self.analyze_synchronization || self.adaptive_cpu;
+        self.launch.adaptive_cpu = self.adaptive_cpu;
         self.launch.no_dynamic_core = self.no_dynamic_core;
         self.launch.dpmi = self.experimental_dpmi.map(Into::into);
         self.launch.core_profile = self.core_profile.clone();

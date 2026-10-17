@@ -906,6 +906,7 @@ impl Session {
         });
         if !far_return
             && self.dpmi.as_ref().unwrap().mode == Mode::Direct
+            && !self.machine.cpu.execution_labels_enabled()
             && structure.is_some()
             && let Some(service) = service
         {

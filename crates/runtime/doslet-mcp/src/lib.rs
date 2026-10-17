@@ -18,6 +18,10 @@ pub type Reply = oneshot::Sender<Result<Response, String>>;
 pub enum Action {
     Screenshot,
     Status,
+    Synchronization {
+        enabled: bool,
+        adaptive: bool,
+    },
     CpuMhz {
         mhz: u16,
     },
@@ -25,9 +29,12 @@ pub enum Action {
         x: u32,
         y: u32,
     },
+    MoveRelative {
+        dx: i16,
+        dy: i16,
+    },
     Click {
-        x: u32,
-        y: u32,
+        position: Option<(u32, u32)>,
         button: u8,
         hold_ms: u16,
     },
@@ -40,6 +47,7 @@ pub enum Action {
     },
     Pause,
     Resume,
+    Exit,
 }
 pub struct Request {
     pub action: Action,
@@ -58,6 +66,42 @@ pub struct Status {
     pub height: u32,
     pub gdb_connected: bool,
     pub cpu_mhz: u16,
+    pub speed_tiers: Option<serde_json::Value>,
+    /// DOS driver position; games consuming relative motion may draw elsewhere.
+    pub mouse_driver_x: u16,
+    pub mouse_driver_y: u16,
+    pub mouse_buttons: u16,
+    pub mouse_relative: bool,
+    pub mouse_captured: bool,
+    pub menu_idle_nanos: u64,
+    pub adaptive_idle_interval_nanos: u64,
+    pub adaptive_idle_head: u32,
+    pub idle_observer_enabled: bool,
+    pub synchronization: String,
+    pub synchronization_analysis: serde_json::Value,
+    pub host_audio_underruns: Option<u64>,
+    pub host_process_id: u32,
+    /// Linux process user+system CPU ticks; None when procfs is unavailable.
+    /// Compare deltas per wall-time interval; no assumed tick frequency.
+    pub host_process_cpu_ticks: Option<u64>,
+    pub guest_audio_service_deadline_misses: Option<u64>,
+    /// Count of observed consecutive SB16 DMA block IRQ service windows.
+    pub guest_audio_service_deadline_checks: u64,
+    /// Scope of the optional deadline counter; null until a window completes.
+    pub guest_audio_service_deadline_source: Option<&'static str>,
+    pub learned_idle_enabled: bool,
+    pub idle_observer_candidate: bool,
+    pub idle_observer_reason: String,
+    pub idle_observer_samples: u32,
+    pub idle_observer_repeated: u32,
+    pub idle_observer_cs: u16,
+    pub idle_observer_ip: u32,
+    pub idle_observer_queries: u64,
+    pub idle_observer_writes: u64,
+    pub idle_observer_device_accesses: u64,
+    pub adaptive_idle_input_wakes: u64,
+    pub adaptive_idle_work_wakes: u64,
+    pub adaptive_idle_interrupt_wakes: u64,
 }
 #[derive(Debug)]
 pub struct Screen {
@@ -68,6 +112,7 @@ pub struct Screen {
 pub enum Response {
     Screen(Screen),
     Status(Status),
+    Exiting,
 }
 
 /// The server owns no machine, framebuffer cache, or per-frame observer.
@@ -125,12 +170,23 @@ impl Server {
                             return;
                         }
                     };
+                    // Finish the accepted exit reply before dropping the transport.
+                    // Bound draining so an idle/misbehaving client cannot block shutdown.
+                    let (shutdown, draining) = oneshot::channel();
+                    let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
+                        let _ = stopped.await;
+                        let _ = shutdown.send(());
+                    });
                     tokio::select! {
-                        result = axum::serve(listener, router) => {
+                        result = serve => {
                             if let Err(e) = result { eprintln!("[ERROR doslet] MCP server: {e}"); }
                         }
-                        _ = stopped => cancellation.cancel(),
+                        _ = async {
+                            let _ = draining.await;
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        } => {}
                     }
+                    cancellation.cancel();
                 });
             })?;
         eprintln!("MCP listening on http://{address}/mcp");

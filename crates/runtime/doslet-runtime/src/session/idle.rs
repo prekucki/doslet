@@ -39,7 +39,7 @@ pub struct IdleLoopStats {
 
 /// Input-driver state visible to services but kept outside guest RAM.
 #[derive(Clone, Copy, PartialEq)]
-struct InputState {
+pub(super) struct InputState {
     mouse: [u16; 3],
     motion: (i16, i16),
     counts: [u16; 6],
@@ -56,14 +56,17 @@ struct Proof {
     cpu: CpuSnapshot,
     input: InputState,
     mark: IdleProofMark,
+    device_accesses: u64,
     steps: u32,
     failure: Option<&'static str>,
+    tier_counts: [u64; 4],
 }
 
 struct Proven {
     cpu: CpuSnapshot,
     input: InputState,
     pass: u32,
+    tier_counts: [u64; 4],
     ram_writes: u64,
     device_accesses: u64,
 }
@@ -106,7 +109,7 @@ impl IdleLoops {
     /// A service that is not a pure query ends the running proof.
     pub(super) fn note_service(&mut self, vector: u8, ax: u16, dl: u8, motion: (i16, i16)) {
         // Reading zero relative motion and resetting it to zero changes nothing.
-        let pure = pure_service(vector, ax, dl) || (vector, ax, motion) == (0x33, 0x0B, (0, 0));
+        let pure = repeatable_service(vector, ax, dl, motion);
         if let Some(proof) = &mut self.proof
             && !pure
         {
@@ -136,9 +139,15 @@ fn pure_service(vector: u8, ax: u16, dl: u8) -> bool {
     }
 }
 
+/// State changes of these services are covered by CPU, RAM and input snapshots.
+pub(super) fn repeatable_service(vector: u8, ax: u16, dl: u8, motion: (i16, i16)) -> bool {
+    pure_service(vector, ax, dl) || (vector, ax, motion) == (0x33, 0x0B, (0, 0))
+}
+
 impl Session {
     pub fn set_idle_loops(&mut self, enabled: bool) {
         if !enabled {
+            self.cancel_menu_idle();
             self.idle_abandon();
             self.idle.proven = None;
             self.idle.head = None;
@@ -150,7 +159,7 @@ impl Session {
         self.idle.stats
     }
 
-    fn input_state(&self) -> InputState {
+    pub(super) fn input_state(&self) -> InputState {
         let mouse = &self.mouse;
         InputState {
             mouse: [mouse.x, mouse.y, mouse.buttons],
@@ -168,7 +177,7 @@ impl Session {
         }
     }
 
-    fn idle_abandon(&mut self) {
+    pub(super) fn idle_abandon(&mut self) {
         if let Some(proof) = self.idle.proof.take() {
             self.machine.end_idle_proof(proof.mark);
         }
@@ -206,7 +215,11 @@ impl Session {
         now: u64,
         budget: u32,
     ) -> Result<Option<u32>, RuntimeError> {
-        if !self.idle.enabled || self.continuation.is_some() || self.storage_wait {
+        if !self.idle.enabled
+            || self.continuation.is_some()
+            || self.storage_wait
+            || self.analyzer_recurrence_recording()
+        {
             self.idle_abandon();
             return Ok(None);
         }
@@ -218,8 +231,14 @@ impl Session {
                     && self.machine.device_accesses() == proven.device_accesses
                     && self.input_state() == proven.input
                 {
-                    let skipped = self.machine.skip_idle_passes(proven.pass, budget)?;
+                    let before = self.machine.time().as_nanos();
+                    let skipped = self.machine.skip_idle_passes_counted(
+                        proven.pass,
+                        budget,
+                        proven.tier_counts,
+                    )?;
                     if skipped != 0 {
+                        self.analyzer_proven_idle(self.machine.time().as_nanos() - before);
                         if skipped >= USEFUL_SKIP {
                             self.idle.backoff = BACKOFF_MIN;
                         }
@@ -258,6 +277,7 @@ impl Session {
             Some("schedule")
         } else if self.machine.cpu.matches(&proof.cpu) {
             let proof = self.idle.proof.take().expect("running proof");
+            let devices_unchanged = self.machine.device_accesses() == proof.device_accesses;
             let unchanged = self.machine.end_idle_proof(proof.mark);
             if unchanged && self.input_state() == proof.input {
                 let r = &self.machine.cpu.registers;
@@ -266,6 +286,9 @@ impl Session {
                     cpu: proof.cpu,
                     input: proof.input,
                     pass: proof.steps,
+                    tier_counts: core::array::from_fn(|i| {
+                        self.machine.cpu.execution_counts()[i] - proof.tier_counts[i]
+                    }),
                     ram_writes: self.machine.ram_writes(),
                     device_accesses: self.machine.device_accesses(),
                 });
@@ -276,10 +299,17 @@ impl Session {
                 self.idle.next_attempt = now + self.idle.backoff;
                 None
             } else {
+                let reason = if !devices_unchanged {
+                    "device access"
+                } else if !unchanged {
+                    "RAM changed or write-log capacity"
+                } else {
+                    "input state changed"
+                };
                 // Keep the proof so the failure applies to its trigger; the
                 // write log has already ended and ending it again is a no-op.
                 self.idle.proof = Some(proof);
-                Some("changed")
+                Some(reason)
             }
         } else if proof.steps >= PROOF_STEPS {
             Some("length")
@@ -302,13 +332,18 @@ impl Session {
             cpu: self.machine.cpu.snapshot(),
             input: self.input_state(),
             mark: self.machine.begin_idle_proof(),
+            device_accesses: self.machine.device_accesses(),
             steps: 0,
             failure: None,
+            tier_counts: self.machine.cpu.execution_counts(),
         });
     }
 
     /// Hooks for `service`: classify the call and note empty input polls.
     pub(super) fn idle_service(&mut self, vector: u8, ax: u16) {
+        if (vector, ax, self.mouse.motion, self.mouse.buttons) == (0x33, 0x0B, (0, 0), 0) {
+            self.note_empty_motion_poll();
+        }
         let dl = self.machine.cpu.registers.get_byte(2);
         self.idle.note_service(vector, ax, dl, self.mouse.motion);
         let poll = matches!(
@@ -318,6 +353,7 @@ impl Session {
             || (vector, ax) == (0x33, 3)
             || (vector, ax, self.mouse.motion) == (0x33, 0x0B, (0, 0));
         if poll {
+            self.observer.query();
             let now = self.steps;
             self.idle.note_poll(now);
         }

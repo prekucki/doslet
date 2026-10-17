@@ -163,3 +163,7 @@ mod tests {
         assert_eq!(registers.read(0x3B5), Some(0x22));
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "registers_saved.rs"]
+mod saved_state;

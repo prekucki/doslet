@@ -128,16 +128,19 @@ pub enum TraceExitReason {
 pub struct TraceExecution {
     pub steps: u32,
     pub reason: TraceExitReason,
+    /// Successful HOT, COLD and IRQ steps; GREY is the remainder.
+    pub tier_counts: [u32; 3],
 }
 impl TraceExecution {
     fn uninstrumented(steps: u32) -> Self {
         Self {
             steps,
             reason: TraceExitReason::Uninstrumented,
+            tier_counts: [0; 3],
         }
     }
     fn packed(result: u64) -> Self {
-        let reason = match result >> 32 {
+        let reason = match (result >> 32) & 15 {
             1 => TraceExitReason::Budget,
             2 => TraceExitReason::ExternalEdge,
             3 => TraceExitReason::LoadGuard,
@@ -150,6 +153,7 @@ impl TraceExecution {
         Self {
             steps: result as u32,
             reason,
+            tier_counts: [36, 45, 54].map(|shift| ((result >> shift) & 511) as u32),
         }
     }
 }
@@ -205,7 +209,7 @@ impl Compiler {
         &mut self,
         instructions: &[TraceInstruction],
     ) -> Result<CompiledTrace, String> {
-        self.compile_trace_impl(instructions, false, false)
+        self.compile_trace_impl(instructions, false, false, None)
             .map(|(block, _)| block)
     }
 
@@ -216,7 +220,7 @@ impl Compiler {
         &mut self,
         instructions: &[TraceInstruction],
     ) -> Result<(CompiledTrace, TraceCompilation), String> {
-        self.compile_trace_impl(instructions, true, false)
+        self.compile_trace_impl(instructions, true, false, None)
             .map(|(block, diagnostic)| (block, diagnostic.expect("diagnostics requested")))
     }
 
@@ -226,7 +230,20 @@ impl Compiler {
         &mut self,
         instructions: &[TraceInstruction],
     ) -> Result<CompiledTrace, String> {
-        self.compile_trace_impl(instructions, false, true)
+        self.compile_trace_impl(instructions, false, true, None)
+            .map(|(block, _)| block)
+    }
+
+    /// Labels are compiled into path-local counters, never scheduling exits.
+    pub fn compile_trace_tiered(
+        &mut self,
+        instructions: &[TraceInstruction],
+        tiers: &[u8],
+    ) -> Result<CompiledTrace, String> {
+        if tiers.len() != instructions.len() || tiers.iter().any(|t| *t > 3) {
+            return Err("invalid trace tiers".into());
+        }
+        self.compile_trace_impl(instructions, false, true, Some(tiers))
             .map(|(block, _)| block)
     }
 
@@ -235,6 +252,7 @@ impl Compiler {
         instructions: &[TraceInstruction],
         diagnostic: bool,
         profiled: bool,
+        tiers: Option<&[u8]>,
     ) -> Result<(CompiledTrace, Option<TraceCompilation>), String> {
         if instructions.is_empty()
             || instructions.len() > MAX_INSTRUCTIONS
@@ -321,6 +339,18 @@ impl Compiler {
             b.switch_to_block(entry);
             b.append_block_params_for_function_params(entry);
             let p = b.block_params(entry).to_vec();
+            let counters = tiers.map(|_| {
+                let counters = [
+                    b.declare_var(types::I32),
+                    b.declare_var(types::I32),
+                    b.declare_var(types::I32),
+                ];
+                let zero = b.ins().iconst(types::I32, 0);
+                for counter in counters {
+                    b.def_var(counter, zero);
+                }
+                counters
+            });
             let regs = core::array::from_fn(|i| {
                 b.ins()
                     .load(types::I32, MemFlags::trusted(), p[0], (i * 4) as i32)
@@ -534,6 +564,15 @@ impl Compiler {
                     }
                     TraceOperation::Branch { .. } => {}
                 }
+                if let (Some(tiers), Some(counters)) = (tiers, counters) {
+                    let tier = usize::from(tiers[index]);
+                    if tier != 2 {
+                        let tier = if tier == 3 { 2 } else { tier };
+                        let old = b.use_var(counters[tier]);
+                        let next = b.ins().iadd_imm(old, 1);
+                        b.def_var(counters[tier], next);
+                    }
+                }
                 let remaining = b.ins().iadd_imm(remaining, -1);
                 let fallthrough = u32::from(instruction.offset) + u32::from(instruction.length);
                 if let Some(target) = absolute_target {
@@ -618,7 +657,16 @@ impl Compiler {
                 let steps = b.ins().uextend(types::I64, completed);
                 let reason = b.ins().uextend(types::I64, state[11]);
                 let reason = b.ins().ishl_imm(reason, 32);
-                b.ins().bor(steps, reason)
+                let mut result = b.ins().bor(steps, reason);
+                if let Some(counters) = counters {
+                    for (counter, shift) in counters.into_iter().zip([36, 45, 54]) {
+                        let count = b.use_var(counter);
+                        let count = b.ins().uextend(types::I64, count);
+                        let count = b.ins().ishl_imm(count, shift);
+                        result = b.ins().bor(result, count);
+                    }
+                }
+                result
             } else {
                 completed
             };
@@ -1419,6 +1467,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn irq_counter_preserves_full_256_step_trace_and_exit_reason() {
+        let instructions = [TraceInstruction {
+            offset: 0,
+            length: 2,
+            operation: TraceOperation::Branch {
+                condition: None,
+                target: 0,
+            },
+        }];
+        let mut compiler = Compiler::new().unwrap();
+        for tier in 0..4 {
+            let code = compiler
+                .compile_trace_tiered(&instructions, &[tier])
+                .unwrap();
+            let mut registers = [0; 8];
+            let mut flags = 2;
+            let mut ip = 0;
+            let result = compiler.execute_trace_report_with_exclusion(
+                code,
+                &mut registers,
+                &mut flags,
+                &mut ip,
+                256,
+                0,
+                &[],
+                0,
+                0,
+            );
+            assert_eq!(result.steps, 256);
+            assert_eq!(result.reason, TraceExitReason::Budget);
+            let mut counts = [0; 3];
+            if tier != 2 {
+                counts[if tier == 3 { 2 } else { usize::from(tier) }] = 256;
+            }
+            assert_eq!(result.tier_counts, counts);
+        }
+    }
+
+    #[test]
+    fn tiered_trace_counts_actual_path_and_partial_budget() {
+        let instructions = [
+            TraceInstruction {
+                offset: 0,
+                length: 1,
+                operation: TraceOperation::Inc {
+                    register: 0,
+                    decrement: false,
+                },
+            },
+            TraceInstruction {
+                offset: 1,
+                length: 2,
+                operation: TraceOperation::Branch {
+                    condition: Some(5),
+                    target: 0,
+                },
+            },
+        ];
+        let mut compiler = Compiler::new().unwrap();
+        let code = compiler
+            .compile_trace_tiered(&instructions, &[0, 1])
+            .unwrap();
+        for (budget, expected_steps, expected_counts) in [(3, 3, [2, 1, 0]), (256, 6, [3, 3, 0])] {
+            let mut registers = [0; 8];
+            registers[0] = u32::MAX - 2;
+            let mut flags = 2;
+            let mut ip = 0;
+            let result = compiler.execute_trace_report_with_exclusion(
+                code,
+                &mut registers,
+                &mut flags,
+                &mut ip,
+                budget,
+                0,
+                &[],
+                0,
+                0,
+            );
+            assert_eq!(result.steps, expected_steps);
+            assert_eq!(result.tier_counts, expected_counts);
+        }
+        let guarded = [TraceInstruction {
+            offset: 0,
+            length: 2,
+            operation: TraceOperation::Move {
+                target: 0,
+                source: TraceSource::Memory(DwordMemoryAddress {
+                    base: None,
+                    index: None,
+                    scale: 0,
+                    displacement: 4096,
+                }),
+            },
+        }];
+        let code = compiler.compile_trace_tiered(&guarded, &[0]).unwrap();
+        let result = compiler.execute_trace_report_with_exclusion(
+            code,
+            &mut [0; 8],
+            &mut 2,
+            &mut 0,
+            256,
+            0,
+            &[],
+            0,
+            0,
+        );
+        assert_eq!(result.steps, 0);
+        assert_eq!(result.tier_counts, [0, 0, 0]);
+    }
+
+    #[test]
     fn ram_trace_follows_links_without_returning_and_preserves_partial_progress() {
         let mut compiler = Compiler::new().unwrap();
         let instructions = [
@@ -1692,6 +1851,7 @@ mod tests {
                 assert_eq!(
                     result,
                     TraceExecution {
+                        tier_counts: [0; 3],
                         steps: 0,
                         reason: if profiled {
                             reason
@@ -1860,6 +2020,7 @@ mod tests {
             assert_eq!(
                 result,
                 TraceExecution {
+                    tier_counts: [0; 3],
                     steps: 0,
                     reason: expected
                 }
@@ -2420,11 +2581,19 @@ mod tests {
             assert_eq!(
                 reference,
                 TraceExecution {
+                    tier_counts: [0; 3],
                     steps,
                     reason: TraceExitReason::Uninstrumented
                 }
             );
-            assert_eq!(actual, TraceExecution { steps, reason });
+            assert_eq!(
+                actual,
+                TraceExecution {
+                    tier_counts: [0; 3],
+                    steps,
+                    reason
+                }
+            );
             assert_eq!(plain_regs, profiled_regs);
             assert_eq!(plain_flags, profiled_flags);
             assert_eq!(plain_ip, profiled_ip);
@@ -2567,11 +2736,19 @@ mod tests {
             assert_eq!(
                 reference,
                 TraceExecution {
+                    tier_counts: [0; 3],
                     steps,
                     reason: TraceExitReason::Uninstrumented
                 }
             );
-            assert_eq!(actual, TraceExecution { steps, reason });
+            assert_eq!(
+                actual,
+                TraceExecution {
+                    tier_counts: [0; 3],
+                    steps,
+                    reason
+                }
+            );
             assert_eq!(plain_regs, profiled_regs);
             assert_eq!(plain_flags, profiled_flags);
             assert_eq!(plain_ip, profiled_ip);
@@ -2627,6 +2804,7 @@ mod tests {
         assert_eq!(
             result,
             TraceExecution {
+                tier_counts: [0; 3],
                 steps: 3,
                 reason: TraceExitReason::Budget
             }

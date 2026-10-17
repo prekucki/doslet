@@ -18,6 +18,7 @@ impl Session {
             (u16::from(scan) << 8) | u16::from(ascii),
         )?;
         self.machine.bus.write_u16(0x41C, next)?;
+        self.menu_idle_input();
         Ok(true)
     }
     pub fn set_key_modifiers(&mut self, flags: u8) -> Result<(), RuntimeError> {

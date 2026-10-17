@@ -31,9 +31,9 @@ CARGO_TARGET_DIR=target/civ-probe cargo run -p doslet-headless --release --locke
   --example inspect_civ -- games/HoMnM/HEROES.EXE '' 100000000
 ```
 
-## CD-ROM startup after mounting the user ISO
+## CD-ROM startup with a mounted ISO
 
-The user supplied `games/HoMnM/homm1.gog`, a 437-MiB ISO 9660 image. Enabling
+The test configuration mounts an ISO 9660 game-disc image. Enabling
 MSCDEX discovery alone changed the failure to a missing-disc message: the game
 then tried to open `D:\HEROES\SOUND\HEROES01.62S` through DOS AH=3Dh. The ISO
 must therefore expose ordinary DOS file access, in addition to raw sectors.
@@ -139,7 +139,7 @@ to the main menu, and another Esc exits without saving with DOS status 0 at
 130531090 steps. Host playback, every sound-card choice and a saved
 configuration's behavior in HEROES remain separate acceptance work.
 
-The native application regression uses the user's exact profile plus the
+The native application regression uses the game launch profile plus the
 SETUP executable override, disables host audio and checks both menus and clean
 exit. The headless screenshots are local artifacts at
 `/tmp/doslet-heroes-setup-menu.png` and `/tmp/doslet-heroes-setup-sound.png`.
@@ -156,7 +156,7 @@ target/release/doslet --config games/HoMnM.toml --game games/HoMnM/SETUP.EXE
 
 ## Register arithmetic after native audio startup
 
-The user reported `D8 C1` at `0180:001A667F`, the register form
+A gameplay report identified unsupported `D8 C1` at `0180:001A667F`, the register form
 `FADD ST(0), ST(1)`. FADD, FMUL, FSUB and FSUBR with an ST(0) destination
 now use the retained finite significands and the guest precision/rounding
 control. CPU regression tests check result, operand order, unchanged source
@@ -181,6 +181,19 @@ A recorded real run sampled 4,333 INT 33h/000Bh calls and, after an injected
 movement at 350M steps, observed the game's mouse object at 002832F0h holding
 (500, 370), with sensitivity divisor 1. Guest files were unchanged. This is
 motion/coordinate evidence; it does not establish every button/callback path.
+
+A later GDB inspection of the live city captured 80 consecutive INT 33h calls,
+all AX=000Bh. Stepping through the wrapper confirmed that the game reads the
+returned CX/DX and takes its no-motion branch when both low words are zero.
+The nonzero branch uses the accumulation described above. Static inspection of
+initialization identifies AX=0000h (reset), AX=0002h (hide), and AX=000Ch (register
+callback). The callback at 00212FF0h creates button events using coordinates from
+the game's own position fields at 00283620h/00283622h; it does not use incoming
+CX/DX as the event position. No AX=0003h absolute read appeared in this city sample.
+This does not exclude queries on unobserved screens or during other transitions.
+Local traces: `target/city-mouse-queries.log`, `target/city-mouse-use.log`.
+Absolute host moves also update the emulator's relative counters, which explains
+why uncaptured absolute tracking could previously appear to work in this game.
 
 Changing the game's motion query to an absolute-position query would also
 require replacing its accumulation/sensitivity logic and preserving its button
@@ -219,7 +232,7 @@ measurement of native UI/audio-thread CPU usage.
 
 ## Register store/pop after timer-wait activation
 
-The user reached the experimental timer-wait path, then reported `DD D8` at
+A gameplay report after timer-wait activation identified unsupported `DD D8` at
 0180:001A3FB9. Disassembly confirms FSTP ST(0), immediately followed by FILD of
 the next integer. Register FST/FSTP forms (DD D0..DF) now copy retained values
 and tags without format rounding, and optionally pop. ST(0) as a destination
@@ -230,12 +243,12 @@ CPU tests exercise all eight destinations with and without pop, including exact
 integers beyond binary64 precision under single-precision PC, and verify no bus
 writes or integer-flag changes. Unit tests cover TOP wrapping, zero/special tags,
 destination overwrite and an empty source. Workspace tests, Clippy and the native
-release build pass. The user's subsequent gameplay path has not been replayed;
+release build pass. The full gameplay path has not been replayed;
 this establishes the reported instruction support rather than gameplay acceptance.
 
 ## Animated title residue: RAM versus SVGA
 
-The user reported repeated strips of the purple title flag above the current
+A visual report identified repeated strips of the purple title flag above the current
 logo, followed by a partially erased/star-shaped logo. An ISO-backed headless
 run without the Esc shortcut reproduces the upper strips at 250M steps. In this
 recorded run the main menu is clean at about 300M steps; this does not establish

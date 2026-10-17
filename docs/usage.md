@@ -51,12 +51,18 @@ Keep the executable alongside its original DOS4GW and data files. DOS text
 screens now render during startup; the recorded PRINCE HDI logo appears around
 7.3 seconds of emulated time. Host speed may affect how long startup takes.
 BIOS/DOS keyboard input is available. DOS mouse input includes position, buttons, ranges, a graphics cursor and guest callbacks.
-Click the guest display to capture the mouse and use relative movement. **Esc**
-releases capture; a subsequent Esc reaches the game. Focus loss, pause, reset
-and game termination also release capture. The system cursor stays visible
-until capture succeeds, unless **Hide cursor over the game** is enabled in
-Settings → Input. Turn off **Capture mouse on click** to use absolute movement
-and pass Esc directly to the game. Browser capture uses Pointer Lock.
+On native builds, a guest read of relative motion counters (INT 33h, AX=000Bh)
+selects relative input for one emulated second after the latest read. Absolute
+reads during that interval do not cancel it. Hover movement is blocked until you
+click the guest display to capture the mouse. After one second without relative
+reads, capture is released automatically and absolute movement resumes. Absolute
+input does not require capture. **Esc** releases capture; a subsequent Esc reaches
+the game. Focus loss, pause, reset and game termination also release capture.
+The host cursor stays visible while relative input is waiting for capture.
+**Hide cursor over the game** controls visibility during uncaptured absolute input.
+Leave **Capture mouse on click** enabled for games using relative counters.
+Browser capture still uses explicit click-to-lock Pointer Lock; disabling capture
+there selects absolute input.
 
 By default, MIDI from the guest is rendered by a basic procedural synthesizer
 and mixed with Sound Blaster PCM and AdLib/OPL3 FM on the default audio device.
@@ -87,8 +93,10 @@ since the last note. It tracks game output, independently of the selected
 synthesizer; a dark lamp does not mean that a sustained note has stopped sounding.
 The lamp stays dim while paused and adds no separate refresh timer.
 
-Press **Run** to execute the built-in demo, **Pause** to suspend execution, **Step** to
-advance one execution step, or **Reset** to create a fresh session. Linux builds
+Press the play icon to start or resume, the pause icon to suspend execution,
+or the restart icon to create a fresh session. Hover over each icon for its
+label. **Info → Step instruction** advances one execution step while paused.
+Linux builds
 require a C linker, `pkg-config`, ALSA and udev development files
 (`libasound2-dev` and `libudev-dev` on Ubuntu/Debian); launching requires a working Wayland or X11
 session and graphics driver. Dependency resolution and native compilation are
@@ -100,19 +108,50 @@ lag means execution is falling behind; increasing the configured MHz also
 increases the required host work. A stalled window does not stop emulation:
 presentation resumes with the latest image instead of replaying queued frames.
 
-On desktop, **1:1** beside **GUEST DISPLAY** resizes the window to show each guest
-pixel as one physical screen pixel, including on HiDPI displays. It uses the raw
-image dimensions (for example, 720×400 for text) and allows scrolling if the
-window is too small. **Fit** restores automatic scaling with 4:3 proportions.
+**Pixel perfect** selects the largest whole-number zoom that fits the available
+display area, measured in physical pixels, including on HiDPI displays. It does
+not resize the window. A 320×200 frame can become 640×400 or 960×600; a 640×480
+frame can become 1280×960. The raw raster proportions are preserved, including
+720×400 text. If even 1× does not fit, the display scrolls. **Fit** fills the
+available area at 4:3 proportions and permits fractional scaling.
+
+The small filter selector beside these buttons works on desktop and in the
+browser, including while paused:
+
+- **Nearest** preserves the original colors and pixel edges. Use it with
+  **Pixel perfect** for an exact integer enlargement.
+- **Sharp Bilinear** first repeats pixels by whole factors, then blends the
+  remaining fractional scale. This keeps pixel interiors sharp while softening
+  boundaries. The intermediate enlargement is capped at 4× per axis.
+- **HQ2x** uses the HQx edge-aware algorithm to enlarge the frame 2× before
+  linear sampling to the selected display size. It smooths diagonals and can
+  change the appearance of small fonts.
+
+Scaling and filtering are independent. Filters operate on presentation snapshots
+in the UI; guest execution and mouse coordinates still use the original frame.
+Filtered images are cached until the source frame, filter or intermediate zoom
+changes. These filters use CPU preprocessing on both platforms; their live
+frame rate has not been benchmarked.
+
+Presentation keeps the previous image visible until the renderer has uploaded
+its replacement. At most one upload is in progress; subsequent frames replace
+the waiting frame, so a slower renderer does not accumulate a playback queue.
+An upload failure keeps the last ready image and shows an error. Selecting a
+filter or scaling mode retries the upload.
 
 ### Machine configuration and saves
 
-Open **Settings** in either frontend to edit a draft, validate its
+To resume a portable machine snapshot in the native window, use
+`target/release/doslet --load-state target/heroes-states/city.pb.gz`.
+See [portable states](save-states.md#resume-in-the-native-window) for restore
+semantics and the optional static hot/cold/grey experiment.
+
+Open **Info → Settings…** in either frontend to edit a draft, validate its
 resources and **Apply and restart**. The editor configures RAM, x87, SB16 and
 MPU-401 hardware, AT/BIOS keyboard input, a two-axis/two-button gameport, host
 output, installation media and save policy. Native Apply prepares sources on a
 separate thread; failed preparation preserves the active session and reset
-settings. Native **Fit** and **1:1** display sizing remain available.
+settings. **Fit**, **Pixel perfect** and display filters remain available.
 
 Profiles import version 1 or 2 and export version 2. Persistent overlays use an
 explicit native save directory or browser **IndexedDB** namespace. Save
@@ -336,7 +375,7 @@ use a separate 1-MiB overlay. Choose temporary or persistent saves under
 must be exported or explicitly discarded before restart. See
 [configuration](configuration.md) for save policies and limits.
 BIOS/DOS keyboard input and DOS mouse-driver input are mapped from the UI. **Start game** creates and resumes Web Audio for the actual
-guest MIDI stream. If the browser keeps audio suspended, open **Audio → Enable audio**;
+guest MIDI stream. If the browser keeps audio suspended, open **Info → Audio… → Enable audio**;
 the same button offers **Mute** / **Unmute** once audio is running. **Info**
 reports context state, note events, peak, rendered audio frames and underruns.
 The machine and ZIP live in a dedicated Web Worker. A separate Rust/WASM module

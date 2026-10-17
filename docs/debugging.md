@@ -40,6 +40,80 @@ new debugger hook, breakpoint check or function pointer. With GDB disabled there
 is no listener or hotspot allocation. An enabled listener checks for attachment
 between host work turns; it retains ordinary batches until a client connects.
 
+## MCP shutdown
+
+The native MCP `exit` tool accepts no arguments. It returns
+`{"status":"Exiting"}` when shutdown is accepted, cancels pending gestures and
+releases their buttons and keys. It works while running, paused, or controlled
+by GDB. Later control requests are rejected.
+
+Shutdown saves the dynamic-core profile and closes the application through iced;
+the normal teardown joins the emulation and host workers. The HTTP server drains
+accepted responses for at most two seconds before closing. `Exiting` acknowledges
+the request, not completed process termination. Unsaved guest progress is not
+saved automatically, just as when closing the window.
+
+## MCP mouse control
+
+Start the native frontend with `--mcp 127.0.0.1:5004` and connect the client to
+`http://127.0.0.1:5004/mcp`. Read `screenshot` before moving or clicking.
+
+`move_mouse` accepts either `x`/`y` in native screenshot pixels or `dx`/`dy` in
+relative mouse counts. Supply both members of exactly one pair. Positive relative
+values move right/down. The tool waits 250 guest milliseconds before returning
+a screenshot so the game has time to consume input and draw its cursor.
+
+Games such as Heroes maintain their own cursor from INT 33h/000Bh motion counts.
+Their visible cursor can diverge from the DOS driver's absolute position.
+For these games, use relative movement, inspect the returned screenshot and
+correct with another small move if necessary. Relative counts are not guaranteed
+to equal pixels: game sensitivity determines their effect. Then call `click`
+without `x`/`y` to press at the current cursor without injecting another move.
+
+For example, `move_mouse` with `{"dx":20,"dy":-10}` moves relatively, and
+`click` with `{"button":"right"}` right-clicks in place. Existing `x`/`y`
+calls remain supported for games using the DOS driver's absolute position.
+A positioned click waits 250 guest milliseconds after moving, then holds the
+button for `hold_ms` (default 250, range 10–1000), releases it and waits another
+250 guest milliseconds before returning the screenshot. An in-place click
+omits the initial movement delay. Caller disconnect, pause, replacement or the
+20-second host timeout cancels the gesture and releases agent-held input.
+
+Status includes `mouse_driver_x`, `mouse_driver_y` and `mouse_buttons` for
+diagnostics. The driver coordinates are **not** a measurement of a game-drawn
+cursor. Use the screenshot to locate that cursor.
+
+Live validation (2026-10-16): Heroes at 640×480 and 133 MHz accepted relative
+movement through the directly connected MCP tools. An in-place left click opened
+a main-menu submenu; another relative move and in-place click on Cancel returned
+to the main menu. The final status reported no held mouse buttons. This confirms
+the relative-movement/click workflow in that game; it does not establish automatic
+absolute positioning for arbitrary game-drawn cursors.
+
+## MCP host counters
+
+Status includes `host_process_id` and, on Linux, `host_process_cpu_ticks`.
+The latter sums the process's user and kernel CPU counters from `/proc/self/stat`
+when servicing the MCP request; it adds no guest instruction hook. Other systems
+or an unavailable counter return `null`. The Linux fields and their tick units
+are documented in the [proc filesystem reference](https://docs.kernel.org/filesystems/proc.html).
+
+Compare counter deltas over equal wall-time windows with the same process ID.
+Do not interpret raw ticks as milliseconds or CPU percent without the system's
+tick frequency. Alternating at least three fixed/adaptive pairs, after warming
+the JIT and settling the scene, permits a relative host-cost comparison without
+assuming that frequency. Record guest-time progress, effective MHz and
+`host_audio_underruns` deltas too. Host CPU savings alone do not establish smooth
+music, animation or input responsiveness; those require the actual game and
+playback checks. Keep GDB detached during performance measurements.
+
+For guest audio, compare `guest_audio_service_deadline_checks` and
+`guest_audio_service_deadline_misses` deltas too. The source field explicitly
+limits this counter to SB16 DMA block IRQ acknowledgements before the next block
+completes. A miss is independent of host queue starvation. Zero checks and a
+`null` miss count mean no complete observation; zero misses with nonzero checks
+do not establish timely guest buffer refills or smooth OPL/MIDI playback.
+
 ## Headless: stop at an exact step
 
 Build and stop Heroes after a repeatable startup:

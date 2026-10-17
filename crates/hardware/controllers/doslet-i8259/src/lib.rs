@@ -135,3 +135,7 @@ mod tests {
         assert_eq!(pic.acknowledge(), Some(0x20));
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

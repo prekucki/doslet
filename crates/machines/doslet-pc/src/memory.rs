@@ -1,6 +1,7 @@
 use alloc::{boxed::Box, vec};
 use core::ops::Range;
 use doslet_bus::{BusError, CodeCheck, CodeOwnerId};
+mod journal;
 
 pub const RAM_SIZE: usize = 16 * 1024 * 1024;
 const PAGE_SIZE: usize = 4096;
@@ -57,6 +58,7 @@ pub(crate) struct Ram {
     /// Mutations of any page, for idle proofs to detect device and service writes.
     writes: u64,
     log: Option<WriteLog>,
+    journal: journal::Journal,
 }
 impl Default for Ram {
     fn default() -> Self {
@@ -72,6 +74,7 @@ impl Ram {
             code_space: 0,
             writes: 0,
             log: None,
+            journal: journal::Journal::default(),
         };
         ram.set_mapping(0);
         ram
@@ -100,6 +103,7 @@ impl Ram {
         if let Some(log) = &mut self.log {
             log.record(address, *byte);
         }
+        self.journal.record(address, *byte);
         *byte = value;
         self.bump(address as usize / PAGE_SIZE);
         Ok(())
@@ -126,7 +130,12 @@ impl Ram {
                 }
             }
         }
+        self.journal
+            .record_range(range.start, &self.bytes[range.clone()]);
         self.bytes.get_mut(range)
+    }
+    pub(crate) fn recurrence_recording(&self) -> bool {
+        self.journal.recording()
     }
     /// Native stores maintain generations themselves after checking exhaustion.
     /// Keep both mutable borrows disjoint and do not invalidate untouched pages.
@@ -134,7 +143,7 @@ impl Ram {
         &mut self,
         range: Range<usize>,
     ) -> Option<doslet_bus::NativeRamMut<'_>> {
-        if self.code_space == 0 {
+        if self.code_space == 0 || self.journal.recording() {
             return None;
         }
         if let Some(log) = &mut self.log {
@@ -169,6 +178,13 @@ impl Ram {
     }
     pub(crate) fn writes(&self) -> u64 {
         self.writes
+    }
+    pub(crate) fn begin_recurrence(&mut self) -> u64 {
+        self.journal.begin();
+        self.code_space
+    }
+    pub(crate) fn end_recurrence(&mut self, space: u64) -> bool {
+        self.journal.end(&self.bytes) && space != 0 && space == self.code_space
     }
     fn bump(&mut self, page: usize) {
         self.writes = self.writes.wrapping_add(1);
@@ -328,3 +344,7 @@ mod tests {
         assert!(ram.code_valid(&first) && !ram.code_valid(&check));
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "memory_saved.rs"]
+mod saved_state;

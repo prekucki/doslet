@@ -144,6 +144,17 @@ impl PcMachine {
         }
         // A whole taken iteration restores exactly the same AL, flags and IP.
         // VGA status reads currently have no other architectural side effects.
+        if self.cpu.execution_labels_enabled() {
+            let base = candidate.cs.base.wrapping_add(candidate.start);
+            let mut counts = [0; 4];
+            for offset in [0, 1, 3] {
+                let tier = self
+                    .cpu
+                    .execution_tier_at(&self.bus, base.wrapping_add(offset));
+                counts[usize::from(tier)] += u64::from(skipped / 3);
+            }
+            self.cpu.account_skipped_execution(counts);
+        }
         self.advance_hardware_steps(skipped)?;
         #[cfg(feature = "profiling")]
         {

@@ -298,18 +298,66 @@ struct PreparedBlock {
     register_count: u8,
     length: u8,
     trace: Option<PreparedTrace>,
+    labelled: bool,
+    register_tiers: [u8; MAX_INSTRUCTIONS],
+    trace_tiers: [u8; MAX_INSTRUCTIONS],
+    register_counts: [u64; 4],
 }
 impl PreparedBlock {
     fn fingerprint(&self) -> u64 {
         self.bytes[..usize::from(self.length)]
             .iter()
+            .chain(self.register_tiers.iter())
+            .chain(self.trace_tiers.iter())
+            .chain(core::iter::once(&(self.labelled as u8)))
             .fold(0xcbf29ce484222325, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
             })
     }
     fn same_code(&self, other: &Self) -> bool {
-        self.length == other.length
+        self.labelled == other.labelled
+            && self.register_tiers == other.register_tiers
+            && self.trace_tiers == other.trace_tiers
+            && self.length == other.length
             && self.bytes[..usize::from(self.length)] == other.bytes[..usize::from(other.length)]
+    }
+    fn label(&mut self, profile: &crate::execution_tiers::ExecutionProfile, address: u32) {
+        self.labelled = true;
+        let mut offset = 0;
+        for i in 0..usize::from(self.register_count) {
+            let end = offset + usize::from(self.instructions[i].length);
+            let tier = profile.classify(
+                address.wrapping_add(offset as u32),
+                true,
+                &self.bytes[offset..end],
+            );
+            self.register_tiers[i] = tier;
+            self.register_counts[usize::from(tier)] += 1;
+            offset = end;
+        }
+        if let Some(trace) = &self.trace {
+            for i in 0..usize::from(trace.count) {
+                let instruction = trace.instructions[i];
+                let offset = usize::from(instruction.offset);
+                self.trace_tiers[i] = profile.classify(
+                    address.wrapping_add(offset as u32),
+                    true,
+                    &self.bytes[offset..offset + usize::from(instruction.length)],
+                );
+            }
+        }
+    }
+    fn count_register_steps(&self, counts: &mut [u64; 4], steps: u32) {
+        if !self.labelled || self.register_count == 0 {
+            return;
+        }
+        let passes = u64::from(steps / u32::from(self.register_count));
+        for (total, per_pass) in counts.iter_mut().zip(self.register_counts) {
+            *total += per_pass * passes;
+        }
+        for tier in &self.register_tiers[..(steps % u32::from(self.register_count)) as usize] {
+            counts[usize::from(*tier)] += 1;
+        }
     }
     fn decode(bytes: &[u8]) -> Self {
         let mut block = Self {
@@ -322,6 +370,10 @@ impl PreparedBlock {
             register_count: 0,
             length: 0,
             trace: None,
+            labelled: false,
+            register_tiers: [2; MAX_INSTRUCTIONS],
+            trace_tiers: [2; MAX_INSTRUCTIONS],
+            register_counts: [0; 4],
         };
         while usize::from(block.count) < MAX_INSTRUCTIONS {
             let offset = usize::from(block.length);
@@ -390,7 +442,12 @@ fn compile_native(
 ) -> Result<NativeFunction, String> {
     let code = if let Some(trace) = &block.trace {
         let instructions = &trace.instructions[..usize::from(trace.count)];
-        let code = if exit_profiling {
+        let code = if block.labelled {
+            compiler.compile_trace_tiered(
+                instructions,
+                &block.trace_tiers[..usize::from(trace.count)],
+            )?
+        } else if exit_profiling {
             compiler.compile_trace_profiled(instructions)?
         } else {
             compiler.compile_trace(instructions)?
@@ -984,8 +1041,52 @@ impl Cpu {
         budget: u32,
         limit: impl FnOnce(&B) -> u32,
     ) -> u32 {
+        if self.execution_labels_enabled() {
+            self.dynamic_batch_mode::<B, false, true>(bus, budget, limit, [0; 2])
+        } else {
+            self.dynamic_batch_mode::<B, false, false>(bus, budget, limit, [0; 2])
+        }
+    }
+
+    /// Optional scheduler yield at block-head arrival, including JIT exits.
+    pub fn dynamic_batch_until_block<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        head: u32,
+    ) -> u32 {
+        self.dynamic_batch_until_blocks(bus, budget, limit, [head; 2])
+    }
+
+    /// Optional scheduler hints for two selected block heads.
+    pub fn dynamic_batch_until_blocks<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        heads: [u32; 2],
+    ) -> u32 {
+        if self.execution_labels_enabled() {
+            self.dynamic_batch_mode::<B, true, true>(bus, budget, limit, heads)
+        } else {
+            self.dynamic_batch_mode::<B, true, false>(bus, budget, limit, heads)
+        }
+    }
+
+    fn dynamic_batch_mode<B: CpuBus, const YIELD: bool, const COUNT: bool>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        heads: [u32; 2],
+    ) -> u32 {
         if budget < 2 || !self.dynamic_ready() {
-            return self.interpret_batch(bus, budget, limit);
+            return if YIELD {
+                self.interpret_batch_until_blocks(bus, budget, limit, heads)
+            } else {
+                self.interpret_batch(bus, budget, limit)
+            };
         }
         // Native blocks and batched instructions cannot load segment registers,
         // so the CS context and data windows stay valid for the whole slice.
@@ -997,15 +1098,25 @@ impl Cpu {
         let mut native_steps = 0;
         let mut native_blocks = 0;
         'blocks: while completed < budget {
+            if YIELD && completed != 0 && heads.contains(&self.registers.ip) {
+                break;
+            }
             let Some((index, count, check)) = self.batch_block(code, bus) else {
                 break;
             };
             for position in 0..count {
+                if YIELD && completed != 0 && heads.contains(&self.registers.ip) {
+                    break 'blocks;
+                }
                 let instruction = self.block_instruction(index, position);
                 let remaining = budget - completed;
                 if remaining >= 2 && instruction.native_candidate() {
-                    let steps =
-                        self.try_native_block(NativeBus::Write(bus), remaining, || remaining);
+                    let steps = self.try_native_block_mode::<B, YIELD>(
+                        NativeBus::Write(bus),
+                        remaining,
+                        || remaining,
+                        heads,
+                    );
                     if steps != 0 {
                         completed += steps;
                         native_steps += steps;
@@ -1026,6 +1137,9 @@ impl Cpu {
                 ) {
                     break 'blocks;
                 }
+                if COUNT {
+                    self.execution_counts[instruction.tier()] += 1;
+                }
                 completed += 1;
                 // As in the interpreter batch: control transfers, repeated
                 // strings, the budget and code stores end the block.
@@ -1043,9 +1157,19 @@ impl Cpu {
 
     fn try_native_block<B: MemoryBus>(
         &mut self,
+        memory: NativeBus<'_, B>,
+        budget: u32,
+        limit: impl FnOnce() -> u32,
+    ) -> u32 {
+        self.try_native_block_mode::<B, false>(memory, budget, limit, [0; 2])
+    }
+
+    fn try_native_block_mode<B: MemoryBus, const YIELD: bool>(
+        &mut self,
         mut memory: NativeBus<'_, B>,
         budget: u32,
         limit: impl FnOnce() -> u32,
+        heads: [u32; 2],
     ) -> u32 {
         let bus = memory.as_ref();
         let r = &self.registers;
@@ -1093,7 +1217,10 @@ impl Cpu {
                 // Imported templates already enter this pool during explicit
                 // preparation. Reuse only the complete current representation:
                 // an older, shorter register prefix must not pin a RAM trace.
-                let block = PreparedBlock::decode(bytes);
+                let mut block = PreparedBlock::decode(bytes);
+                if let Some(profile) = &self.decode_cache.profile {
+                    block.label(profile, address);
+                }
                 let native = if block.count >= 2 {
                     self.dynamic
                         .pool
@@ -1121,6 +1248,16 @@ impl Cpu {
         }
         entry.hits = entry.hits.saturating_add(1);
         let block = entry.prepared.as_ref().unwrap();
+        // A native trace can cross an interior boundary or loop back to its
+        // entry several times. Execute such a block through the decoded path
+        // so every requested arrival remains visible to the scheduler.
+        if YIELD
+            && heads
+                .iter()
+                .any(|head| head.wrapping_sub(r.ip) < u32::from(block.length))
+        {
+            return 0;
+        }
         let Some(code) = entry.compiled else {
             return 0;
         };
@@ -1169,6 +1306,7 @@ impl Cpu {
         match code.function {
             NativeFunction::Registers(code) => {
                 let steps = compiler.execute(code, registers, &mut self.flags, ip, budget);
+                block.count_register_steps(&mut self.execution_counts, steps);
                 if profiling {
                     let looping = block.instructions[..usize::from(block.register_count)]
                         .last()
@@ -1231,6 +1369,14 @@ impl Cpu {
                                 ram.excluded_start,
                                 ram.excluded_len,
                             );
+                            if block.labelled {
+                                self.execution_counts[0] += u64::from(report.tier_counts[0]);
+                                self.execution_counts[1] += u64::from(report.tier_counts[1]);
+                                self.execution_counts[3] += u64::from(report.tier_counts[2]);
+                                self.execution_counts[2] += u64::from(
+                                    report.steps - report.tier_counts.iter().sum::<u32>(),
+                                );
+                            }
                             (report.steps, exit_reason(report.reason))
                         } else {
                             let ram = if trace.segments == 0 {
@@ -1257,6 +1403,14 @@ impl Cpu {
                                 ram.excluded_start,
                                 ram.excluded_len,
                             );
+                            if block.labelled {
+                                self.execution_counts[0] += u64::from(report.tier_counts[0]);
+                                self.execution_counts[1] += u64::from(report.tier_counts[1]);
+                                self.execution_counts[3] += u64::from(report.tier_counts[2]);
+                                self.execution_counts[2] += u64::from(
+                                    report.steps - report.tier_counts.iter().sum::<u32>(),
+                                );
+                            }
                             (report.steps, exit_reason(report.reason))
                         }
                     })()
@@ -1290,6 +1444,7 @@ impl Cpu {
                     && let Some(code) = register_fallback
                 {
                     let completed = compiler.execute(code, registers, &mut self.flags, ip, budget);
+                    block.count_register_steps(&mut self.execution_counts, completed);
                     if profiling {
                         record_exit(
                             &mut self.dynamic.exit_records,

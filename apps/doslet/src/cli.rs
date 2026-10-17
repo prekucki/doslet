@@ -75,6 +75,48 @@ pub struct Cli {
     /// Experimentally batch three Heroes timer polling loops; off by default
     #[arg(long)]
     pub experimental_heroes_timer_waits: bool,
+    /// Adaptively yield known empty Heroes event loops; changes polling cadence
+    #[arg(long, alias = "experimental-heroes-adaptive-idle")]
+    pub experimental_heroes_menu_idle: bool,
+    /// Observe recurring code and input queries without skipping execution
+    #[arg(long)]
+    pub observe_idle: bool,
+    /// Experimentally budget empty input polls and countdown guards; enables observation
+    #[arg(long, conflicts_with = "experimental_heroes_menu_idle")]
+    pub adaptive_idle: bool,
+
+    /// Trace bounded synchronization episodes without changing CPU throughput
+    #[arg(long)]
+    pub analyze_synchronization: bool,
+    /// Experimental CPU budget from complete synchronization episodes
+    #[arg(long, conflicts_with_all = ["adaptive_idle", "experimental_heroes_menu_idle", "experimental_heroes_timer_waits"])]
+    pub adaptive_cpu: bool,
+
+    /// Frozen execution labels with independently configurable CPU rates
+    #[arg(long, value_name = "JSON", conflicts_with_all = ["adaptive_cpu", "adaptive_idle", "analyze_synchronization", "observe_idle", "experimental_heroes_menu_idle", "experimental_heroes_timer_waits"])]
+    pub speed_tier_profile: Option<PathBuf>,
+    /// Directory for profiles indexed by SHA-256 of the game EXE (default user data directory)
+    #[arg(long, value_name = "DIR")]
+    pub speed_tier_cache: Option<PathBuf>,
+    /// Disable automatic activation of a previously learned game profile
+    #[arg(long, conflicts_with = "speed_tier_profile")]
+    pub no_speed_tiers: bool,
+    /// Reclassify GREY >10% using paired one-second background state replays
+    #[arg(long, requires = "speed_tier_profile")]
+    pub learn_speed_tiers: bool,
+    /// Cold candidate throughput for --speed-tier-profile (default 8 MHz)
+    #[arg(long, value_name = "MHZ", requires = "speed_tier_profile", value_parser = clap::value_parser!(u16).range(1..=1000))]
+    pub cold_mhz: Option<u16>,
+    /// HOT throughput; omit for MAX (zero instruction-budget cost)
+    #[arg(long, value_name = "MHZ", requires = "speed_tier_profile", value_parser = clap::value_parser!(u16).range(1..=1000))]
+    pub hot_mhz: Option<u16>,
+    /// GREY throughput (default 133 MHz), including IRQ code
+    #[arg(long, value_name = "MHZ", requires = "speed_tier_profile", value_parser = clap::value_parser!(u16).range(1..=1000))]
+    pub grey_mhz: Option<u16>,
+    /// Resume a Protobuf state (.pb or .pb.gz); use --config to resolve its media
+    #[arg(long, value_name = "STATE", conflicts_with_all = ["cpu_mhz", "memory_mib", "no_x87", "no_sb16", "no_mpu401", "drive_mode"])]
+    pub load_state: Option<PathBuf>,
+
     /// Use the interpreter instead of the native dynamic core
     #[arg(long)]
     pub no_dynamic_core: bool,
@@ -124,6 +166,36 @@ pub struct Cli {
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+    #[test]
+    fn speed_tiers_and_snapshot_options_are_explicit() {
+        let cli = Cli::try_parse_from([
+            "doslet",
+            "--load-state",
+            "city.pb.gz",
+            "--speed-tier-profile",
+            "city.json",
+            "--cold-mhz",
+            "8",
+        ])
+        .unwrap();
+        assert_eq!(cli.cold_mhz, Some(8));
+        assert!(cli.load_state.is_some());
+        for extra in [
+            "--adaptive-cpu",
+            "--adaptive-idle",
+            "--analyze-synchronization",
+        ] {
+            assert!(
+                Cli::try_parse_from(["doslet", "--speed-tier-profile", "city.json", extra])
+                    .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["doslet", "--cold-mhz", "8"]).is_err());
+        assert!(
+            Cli::try_parse_from(["doslet", "--load-state", "city.pb.gz", "--cpu-mhz", "66"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn midi_modes_and_moont_port_selection_parse_explicitly() {

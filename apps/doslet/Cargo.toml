@@ -20,11 +20,18 @@ doslet-mt32.workspace = true
 doslet-dos.workspace = true
 web-time = "1.1.0"
 doslet-x86.workspace = true
-iced = { version = "0.14.0", default-features = false, features = ["image-without-codecs", "crisp", "fira-sans"] }
+hqx = "0.1.1"
+iced = { version = "0.14.0", default-features = false, features = ["image-without-codecs", "svg", "crisp", "fira-sans"] }
+# iced exposes allocation tasks only with its codec-enabled `image` feature.
+iced_runtime = "0.14.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+doslet-runtime = { workspace = true, features = ["save-state"] }
+flate2 = "1"
 doslet-debugger.workspace = true
 doslet-mcp.workspace = true
+serde_json = "1"
+sha2 = "0.10.9"
 clap = { version = "4", features = ["derive"] }
 gilrs = "0.11.2"
 ureq = "3"

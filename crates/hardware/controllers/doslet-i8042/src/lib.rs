@@ -361,3 +361,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

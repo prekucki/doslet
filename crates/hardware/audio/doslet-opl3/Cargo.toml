@@ -6,7 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+prost = { workspace = true, optional = true }
+doslet-state = { workspace = true, optional = true }
 nuked-opl3 = "=0.1.0"
 
 [lints]
 workspace = true
+
+[features]
+save-state = ["dep:doslet-state", "dep:prost", "nuked-opl3/save-state"]

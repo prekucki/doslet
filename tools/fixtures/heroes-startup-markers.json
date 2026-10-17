@@ -1,0 +1,6 @@
+{
+  "description": "Sampled menu marker for the local Heroes executable. Validate screenshots; this is not a generic scene detector.",
+  "menu_head": 2194850,
+  "callback_offset": 40,
+  "callback": 2134748
+}

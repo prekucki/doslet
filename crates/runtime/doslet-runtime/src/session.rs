@@ -14,15 +14,28 @@ use doslet_storage::{CachedSource, HostCompletion, HostRequest, StorageError};
 use doslet_vfs::{HandleTable, MountId, NodeId, OpenFile};
 use doslet_vga::IndexedFrame;
 use doslet_x86::{CpuError, Gpr16, Registers, StepOutcome, linear_address};
+mod analyzer;
+pub use analyzer::{AnalyzerStats, CallerEffect, CandidateStats};
 mod cdrom;
 mod clock;
+mod cooperative;
+pub use cooperative::{EventIdleSite, MenuIdleSite, MenuIdleStats};
 pub mod debug;
 pub mod dpmi;
 mod idle;
+mod observation;
+mod synchronization;
+pub mod wait_budget;
 use cdrom::CdromImage;
 pub use idle::IdleLoopStats;
+pub use observation::IdleObservation;
+pub use synchronization::SynchronizationStats;
 mod keyboard;
 mod mouse;
+#[cfg(feature = "save-state")]
+mod saved;
+#[cfg(feature = "save-state")]
+pub use saved::{StateResources, WorkingState};
 mod storage;
 mod vesa;
 mod video;
@@ -120,6 +133,7 @@ pub struct Session {
     mouse: doslet_dos::mouse::Mouse,
     mouse_fraction: [f64; 2],
     mouse_last_read: Option<u64>,
+    mouse_last_relative_read: Option<u64>,
     dos_time_origin_nanos: u64,
     dos_time_origin_centis: u32,
     memory: MemoryArena,
@@ -144,6 +158,10 @@ pub struct Session {
     idle: idle::IdleLoops,
     dpmi: Option<Box<dpmi::Host>>,
     service_flags: Option<u16>,
+    menu_idle: cooperative::MenuIdle,
+    observer: observation::Observer,
+    synchronization: synchronization::Synchronization,
+    analyzer: analyzer::Analyzer,
 }
 
 impl Session {
@@ -290,6 +308,7 @@ impl Session {
             mouse: doslet_dos::mouse::Mouse::default(),
             mouse_fraction: [0.0; 2],
             mouse_last_read: None,
+            mouse_last_relative_read: None,
             dos_time_origin_nanos: 0,
             dos_time_origin_centis: 0,
             memory,
@@ -314,6 +333,10 @@ impl Session {
             idle: idle::IdleLoops::default(),
             dpmi: None,
             service_flags: None,
+            menu_idle: cooperative::MenuIdle::default(),
+            observer: observation::Observer::default(),
+            synchronization: synchronization::Synchronization::default(),
+            analyzer: analyzer::Analyzer::default(),
         })
     }
     /// Transfer a preloaded input drive into the session during setup.
@@ -435,6 +458,9 @@ impl Session {
     }
     /// Experimental caller-selected memory polling sites; no guest code patches.
     pub fn set_memory_wait_sites(&mut self, operand: u32, starts: [u32; 3]) {
+        if self.analyzer.controller {
+            self.set_adaptive_cpu(false);
+        }
         self.machine
             .set_memory_wait_sites(Some(doslet_pc::MemoryWaitSites { operand, starts }));
     }
@@ -571,7 +597,30 @@ impl Session {
             && !self.timeslice_yielded
         {
             let now = self.steps + u64::from(completed);
-            let step = match self.idle_advance(now, budget - completed) {
+            let idle = self
+                .analyzer_advance(now, budget - completed)
+                .and_then(|result| {
+                    if result.is_some() {
+                        Ok(result)
+                    } else {
+                        self.synchronization_advance(now, budget - completed)
+                    }
+                })
+                .and_then(|trace| {
+                    if trace.is_some() {
+                        Ok(trace)
+                    } else {
+                        self.menu_idle_advance(budget - completed)
+                    }
+                })
+                .and_then(|result| {
+                    if result.is_some() {
+                        Ok(result)
+                    } else {
+                        self.idle_advance(now, budget - completed)
+                    }
+                });
+            let step = match idle {
                 Ok(Some(consumed)) => Ok(consumed),
                 Ok(None) => self.execute_step(budget - completed),
                 Err(error) => Err(error),
@@ -587,11 +636,43 @@ impl Session {
             }
         }
         self.steps += u64::from(completed);
+        self.observe_idle();
+        self.analyzer_control();
         completed
     }
+    pub fn set_execution_tiers(
+        &mut self,
+        labels: Option<alloc::vec::Vec<doslet_x86::ExecutionLabel>>,
+        rates: [Option<u16>; 3],
+    ) -> Result<(), &'static str> {
+        let idle = self.idle.enabled;
+        self.set_idle_loops(false);
+        let result = self.machine.set_execution_tiers(labels, rates);
+        self.set_idle_loops(idle);
+        result
+    }
+    pub fn replace_execution_labels(
+        &mut self,
+        labels: alloc::vec::Vec<doslet_x86::ExecutionLabel>,
+    ) -> Result<(), &'static str> {
+        let idle = self.idle.enabled;
+        self.set_idle_loops(false);
+        let result = self.machine.cpu.replace_execution_labels(labels);
+        self.set_idle_loops(idle);
+        result
+    }
+    /// Actual instruction/microstep counts, excluding proven skipped passes.
+    pub fn executed_tier_counts(&self) -> [u64; 4] {
+        self.machine.cpu.executed_tier_counts()
+    }
+    pub fn execution_tier_stats(&self) -> ([u64; 4], [u64; 4]) {
+        self.machine.execution_tier_stats()
+    }
+
     /// Live CPU throughput change; devices and accumulated guest time continue.
     pub fn set_cpu_mhz(&mut self, mhz: u16) -> Result<(), RuntimeError> {
         self.machine.set_cpu_mhz(mhz)?;
+        self.analyzer.ceiling = mhz;
         let enabled = self.idle.enabled;
         self.set_idle_loops(false);
         self.set_idle_loops(enabled);
@@ -610,9 +691,42 @@ impl Session {
         }
     }
     fn execute_step(&mut self, budget: u32) -> Result<u32, RuntimeError> {
+        self.execute_step_mode::<false>(budget, None)
+    }
+    fn execute_step_observed(
+        &mut self,
+        observation: &mut doslet_pc::StepObservation,
+    ) -> Result<u32, RuntimeError> {
+        self.execute_step_mode::<true>(1, Some(observation))
+    }
+    fn execute_step_mode<const OBSERVE: bool>(
+        &mut self,
+        budget: u32,
+        mut observation: Option<&mut doslet_pc::StepObservation>,
+    ) -> Result<u32, RuntimeError> {
+        let before_service_writes = if OBSERVE {
+            self.machine.ram_writes()
+        } else {
+            0
+        };
+        let before_service_devices = if OBSERVE {
+            self.machine.device_accesses()
+        } else {
+            0
+        };
         self.apply_input();
         if self.continuation.is_none() && self.dpmi.is_some() {
-            self.dpmi_dispatch()?;
+            // Observed execution needs the actual real-mode instruction and
+            // its bus trace. Retain the configured mode for subsequent calls.
+            let mode = self.dpmi.as_ref().unwrap().mode;
+            if OBSERVE {
+                self.dpmi.as_mut().unwrap().mode = dpmi::Mode::Reflect;
+            }
+            let result = self.dpmi_dispatch();
+            if OBSERVE {
+                self.dpmi.as_mut().unwrap().mode = mode;
+            }
+            result?;
             if self.status != SessionStatus::Running {
                 return Ok(1);
             }
@@ -646,7 +760,17 @@ impl Session {
                 }
             }
         }
-        let (outcome, consumed) = self.machine.step_with_idle_budget(budget)?;
+        let (outcome, consumed) = if OBSERVE {
+            let changed = self.machine.ram_writes() != before_service_writes;
+            let device_accesses = self.machine.device_accesses() != before_service_devices;
+            let observation = observation.as_mut().unwrap();
+            let result = self.machine.step_observed(observation)?;
+            observation.service_writes_unobserved = changed;
+            observation.service_device_accesses_unobserved = device_accesses;
+            result
+        } else {
+            self.machine.step_with_idle_budget(budget)?
+        };
         if outcome == StepOutcome::Halted {
             self.status = SessionStatus::Halted;
         }
@@ -654,6 +778,8 @@ impl Session {
     }
     fn service(&mut self, vector: u8) -> Result<(), RuntimeError> {
         let ax = self.machine.cpu.registers.get(Gpr16::Ax);
+        // Host services can mutate device state directly, outside port counters.
+        self.analyzer_recurrence_service(vector, ax);
         self.idle_service(vector, ax);
         if vector == 0x10 && ax >> 8 == 0x12 && self.machine.cpu.registers.get(Gpr16::Bx) == 0x80 {
             // Cirrus Logic VGA-type inquiry; no Cirrus extension BIOS is installed.
@@ -2130,3 +2256,7 @@ mod tests {
         assert!(session.frame().is_none());
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "session_saved.rs"]
+mod saved_state;

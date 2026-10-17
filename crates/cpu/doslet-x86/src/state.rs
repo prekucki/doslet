@@ -498,3 +498,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "state_saved.rs"]
+mod saved_state;

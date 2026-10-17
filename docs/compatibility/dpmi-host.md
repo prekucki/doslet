@@ -98,6 +98,8 @@ execution budget. A replaced real-mode IRET consumes one machine timing step;
 the protected-mode IRET still executes normally.
 Debugger attachment selects reflection for subsequent calls and restores the
 selected mode on detach.
+Observed analyzer steps and execution with address-specific speed labels also
+use reflection so the real instruction remains visible to tracing and timing.
 
 The CPU exposes a small integer context save/restore boundary without depending
 on DOS, BIOS or the runtime. The runtime owns host state. Context restoration
@@ -105,6 +107,11 @@ reloads hidden segment caches and invalidates code-context hints even when the
 numeric selector is unchanged. Floating-point state remains owned by the CPU.
 
 This is an experimental subset, not a conforming general-purpose DPMI server:
+
+- Portable save states and diagnostic working-state capture reject sessions
+  with this host enabled: its descriptors, allocation metadata and pending
+  callback contexts do not yet have a portable state representation. Ordinary
+  sessions keep their existing save/restore support.
 
 - Paging, demand commitment, VM86 and privilege-changing gates remain absent.
   Clients execute at CPL 3 with IOPL 3 under the existing CPU model.

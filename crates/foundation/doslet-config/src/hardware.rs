@@ -74,3 +74,7 @@ impl HardwareConfig {
         self.memory_mib as usize * 1024 * 1024
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "hardware_saved.rs"]
+mod saved_state;

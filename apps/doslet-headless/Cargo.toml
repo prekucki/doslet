@@ -5,10 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [features]
-default = ["dynamic-core"]
+default = ["dynamic-core", "save-state"]
+save-state = ["doslet-runtime/save-state"]
 dynamic-core = ["doslet-runtime/dynamic-core"]
 profiling = ["doslet-runtime/profiling"]
 [dependencies]
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 doslet-config.workspace = true
 doslet-pcm.workspace = true
 doslet-runtime.workspace = true
@@ -19,5 +21,27 @@ doslet-executable.workspace = true
 doslet-x86.workspace = true
 doslet-dos.workspace = true
 doslet-debugger.workspace = true
+flate2 = "1"
+png = "0.18"
+serde_json = "1"
+sha2 = "0.10.9"
+
+[[example]]
+name = "heroes_states"
+required-features = ["save-state"]
+
+[[example]]
+name = "state_graph_trace"
+required-features = ["save-state", "profiling"]
+[[example]]
+name = "startup_timing"
+required-features = ["profiling", "save-state"]
+[[example]]
+name = "state_speed_tiers"
+required-features = ["profiling", "save-state"]
+[[example]]
+name = "bench_weighted_tiers"
+required-features = ["save-state"]
+
 [lints]
 workspace = true

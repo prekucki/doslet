@@ -121,6 +121,7 @@ impl Session {
             let Some(event) = self.input.next_event() else {
                 break;
             };
+            self.menu_idle_input();
             match event {
                 doslet_input::GuestEvent::Key { key, pressed } => {
                     if let Err(error) = self.machine.key_event(key, pressed) {
@@ -733,6 +734,22 @@ impl Session {
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
+    /// Start a fresh host attachment after restoring a portable snapshot.
+    pub fn renew_epoch(&mut self) -> Result<(), RuntimeError> {
+        if self.continuation.is_some() || self.storage_wait || self.persistent.is_some() {
+            return Err(RuntimeError::InvalidLaunch);
+        }
+        let epoch = new_epoch()?;
+        self.release_keys()?;
+        self.epoch = epoch;
+        self.input.reset(epoch);
+        if let Some(cd) = &mut self.cdrom
+            && let cdrom::Media::Remote(provider) = &mut cd.image
+        {
+            provider.source_mut().reset_epoch(epoch);
+        }
+        Ok(())
+    }
     pub fn set_epoch(&mut self, epoch: u64) -> Result<(), RuntimeError> {
         if self.status != SessionStatus::Ready || self.continuation.is_some() {
             return Err(RuntimeError::InvalidLaunch);
@@ -777,3 +794,7 @@ impl Session {
         Ok(())
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "storage_saved.rs"]
+mod saved_state;

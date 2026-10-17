@@ -47,7 +47,8 @@ shim updates the BIOS key ring only when executed through the guest IVT.
 The gameport implements guest-time charge deadlines at port 201h.
 
 The native `doslet-emulation` thread creates and exclusively owns the Session,
-execution cache, storage adapter and sample synthesizers. It processes at most 256 queued
+execution cache and storage adapter. With a host audio device, `doslet-audio`
+owns MIDI synthesis and PCM resampling/mixing. Emulation processes at most 256 queued
 commands between bounded execution turns. Each turn has a 400000-step budget,
 10000-step chunks and an 8-ms host-work check between chunks. Once per turn
 it polls/submits a bounded JIT job; Cranelift runs on a separate `doslet-jit`
@@ -65,6 +66,45 @@ the next one. A stalled UI stops presentation work without stopping
 emulation. Paused sessions request no periodic UI updates. Editor command
 sequence numbers prevent older snapshots from overwriting newer local edits.
 Shutdown joins the owner after saving its dynamic-core profile.
+
+The opt-in native speed-tier adapter installs static code labels into the CPU's
+execution caches. Native blocks retain their control-flow scope and return counts
+of completed HOT/COLD/GREY/IRQ work. The machine converts those counts to time with
+configurable rational weights; device horizons still bound execution. Host clocks
+stay in the native adapter, which bounds MAX work and services devices even when
+its instruction cost is zero. Existing proven idle/VGA batching accounts the labels
+of skipped iterations. Unknown/changed code uses GREY; confirmed IRQ labels have
+separate counters at the same clock rate. Legacy graph-based IRQ guesses remain
+learnable GREY until checked by a replay. The
+older headless replay planner is diagnostic-only. See the
+[experiment and live controls](compatibility/speed-tier-replays.md).
+Native portable-state loading prepares one owner on a bounded setup stack before
+handing it to the emulation worker. Saved states refer to immutable disk assets
+by type, DOS drive/path, length and checksum; restoration binds matching assets
+from the launch profile. Mutable RAM, devices, overlays and handles have one
+owner each. See [portable states](save-states.md).
+
+Optional native tier learning samples actual executed counters once per host
+second, excluding skipped iterations. GREY above 10% schedules one independent
+state copy for paired one-second guest-time replays at the GREY rate (capped at
+333 MHz) and three times that rate. Only the background copy disables idle/VGA
+acceleration and traces instructions. Immutable media are shared; guest RAM and
+mutable devices/filesystem state are copied explicitly at a batch boundary.
+Fresh entry is captured before the first live batch; at most four further
+high-GREY snapshots wait for the single worker. The worker yields periodically,
+has a 120-second host deadline, and cancels on session replacement or policy disable.
+Results require the same session epoch. Stored instruction-byte guards validate
+labels on decode, so evidence for unloaded startup code can survive until restart. Interrupt frames are tracked only in the diagnostic
+copy; new IRQ instructions receive a distinct IRQ label. Learning adds HOT/COLD/IRQ to GREY
+sites and never revokes an established colour. Installation invalidates decoded/native labels without resetting clock fractions
+or execution counters; instruction blocks remain intact.
+
+Native CLI startup selects persisted tier labels by the executable's SHA-256,
+then validates instruction bytes through the existing decode path. The host adapter
+owns persistence: one background writer serializes a bounded copy of the label map,
+atomically replaces its JSON file, and flushes outstanding changes on orderly
+shutdown. It also stores rates and the learning setting. Disk I/O and hashing are
+outside the instruction execution path; CPU libraries do not depend on storage.
 
 ## Dependency graph
 
@@ -169,6 +209,29 @@ maps guest nanoseconds to sample frames; MIDI timestamps currently have bounded
 batch resolution. Native CPAL owns a reserved host audio queue and shares only
 those frames with the output callback. The machine remains owned by the
 emulation thread.
+
+Native sample output uses eight preallocated, recycled packets between emulation
+and `doslet-audio`. Each holds up to 4096 timed PCM frames and 16384 translated
+MIDI bytes. Emulation reserves a packet before advancing a CPU chunk; a full pool
+or at least 80 ms of unrendered guest time defers the next chunk. That time bound
+can be crossed by the final accepted chunk. Packets preserve the existing order:
+receive timed PCM, render to the committed guest timestamp, then apply that
+batch's MIDI. Synthesis never advances beyond committed guest time. Audio refill
+pacing subtracts pending synthesis time from its target to avoid counting it twice.
+The worker renders at most 512 frames before checking control requests. A full
+CPAL queue makes it wait, without holding a machine or synthesis lock.
+
+Rust, Apple DLS and CM-32L synthesizers are created, restored, used and destroyed
+on the audio owner. Configuration uses a separate control channel and acknowledges
+only after successful construction/replay, cancellation of older packets and
+clearing the old CPAL frames. Failed preparation preserves the previous output.
+Pause gates playback while retaining queued sound and synth state; reset and
+shutdown can interrupt a full paused output queue. Worker failures pause the PC
+and reach the existing notice/stderr path. The device-free path uses the same
+renderer synchronously. OPL/DSP register behavior, DMA, IRQs and source PCM
+generation remain with the machine. Thread priorities and the CPAL frame-queue
+mutex are unchanged; synthesis occurs outside that mutex and outside the callback.
+
 The native desktop and headless applications share the host `doslet-debugger`
 crate and its `gdbstub` TCP adapter. The desktop polls its nonblocking protocol
 state machine on the existing emulation owner, so partial packets and stopped
@@ -329,8 +392,22 @@ the remaining emulation libraries retain their `no_std` source boundaries.
 State still has one mutable owner and synthesis allocates nothing after setup.
 See the [`no_std` backlog item](backlog.md).
 
+The local `nuked-opl3` 0.1.0 patch adds optional Protobuf state conversion for
+the complete synthesis core, without changing synthesis. This captures active
+oscillators, envelopes and the resampler rather than replaying registers.
+Component `save-state` features depend on `doslet-state`; they allocate only
+during explicit capture/restore and add no execution hooks. See
+[portable guest states](save-states.md) and the [vendor notes](../vendor/README.md).
+
 The absent AWE/EMU8000 probe banks are explicit machine wiring, rather than an
 emulated synth. Neither DSP nor mixer depends on the CPU or host audio.
+The DSP counts service windows between consecutive auto-init DMA blocks and
+records a miss if the previous block's matching IRQ has not been acknowledged
+when the next block completes. Transfer replacement/reset cancels the open
+window; completed counters survive DSP reset. This fixed-size chip diagnostic
+has no host clock or CPU dependency. Runtime adaptation observes new misses
+between bounded batches and restores its user ceiling; MCP and native Details
+report this limited IRQ-service scope separately from host PCM underruns.
 
 ## Chip-to-machine boundary
 
@@ -488,6 +565,134 @@ Whole two-step iterations advance strictly before PIT/DSP events with the same
 1-ms bound. The path remains disabled by default and does not patch guest code.
 No chip reads a host clock or depends on UI refresh. Precise CPU/bus timing and
 complete arbitration/cascading remain future work.
+
+The separate, opt-in `--experimental-heroes-menu-idle` policy changes polling
+cadence rather than proving instruction equivalence. Native setup supplies the
+menu and event-list addresses; runtime recognition checks flat segments and
+CALL/backedge bytes. Menu checks require an empty stack event, the known callback
+and a positive animation countdown. Event-list checks require an empty stack
+event, the selected context, CL=0 and a finished handler iterator. Held mouse
+buttons and a pointer within eight coordinate units of an edge exclude the
+event-list candidate, preserving stationary edge scrolling.
+
+Two empty observations start 125-us waits. Every six further empty observations
+doubles the limit, up to 1 ms. Changed display revision resets confidence and
+reserves 2 ms of full-speed guest execution. Host input immediately cancels a
+wait and reserves 100 ms at the configured MHz. Invalid candidates reset the
+limit; normal hardware wakeups preserve confidence. This is a bounded polling
+heuristic, not a general proof of inactivity. The original strict idle detector
+remains separate. An optional two-head scheduler hint brings execution back to
+the runtime on arrival at either selected IP. Interpreter
+and JIT use const-generic specializations; ordinary execution contains no
+block-head comparison. This scheduling hint is not an instruction breakpoint.
+Each hardware advance stops at the next PIT, keyboard, DSP or OPL event. An
+eligible IRQ, input-state change, RAM write, changed CPU state or the time limit
+ends the wait. Debug/single-step execution disables it. Idle scheduling units
+count toward the existing finite budget; they are not retired instructions.
+The desktop exposes a live toggle, accumulated idle time and current wait limit.
+MCP status also exposes the last recognized head and wake counters. The alias
+`--experimental-heroes-adaptive-idle` enables the same policy. For this experiment
+only, host PCM pacing uses low/high watermarks based on observed callback size,
+with a 30-ms minimum high target and an 80-ms lead cap. This reserves audio
+before the queue empties while guest interrupt timing remains device-driven.
+It does not establish identical game state or glitch-free audible playback.
+
+The separate `--observe-idle` diagnostic is address-independent and never
+authorizes skipped execution. At `Session::advance` boundaries, no more often than
+20,011 scheduling units, it samples CS/base/mode/IP into 64 fixed entries. A
+250-ms guest-time window reports recurrence, input-query service calls, RAM
+write/device-access deltas, host input and sampled display revisions. Four
+visits to one site among at least eight samples, input queries, and no observed
+input or display activity produce an **unverified polling candidate**. Queries
+need not have returned empty. RAM/device effects are reported as unverified,
+not treated as harmless; IRQ audio work may contribute to these counters.
+Sampling can miss work or alias execution, and does not prove a complete loop.
+The observer never authorizes sleeping. In addition to PC samples it runs
+bounded reference-execution traces: at most 512 single steps every two million
+scheduling units, with fixed storage for 32 aging conditions. The tracer supports
+absolute byte/word/dword CMP with an 8-bit immediate followed by JZ/JNZ, and
+IN AL,DX followed by AND/TEST and JZ/JNZ. It records actual branch outcomes and
+AL returned by the guest IN; it never performs an extra device read. RAM values
+are inspected through the side-effect-free debugger view, with segmentation
+validation and paging rejection. A changed watched value records the step PC,
+IRQ-pending state and device-access activity at that boundary. This does not
+prove which instruction, IRQ handler or device wrote it, or identify a timer or
+audio buffer automatically. Unsupported forms remain unclassified.
+
+During trace bursts, existing strict proofs are abandoned and the optional
+Heroes heuristic is cancelled; those paths resume between bursts. Reference
+stepping affects profiling and can change heuristic polling cadence if both
+experiments are enabled. Disable Heroes adaptive idle for reference comparisons.
+No unconditional instruction tracing is added to the CPU. Existing strict proofs
+and opt-in Heroes recipes remain independent. Disabled observation adds runtime guards and service/input guards; no CPU
+instruction hook exists.
+The desktop Details toggle and MCP status expose the most recent window.
+
+The separate opt-in `--adaptive-idle` policy uses this tracer to learn a RAM
+countdown guard: CMP against zero, JNE forward by at most 64 bytes to RET. The
+first structural matches install up to two independent batch observation points.
+Eight observations,
+including both decreasing and increasing values, are required before waiting.
+Only zero-based 32-bit code can supply these candidates. Each point retains its
+own evidence: an adjacent static guard cannot overwrite a countdown while it
+is learning. Occupied points can only be replaced after a one-second absence.
+16-bit DOS/driver predicates cannot replace them.
+Validated arrivals at that point refresh evidence independently of trace bursts;
+sparse tracing must not expire an actively visited guard. A gap longer than one
+guest second or a MHz change resets confidence and requires new counter changes.
+It yields batches at the learned guard and revalidates the code, positive counter,
+flat 32-bit segments, recent evidence at the current MHz and input queries.
+Actual input reserves the shared 100-ms grace before waiting. Pointer position,
+screen edges and display revisions do not gate this policy: they do not measure
+CPU demand. The fixed Heroes event-list recipe retains its separate edge guard.
+The next known service horizon minus max(100 us, observed recurrence peak)
+bounds each wait to 25–250 us. Device events still run and eligible IRQs wake the
+CPU through the existing cooperative path. Observation off disables learning
+and clears its batch yield point. Details and MCP expose the arrival count and
+last guard eligibility reason. Storage is fixed and execution allocates none.
+This is a heuristic: neither the counter writer nor absence of work in the
+caller is proven. It remains disabled by default and replaces the fixed Heroes
+recipe when enabled. The diagnostic provisional budget remains separate.
+
+The same opt-in policy also budgets repeated empty INT 33h/000Bh relative-motion
+queries with no pressed buttons. It measures guest CPU time between queries,
+subtracting its own cooperative waits. After eight intervals, the largest work
+interval in a bounded 32-sample window sets the reserve. A query may request
+up to `250 us - work`, further bounded by the next known service horizon minus
+`max(100 us, 2 * work)`. Less than 25 us of spare time means ordinary execution.
+Thus expensive work reduces waiting without interpreting screen contents or
+mouse coordinates. Host input and MHz changes reset confidence. A pending wait
+expires after 1 ms and starts only when maskable interrupts are accepted;
+device events and IRQ wake behavior use the existing cooperative path.
+This deliberately changes polling cadence and does not prove absence of useful
+work between queries. It is experimental, not a general CPU-demand oracle.
+Details/MCP report empty-poll waits and the observed work peak separately from
+learned countdown checks. Disabled adaptive mode does not collect this budget.
+
+Synchronization diagnostics also report a provisional time/step budget. Repeated
+visits to the same condition within one trace burst measure a recurrence cost;
+untraced gaps are excluded. At least four samples, at most 250 ms old and at the
+current MHz, are required. The largest observed cost is retained until the
+condition entry expires or its MHz changes. The estimator subtracts that cost
+and a reserve of max(100 us, 25% of cost) from the next known service horizon,
+clamping at zero. Four nominal CPU clocks per scheduling unit convert time to
+steps; these are not measured historical processor cycles.
+
+Known horizons include pending PIC requests, PIT channel-zero pulses, AT
+keyboard events and the earliest DSP block completion assuming unstalled DMA.
+Individual OPL/DSP sample-generation events are not CPU service deadlines.
+For an observed mask 08h on the active VGA status port, the condition is linked
+to the next retrace transition, which further bounds the horizon. This
+is deliberately partial: host output queue slack, other hardware sources and
+the causal connection between a condition and an IRQ are not established. A
+recurrence may be an empty poll rather than useful work. Therefore the displayed
+budget is diagnostic only and never permits sleeping or changes configured MHz.
+
+
+Live MHz changes replace only the CPU step-clock ratio, retaining its fractional
+phase rounded to the new denominator. Peripheral fractions and accumulated time
+remain intact. The owner updates the active/reset recipe between batches; the
+frontend does not replace the Session or restart the audio stream.
 
 Two independent 8237 instances own address/count/mode/mask state. The machine
 owns page registers and byte/word address wiring, including 64/128-KiB wrapping.
@@ -729,3 +934,99 @@ the chip's borrowed scanout interface.
 - Add another CPU engine behind the architectural-state boundary. Keep a simple
   interpreter as the correctness reference; benchmark before specializing.
 - Reserve large buffers and event capacity at setup. Expose overflow explicitly.
+
+## Synchronization analysis boundary
+
+`doslet-x86::analysis` exposes bounded decoded effects and control-flow records
+from the interpreter decoder. It owns no PC devices and only uses side-effect-free
+`MemoryBus` code views and page-generation checks. Each instruction is a small
+basic-block subdivision with explicit successor edges. The first supported
+context is flat 32-bit CS/DS/SS without paging; other contexts remain incomplete.
+
+`doslet-bus::observation::Observed<B>` statically wraps an ordinary bus for traced
+CPU steps. It forwards transaction widths and records returned reads and successful
+writes in 64 fixed slots. Failed partial transactions and capacity exhaustion
+mark the trace incomplete. Ordinary execution instantiates the machine step with
+observation disabled; it does not call an observer per instruction. The PC layer
+records actual IRQ entry and distinguishes hardware RAM changes outside the CPU
+transaction trace. Runtime services remain outside that wrapper and explicitly
+invalidate instruction-trace episodes when their writes are unobserved.
+
+VGA boundary accounting does not require tracing the work between polls. I/O
+ends ordinary native/register batches, so the runtime observes the actual
+IN/test/branch sequence and records confirmed waiting. It retains the existing
+strict VGA batching proof through `try_vga_wait_batch`; it introduces no new
+skipping semantics. The difference between total guest elapsed time and confirmed
+waiting is a conservative work upper bound, including IRQs, runtime services and
+unsupported code. Sparse static coverage is reported independently rather than
+used to erase this continuous clock measurement or classify unknown work as idle.
+An IRQ suspends an in-flight port condition until the actual IRET returns to
+the saved CS/IP/SP, with a 20-ms bound. Interrupt time remains work. An abandoned
+condition invalidates its incomplete episode, preventing adjacent presentation
+periods from being joined accidentally.
+
+The runtime owns a fixed 64-node graph, four predicate records, an eight-entry
+observed IRQ stack and bounded episode statistics. Code-generation, context,
+trace-gap and clock changes invalidate the relevant evidence. An unknown initial
+interrupt context is never called foreground ownership. The runtime's separate
+opt-in controller changes effective CPU throughput between batches, preserving
+configured MHz as its fallback ceiling. No confidence score authorizes loop
+skipping. MCP serializes named fields in the host adapter; no JSON allocation or
+host clock enters emulation execution. See [development](development.md#bounded-synchronization-analyzer)
+for the admitted predicates, limits and validation boundary.
+
+Returning guards have two separate diagnostic records. Their caller is linked
+through the actual flat stack and decoded direct CALL, rather than guessed from
+a returning function's recurrence cost. A bounded IRQ-only observation path
+captures their RAM writer independently of sparse foreground discovery. Static
+effect gaps do not erase actual bus-write attribution within that observed
+handler; nested interrupts, trace overflow, unobserved writes and budget
+exhaustion do. These guard records do not authorize throughput reduction.
+
+A diagnostic caller probe follows one dynamically observed returning iteration,
+including bounded transitions through 16-bit code. It compares CPU, input,
+ordinary RAM write results and modeled CMOS register state at the same instruction
+boundary. Its fixed effect table and byte ledger live in the session; only small
+summary statistics enter frontend snapshots. The opt-in bus wrapper captures old
+RAM values through ordinary-memory views, never extra device reads. Mapping gaps,
+write/trace overflow and unobserved effects remain explicit. This dynamic inventory
+does not extend the admitted static graph or the strict skipping contract, and
+does not itself qualify a controller budget.
+
+An unchanged caller inventory may install an exact instruction boundary for
+continuous recurrence measurement. The PC owns a separate bounded RAM journal
+and IRQ/device-access marks; the runtime owns CPU/input snapshots and checks
+fresh countdown-source evidence. Only restored CMOS shutdown-status scratch
+writes are admitted device effects. Every interval executes normally; only after
+complete state comparison can its elapsed time enter continuous wait accounting.
+The returning guard's zero/nonzero arrivals can delimit complete work/wait
+episodes; source-only samples still cannot qualify a budget. Unmodeled services,
+interrupts, mapping changes and journal overflow
+exclude the interval. Native store views are unavailable while the journal is
+valid, so writes cannot bypass its old-byte capture. This observation path does
+not extend the strict idle-skipping contract. While that journal is valid, the
+PC selects decoded batches at the scheduling boundary, avoiding repeated failed
+native-store attempts. Overflow and journal completion restore normal JIT use.
+
+When no returning-guard anchor with fresh source evidence exists, bounded scouts may install an
+executed, taken direct backedge as a recurrence boundary, including conditional
+branches. A fallthrough does not discover a boundary. This requires
+an existing, fresh, stable VGA cadence model; the backedge does not supply a new
+deadline. A frequently visited guard without observed writers cannot monopolize
+discovery; a later caller inventory does not replace an active backedge.
+The same complete state journal checks every execution, including
+indirect calls. Eight consecutive unchanged intervals qualify the boundary;
+only individually verified later intervals contribute waiting to complete VGA
+episodes. Changing or interrupted executions remain work. An interval exceeding
+5 ms loses its journal but retains the boundary, so animation work does not erase
+the next frame's measurement. A boundary absent for 250 ms, changed code/context,
+or missing presentation source ends observation.
+Source candidates are checked at complete arrivals before classifying waiting;
+code validity and journal/absence time limits are checked between arrivals too.
+Eight rejected/cancelled intervals abandon an unqualified probe. A qualified
+boundary tolerates bursts of changing handlers for at most 250 ms without
+another unchanged interval, without crediting those changes as waiting. An
+eight-entry cooldown table prevents immediately retrying an abandoned probe for
+250 ms. Losing a qualified
+anchor invalidates the associated work estimates. Storage remains fixed-capacity
+and this extension does not skip execution or recognize game addresses.

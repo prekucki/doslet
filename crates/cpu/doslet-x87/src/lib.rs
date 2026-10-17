@@ -1296,3 +1296,7 @@ mod tests {
         assert_eq!(fpu.status(), 0x7F00);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

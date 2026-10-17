@@ -44,7 +44,20 @@ impl StepClock {
     }
 }
 
+pub(crate) struct TierTiming {
+    clocks: [Option<StepClock>; 4],
+    previous: [u64; 4],
+    nanos: [u64; 4],
+    slowest: u64,
+    denominator: u64,
+    costs: [u64; 4],
+    fraction: u64,
+}
+
 pub(crate) struct Timing {
+    /// Transient diagnostic execution mode; never serialized.
+    external_cpu: bool,
+    pub(crate) tiers: Option<TierTiming>,
     cpu: StepClock,
     pub time: EmuTime,
     pit_fraction: u64,
@@ -58,6 +71,8 @@ impl Default for Timing {
 impl Timing {
     pub(crate) fn new(cpu_mhz: u16) -> Self {
         Self {
+            external_cpu: false,
+            tiers: None,
             cpu: StepClock::new(cpu_mhz),
             time: EmuTime::ZERO,
             pit_fraction: 0,
@@ -66,6 +81,100 @@ impl Timing {
     }
 }
 impl PcMachine {
+    /// Install native scheduling labels and rates; None is zero-cost/MAX.
+    /// Device clocks are charged once from completed CPU counters per batch.
+    pub fn set_execution_tiers(
+        &mut self,
+        labels: Option<alloc::vec::Vec<doslet_x86::ExecutionLabel>>,
+        rates: [Option<u16>; 3],
+    ) -> Result<(), &'static str> {
+        if rates[1..].iter().any(Option::is_none)
+            || rates.iter().flatten().any(|r| !(1..=1000).contains(r))
+        {
+            return Err("invalid tier rates");
+        }
+        let rates = [rates[0], rates[1], rates[2], rates[2]];
+        let enabled = labels.is_some();
+        self.cpu.set_execution_labels(labels)?;
+        fn gcd(mut a: u64, mut b: u64) -> u64 {
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        }
+        let denominator = rates
+            .into_iter()
+            .flatten()
+            .fold(1, |d, r| d / gcd(d, u64::from(r)) * u64::from(r));
+        self.timing.tiers = enabled.then(|| TierTiming {
+            denominator,
+            costs: rates.map(|r| r.map_or(0, |r| 4000 * (denominator / u64::from(r)))),
+            fraction: self.timing.cpu.fraction * denominator / self.timing.cpu.mhz,
+            clocks: rates.map(|r| r.map(StepClock::new)),
+            previous: [0; 4],
+            nanos: [0; 4],
+            slowest: u64::from(rates.into_iter().flatten().min().unwrap()),
+        });
+        Ok(())
+    }
+    pub fn execution_tier_stats(&self) -> ([u64; 4], [u64; 4]) {
+        (
+            self.cpu.execution_counts(),
+            self.timing.tiers.as_ref().map_or([0; 4], |t| t.nanos),
+        )
+    }
+
+    /// Diagnostic host-driven clock experiment. The owner must advance devices
+    /// after every bounded CPU batch; no host clock enters the machine library.
+    pub fn debug_external_cpu_clock(&mut self, enabled: bool) {
+        self.timing.external_cpu = enabled;
+    }
+
+    /// Advance at most one millisecond, splitting at sample/timer deadlines.
+    /// Unlike cooperative idle, elapsed CPU time must be charged even with IF=0
+    /// or an IRQ already pending. Returns the actual device time advanced.
+    pub fn debug_advance_device_time(&mut self, nanos: u64) -> Result<u64, MachineError> {
+        let mut remaining = nanos.min(1_000_000);
+        let requested = remaining;
+        for _ in 0..4096 {
+            if remaining == 0 {
+                break;
+            }
+            let mut slice = remaining;
+            if let Some(ticks) = self
+                .bus
+                .pit
+                .ticks_until_pulse(0)
+                .expect("installed channel")
+            {
+                slice = slice.min(
+                    (u64::from(ticks) * 1_000_000_000 - self.timing.pit_fraction)
+                        .div_ceil(1_193_182),
+                );
+            }
+            if self.hardware_config().keyboard == doslet_config::KeyboardMode::At
+                && let Some(deadline) = self.bus.keyboard.next_deadline()
+            {
+                slice = slice.min(deadline.saturating_sub(self.time().as_nanos()).max(1));
+            }
+            if self.hardware_config().sb16 {
+                if self.bus.dsp.playback_format().is_some() {
+                    slice = slice.min(
+                        (1_000_000_000 - self.timing.pcm_fraction)
+                            .div_ceil(u64::from(self.bus.dsp.sample_rate())),
+                    );
+                }
+                if let Some(next) = self.bus.opl.next_sample_nanos() {
+                    slice = slice.min(next);
+                }
+            }
+            let slice = slice.max(1).min(remaining);
+            self.advance_hardware_nanos(slice)?;
+            remaining -= slice;
+        }
+        Ok(requested - remaining)
+    }
+
     /// Change instruction throughput without resetting device clocks or guest time.
     /// Retain the sub-nanosecond CPU phase, rounded down to the new denominator.
     pub fn set_cpu_mhz(&mut self, mhz: u16) -> Result<(), MachineError> {
@@ -81,10 +190,78 @@ impl PcMachine {
         Ok(())
     }
 
+    /// One bounded hardware slice for an explicit cooperative idle policy.
+    /// This is not proof of instruction equivalence. Stop at each device event;
+    /// callers must resume CPU execution as soon as an IRQ becomes eligible.
+    pub fn advance_cooperative_idle(
+        &mut self,
+        budget: u32,
+        nanos: u64,
+    ) -> Result<u32, MachineError> {
+        use doslet_x86::flags;
+        if budget == 0
+            || nanos == 0
+            || self.cpu.is_halted()
+            || !self.cpu.accepts_maskable_interrupt()
+            || self.cpu.has_interrupt_shadow()
+            || self.interrupt_pending()
+            || self.cpu.flags & (flags::TRAP | flags::RESUME | flags::VIRTUAL | flags::ALIGNMENT)
+                != 0
+            || self.cpu.control.cr0 & 0x8000_0000 != 0
+        {
+            return Ok(0);
+        }
+        let steps = self.steps_to_event_nanos(budget, nanos);
+        self.advance_hardware_steps(steps)?;
+        Ok(steps)
+    }
     /// Functional clock: four configured nominal CPU clocks per execution/IRQ/idle
     /// step. This is deterministic across batches, not cycle-accurate timing.
     pub(crate) fn advance_hardware(&mut self) -> Result<(), MachineError> {
         self.advance_hardware_steps(1)
+    }
+    /// Diagnostic horizon for known scheduled CPU service sources. Not permission
+    /// to skip a guest loop: input, other devices and RAM dependencies are unproven.
+    /// Sample-generation events are deliberately distinct from DSP block IRQs.
+    pub fn diagnostic_service_horizon(&self) -> (Option<u64>, &'static str) {
+        if self.bus.pic.has_interrupt() {
+            return (Some(0), "pending IRQ");
+        }
+        let mut result = (None, "unknown");
+        let mut include = |nanos: u64, source| {
+            if result.0.is_none_or(|old| nanos < old) {
+                result = (Some(nanos), source);
+            }
+        };
+        if let Some(ticks) = self
+            .bus
+            .pit
+            .ticks_until_pulse(0)
+            .expect("installed channel")
+        {
+            include(
+                (u64::from(ticks) * 1_000_000_000 - self.timing.pit_fraction).div_ceil(1_193_182),
+                "PIT pulse",
+            );
+        }
+        if self.hardware_config().keyboard == doslet_config::KeyboardMode::At
+            && let Some(deadline) = self.bus.keyboard.next_deadline()
+        {
+            include(
+                deadline.saturating_sub(self.time().as_nanos()),
+                "keyboard event",
+            );
+        }
+        if self.hardware_config().sb16
+            && let Some(frames) = self.bus.dsp.frames_until_block_irq()
+        {
+            include(
+                (u64::from(frames) * 1_000_000_000 - self.timing.pcm_fraction)
+                    .div_ceil(u64::from(self.bus.dsp.sample_rate())),
+                "DSP block IRQ (earliest)",
+            );
+        }
+        result
     }
     pub(crate) fn idle_steps_to_event(&self, budget: u32) -> u32 {
         self.steps_to_event_nanos(budget, 1_000_000)
@@ -119,10 +296,18 @@ impl Timing {
                 (1_000_000_000 - self.pcm_fraction).div_ceil(u64::from(bus.dsp.sample_rate()));
             nanos = nanos.min(deadline);
         }
-        let steps = self.cpu.steps_until_nanos(nanos);
+        let steps = if let Some(tiers) = &self.tiers {
+            nanos.saturating_mul(tiers.slowest) / 4000
+        } else {
+            self.cpu.steps_until_nanos(nanos)
+        };
         let steps = if bus.hardware_config().sb16 {
             bus.opl.next_sample_nanos().map_or(steps, |deadline| {
-                steps.min(self.cpu.steps_until_nanos(deadline))
+                steps.min(if let Some(tiers) = &self.tiers {
+                    deadline.saturating_mul(tiers.slowest) / 4000
+                } else {
+                    self.cpu.steps_until_nanos(deadline)
+                })
             })
         } else {
             steps
@@ -133,7 +318,37 @@ impl Timing {
 impl PcMachine {
     #[inline]
     pub(crate) fn advance_hardware_steps(&mut self, steps: u32) -> Result<(), MachineError> {
-        let nanos = self.timing.cpu.advance(steps);
+        if self.timing.external_cpu {
+            return Ok(());
+        }
+        let nanos = if let Some(tiers) = &mut self.timing.tiers {
+            let counts = self.cpu.execution_counts();
+            let mut delta = core::array::from_fn::<_, 4, _>(|i| counts[i] - tiers.previous[i]);
+            // IRQ entry, HLT and explicit hardware-only skips are GREY unless
+            // a proved wait supplied its actual per-tier iteration counts.
+            let missing = u64::from(steps).saturating_sub(delta.iter().sum());
+            if missing != 0 {
+                self.cpu.account_execution([0, 0, missing, 0]);
+                delta[2] += missing;
+            }
+            tiers.previous = self.cpu.execution_counts();
+            let mut total = tiers.fraction;
+            for (i, n) in delta.into_iter().enumerate() {
+                let ns = tiers.clocks[i]
+                    .as_mut()
+                    .map_or(0, |clock| clock.advance(n as u32));
+                tiers.nanos[i] += ns;
+                total += n * tiers.costs[i];
+            }
+            tiers.fraction = total % tiers.denominator;
+            total / tiers.denominator
+        } else {
+            self.timing.cpu.advance(steps)
+        };
+        self.advance_hardware_nanos(nanos)
+    }
+
+    fn advance_hardware_nanos(&mut self, nanos: u64) -> Result<(), MachineError> {
         self.timing.time = self
             .timing
             .time
@@ -268,6 +483,26 @@ pub(crate) mod tests {
     use super::*;
     use doslet_bus::{MemoryBus, PortBus};
     #[test]
+    fn service_horizon_uses_audio_block_not_each_sample_and_keeps_phase() {
+        let mut m = PcMachine::default();
+        m.bus.pit.write_control(0x34).unwrap();
+        m.bus.pit.write_counter(0, 0).unwrap();
+        m.bus.pit.write_counter(0, 0).unwrap();
+        for byte in [0x41, 0x07, 0xd0, 0xc6, 0, 3, 0] {
+            m.bus.dsp.write_command(byte).unwrap();
+        }
+        m.timing.pcm_fraction = 500_000_000;
+        let before = m.bus.dsp.diagnostics().dma_units;
+        assert_eq!(
+            m.diagnostic_service_horizon(),
+            (Some(1_750_000), "DSP block IRQ (earliest)")
+        );
+        assert_eq!(m.bus.dsp.diagnostics().dma_units, before);
+        assert_eq!(m.timing.pcm_fraction, 500_000_000);
+        m.bus.pic.raise_edge(0);
+        assert_eq!(m.diagnostic_service_horizon(), (Some(0), "pending IRQ"));
+    }
+    #[test]
     fn live_clock_change_retains_machine_and_device_phase() {
         let mut m = idle_machine(true);
         m.advance_hardware_steps(7).unwrap();
@@ -290,6 +525,125 @@ pub(crate) mod tests {
         assert_eq!(m.time().as_nanos() - time.as_nanos(), 4000);
     }
 
+    #[test]
+    fn dma_ack_deadlines_follow_device_time_at_different_cpu_speeds() {
+        for mhz in [8, 33, 133] {
+            let mut m = idle_machine(true); // 2 kHz, one DMA unit per block.
+            m.set_cpu_mhz(mhz).unwrap();
+            let half_ms = u32::from(mhz) * 125;
+            // As in ordinary execution, each hardware batch ends no later
+            // than the next sample event.
+            m.advance_hardware_steps(half_ms).unwrap();
+            m.advance_hardware_steps(half_ms).unwrap();
+            assert_eq!(m.time().as_nanos(), 1_000_000);
+            assert_eq!(m.bus.dsp.diagnostics().block_irq_deadlines, 1);
+            assert_eq!(m.bus.dsp.diagnostics().block_irq_deadline_misses, 1);
+            m.bus.read_port_u8(0x22f).unwrap();
+            // The next block arrives in exactly 500 us at every CPU speed.
+            m.advance_hardware_steps(half_ms).unwrap();
+            assert_eq!(m.bus.dsp.diagnostics().block_irq_deadlines, 2);
+            assert_eq!(m.bus.dsp.diagnostics().block_irq_deadline_misses, 1);
+            m.advance_hardware_steps(half_ms).unwrap();
+            assert_eq!(m.bus.dsp.diagnostics().block_irq_deadlines, 3);
+            assert_eq!(m.bus.dsp.diagnostics().block_irq_deadline_misses, 2);
+        }
+    }
+
+    #[test]
+    fn external_device_time_matches_small_steps_with_pending_irqs_and_audio() {
+        for dma in [false, true] {
+            let mut external = idle_machine(dma);
+            let mut reference = idle_machine(dma);
+            // At 1000 MHz each ordinary step is exactly four nanoseconds.
+            reference.set_cpu_mhz(1000).unwrap();
+            external.cpu.flags &= !doslet_x86::flags::INTERRUPT;
+            let cpu = external.cpu.snapshot();
+            assert_eq!(external.debug_advance_device_time(0).unwrap(), 0);
+            for _ in 0..3 {
+                assert_eq!(
+                    external.debug_advance_device_time(u64::MAX).unwrap(),
+                    1_000_000
+                );
+                for _ in 0..250_000 {
+                    reference.advance_hardware().unwrap();
+                }
+                assert_eq!(external.time(), reference.time());
+                assert_eq!(external.timing.pit_fraction, reference.timing.pit_fraction);
+                assert_eq!(external.timing.pcm_fraction, reference.timing.pcm_fraction);
+                assert_eq!(
+                    external.bus.pic.read_command(),
+                    reference.bus.pic.read_command()
+                );
+                assert_eq!(
+                    external.bus.dsp.diagnostics(),
+                    reference.bus.dsp.diagnostics()
+                );
+                assert_eq!(
+                    external.bus.vga.read_status(0x3DA),
+                    reference.bus.vga.read_status(0x3DA)
+                );
+                let mut a = [[0; 2]; 128];
+                let mut b = [[0; 2]; 128];
+                assert_eq!(external.drain_pcm(&mut a), reference.drain_pcm(&mut b));
+                assert_eq!(a, b);
+                assert!(external.cpu.matches(&cpu));
+            }
+        }
+    }
+
+    #[test]
+    fn external_cpu_clock_freezes_time_but_delivers_charged_irq_on_next_step() {
+        let mut m = idle_machine(false);
+        m.debug_external_cpu_clock(true);
+        m.step().unwrap(); // HLT
+        assert_eq!(m.time().as_nanos(), 0);
+        assert_eq!(m.timing.cpu.fraction, 0);
+        assert!(m.cpu.is_halted());
+        assert_eq!(m.debug_advance_device_time(40_000).unwrap(), 40_000);
+        assert!(m.interrupt_pending());
+        m.step().unwrap();
+        assert!(!m.cpu.is_halted());
+        assert_eq!(m.cpu.registers.ip, 0x200);
+        assert_eq!(m.time().as_nanos(), 40_000);
+        m.debug_external_cpu_clock(false);
+        m.step().unwrap();
+        assert_eq!(m.time().as_nanos(), 40_121);
+    }
+
+    #[test]
+    fn cooperative_idle_matches_single_hardware_steps_and_stops_for_irq() {
+        for dma in [false, true] {
+            let mut fast = idle_machine(dma);
+            let mut reference = idle_machine(dma);
+            let cpu = fast.cpu.snapshot();
+            let mut total = 0;
+            loop {
+                let used = fast.advance_cooperative_idle(10000, 500_000).unwrap();
+                if used == 0 {
+                    break;
+                }
+                for _ in 0..used {
+                    reference.advance_hardware().unwrap();
+                }
+                total += used;
+                assert_eq!(fast.time(), reference.time());
+                assert_eq!(
+                    fast.bus.pic.read_command(),
+                    reference.bus.pic.read_command()
+                );
+                assert_eq!(fast.bus.dsp.irq_status(), reference.bus.dsp.irq_status());
+                let mut a = [[0; 2]; 32];
+                let mut b = [[0; 2]; 32];
+                assert_eq!(fast.drain_pcm(&mut a), reference.drain_pcm(&mut b));
+                assert_eq!(a, b);
+                assert!(total < 10000);
+            }
+            assert!(total > 0);
+            assert!(fast.interrupt_pending());
+            assert!(fast.cpu.matches(&cpu));
+            assert_eq!(fast.advance_cooperative_idle(10000, 500_000).unwrap(), 0);
+        }
+    }
     #[test]
     fn step_clock_matches_reference_and_deadlines_at_every_fraction() {
         for mhz in [1, 8, 25, 33, 66, 100, 132, 133, 1000] {
@@ -504,3 +858,7 @@ pub(crate) mod tests {
         assert_eq!(machine.bus.dsp.irq_status(), 0);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "timing_saved.rs"]
+mod saved_state;

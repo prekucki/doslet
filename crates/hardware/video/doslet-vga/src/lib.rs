@@ -517,3 +517,7 @@ mod tests {
         assert_eq!(frame.palette[0][0], 255);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["apps/common", "vendor/iced_runtime", "vendor/iced_winit"]
+exclude = ["apps/common", "vendor/iced_runtime", "vendor/iced_winit", "vendor/nuked-opl3"]
 members = [
     "crates/foundation/*",
     "crates/cpu/*",
@@ -23,6 +23,8 @@ rust-version = "1.99"
 license = "GPL-2.0-or-later"
 
 [workspace.dependencies]
+doslet-state = { path = "crates/foundation/doslet-state" }
+prost = { version = "0.14", default-features = false, features = ["derive"] }
 doslet-config = { path = "crates/foundation/doslet-config" }
 doslet-input = { path = "crates/foundation/doslet-input" }
 doslet-storage = { path = "crates/system/doslet-storage" }
@@ -69,5 +71,6 @@ inherits = "release"
 opt-level = 3
 
 [patch.crates-io]
+nuked-opl3 = { path = "vendor/nuked-opl3" }
 iced_runtime = { path = "vendor/iced_runtime" }
 iced_winit = { path = "vendor/iced_winit" }

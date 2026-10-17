@@ -294,3 +294,7 @@ mod tests {
         assert_eq!(pit.advance(0, 18), Ok(3));
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

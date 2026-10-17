@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [dependencies]
+prost = { workspace = true, optional = true }
+doslet-state = { workspace = true, optional = true }
 doslet-storage.workspace = true
 [lints]
 workspace = true
+
+[features]
+save-state = ["dep:doslet-state", "dep:prost"]

@@ -46,6 +46,14 @@ impl PcMachine {
     /// Account for whole passes of a proven loop that end strictly before the
     /// next hardware event and within `budget`. Returns the skipped steps.
     pub fn skip_idle_passes(&mut self, pass: u32, budget: u32) -> Result<u32, MachineError> {
+        self.skip_idle_passes_counted(pass, budget, [0; 4])
+    }
+    pub fn skip_idle_passes_counted(
+        &mut self,
+        pass: u32,
+        budget: u32,
+        counts: [u64; 4],
+    ) -> Result<u32, MachineError> {
         if pass == 0 || self.cpu.is_halted() || self.interrupt_pending() {
             return Ok(0);
         }
@@ -53,6 +61,10 @@ impl PcMachine {
         let steps = budget.min(event.saturating_sub(1)) / pass * pass;
         if steps == 0 {
             return Ok(0);
+        }
+        if self.cpu.execution_labels_enabled() {
+            self.cpu
+                .account_skipped_execution(counts.map(|n| n * u64::from(steps / pass)));
         }
         self.advance_hardware_steps(steps)?;
         #[cfg(feature = "profiling")]

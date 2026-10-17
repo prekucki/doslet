@@ -43,17 +43,17 @@ Status: actual HDI logo, introductory letter/map and main-menu frames have been
 captured through guest execution. Music files open through a sparse RAM overlay
 and the real MPU stream contains note events. The desktop CLI can start the game;
 a 300M-step opt-in test through UI batches observes nonblank pixels, MIDI notes
-and successful game Reset. A user-supplied live screenshot also confirms the
+and successful game Reset. A recorded live screenshot also confirms the
 introductory letter/map in iced and nonzero audio consumed by the host callback.
 The browser Worker/AudioWorklet path also runs the actual ZIP to 300M steps,
-640×480 graphics and 269 note-ons. The user confirms Rust-synth sound and graphics
-in Firefox and Chrome. The user also confirms native Rust-synth playback and
-native TiMidity playback, substantially smoother with 100-ms client buffering.
+640×480 graphics and 269 note-ons. Listening checks reported Rust-synth sound and graphics in Firefox and Chrome,
+and native Rust-synth playback. Native MIDI playback was also reported; this
+does not establish instrument fidelity.
 Original instrument fidelity and interactive gameplay remain unverified. See
 [the music inventory and synth-selection analysis](prince-music.md).
 The [original DOS toolchain inventory](prince-toolchain.md) records Watcom,
 DOS/4GW and sound/graphics provenance separately from unverified authoring tools.
-Inspection date: 2026-10-14, Europe/Warsaw.
+Inspection date: 2026-10-14.
 
 ## Local input
 
@@ -113,16 +113,16 @@ sample reports Running at 300240000 execution steps / 36392727272 guest ns,
 nonblank 640×480 graphics, 269 note-ons, 1744384 rendered audio frames,
 peak 0.391588 and zero worklet underruns. The sink was muted in the isolated
 profile; this establishes executed synthesis rather than independent listening.
-Separately, the user reported working graphics/audio in Firefox and working
-graphics/Rust-synth audio in Chrome. These reports do not establish the same
+Separate interactive checks reported working graphics/audio in Firefox and
+working graphics/Rust-synth audio in Chrome. These reports do not establish the same
 frame/step boundary as the scripted run.
 
 The script also verifies continued Worker/audio progress during an 800-ms window
 stall, pause/resume/reset, and Web MIDI framing/output replacement using a mock
-device. The user's Chrome TiMidity port lacked `clear()`; an adapter correction
+device. Some Web MIDI output ports lack `clear()`; an adapter correction
 now uses a bounded cancelable timer queue for those ports. The mock exercises
 that case and recovery after a device fault without resetting guest RAM.
-Native TiMidity playback is now reported by the user; browser TiMidity listening
+Native MIDI playback has a listening report; browser TiMidity listening
 after the correction remains unrecorded. Host MIDI supplies no built-in OS
 synthesizer.
 
@@ -140,7 +140,7 @@ The opt-in `local_prince_reaches_intro_through_ui_batches` test completed 300M
 steps through UI scheduling/audio processing, observed nonblank 640×480 scanout
 and MIDI notes, and verified Reset. It uses the local installation and opens no
 window or host audio device. A subsequent live launch displayed the introductory
-letter/map in iced. The user's screenshot records Running at 433520000 steps,
+letter/map in iced. The captured screenshot records Running at 433520000 steps,
 44100-Hz MIDI output, 375 note-ons, peak 0.39 and 2314742 consumed host audio
 frames. This verifies display and nonzero callback output, not speaker audibility
 or original instrument fidelity. The historical headless captures below remain
@@ -210,7 +210,7 @@ control foundations are now implemented. DMA transfers, PCM/audio, timed IRQ
 delivery, further game services and actual MIDI synthesis/playback remain open.
 The UI still runs the original synthetic demo. Fresh validation passed 102 tests,
 Clippy with -D warnings, formatting and frontend dependencies for WASM; these
-checks are distinct from real game compatibility. No GUI/reference DOSBox run
+checks are distinct from real game compatibility. No GUI reference run
 or audible game music was recorded.
 
 ### Earlier 386/A20 boundary
@@ -283,7 +283,7 @@ it provides neither synthesis nor audible game-music evidence.
 
 ## Acceptance stages
 
-1. Record a reference run in DOSBox Staging: configuration, executable identity,
+1. Record a fixed-speed reference run in Doslet: configuration, executable identity,
    selected video/audio paths, title/menu screenshots and startup diagnostics.
 2. Run the actual MZ stub/extender startup in Doslet; report unsupported
    instructions, services and device accesses with guest addresses.

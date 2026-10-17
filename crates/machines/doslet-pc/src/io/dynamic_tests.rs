@@ -1682,6 +1682,57 @@ fn warm(m: &mut PcMachine) {
 }
 
 #[test]
+fn native_block_yield_returns_to_scheduler_without_changing_executed_state() {
+    let mut native = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut native, &mut reference] {
+        code(m, 0x1000, &[0x40, 0xeb, 0xfd]);
+        m.cpu.step(&mut m.bus).unwrap();
+        m.cpu.registers.ip = 0x1000;
+    }
+    warm(&mut native);
+    for _ in 0..10 {
+        let count = native
+            .cpu
+            .dynamic_batch_until_block(&mut native.bus, 256, |_| 256, 0x1000);
+        assert_eq!(count, 2);
+        assert_eq!(native.cpu.registers.ip, 0x1000);
+        for _ in 0..count {
+            reference.cpu.step(&mut reference.bus).unwrap();
+        }
+        state(&native, &reference);
+    }
+    // The boundary intersects this compiled loop. Ordinary execution can still
+    // use native code once the scheduler no longer requests the boundary.
+    let before = native.cpu.dynamic_stats().executed_steps;
+    assert_eq!(native.cpu.dynamic_batch(&mut native.bus, 256, |_| 256), 256);
+    assert!(native.cpu.dynamic_stats().executed_steps > before);
+}
+
+#[test]
+fn native_instruction_yield_does_not_cross_an_interior_compiled_boundary() {
+    let mut native = machine(true);
+    let mut reference = machine(false);
+    for m in [&mut native, &mut reference] {
+        code(m, 0x1000, &[0x40, 0x43, 0x41, 0xeb, 0xfb]);
+        m.cpu.step(&mut m.bus).unwrap();
+        m.cpu.registers.ip = 0x1000;
+    }
+    warm(&mut native);
+    for round in 0..10 {
+        let count = native
+            .cpu
+            .dynamic_batch_until_block(&mut native.bus, 256, |_| 256, 0x1002);
+        assert_eq!(count, if round == 0 { 2 } else { 4 });
+        assert_eq!(native.cpu.registers.ip, 0x1002);
+        for _ in 0..count {
+            reference.cpu.step(&mut reference.bus).unwrap();
+        }
+        state(&native, &reference);
+    }
+}
+
+#[test]
 fn native_code_survives_execution_cache_collisions_and_rebinding_at_other_addresses() {
     let mut m = machine(true);
     let bytes = [0x40, 0x41, 0x66, 0x90];
@@ -1943,4 +1994,58 @@ fn delayed_compilation_keeps_executing_and_publication_rechecks_guest_code() {
     }
     state(&native, &reference);
     assert_eq!(native.cpu.dynamic_stats().executed_steps, 0);
+}
+
+#[test]
+fn weighted_tiers_preserve_mixed_native_blocks_and_guest_state() {
+    let bytes = [0x40, 0x43, 0x49, 0x75, 0xfb, 0xfa];
+    let mut native = call_trace_machine(true, &bytes);
+    let mut reference = call_trace_machine(true, &bytes);
+    native.cpu.set_dynamic_core(true);
+    reference.cpu.set_dynamic_core(false);
+    native.set_cpu_mhz(133).unwrap();
+    reference.set_cpu_mhz(133).unwrap();
+    native.cpu.registers.set32(Gpr32::Ecx, 10000);
+    reference.cpu.registers.set32(Gpr32::Ecx, 10000);
+    let base = native
+        .cpu
+        .registers
+        .segment_cache(SegmentRegister::Cs)
+        .base
+        .wrapping_add(native.cpu.registers.ip);
+    let labels = [(0, 0), (1, 1), (2, 2), (3, 3)]
+        .map(|(offset, tier)| {
+            let mut bytes = [0; 15];
+            bytes.copy_from_slice(native.bus.code_bytes(base + offset, 15).unwrap());
+            doslet_x86::ExecutionLabel {
+                address: base + offset,
+                code32: true,
+                bytes,
+                tier,
+            }
+        })
+        .to_vec();
+    native
+        .set_execution_tiers(Some(labels), [Some(133); 3])
+        .unwrap();
+    for _ in 0..100 {
+        let (_, n) = native.step_with_idle_budget(256).unwrap();
+        let mut completed = 0;
+        while completed < n {
+            completed += reference.step_with_idle_budget(n - completed).unwrap().1;
+        }
+        native.cpu.prepare_dynamic(8);
+        assert_eq!(ram_scan_registers(&native), ram_scan_registers(&reference));
+        assert_eq!(native.time(), reference.time());
+    }
+    let counts = native.cpu.execution_counts();
+    assert!(counts.iter().all(|n| *n > 100));
+    assert!(native.cpu.dynamic_stats().executed_steps > 1000);
+    // Changed code keeps its new semantics and falls back to GREY classification.
+    let before = native.cpu.execution_counts();
+    native.bus.write_u8(base, 0x48).unwrap();
+    native.cpu.registers.ip = base;
+    native.step_with_idle_budget(1).unwrap();
+    assert_eq!(native.cpu.execution_counts()[0], before[0]);
+    assert_eq!(native.cpu.execution_counts()[2], before[2] + 1);
 }

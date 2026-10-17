@@ -1,6 +1,13 @@
 use super::*;
 
 impl Session {
+    /// Relative reads take precedence for one second of guest time, even if
+    /// absolute position queries are interleaved. Host motion is not evidence.
+    pub fn pointer_relative_in_use(&self) -> bool {
+        self.mouse_last_relative_read
+            .is_some_and(|last| self.emulated_nanos().saturating_sub(last) < 1_000_000_000)
+    }
+
     /// A visible driver cursor or recent guest input consumption justifies
     /// hiding the host cursor. Installation probes and host motion do not.
     pub fn pointer_in_use(&self) -> bool {
@@ -24,6 +31,9 @@ impl Session {
         self.mouse.revision = self.mouse.revision.wrapping_add(1);
     }
     pub fn pointer_move(&mut self, x: u16, y: u16) {
+        if self.pointer_position() != (x, y) {
+            self.menu_idle_input();
+        }
         self.mouse_fraction = [0.0; 2];
         self.mouse.move_to(x, y);
     }
@@ -32,6 +42,9 @@ impl Session {
     pub fn pointer_relative(&mut self, dx: f64, dy: f64) {
         if !dx.is_finite() || !dy.is_finite() {
             return;
+        }
+        if dx != 0.0 || dy != 0.0 {
+            self.menu_idle_input();
         }
         let position = [self.mouse.x, self.mouse.y];
         let mut motion = [0; 2];
@@ -50,9 +63,16 @@ impl Session {
         self.mouse.move_relative(motion[0], motion[1]);
     }
     pub fn pointer_button(&mut self, button: u8, pressed: bool) {
+        let before = self.mouse.buttons;
         self.mouse.button(button, pressed);
+        if before != self.mouse.buttons {
+            self.menu_idle_input();
+        }
     }
     pub fn release_pointer_buttons(&mut self) {
+        if self.mouse.buttons != 0 {
+            self.menu_idle_input();
+        }
         self.mouse.release_buttons();
     }
     pub fn pointer_dimensions(&self) -> (u16, u16) {
@@ -67,6 +87,9 @@ impl Session {
     }
     pub fn pointer_position(&self) -> (u16, u16) {
         (self.mouse.x, self.mouse.y)
+    }
+    pub fn pointer_buttons(&self) -> u16 {
+        self.mouse.buttons
     }
     pub fn pointer_ranges(&self) -> ((u16, u16), (u16, u16)) {
         (self.mouse.x_range, self.mouse.y_range)
@@ -106,6 +129,7 @@ impl Session {
         match ax {
             0 | 0x21 => {
                 self.mouse_last_read = None;
+                self.mouse_last_relative_read = None;
                 self.mouse_fraction = [0.0; 2];
                 self.mouse = doslet_dos::mouse::Mouse::default();
                 self.mouse.y_range.1 = self.pointer_dimensions().1 - 1;
@@ -170,6 +194,7 @@ impl Session {
             }
             0x0B => {
                 self.mouse_last_read = Some(self.emulated_nanos());
+                self.mouse_last_relative_read = Some(self.emulated_nanos());
                 self.machine
                     .cpu
                     .registers
@@ -288,6 +313,34 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_queries_dominate_absolute_queries_for_one_guest_second() {
+        let mut session = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
+        assert!(!session.pointer_relative_in_use());
+        session.pointer_relative(3.0, 4.0);
+        assert!(!session.pointer_relative_in_use());
+        session.mouse_service(0x0b).unwrap();
+        session.mouse_service(3).unwrap();
+        assert!(session.pointer_relative_in_use());
+        while session.emulated_nanos() < 999_999_999 {
+            session
+                .debug_advance_device_time(999_999_999 - session.emulated_nanos())
+                .unwrap();
+        }
+        assert!(session.pointer_relative_in_use());
+        session.debug_advance_device_time(1).unwrap();
+        assert!(!session.pointer_relative_in_use());
+        session.mouse_service(0x0b).unwrap();
+        #[cfg(feature = "save-state")]
+        assert!(
+            Session::load_state(&session.save_state().unwrap())
+                .unwrap()
+                .pointer_relative_in_use()
+        );
+        session.mouse_service(0x21).unwrap();
+        assert!(!session.pointer_relative_in_use());
+    }
 
     #[test]
     fn pointer_usage_requires_guest_reads_or_visible_driver_cursor_and_expires() {

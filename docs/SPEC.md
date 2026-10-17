@@ -216,6 +216,50 @@ three known sites, a positive ordinary-RAM counter and matching arithmetic flags
 Whole iterations stop before PIT/DSP deadlines, with a 1-ms bound; IRQ eligibility,
 shadow/debug state, paging and changed code force ordinary execution. The counter
 is changed by guest code, never by the optimizer. This feature is off by default.
+The separate native `--experimental-heroes-menu-idle` option deliberately
+reduces empty menu and completed event-list polling. The alias
+`--experimental-heroes-adaptive-idle` selects the same opt-in policy. Validated
+loop/context checks adapt CPU inactivity from 125 us to at most 1 ms, sliced at
+device events and cancelled for IRQ/input changes. Input reserves 100 ms at the
+configured MHz; display revision changes reset confidence and reserve 2 ms.
+Event-list waits exclude held mouse buttons and edge scrolling positions.
+It preserves device clocking but does not promise identical instruction counts
+or RAM state. The Details toggle exposes accumulated idle time. Host PCM refill
+watermarks reserve upcoming output with at most 80 ms of guest lead. See the
+[Heroes investigation](compatibility/heroes-waits.md#experimental-menu-idle-and-live-cpu-clock).
+Native `--observe-idle` enables bounded, address-independent diagnostics for
+recurring execution with input queries. Details and MCP report candidate status
+and rejection/uncertainty reasons every approximately 250 ms of guest time.
+The observer does not establish inactivity, change MHz or authorize skipped
+instructions. Bounded 512-step reference traces every two million scheduling
+units record supported RAM/port predicates, actual branch outcomes and watched
+value changes. They temporarily replace batching and suspend the Heroes
+heuristic; source attribution remains unproven. Hardware advances through the
+ordinary execution path. A provisional budget subtracts observed recurrence
+cost and a margin from known PIT/keyboard/DSP-block service horizons. It rejects
+stale or changed-MHz cost samples and is never used to authorize sleep. The
+condition's wake source and useful-work cost remain unproven; host audio queue
+slack is not included. RAM and device effects remain explicitly unverified.
+Native `--adaptive-idle` additionally enables experimental learned waiting. It
+recognizes changing RAM countdown guards that return immediately while nonzero,
+without game-specific addresses. Waiting requires repeated observations with
+both decreases and increases, input queries, unchanged validated code and a
+positive service budget. Each wait is at most 250 us and stops for eligible IRQs.
+Validated batch arrivals maintain learning at two independent candidate points
+between sparse trace bursts. Static neighboring guards cannot overwrite active
+countdown evidence. A gap
+longer than one guest second or a clock change requires fresh counter changes.
+Host input restores execution. This heuristic does not prove the caller has no
+useful work and is disabled by default. It is separate from strict idle proofs
+and mutually exclusive with the Heroes recipe.
+
+The opt-in adaptive policy additionally budgets repeated empty relative-motion
+queries (INT 33h/000Bh, zero motion and no pressed buttons). It measures work
+between queries excluding its own waits, and waits only with positive spare
+time before a known hardware service deadline. Input, increased work and changed
+MHz reduce or reset waiting; each wait remains bounded to 250 us. This is an
+experimental throughput policy, not a proof that the guest has no useful work.
+
 Architectural exception delivery and
 complete historical CPU-model behavior are not implemented. Unsupported opcodes,
 operands, ports and services stop the session with a diagnostic; a faulted
@@ -227,6 +271,12 @@ time and rational peripheral clock conversion exist independently. The PC now
 advances a functional timeline by four nominal CPU clocks per execution,
 IRQ-entry or idle step. `machine.cpu_mhz` selects 1–1000 MHz, defaulting to 33;
 it changes CPU work per guest second without changing peripheral rates.
+The native Details panel also changes CPU MHz live, retaining RAM, registers,
+accumulated time, PIT/DSP phases and audio output. The runtime accepts 1..1000;
+the UI offers presets. The CPU sub-nanosecond remainder is converted to the new
+denominator by rounding down; each change loses less than 1 ns. Reset retains
+the selected rate without rewriting the profile file. GDB attachment and
+pending machine preparation block the desktop control.
 Fractional time is retained for PIT 1,193,182-Hz input,
 selected VGA pixel clocks and DSP sample rates. This is deterministic across
 host batches; it is not cycle-accurate CPU/bus arbitration or complete peripheral
@@ -635,13 +685,18 @@ rather than embedding dependencies on CPU or host audio.
 
 The desktop and web application share iced view construction. Both window states
 contain snapshots and presentation data. A dedicated native thread owns the
-Session, JIT and sample synthesis; a bounded command queue transfers input and
+Session and execution state; a bounded command queue transfers input and
 control. A single latest-snapshot slot and coalesced notifications bound frame
 traffic to at most one publication per 16 ms. UI acknowledgements request further
 frames; emulation continues independently when presentation stalls.
 The native worker runs at most 400000 execution steps per turn in 10000-step
-chunks, checking an 8-ms host-work budget between chunks. JIT preparation runs
-once per turn and can exceed that soft time budget. The worker waits only when
+chunks, checking an 8-ms host-work budget between chunks. JIT jobs are polled and
+submitted once per turn to the separate compiler thread. With a host audio device,
+MIDI sample synthesis and PCM resampling/mixing run on `doslet-audio`. Eight recycled
+packets carry timed PCM and MIDI without sharing the Session. Packet exhaustion
+or 80 ms of pending synthesis yields before the next CPU chunk. Reset/output
+changes cancel old packets and queued frames only after replacement setup succeeds;
+pause preserves them. The no-device renderer remains synchronous. The worker waits only when
 caught up or blocked. The browser Worker owns its Session and runs at most 400000
 steps and about 8 ms of host work per turn, yielding between turns. A host
 monotonic clock paces native and silent browser execution; active worklet playback
@@ -703,8 +758,7 @@ setup. WASM compilation happens before worklet creation, outside rendering.
 Start game resumes Web Audio in response to a user gesture; Enable audio retries
 a suspended context, with Mute/Unmute available once running. A suspended context
 does not block guest execution. Epochs invalidate stale audio on game/output
-changes. Pause preserves queued synth state; Reset clears it. The user confirmed
-Rust synth sound and graphics in Firefox and Chrome.
+changes. Pause preserves queued synth state; Reset clears it. Interactive checks reported Rust synth sound and graphics in Firefox and Chrome.
 
 Native macOS additionally supports `apple` output through the system
 DLSMusicDevice General MIDI bank. The host-only adapter receives routed GM
@@ -791,11 +845,11 @@ its actual DOS4GW overlay, prints the extender banner and executes flat 32-bit
 initialization from the game image. Actual HDI logo, introductory letter/map and
 main-menu frames have been captured. Sparse RAM writes permit the game's MIDI
 files to open in read/write mode; the real MPU stream now contains note events.
-The native frontend now loads game sessions through `--game`; a live user
+The native frontend now loads game sessions through `--game`; a recorded live
 screenshot confirms the actual introduction and nonzero MIDI output consumed by
 the host callback. Independent native listening, instrument fidelity and interactive
 gameplay remain unverified. Browser ZIP import is implemented; real browser
-execution was observed by the user in Firefox, and browser MIDI is confirmed
+execution was observed in Firefox, and browser MIDI is confirmed
 audible. Chrome rendering after the Canvas2D change still needs confirmation.
 
 ## Sources
@@ -805,3 +859,49 @@ audible. Chrome rendering after the Canvas2D change still needs confirmation.
 - [iced feature definitions](https://docs.rs/crate/iced/0.14.0/features).
 - [allocation-counter](https://docs.rs/allocation-counter/0.8.1/allocation_counter/):
   host-only test instrumentation; not linked into production emulation.
+
+## Experimental synchronization analysis
+
+The separate `--analyze-synchronization` and `--adaptive-cpu` switches select
+bounded diagnostic observation and opt-in CPU-throughput control respectively.
+Diagnostic mode never enables control. Missing complete episodes, unknown source
+ownership, unsupported predicate context and stale evidence prohibit a lower budget.
+VGA boundary measurement charges all time outside confirmed waits as a work upper
+bound while retaining ordinary JIT execution and the existing strict VGA batching
+proof. Unknown work code cannot be classified as waiting. RAM instruction-trace
+episodes additionally require contiguous observation and complete static coverage.
+The controller preserves manual configured MHz as its ceiling, reduces gradually,
+and returns to that ceiling on invalidation or missed learned episode deadlines.
+The current implementation recognizes direct flat-32-bit wait loops. Returning
+guards have separate direct-caller and bounded IRQ-writer diagnostics. A bounded
+caller probe records a whole observed iteration, bus effects and endpoint CPU,
+input, written RAM and CMOS state. This does not establish complete timed
+work/wait episodes or a caller budget. The IRQ observation has a fixed step
+limit and cannot turn an unsupported caller path into waiting. A separate bounded
+RAM journal can measure actual unchanged caller intervals at exact instruction
+boundaries after fresh IRQ-source evidence. Complete CPU/input/RAM/CMOS state
+comparison is required; IRQs, services, mapping changes, overflow and unsupported
+device accesses reject the interval. Restored CMOS shutdown-status scratch writes
+are admitted only for this measured waiting, never for strict skipping. These
+intervals augment continuous VGA and returning-caller work/wait accounting
+without extrapolation. Returning-caller episodes require observed countdown
+expiration, update work and nonzero waiting at the same selected call boundary.
+Runtime-service
+device accesses and runtime-service/DMA writes
+without a transaction observation remain explicit attribution gaps. Host audio
+underruns and guest audio-service deadlines are separate diagnostics. The modeled
+guest deadline is acknowledgement of the previous SB16 DMA block IRQ before
+the next block of that continuous transfer completes. The diagnostic reports
+both observed windows and misses, with unknown/null before any window completes.
+New misses restore the adaptive controller's ceiling. Buffer-refill, OPL/MIDI
+sequencing and audible continuity are not inferred from that counter.
+For event dispatch without a returning IRQ guard, the analyzer can observe an
+executed unconditional backedge once a fresh, stable VGA cadence exists. Eight
+consecutive complete unchanged intervals qualify the observation boundary, and
+each subsequent interval still requires full state/effect comparison. This only
+refines the work upper bound of complete VGA episodes; it supplies neither a new
+deadline nor permission to skip code. Changing animation/input handlers remain
+work, and incomplete or repeatedly rejected probes are abandoned with bounded
+retry delay.
+The [development contract](development.md#bounded-synchronization-analyzer)
+describes capacities, reserves, trace windows and current acceptance limitations.

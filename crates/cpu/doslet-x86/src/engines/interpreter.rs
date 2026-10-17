@@ -4,6 +4,7 @@ use crate::{Gpr16, Gpr32, Registers, decode, flags};
 use core::fmt;
 use doslet_bus::{BusError, CpuBus, MemoryBus};
 mod cache;
+pub use cache::analysis;
 #[cfg(all(
     feature = "dynamic-core",
     not(target_arch = "wasm32"),
@@ -227,6 +228,8 @@ pub struct Cpu {
     halted: bool,
     interrupt_shadow: u8,
     decode_cache: cache::Cache,
+    execution_counts: [u64; 4],
+    execution_skipped: [u64; 4],
     #[cfg(all(
         feature = "dynamic-core",
         not(target_arch = "wasm32"),
@@ -364,6 +367,8 @@ impl Default for Cpu {
             halted: false,
             interrupt_shadow: 0,
             decode_cache: cache::Cache::default(),
+            execution_counts: [0; 4],
+            execution_skipped: [0; 4],
             #[cfg(all(
                 feature = "dynamic-core",
                 not(target_arch = "wasm32"),
@@ -375,6 +380,68 @@ impl Default for Cpu {
 }
 
 impl Cpu {
+    pub fn set_execution_labels(
+        &mut self,
+        labels: Option<alloc::vec::Vec<crate::ExecutionLabel>>,
+    ) -> Result<(), &'static str> {
+        let profile = labels
+            .map(crate::execution_tiers::ExecutionProfile::new)
+            .transpose()?;
+        self.decode_cache.clear();
+        self.decode_cache.profile = profile;
+        self.execution_counts = [0; 4];
+        self.execution_skipped = [0; 4];
+        #[cfg(all(
+            feature = "dynamic-core",
+            not(target_arch = "wasm32"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            let enabled = self.dynamic_core_enabled();
+            self.dynamic = dynamic::Cache::default();
+            self.set_dynamic_core(enabled);
+        }
+        Ok(())
+    }
+    /// Recolour at a batch boundary without losing cumulative counts.
+    pub fn replace_execution_labels(
+        &mut self,
+        labels: alloc::vec::Vec<crate::ExecutionLabel>,
+    ) -> Result<(), &'static str> {
+        let (counts, skipped) = (self.execution_counts, self.execution_skipped);
+        self.set_execution_labels(Some(labels))?;
+        self.execution_counts = counts;
+        self.execution_skipped = skipped;
+        Ok(())
+    }
+    pub fn executed_tier_counts(&self) -> [u64; 4] {
+        core::array::from_fn(|i| self.execution_counts[i].saturating_sub(self.execution_skipped[i]))
+    }
+    pub fn account_skipped_execution(&mut self, counts: [u64; 4]) {
+        self.account_execution(counts);
+        for (total, count) in self.execution_skipped.iter_mut().zip(counts) {
+            *total += count;
+        }
+    }
+    pub fn execution_labels_enabled(&self) -> bool {
+        self.decode_cache.profile.is_some()
+    }
+    pub fn execution_counts(&self) -> [u64; 4] {
+        self.execution_counts
+    }
+    pub fn account_execution(&mut self, counts: [u64; 4]) {
+        for (total, n) in self.execution_counts.iter_mut().zip(counts) {
+            *total += n;
+        }
+    }
+    pub fn execution_tier_at<B: MemoryBus>(&self, bus: &B, address: u32) -> u8 {
+        self.decode_cache.profile.as_ref().map_or(2, |p| {
+            bus.code_bytes(address, 15).map_or(2, |bytes| {
+                p.classify(address, self.registers.code32(), bytes)
+            })
+        })
+    }
+
     /// Keep the original byte-fetching interpreter available as a reference.
     pub fn set_decode_cache(&mut self, enabled: bool) {
         self.decode_cache.clear();
@@ -406,6 +473,24 @@ impl Cpu {
     /// One bounded execution step. REP STOSB performs at most one write per step.
     /// Errors stop execution; precise guest exception delivery is not implemented yet.
     pub fn step<B: CpuBus>(&mut self, bus: &mut B) -> Result<StepOutcome, CpuError> {
+        if !self.execution_labels_enabled() {
+            return self.step_uncounted(bus);
+        }
+        let tier = self.execution_tier_at(
+            bus,
+            self.registers
+                .segment_cache(SegmentRegister::Cs)
+                .base
+                .wrapping_add(self.registers.ip),
+        );
+        let result = self.step_uncounted(bus);
+        if result.is_ok() {
+            self.execution_counts[usize::from(tier)] += 1;
+        }
+        result
+    }
+
+    fn step_uncounted<B: CpuBus>(&mut self, bus: &mut B) -> Result<StepOutcome, CpuError> {
         if self.halted {
             return Ok(StepOutcome::Halted);
         }
@@ -1486,4 +1571,41 @@ fn write_word<B: MemoryBus>(bus: &mut B, address: u32, value: u16) -> Result<(),
     let [low, high] = value.to_le_bytes();
     bus.write_u8(address, low)?;
     bus.write_u8(address.wrapping_add(1), high)
+}
+
+#[cfg(feature = "save-state")]
+#[path = "interpreter_saved.rs"]
+mod saved_state;
+
+#[cfg(feature = "save-state")]
+impl doslet_state::State for Cpu {
+    type Wire = <CpuSnapshot as doslet_state::State>::Wire;
+
+    fn save(&self) -> Self::Wire {
+        self.snapshot().save()
+    }
+
+    fn load(wire: Self::Wire) -> Result<Self, doslet_state::InvalidState> {
+        let saved = CpuSnapshot::load(wire)?;
+        if saved.cpl > 3 || saved.interrupt_shadow > 2 {
+            return Err(doslet_state::InvalidState("CPU privilege/interrupt shadow"));
+        }
+        // Fresh lineage and empty decode/JIT caches: host addresses never enter a state.
+        let mut cpu = Self::default();
+        for (code, value) in saved.general.into_iter().enumerate() {
+            cpu.registers.set32(Gpr32::decode(code as u8), value);
+        }
+        let r = &mut cpu.registers;
+        [r.es, r.cs, r.ss, r.ds, r.fs, r.gs] = saved.selectors;
+        r.ip = saved.ip;
+        r.caches = saved.caches;
+        r.protected = saved.protected;
+        r.cpl = saved.cpl;
+        cpu.flags = saved.flags;
+        cpu.control = saved.control;
+        cpu.fpu = saved.fpu;
+        cpu.halted = saved.halted;
+        cpu.interrupt_shadow = saved.interrupt_shadow;
+        Ok(cpu)
+    }
 }
