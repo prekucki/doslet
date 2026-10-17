@@ -241,6 +241,16 @@ impl PcMachine {
     pub fn step(&mut self) -> Result<StepOutcome, MachineError> {
         self.step_with_idle_budget(1).map(|(outcome, _)| outcome)
     }
+    /// Account for one instruction replaced by a runtime service. The caller
+    /// must preserve its CPU effects and the interrupt boundary separately.
+    pub fn advance_service_step(&mut self) -> Result<(), MachineError> {
+        self.advance_hardware_steps(1)?;
+        #[cfg(feature = "profiling")]
+        {
+            self.bus.stats.cpu_steps += 1;
+        }
+        Ok(())
+    }
     /// Normal execution consumes one logical step. Native/RAM slices, HLT and
     /// confirmed waits may consume more, within the budget and device deadlines.
     pub fn step_with_idle_budget(

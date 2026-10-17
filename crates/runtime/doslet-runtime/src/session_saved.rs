@@ -310,6 +310,8 @@ impl Session {
             fault: None,
             persistent: None,
             idle: Default::default(),
+            dpmi: None,
+            service_flags: None,
             menu_idle: Default::default(),
             observer: Default::default(),
             synchronization: Default::default(),

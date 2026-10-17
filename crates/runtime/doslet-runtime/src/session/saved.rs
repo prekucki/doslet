@@ -71,6 +71,11 @@ impl Session {
     }
 
     fn check_snapshot_boundary(&self) -> Result<(), InvalidState> {
+        if self.dpmi.is_some() {
+            return Err(InvalidState(
+                "save states do not yet support the experimental DPMI host",
+            ));
+        }
         if self.fault.is_some() || self.status == SessionStatus::Faulted {
             return Err(InvalidState("cannot save a faulted session"));
         }

@@ -25,6 +25,7 @@ pub struct LaunchSettings {
     pub adaptive_cpu: bool,
     pub adaptive_idle: bool,
     pub no_dynamic_core: bool,
+    pub dpmi: Option<doslet_runtime::session::dpmi::Mode>,
     pub core_profile: Option<PathBuf>,
 }
 impl Default for LaunchSettings {
@@ -46,6 +47,7 @@ impl Default for LaunchSettings {
             adaptive_cpu: false,
             adaptive_idle: false,
             no_dynamic_core: false,
+            dpmi: None,
             core_profile: None,
         }
     }
@@ -108,6 +110,9 @@ pub fn load_game_with_settings(
         session = session.with_cdrom_image(*letter, fs::read(image)?)?;
     }
     session.configure_launch(&settings.command_tail, &settings.working_directory)?;
+    if let Some(mode) = settings.dpmi {
+        session.enable_dpmi(mode)?;
+    }
     session.set_dynamic_core(!settings.no_dynamic_core);
     set_heroes_menu_idle(&mut session, settings.heroes_menu_idle);
     session.set_idle_observation(settings.observe_idle);

@@ -6,6 +6,9 @@ execution-engine details. For everyday use, see [using Doslet](usage.md).
 For native desktop/headless remote debugging, RAM patches and mixed 16/32-bit guest
 inspection, see [debugging with GDB](debugging.md).
 
+For the optional DOS/4GW host, direct BIOS/DOS dispatch experiment, allocation
+telemetry and bounded game comparisons, see [experimental DPMI](compatibility/dpmi-host.md).
+
 For repeatable scene tests without a window or audio device, see
 [portable guest states and Heroes fixtures](save-states.md). The optional
 Protobuf format uses checked-in Rust bindings and does not require `protoc`.

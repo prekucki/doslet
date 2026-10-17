@@ -890,6 +890,14 @@ local, outside the original game directory.
 
 ## Service interception
 
+An optional [DPMI host](compatibility/dpmi-host.md) belongs to the runtime session.
+It supplies its own descriptors, gates, bounded callback frames and guest-page
+allocator. The CPU only exposes integer context save/restore and explicit mode
+setup; it has no dependency on DPMI or BIOS. Eligible unchanged service shims can
+be dispatched in protected mode while preserving the reflected path's memory
+effects and logical time. The PC supplies one bounded timing step for a replaced
+IRET. The original guest extender remains the default execution path.
+
 The CPU implements ordinary INT and IRET stack/vector behavior. The runtime
 installs BIOS/DOS shims in guest memory and checks arrival at those addresses.
 Replacing an IVT entry runs the guest's replacement handler. This avoids teaching
