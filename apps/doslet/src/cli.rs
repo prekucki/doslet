@@ -22,6 +22,20 @@ pub enum DriveMode {
     Rw,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DpmiMode {
+    Reflect,
+    Direct,
+}
+impl From<DpmiMode> for doslet_runtime::session::dpmi::Mode {
+    fn from(mode: DpmiMode) -> Self {
+        match mode {
+            DpmiMode::Reflect => Self::Reflect,
+            DpmiMode::Direct => Self::Direct,
+        }
+    }
+}
+
 /// Run a DOS game in the Doslet desktop window.
 #[derive(Debug, Default, Parser)]
 #[command(
@@ -64,6 +78,9 @@ pub struct Cli {
     /// Use the interpreter instead of the native dynamic core
     #[arg(long)]
     pub no_dynamic_core: bool,
+    /// Opt in to the experimental DPMI host; direct avoids eligible BIOS/DOS mode switches
+    #[arg(long, value_enum)]
+    pub experimental_dpmi: Option<DpmiMode>,
 
     /// Listen for a remote GDB client; attachment stops the guest
     #[arg(long, value_name = "IP:PORT")]
@@ -144,6 +161,8 @@ mod tests {
         let cli = Cli::try_parse_from([
             "doslet",
             "--no-dynamic-core",
+            "--experimental-dpmi",
+            "direct",
             "--core-profile",
             "target/game.core-profile",
         ])
@@ -151,6 +170,10 @@ mod tests {
         .resolve()
         .unwrap();
         assert!(cli.launch.no_dynamic_core);
+        assert_eq!(
+            cli.launch.dpmi,
+            Some(doslet_runtime::session::dpmi::Mode::Direct)
+        );
         assert_eq!(
             cli.launch.core_profile,
             Some(PathBuf::from("target/game.core-profile"))

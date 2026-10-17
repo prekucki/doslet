@@ -401,6 +401,7 @@ impl Cli {
         self.midi_mode.get_or_insert(MidiMode::Gm);
         self.launch.heroes_timer_waits = self.experimental_heroes_timer_waits;
         self.launch.no_dynamic_core = self.no_dynamic_core;
+        self.launch.dpmi = self.experimental_dpmi.map(Into::into);
         self.launch.core_profile = self.core_profile.clone();
         if let Some(mode) = self.drive_mode {
             self.launch.writable = mode != DriveMode::Ro;

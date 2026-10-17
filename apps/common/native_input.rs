@@ -19,6 +19,7 @@ pub struct LaunchSettings {
     pub cdrom: Option<(u8, PathBuf)>,
     pub heroes_timer_waits: bool,
     pub no_dynamic_core: bool,
+    pub dpmi: Option<doslet_runtime::session::dpmi::Mode>,
     pub core_profile: Option<PathBuf>,
 }
 impl Default for LaunchSettings {
@@ -34,6 +35,7 @@ impl Default for LaunchSettings {
             cdrom: None,
             heroes_timer_waits: false,
             no_dynamic_core: false,
+            dpmi: None,
             core_profile: None,
         }
     }
@@ -96,6 +98,9 @@ pub fn load_game_with_settings(
         session = session.with_cdrom_image(*letter, fs::read(image)?)?;
     }
     session.configure_launch(&settings.command_tail, &settings.working_directory)?;
+    if let Some(mode) = settings.dpmi {
+        session.enable_dpmi(mode)?;
+    }
     session.set_dynamic_core(!settings.no_dynamic_core);
     if let Some(path) = &settings.core_profile {
         load_core_profile(&mut session, path);

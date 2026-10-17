@@ -7,6 +7,7 @@ pub struct ExecutionSettings {
     dynamic: bool,
     idle: bool,
     vga: bool,
+    dpmi: Option<super::dpmi::Mode>,
 }
 
 pub const GENERAL: [Gpr32; 8] = [
@@ -26,10 +27,14 @@ impl Session {
             dynamic: self.dynamic_core_enabled(),
             idle: self.idle.enabled,
             vga: self.machine.vga_wait_acceleration_enabled(),
+            dpmi: self.dpmi.as_ref().map(|h| h.mode),
         };
         self.set_dynamic_core(false);
         self.set_idle_loops(false);
         self.set_vga_wait_acceleration(false);
+        if let Some(host) = &mut self.dpmi {
+            host.mode = super::dpmi::Mode::Reflect;
+        }
         settings
     }
 
@@ -37,6 +42,9 @@ impl Session {
         self.set_dynamic_core(settings.dynamic);
         self.set_idle_loops(settings.idle);
         self.set_vga_wait_acceleration(settings.vga);
+        if let (Some(host), Some(mode)) = (&mut self.dpmi, settings.dpmi) {
+            host.mode = mode;
+        }
     }
     /// Bus-linear PC before the PC's A20 mapping. Architectural EIP remains
     /// available through `registers`; a debugger can display both explicitly.

@@ -46,6 +46,10 @@ impl Session {
         Ok(Some(value))
     }
     fn saved_zero(&mut self, zero: bool) -> Result<(), RuntimeError> {
+        if let Some(flags) = &mut self.service_flags {
+            *flags = (*flags & !0x40) | if zero { 0x40 } else { 0 };
+            return Ok(());
+        }
         let r = self.registers();
         let address = linear_address(r.ss, r.get(Gpr16::Sp).wrapping_add(4));
         let flags = self.machine.bus.read_u16(address)?;

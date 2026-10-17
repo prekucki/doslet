@@ -252,6 +252,72 @@ pub struct CpuSnapshot {
     interrupt_shadow: u8,
 }
 
+/// Integer execution context for a machine-provided service boundary. Floating
+/// point state and execution caches remain owned by the CPU across the switch.
+#[derive(Clone)]
+pub struct CpuContext {
+    general: [u32; 8],
+    ip: u32,
+    caches: [crate::SegmentCache; 6],
+    protected: bool,
+    cpl: u8,
+    flags: u32,
+    control: ControlRegisters,
+    halted: bool,
+    interrupt_shadow: u8,
+}
+
+impl Cpu {
+    pub fn context(&self) -> CpuContext {
+        CpuContext {
+            general: core::array::from_fn(|i| self.registers.get32(Gpr32::decode(i as u8))),
+            ip: self.registers.ip,
+            caches: crate::SegmentRegister::ALL.map(|s| self.registers.segment_cache(s)),
+            protected: self.protected_mode(),
+            cpl: self.registers.cpl,
+            flags: self.flags,
+            control: self.control.clone(),
+            halted: self.halted,
+            interrupt_shadow: self.interrupt_shadow,
+        }
+    }
+
+    pub fn restore_context(&mut self, context: &CpuContext) {
+        for (i, value) in context.general.iter().enumerate() {
+            self.registers.set32(Gpr32::decode(i as u8), *value);
+        }
+        self.registers.protected = context.protected;
+        self.registers.cpl = context.cpl;
+        for (segment, cache) in crate::SegmentRegister::ALL.into_iter().zip(context.caches) {
+            // Invalidate the CS context hint even if the numeric selector is
+            // unchanged. The same selector can have a different hidden cache.
+            self.registers.set_segment(segment, cache);
+        }
+        self.registers.ip = context.ip;
+        self.flags = context.flags;
+        self.control = context.control.clone();
+        self.halted = context.halted;
+        self.interrupt_shadow = context.interrupt_shadow;
+    }
+
+    /// Change PE while retaining hidden caches, as a control-register write
+    /// does. Segment reloads are explicit operations by the caller.
+    pub fn set_protected_mode(&mut self, protected: bool) {
+        self.control.cr0 = (self.control.cr0 & !1) | u32::from(protected);
+        self.registers.sync_mode(protected);
+        if !protected {
+            self.registers.cpl = 0;
+        }
+    }
+
+    /// Set the privilege of a host-established context before reloading its
+    /// segments. Guest control transfers continue to use ordinary validation.
+    pub fn set_current_privilege_level(&mut self, level: u8) {
+        assert!(level < 4);
+        self.registers.cpl = level;
+    }
+}
+
 impl Cpu {
     pub fn snapshot(&self) -> CpuSnapshot {
         let r = &self.registers;

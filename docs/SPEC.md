@@ -478,8 +478,11 @@ handling remain pending.
 
 BIOS extended-memory queries match installed RAM, and A20 enable/disable/query
 services reflect the actual gate. Other unavailable INT 15h functions return
-AH=86h/CF=1. DPMI, XMS and VCPI installation probes report absence through their
-defined status registers; no external host is installed. Their explicit IVT
+AH=86h/CF=1. By default DPMI, XMS and VCPI installation probes report absence
+through their defined status registers. An opt-in runtime DPMI host supports
+the experimental DOS/4GW service and allocation subset documented in
+[DPMI host](compatibility/dpmi-host.md); it is not a general-purpose DPMI server.
+Their explicit IVT
 shims prevent startup from running uninitialized RAM through a null vector.
 INT 2Fh/AX=1680h releases the current execution batch and returns AL=00h.
 The session remains running; `Session::timeslice_yielded()` reports this stop

@@ -17,6 +17,7 @@ use doslet_x86::{CpuError, Gpr16, Registers, StepOutcome, linear_address};
 mod cdrom;
 mod clock;
 pub mod debug;
+pub mod dpmi;
 mod idle;
 use cdrom::CdromImage;
 pub use idle::IdleLoopStats;
@@ -141,6 +142,8 @@ pub struct Session {
     joystick_axes: [i16; 2],
     joystick_buttons: [bool; 2],
     idle: idle::IdleLoops,
+    dpmi: Option<Box<dpmi::Host>>,
+    service_flags: Option<u16>,
 }
 
 impl Session {
@@ -309,6 +312,8 @@ impl Session {
             joystick_axes: [0; 2],
             joystick_buttons: [false; 2],
             idle: idle::IdleLoops::default(),
+            dpmi: None,
+            service_flags: None,
         })
     }
     /// Transfer a preloaded input drive into the session during setup.
@@ -606,6 +611,16 @@ impl Session {
     }
     fn execute_step(&mut self, budget: u32) -> Result<u32, RuntimeError> {
         self.apply_input();
+        if self.continuation.is_none() && self.dpmi.is_some() {
+            self.dpmi_dispatch()?;
+            if self.status != SessionStatus::Running {
+                return Ok(1);
+            }
+            if self.dpmi.as_ref().is_some_and(|h| h.direct_return_pending) {
+                self.machine.advance_service_step()?;
+                return Ok(1);
+            }
+        }
         if self.continuation.is_some() {
             if !self.resume_storage()? {
                 return Ok(1);
@@ -786,7 +801,10 @@ impl Session {
                 self.timeslice_yielded = true;
             }
             (0x2F, _) if ax == 0x1687 => {
-                self.machine.cpu.registers.set(Gpr16::Ax, 1); // No external DPMI host installed.
+                self.dpmi_probe();
+            }
+            (0x2F, _) if ax == 0x1600 => {
+                self.machine.cpu.registers.set_byte(0, 0); // Windows is absent.
             }
             (0x2F, _) if ax == 0x1500 => {
                 self.mscdex_service(ax)?;
@@ -1651,6 +1669,10 @@ impl Session {
     }
 
     fn set_carry(&mut self, carry: bool) -> Result<(), BusError> {
+        if let Some(flags) = &mut self.service_flags {
+            *flags = (*flags & !1) | u16::from(carry);
+            return Ok(());
+        }
         let r = &self.machine.cpu.registers;
         let address = linear_address(r.ss, r.get(Gpr16::Sp).wrapping_add(4));
         let flags = self.machine.bus.read_u16(address)?;
