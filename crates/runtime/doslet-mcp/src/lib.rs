@@ -2,6 +2,7 @@
 mod keys;
 mod tools;
 pub use keys::{Stroke, key_stroke, text_strokes};
+use rmcp::schemars;
 use serde::Serialize;
 use std::{
     io,
@@ -16,6 +17,12 @@ pub type Reply = oneshot::Sender<Result<Response, String>>;
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    CodeTags {
+        start: u32,
+        end: u32,
+        bits: u8,
+        tier: Option<CodeTier>,
+    },
     Screenshot,
     Status,
     Synchronization {
@@ -48,6 +55,13 @@ pub enum Action {
     Pause,
     Resume,
     Exit,
+}
+#[derive(Clone, Copy, Debug, serde::Deserialize, Serialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CodeTier {
+    Hot,
+    Cold,
+    Grey,
 }
 pub struct Request {
     pub action: Action,
@@ -110,6 +124,7 @@ pub struct Screen {
 }
 #[derive(Debug)]
 pub enum Response {
+    CodeTags(serde_json::Value),
     Screen(Screen),
     Status(Status),
     Exiting,

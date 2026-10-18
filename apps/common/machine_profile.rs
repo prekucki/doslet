@@ -69,6 +69,27 @@ pub(crate) fn cpu_mhz(t: &dyn TableLike) -> Result<Option<u16>, String> {
     }
     Ok(mhz.or(legacy))
 }
+pub fn patch_paths(game: &dyn TableLike) -> Result<Vec<String>, String> {
+    let Some(item) = game.get("patches") else {
+        return Ok(Vec::new());
+    };
+    let paths = item
+        .as_array()
+        .ok_or("game.patches must be an array of paths")?;
+    if paths.len() > 32 {
+        return Err("game.patches supports at most 32 files".into());
+    }
+    paths
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| "game.patches must contain nonempty paths".into())
+        })
+        .collect()
+}
+
 pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
     let doc = text.parse::<DocumentMut>().map_err(|e| e.to_string())?;
     let t = doc.as_table();
@@ -227,10 +248,11 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
     if let Some(g) = section(t, "game")? {
         fields(
             g,
-            &["executable", "arguments", "working_directory"],
+            &["executable", "arguments", "working_directory", "patches"],
             "game.",
         )?;
         spec.game.executable = string(g, "executable")?.unwrap_or_default();
+        spec.game.patches = patch_paths(g)?;
         if let Some(v) = string(g, "working_directory")? {
             spec.game.working_directory = v;
         }
@@ -342,10 +364,11 @@ fn parse_v1(t: &dyn TableLike) -> Result<MachineSpec, String> {
     if let Some(game) = section(t, "game")? {
         fields(
             game,
-            &["executable", "arguments", "working_directory"],
+            &["executable", "arguments", "working_directory", "patches"],
             "game.",
         )?;
         spec.game.executable = string(game, "executable")?.unwrap_or_default();
+        spec.game.patches = patch_paths(game)?;
         if let Some(v) = string(game, "working_directory")? {
             spec.game.working_directory = v;
         }
@@ -508,6 +531,13 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
         a.push(arg.as_str());
     }
     d["game"]["arguments"] = value(a);
+    if !spec.game.patches.is_empty() {
+        let mut paths = Array::new();
+        for path in &spec.game.patches {
+            paths.push(path.as_str());
+        }
+        d["game"]["patches"] = value(paths);
+    }
     let mut drives = ArrayOfTables::new();
     for mount in &spec.mounts {
         let mut t = Table::new();

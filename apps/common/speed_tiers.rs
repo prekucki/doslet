@@ -41,6 +41,7 @@ impl Tier {
 #[derive(Clone)]
 pub(crate) struct Node {
     pub(crate) locked: bool,
+    pub(crate) manual: bool,
     pub(crate) code: [u8; 15],
     pub(crate) tier: Tier,
 }
@@ -126,6 +127,7 @@ impl Profile {
                 Node {
                     // Legacy graph IRQ/scene guesses are not permanent evidence.
                     locked: matches!(n["reason"].as_str(), Some("code-conflict")),
+                    manual: n["reason"] == "manual",
                     code: code.try_into().map_err(|_| "code length")?,
                     tier,
                 },
@@ -337,6 +339,7 @@ mod tests {
             (pc, false),
             Node {
                 locked: false,
+                manual: false,
                 code,
                 tier: Tier::Slow,
             },
@@ -363,6 +366,7 @@ mod tests {
                 (pc, true),
                 Node {
                     locked: false,
+                    manual: false,
                     code: [0x90; 15],
                     tier: if pc < 3 { Tier::Fast } else { Tier::Slow },
                 },

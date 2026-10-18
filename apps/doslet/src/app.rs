@@ -413,6 +413,31 @@ impl Doslet {
     pub(crate) fn speed_tier_stats(&self) -> Option<crate::native_speed_tiers::Stats> {
         self.speed_tiers.as_ref().map(|t| t.stats)
     }
+    pub(crate) fn code_tags(
+        &mut self,
+        start: u32,
+        end: u32,
+        bits: u8,
+        tier: Option<doslet_mcp::CodeTier>,
+    ) -> Result<serde_json::Value, String> {
+        if tier.is_some() && (self.gdb_connected() || self.configurator.pending) {
+            return Err("Tagging requires no GDB connection or pending machine preparation".into());
+        }
+        self.speed_tiers
+            .as_mut()
+            .ok_or("No speed-tier profile is loaded")?
+            .code_tags(
+                &mut self.session,
+                start,
+                end,
+                bits,
+                tier.map(|t| match t {
+                    doslet_mcp::CodeTier::Hot => crate::speed_tiers::Tier::Fast,
+                    doslet_mcp::CodeTier::Cold => crate::speed_tiers::Tier::Slow,
+                    doslet_mcp::CodeTier::Grey => crate::speed_tiers::Tier::Grey,
+                }),
+            )
+    }
     fn disable_speed_tiers(&mut self) {
         if let Some(tiers) = &mut self.speed_tiers
             && tiers.stats.enabled
@@ -1159,9 +1184,19 @@ impl Doslet {
         };
         self.save_core_profile();
         let mut settings = self.launch.clone();
+        if spec.game.executable.is_empty() && !spec.game.patches.is_empty() {
+            self.configurator.message = Some("game.patches requires an executable".into());
+            return Task::none();
+        }
         settings.hardware = plan.hardware;
         settings.machine_spec = Some(spec.clone());
         settings.command_tail = plan.command_tail;
+        settings.patches = spec
+            .game
+            .patches
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
         settings.working_directory = spec.game.working_directory.as_bytes().to_vec();
         settings.root = None;
         settings.cdrom = None;

@@ -66,6 +66,10 @@ the next one. A stalled UI stops presentation work without stopping
 emulation. Paused sessions request no periodic UI updates. Editor command
 sequence numbers prevent older snapshots from overwriting newer local edits.
 Shutdown joins the owner after saving its dynamic-core profile.
+Pending iced effects are collected in a flat list; empty tasks are discarded.
+Snapshot replacement appends those lists and batches them only when the UI
+consumes a packet. Paused execution and a stalled UI therefore do not build a
+recursive chain of empty task streams for the main thread to poll or drop.
 
 The opt-in native speed-tier adapter installs static code labels into the CPU's
 execution caches. Native blocks retain their control-flow scope and return counts
@@ -180,6 +184,15 @@ those views and a caller-supplied ordinary-RAM process range, validates the
 layout, writes through `MemoryBus` and initializes process registers. It has no
 PC device or filesystem dependency. The runtime selects the available PC RAM
 range; the host CLI owns file acquisition and output.
+
+Native RAM patch manifests are parsed and checked against the selected executable
+hash in the host setup adapter. The runtime owns the bounded byte-edit plan and
+checks pending signatures between execution batches, allowing a guest DOS
+extender to install code before patching. All spans must match before any write;
+ordinary RAM write generations invalidate decode/JIT entries. No host paths,
+file access or game-specific addresses enter the CPU or machine components.
+Portable states retain the plan and completed prefix. See
+[memory patches](memory-patches.md) for bounds and lifecycle.
 
 `ReadOnlyDrive` owns preloaded file buffers transferred by the host during setup.
 DOS handles are fixed-size records referring to those buffers; reads borrow the

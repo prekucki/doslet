@@ -1,0 +1,24 @@
+version = 1
+name = "Heroes: absolute mouse in town"
+executable_sha256 = "0e87d3025f437158dfb9099ca2921c83bac5bf9e4708bad04e4d5fc8297218a2"
+timeout_steps = 500000000
+
+# The DOS/4GW guest loader must have installed the interrupt wrapper and polls.
+[[guards]]
+address = 0x21213d
+expected = "51 83 ec 0c 89 c1 89 e0 e8 3c 8f 01 00 89 c8 89"
+
+[[writes]]
+address = 0x0f1800
+expected_zeroes = 1536
+file = "mouse.bin"
+
+[[writes]]
+address = 0x213fab
+expected = "be 0b 00 00 00"
+replacement = "e9 50 d8 ed ff"
+
+[[writes]]
+address = 0x214a55
+expected = "ba 0b 00 00 00"
+replacement = "e9 a6 ce ed ff"

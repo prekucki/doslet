@@ -97,6 +97,8 @@ impl Default for OutputRouting {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GameSpec {
     pub executable: String,
+    /// Native patch manifests, resolved relative to the launch profile.
+    pub patches: Vec<String>,
     pub arguments: Vec<String>,
     pub working_directory: String,
 }
@@ -104,6 +106,7 @@ impl Default for GameSpec {
     fn default() -> Self {
         Self {
             executable: String::new(),
+            patches: Vec::new(),
             arguments: Vec::new(),
             working_directory: "C:\\".into(),
         }
@@ -349,6 +352,12 @@ impl MachineSpec {
                     "binding names must be unique and locations nonempty",
                 ));
             }
+        }
+        if self.game.patches.len() > 32 || self.game.patches.iter().any(String::is_empty) {
+            return Err(ConfigError::new(
+                "game.patches",
+                "must contain at most 32 nonempty paths",
+            ));
         }
         let directory = &self.game.working_directory;
         if !directory.is_ascii()

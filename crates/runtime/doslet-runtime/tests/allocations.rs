@@ -7,6 +7,64 @@ include!("../../../../tests/fixtures/iso9660.rs");
 include!("../../../../tests/fixtures/opl3.rs");
 include!("../../../../tests/fixtures/midi.rs");
 
+#[cfg(all(
+    feature = "dynamic-core",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn pending_patch_invalidates_native_code_without_execution_allocations() {
+    use doslet_runtime::session::patches::{MemoryPatch, PatchGuard, PatchWrite};
+    let mut program = protected_graphics_com();
+    program[0x300..0x304].copy_from_slice(&[0xfa, 0x40, 0xeb, 0xfd]); // CLI; INC EAX; JMP back.
+    let mut native = Session::new(&program).unwrap();
+    let mut reference = Session::new(&program).unwrap();
+    native.set_dynamic_core(true);
+    reference.set_dynamic_core(false);
+    reference.set_decode_cache(false);
+    for session in [&mut native, &mut reference] {
+        session
+            .configure_patches(vec![MemoryPatch {
+                name: "replace hot INC with DEC".into(),
+                timeout_steps: 50_000,
+                guards: vec![PatchGuard {
+                    address: 0x10500,
+                    expected: vec![1],
+                }],
+                writes: vec![PatchWrite {
+                    address: 0x10401,
+                    expected: vec![0x40],
+                    replacement: vec![0x48],
+                }],
+            }])
+            .unwrap();
+        session.start();
+        assert_eq!(session.advance(2000), 2000);
+    }
+    assert!(
+        native.prepare_dynamic(8) > 0,
+        "{:?}",
+        native.dynamic_error()
+    );
+    for session in [&mut native, &mut reference] {
+        assert_eq!(session.advance(2000), 2000);
+    }
+    assert!(native.dynamic_stats().executed_steps > 0);
+    for session in [&mut native, &mut reference] {
+        assert!(session.debug_write_memory(0x10500, &[1]));
+    }
+    let measured = allocation_counter::measure(|| {
+        assert_eq!(native.advance(4096), 4096);
+    });
+    assert_eq!(reference.advance(4096), 4096);
+    assert_eq!(native.applied_patch_count(), 1);
+    assert_eq!(native.status(), SessionStatus::Running);
+    assert_eq!(native.registers(), reference.registers());
+    assert_eq!(native.eflags(), reference.eflags());
+    assert_eq!(native.emulated_nanos(), reference.emulated_nanos());
+    assert_eq!(measured.count_total, 0);
+    assert_eq!(measured.bytes_total, 0);
+}
+
 #[test]
 fn opl3_guest_io_synthesis_and_pcm_drain_allocate_nothing_after_setup() {
     let mut session = Session::new(&opl3_tone_program()).unwrap();

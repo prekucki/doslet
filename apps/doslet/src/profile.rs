@@ -11,6 +11,7 @@ struct Profile {
     cpu_mhz: Option<u16>,
     name: Option<String>,
     executable: Option<PathBuf>,
+    patches: Vec<PathBuf>,
     arguments: Vec<String>,
     working_directory: Option<String>,
     root: Option<PathBuf>,
@@ -104,13 +105,17 @@ impl Profile {
         if let Some(game) = section(table, "game")? {
             fields(
                 game,
-                &["executable", "arguments", "working_directory"],
+                &["executable", "arguments", "working_directory", "patches"],
                 "game.",
             )?;
             profile.executable = string(game, "executable", "game.")?
                 .map(|value| path(base, value, "game.executable"))
                 .transpose()?;
             profile.working_directory = string(game, "working_directory", "game.")?;
+            profile.patches = crate::machine_profile::patch_paths(game)?
+                .iter()
+                .map(|p| std::path::absolute(base.join(p)).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
             if let Some(arguments) = game.get("arguments") {
                 let array = arguments
                     .as_array()
@@ -257,6 +262,11 @@ impl Cli {
                 == Some(2);
             let profile = if is_v2 {
                 let mut spec = crate::machine_profile::parse_machine_profile(&text)?;
+                for path in &mut spec.game.patches {
+                    *path = std::path::absolute(base.join(&*path))?
+                        .to_string_lossy()
+                        .into_owned();
+                }
                 for binding in &mut spec.host.bindings {
                     if matches!(
                         binding.kind,
@@ -271,6 +281,7 @@ impl Cli {
                 let mut profile = Profile {
                     name: (!spec.name.is_empty()).then(|| spec.name.clone()),
                     arguments: spec.game.arguments.clone(),
+                    patches: spec.game.patches.iter().map(PathBuf::from).collect(),
                     working_directory: Some(spec.game.working_directory.clone()),
                     writable: true,
                     audio: Some(spec.output.audio),
@@ -358,10 +369,16 @@ impl Cli {
             if self.launch.machine_spec.is_none() {
                 let mut spec = doslet_config::MachineSpec::default();
                 spec.game.arguments = profile.arguments.clone();
+                spec.game.patches = profile
+                    .patches
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
                 self.launch.machine_spec = Some(spec);
             }
             self.profile_name = profile.name;
             self.launch.command_tail = command_tail(&profile.arguments)?;
+            self.launch.patches = profile.patches;
             if let Some(directory) = profile.working_directory {
                 if !directory.is_ascii()
                     || directory.bytes().any(|byte| byte < 0x20 || byte == 0x7F)
@@ -437,6 +454,9 @@ impl Cli {
                     return Err("game.executable must belong to the mounted C: directory".into());
                 }
             }
+        }
+        if self.game.is_none() && !self.launch.patches.is_empty() {
+            return Err("game.patches requires game.executable or --game".into());
         }
         if let Some((_, image)) = &self.launch.cdrom
             && !image.is_file()
@@ -538,6 +558,62 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     include!("../../../tests/fixtures/relocated_mz.rs");
     include!("../../../tests/fixtures/iso9660.rs");
+    #[test]
+    fn patch_files_resolve_from_profile_and_survive_export_and_reload() {
+        use sha2::{Digest, Sha256};
+        for version in [1, 2] {
+            let fixture = Fixture::new(&format!(
+                "version={version}\n[game]\nexecutable='../TINY.EXE'\npatches=['change.toml']\n"
+            ));
+            let digest = Sha256::digest(relocated_mz());
+            let manifest = format!(
+                "version=1\nname='fixture'\nexecutable_sha256='{digest:x}'\ntimeout_steps=10000\n[[writes]]\naddress=0xf1800\nexpected_zeroes=2\nfile='payload.bin'\n"
+            );
+            std::fs::write(fixture.root.join("profiles/change.toml"), &manifest).unwrap();
+            std::fs::write(fixture.root.join("profiles/payload.bin"), [12, 34]).unwrap();
+            let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
+            assert_eq!(
+                cli.launch.patches,
+                [fixture.root.join("profiles/change.toml")]
+            );
+            let spec = cli.launch.machine_spec.as_ref().unwrap();
+            let exported = crate::machine_profile::export_machine_profile(spec);
+            assert_eq!(
+                &crate::machine_profile::parse_machine_profile(&exported).unwrap(),
+                spec
+            );
+            // A fresh load (the same recipe used by restart) reapplies the patch.
+            for _ in 0..2 {
+                let mut session = crate::native_input::load_game_with_settings(
+                    cli.game.as_deref().unwrap(),
+                    &cli.launch,
+                )
+                .unwrap();
+                assert_eq!(session.applied_patch_count(), 0);
+                session.start();
+                session.advance(1);
+                assert_eq!(session.applied_patch_count(), 1);
+                assert_eq!(session.ram_view(0xf1800..0xf1802).unwrap(), &[12, 34]);
+            }
+            std::fs::write(
+                fixture.root.join("profiles/change.toml"),
+                manifest.replace(&format!("{digest:x}"), &"00".repeat(32)),
+            )
+            .unwrap();
+            let error = crate::native_input::load_game_with_settings(
+                cli.game.as_deref().unwrap(),
+                &cli.launch,
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(
+                error.contains("change.toml") && error.contains("SHA-256"),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn cpu_clock_profile_cli_precedence_and_machine_construction() {
         for version in [1, 2] {

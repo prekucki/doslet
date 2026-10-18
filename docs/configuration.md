@@ -1,5 +1,8 @@
 # Configure a machine
 
+Native game profiles support `game.patches`, an ordered list of local RAM patch
+manifests. See [memory patches](memory-patches.md) for configuration and lifecycle.
+
 Open **Info → Settings…** in the desktop or browser workspace. Edit the draft,
 select **Validate**, then **Apply & restart** to construct a new session.
 Changing hardware restarts the guest. Closing the editor retains the draft;

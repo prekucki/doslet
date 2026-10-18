@@ -434,6 +434,12 @@ See [architecture.md](architecture.md#native-dynamic-core) for cache/profile bou
 
 ## DOS and BIOS contract
 
+Native profiles support ordered, SHA-256-qualified RAM patches through
+`game.patches`. The runtime waits for original bytes/guards at bounded batch
+boundaries, validates all spans before an atomic edit, and faults at a configured
+guest step deadline if they never match. Plans survive portable state restoration;
+restart reloads their manifests. See [memory patches](memory-patches.md).
+
 The bootstrap COM loader creates a minimal PSP at segment 1000h, loads code at
 offset 0100h, initializes CS/DS/ES/SS and reserves the stack return word at FFFEh.
 It supports nonempty images up to FEFEh bytes. The standalone real-mode MZ loader

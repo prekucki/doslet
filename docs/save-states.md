@@ -21,8 +21,11 @@ OPL state includes oscillators, envelopes and pending writes; replaying its
 register writes alone would not restore the same sound.
 
 The envelope identifies the file format and machine model. Unsupported versions
-are rejected. The version-1 Protobuf format with embedded media remains readable;
-new captures use version 2. Very old state formats have no importer. Future compatible changes
+are rejected. Version 1 (embedded media) and version 2 (external media) remain
+readable; new captures use version 3. Version 3 also retains pending memory
+patch plans, their deadlines and the completed prefix, so restoration does not
+reapply completed patches. Older readers reject version 3 instead of silently
+dropping pending edits. Very old state formats have no importer. Future compatible changes
 must retain field numbers; removed fields must be reserved. A breaking change
 must increment the format or model version instead of guessing how to restore it.
 Lazy VGA time is encoded as the effective raster phase and pixel fraction, so

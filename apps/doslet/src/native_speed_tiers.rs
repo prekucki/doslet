@@ -3,6 +3,8 @@
 mod learning;
 #[path = "native_speed_persistence.rs"]
 mod persistence;
+#[path = "native_speed_tags.rs"]
+mod tags;
 use crate::speed_tiers::{Profile, Tier};
 use doslet_runtime::{Session, SessionStatus, session::debug::ExecutionSettings};
 use std::{
@@ -347,6 +349,62 @@ mod tests {
     use super::*;
     use doslet_x86::Gpr32;
     use std::collections::{BTreeMap, BTreeSet};
+    #[test]
+    fn manual_tags_are_guarded_live_and_preserve_guest_state_and_counters() {
+        use crate::speed_tiers::Node;
+        let mut s = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
+        let pc = s.debug_pc();
+        let mut c = grey_controller();
+        for i in 0..5 {
+            let mut code = [0; 15];
+            assert!(s.debug_read_memory(pc + i, &mut code));
+            if i == 2 {
+                code[0] ^= 1;
+            }
+            c.profile.nodes.insert(
+                (pc + i, false),
+                Node {
+                    code,
+                    tier: if i == 3 { Tier::Irq } else { Tier::Slow },
+                    locked: i == 4,
+                    manual: false,
+                },
+            );
+        }
+        c.enable(&mut s);
+        s.start();
+        s.advance(50);
+        let before = s.save_state().unwrap();
+        let counts = s.execution_tier_stats();
+        let view = c.code_tags(&mut s, pc, pc + 5, 16, None).unwrap();
+        assert_eq!(view["matching"], 4);
+        assert_eq!(view["code_mismatches"], 1);
+        assert_eq!(view["protected"], 2);
+        let result = c
+            .code_tags(&mut s, pc, pc + 5, 16, Some(Tier::Fast))
+            .unwrap();
+        assert_eq!(result["changed"], 2);
+        assert_eq!(s.save_state().unwrap(), before);
+        assert_eq!(s.execution_tier_stats(), counts);
+        let prior = s.executed_tier_counts();
+        s.advance(50);
+        assert!(s.executed_tier_counts()[0] > prior[0]);
+        assert_eq!(
+            c.code_tags(&mut s, pc, pc + 5, 16, Some(Tier::Fast))
+                .unwrap()["changed"],
+            0
+        );
+        c.code_tags(&mut s, pc, pc + 2, 16, Some(Tier::Grey))
+            .unwrap();
+        assert!(c.profile.nodes[&(pc, false)].manual);
+        assert!(c.profile.nodes[&(pc, false)].tier == Tier::Grey);
+        assert!(c.profile.nodes[&(pc + 2, false)].tier == Tier::Slow);
+        assert!(c.profile.nodes[&(pc + 3, false)].tier == Tier::Irq);
+        assert!(c.profile.nodes[&(pc + 4, false)].locked);
+        for (lo, hi, bits) in [(pc, pc, 16), (pc, pc + 65537, 16), (pc, pc + 1, 8)] {
+            assert!(c.code_tags(&mut s, lo, hi, bits, Some(Tier::Fast)).is_err());
+        }
+    }
     fn grey_controller() -> Controller {
         Controller {
             learner: None,

@@ -69,6 +69,32 @@ The array order is HOT, COLD, GREY, IRQ; `irq_mhz` equals `grey_mhz`. IRQ shares
 count instructions carrying a confirmed IRQ label, including calls to the same
 code outside interrupts. They are not a measurement of time spent inside IRQs.
 
+### Correct labels through MCP
+
+Use `inspect_code_tags` before `tag_code_range` to correct a loaded profile in
+the running native emulator. Both accept decimal physical addresses `start`
+and exclusive `end`, plus `bits` (16 or 32). A request spans at most 65536 bytes.
+For example, inspect `{"start":306956,"end":306993,"bits":16}` before tagging
+that same range with `"tier":"hot"`. These addresses describe one local CIV
+474.03 layout; verify the loaded code before reusing them.
+
+Tagging accepts `hot`, `cold` or `grey`. It changes existing instruction labels
+whose starts fall in the range and whose saved 15-byte signatures match current
+RAM. It does not discover instructions at unknown addresses. Changed code,
+conflict guards and confirmed IRQ labels remain unchanged. Results report the
+previous tier counts, matching signatures, skipped mismatches, protected labels
+and number changed. Shared functions receive the same tag in every caller.
+
+The guest may be running or paused. Tagging requires enabled speed tiers and
+no GDB connection or pending machine preparation. It preserves MHz, guest
+state, clock fractions and cumulative counters. Manual tags survive automatic
+learning, including a manual GREY correction; setting another tag replaces a
+previous manual choice. Corrections are saved asynchronously to the active
+profile cache, with `save_pending` reporting outstanding writes. Keep an exported
+profile in sync if it is explicitly supplied on subsequent launches: a manual
+label in that file takes precedence over a conflicting cached label. Normal
+shutdown flushes pending writes.
+
 ### Scene profiles and repeatable checks
 
 The current combined local profile includes city, menu, puzzle, map and View World.

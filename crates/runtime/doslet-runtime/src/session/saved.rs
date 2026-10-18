@@ -3,7 +3,7 @@ use super::*;
 use doslet_state::InvalidState;
 use prost::Message;
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MODEL: u32 = 1;
 const MAX_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -137,7 +137,7 @@ impl Session {
         }
         let file = SavedSession::decode(bytes).map_err(|_| InvalidState("Protobuf encoding"))?;
         if file.format != "doslet-state"
-            || !matches!(file.version, 1 | VERSION)
+            || !matches!(file.version, 1 | 2 | VERSION)
             || file.machine_model != MODEL
         {
             return Err(InvalidState("unsupported format/version/machine model"));

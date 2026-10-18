@@ -461,6 +461,7 @@ fn merge_traces(a: Trace, b: Trace) -> BTreeMap<Key, Node> {
                     code: second.code,
                     tier: Tier::Irq,
                     locked: true,
+                    manual: false,
                 },
             );
             continue;
@@ -480,6 +481,7 @@ fn merge_traces(a: Trace, b: Trace) -> BTreeMap<Key, Node> {
                 code: second.code,
                 tier,
                 locked: false,
+                manual: false,
             },
         );
     }
@@ -497,6 +499,7 @@ fn merge_traces(a: Trace, b: Trace) -> BTreeMap<Key, Node> {
                     code: node.code,
                     tier: Tier::Irq,
                     locked: true,
+                    manual: false,
                 },
             );
         }
@@ -523,7 +526,7 @@ fn apply(profile: &mut Profile, _session: &Session, nodes: BTreeMap<Key, Node>) 
         if let Some(previous) = profile.nodes.get(&key) {
             // Learning is monotonic: only previously GREY sites can gain colour.
             // A short new window never revokes an established HOT/COLD label.
-            if previous.tier != Tier::Grey || previous.locked {
+            if previous.tier != Tier::Grey || previous.locked || previous.manual {
                 continue;
             }
             if previous.tier == node.tier
@@ -678,7 +681,7 @@ mod tests {
             let changed = apply(&mut profile, &live, merge_traces(a, b));
             let nodes:Vec<_>=profile.nodes.iter().map(|(&(pc,wide),n)|serde_json::json!({
                 "pc":pc,"bits":if wide {32}else{16},"bytes":n.code,"tier":n.tier.name(),
-                "reason":if n.tier==Tier::Irq {"interrupt-frame"}else if n.locked {"code-conflict"}else{"learned"}
+                "reason":if n.manual {"manual"} else if n.tier==Tier::Irq {"interrupt-frame"}else if n.locked {"code-conflict"}else{"learned"}
             })).collect();
             std::fs::write(
                 output,
@@ -950,7 +953,7 @@ mod tests {
         let changes = apply(&mut after.profile, &live, result.nodes);
         let rows: Vec<_> = after.profile.nodes.iter().map(|(&(pc, wide), n)| serde_json::json!({
             "pc":pc, "bits":if wide {32} else {16}, "bytes":n.code, "tier":n.tier.name(),
-            "reason":if n.tier == Tier::Irq {"interrupt-frame"} else if n.locked {"code-conflict"} else {"replay"}
+            "reason":if n.manual {"manual"} else if n.tier == Tier::Irq {"interrupt-frame"} else if n.locked {"code-conflict"} else {"replay"}
         })).collect();
         std::fs::write(
             format!("../../target/tier-weighted-profiles/{scene}-verified-irq.json"),
@@ -1026,6 +1029,7 @@ mod tests {
                         code,
                         tier,
                         locked: tier == Tier::Irq,
+                        manual: false,
                     },
                 )]);
                 assert_eq!(apply(&mut profile, &live, candidate), expected);
@@ -1041,6 +1045,7 @@ mod tests {
                                     code,
                                     tier: Tier::Slow,
                                     locked: false,
+                                    manual: false,
                                 }
                             )])
                         ),
@@ -1083,7 +1088,17 @@ mod tests {
         let key = (live.debug_pc(), false);
         let mut code = [0; 15];
         live.debug_read_memory(key.0, &mut code);
-        let nodes = |tier, locked| BTreeMap::from([(key, Node { code, tier, locked })]);
+        let nodes = |tier, locked| {
+            BTreeMap::from([(
+                key,
+                Node {
+                    code,
+                    tier,
+                    locked,
+                    manual: false,
+                },
+            )])
+        };
         for established in [Tier::Fast, Tier::Slow] {
             let mut p = Profile {
                 nodes: nodes(established, false),
@@ -1109,6 +1124,10 @@ mod tests {
             index: Default::default(),
         };
         let mut changed = nodes(Tier::Fast, false);
+        p.nodes.get_mut(&key).unwrap().manual = true;
+        assert_eq!(apply(&mut p, &live, changed.clone()), 0);
+        assert!(p.nodes[&key].tier == Tier::Grey);
+        p.nodes.get_mut(&key).unwrap().manual = false;
         changed.get_mut(&key).unwrap().code[0] ^= 1;
         assert_eq!(apply(&mut p, &live, changed), 1);
         let mut probe = live.capture_working_state().unwrap().restore().unwrap();

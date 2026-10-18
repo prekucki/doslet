@@ -1,6 +1,8 @@
 //! Native setup adapter shared by the CLI and desktop frontend.
 use doslet_dos::files::ReadOnlyDrive;
 use doslet_runtime::Session;
+#[path = "native_patches.rs"]
+mod patches;
 use std::{
     error::Error,
     fs,
@@ -12,6 +14,7 @@ pub struct LaunchSettings {
     pub hardware: doslet_config::HardwareConfig,
     pub machine_spec: Option<doslet_config::MachineSpec>,
     pub command_tail: Vec<u8>,
+    pub patches: Vec<PathBuf>,
     pub working_directory: Vec<u8>,
     pub root: Option<PathBuf>,
     pub writable: bool,
@@ -34,6 +37,7 @@ impl Default for LaunchSettings {
             hardware: doslet_config::HardwareConfig::default(),
             machine_spec: None,
             command_tail: Vec::new(),
+            patches: Vec::new(),
             working_directory: b"C:\\".to_vec(),
             root: None,
             writable: true,
@@ -96,14 +100,13 @@ pub fn load_game_with_settings(
     } else {
         drive
     };
-    let mut session = Session::from_mz_stub_named_configured(
-        drive
-            .file(filename.as_bytes())
-            .map_err(|code| format!("DOS mount error {code}"))?,
-        dos_name.as_bytes(),
-        settings.hardware,
-    )?
-    .with_drive(drive);
+    let program = drive
+        .file(filename.as_bytes())
+        .map_err(|code| format!("DOS mount error {code}"))?;
+    let patch_plan = patches::load(&settings.patches, program)?;
+    let mut session =
+        Session::from_mz_stub_named_configured(program, dos_name.as_bytes(), settings.hardware)?
+            .with_drive(drive);
     if (settings.machine_spec.is_none() || settings.preload_local_media)
         && let Some((letter, image)) = &settings.cdrom
     {
@@ -113,6 +116,7 @@ pub fn load_game_with_settings(
     if let Some(mode) = settings.dpmi {
         session.enable_dpmi(mode)?;
     }
+    session.configure_patches(patch_plan)?;
     session.set_dynamic_core(!settings.no_dynamic_core);
     set_heroes_menu_idle(&mut session, settings.heroes_menu_idle);
     session.set_idle_observation(settings.observe_idle);

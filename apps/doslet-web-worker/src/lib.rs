@@ -561,6 +561,11 @@ impl WorkerEngine {
         Ok(())
     }
     fn prepare(&mut self, spec: MachineSpec, program: &str, reset: bool) -> Result<String, String> {
+        if !spec.game.patches.is_empty() {
+            return Err(
+                "game.patches currently requires the native loader and local patch files".into(),
+            );
+        }
         if self.session.pending_commit() {
             return Err("Wait for the current save commit before replacing this session".into());
         }

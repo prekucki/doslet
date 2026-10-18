@@ -7,6 +7,8 @@ mod desktop;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_computer;
 #[cfg(not(target_arch = "wasm32"))]
+mod native_effects;
+#[cfg(not(target_arch = "wasm32"))]
 mod native_jit;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_speed_tiers;

@@ -969,4 +969,22 @@ message RuntimeSession {
   repeated sint32 joystick_axes = 30;
   repeated bool joystick_buttons = 31;
   optional uint64 mouse_last_relative_read = 32;
+  repeated RuntimeMemoryPatch patches = 33;
+  uint32 patches_applied = 34;
+}
+
+message RuntimePatchWrite {
+  uint32 address = 1;
+  bytes expected = 2;
+  bytes replacement = 3;
+}
+message RuntimePatchGuard {
+  uint32 address = 1;
+  bytes expected = 2;
+}
+message RuntimeMemoryPatch {
+  string name = 1;
+  uint64 timeout_steps = 2;
+  repeated RuntimePatchWrite writes = 3;
+  repeated RuntimePatchGuard guards = 4;
 }

@@ -1,5 +1,6 @@
 //! Desktop presentation owns snapshots; the emulation thread exclusively owns Session.
 use crate::app::Message;
+use crate::native_effects::Effects;
 use crate::presentation::{DisplayFrame, DisplaySizing};
 use doslet_midi_routing::Mode;
 use doslet_runtime::{RuntimeError, SessionStatus};
@@ -436,7 +437,7 @@ mod tests {
             assert_eq!(exiting["structuredContent"]["status"], "Exiting");
             let packet = wait_for(&worker, |s| s.session.status() == SessionStatus::Paused);
             use iced::futures::{StreamExt, executor::block_on};
-            let mut actions = iced_runtime::task::into_stream(packet.effects).unwrap();
+            let mut actions = iced_runtime::task::into_stream(packet.effects.into_task()).unwrap();
             assert!(
                 block_on(async {
                     while let Some(action) = actions.next().await {
@@ -514,13 +515,13 @@ mod tests {
         let mailbox = Mailbox::default();
         mailbox.publish(Packet {
             snapshot: engine.snapshot(true),
-            effects: Task::none(),
+            effects: Effects::default(),
             sequence: 1,
         });
         engine.session.single_step();
         mailbox.publish(Packet {
             snapshot: engine.snapshot(false),
-            effects: Task::none(),
+            effects: Effects::default(),
             sequence: 2,
         });
         let latest = mailbox.take().unwrap();
@@ -549,7 +550,7 @@ mod tests {
         let mut old = crate::app::Doslet::new();
         app.worker.mailbox.publish(Packet {
             snapshot: old.snapshot(true),
-            effects: Task::none(),
+            effects: Effects::default(),
             sequence: 0,
         });
         let _ = app.update(Message::GamepadsReady);
@@ -611,7 +612,7 @@ mod tests {
 }
 struct Packet {
     snapshot: Snapshot,
-    effects: Task<Message>,
+    effects: Effects<Message>,
     sequence: u64,
 }
 struct Command {
@@ -624,7 +625,9 @@ impl Mailbox {
     fn publish(&self, mut packet: Packet) {
         let mut slot = self.0.lock().unwrap();
         if let Some(previous) = slot.take() {
-            packet.effects = Task::batch([previous.effects, packet.effects]);
+            let mut effects = previous.effects;
+            effects.append(packet.effects);
+            packet.effects = effects;
             if packet.snapshot.configurator.is_none() {
                 packet.snapshot.configurator = previous.snapshot.configurator;
             }
@@ -716,7 +719,7 @@ impl Worker {
                 if ready_tx.send(Ok(engine.snapshot(true))).is_err() {
                     return;
                 }
-                let mut effects = Task::none();
+                let mut effects = Effects::default();
                 let mut config_dirty = false;
                 let mut sequence = 0;
                 let mut last_publish = std::time::Instant::now();
@@ -724,7 +727,7 @@ impl Worker {
                     let overflow = overflowed.swap(false, Ordering::AcqRel);
                     if let Ok(command) = completion_receiver.try_recv() {
                         sequence = sequence.max(command.sequence);
-                        effects = Task::batch([effects, engine.update(command.message)]);
+                        effects.push(engine.update(command.message));
                         config_dirty = true;
                         refresh.store(true, Ordering::Release);
                     }
@@ -736,7 +739,7 @@ impl Worker {
                         };
                         if !matches!(command.message, Message::Tick) {
                             sequence = sequence.max(command.sequence);
-                            effects = Task::batch([effects, engine.update(command.message)]);
+                            effects.push(engine.update(command.message));
                             config_dirty = true;
                             refresh.store(true, Ordering::Release);
                         }
@@ -746,11 +749,11 @@ impl Worker {
                         let _ = engine
                             .session
                             .release_input_source(doslet_input::InputSourceId(1));
-                        effects = Task::batch([effects, engine.update(Message::FocusLost)]);
+                        effects.push(engine.update(Message::FocusLost));
                         engine.notice = Some(
                             "Input queue full; emulation paused and held input released.".into(),
                         );
-                        effects = Task::batch([effects, engine.update(Message::Tick)]);
+                        effects.push(engine.update(Message::Tick));
                         refresh.store(true, Ordering::Release);
                     }
                     // No iced timer drives execution. Each turn checks commands again.
@@ -760,7 +763,7 @@ impl Worker {
                         engine.presentation_revision,
                     );
                     let guest_before = engine.session.emulated_nanos();
-                    effects = Task::batch([effects, engine.worker_tick()]);
+                    effects.push(engine.worker_tick());
                     let progressed = engine.session.emulated_nanos() != guest_before;
                     let after = (
                         engine.session.status(),
@@ -775,7 +778,7 @@ impl Worker {
                         refresh.store(false, Ordering::Release);
                         output.publish(Packet {
                             snapshot: engine.snapshot(config_dirty),
-                            effects: std::mem::replace(&mut effects, Task::none()),
+                            effects: std::mem::take(&mut effects),
                             sequence,
                         });
                         config_dirty = false;
@@ -791,7 +794,7 @@ impl Worker {
                         }) => {}
                         Ok(command) => {
                             sequence = sequence.max(command.sequence);
-                            effects = Task::batch([effects, engine.update(command.message)]);
+                            effects.push(engine.update(command.message));
                             config_dirty = true;
                             refresh.store(true, Ordering::Release);
                         }
@@ -902,7 +905,7 @@ impl Doslet {
                         && !self.state.gdb.is_some_and(|(_, connected)| connected),
                 );
                 Task::batch([
-                    packet.effects,
+                    packet.effects.into_task(),
                     self.display_sizing
                         .refresh(&self.state.display)
                         .map(Message::DisplaySizing),

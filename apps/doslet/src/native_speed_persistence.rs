@@ -76,10 +76,10 @@ impl Persistence {
         let mut loaded = 0;
         for (key, node) in learned.nodes {
             if let Some(base) = combined.get(&key) {
-                if base.code != node.code || base.locked {
+                if base.code != node.code || base.locked || base.manual {
                     continue;
                 }
-                if base.tier != Tier::Grey && base.tier != node.tier {
+                if !node.manual && base.tier != Tier::Grey && base.tier != node.tier {
                     continue;
                 }
             }
@@ -253,7 +253,7 @@ fn write(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rows: Vec<_> = nodes.iter().map(|(&(pc, wide), n)| serde_json::json!({
         "pc":pc, "bits":if wide {32} else {16}, "bytes":n.code, "tier":n.tier.name(),
-        "reason":if n.tier == Tier::Irq {"interrupt-frame"} else if n.locked {"code-conflict"} else {"learned"}
+        "reason":if n.manual {"manual"} else if n.tier == Tier::Irq {"interrupt-frame"} else if n.locked {"code-conflict"} else {"learned"}
     })).collect();
     let bytes = serde_json::to_vec(&serde_json::json!({"learning_version":1,
         "identity":identity, "rates":rates, "learning":learning, "unknown":"grey", "irq_policy":"static-grey", "nodes":rows}))?;
@@ -343,6 +343,7 @@ mod tests {
         .unwrap();
         store.learning = true;
         current.nodes.get_mut(&(256, false)).unwrap().tier = Tier::Fast;
+        current.nodes.get_mut(&(256, false)).unwrap().manual = true;
         store.changed();
         store.poll(&current);
         for (address, tier) in [(257, Tier::Slow), (258, Tier::Irq)] {
@@ -352,6 +353,7 @@ mod tests {
                     code: [0x90; 15],
                     tier,
                     locked: tier == Tier::Irq,
+                    manual: false,
                 },
             );
         }
@@ -372,6 +374,7 @@ mod tests {
         .unwrap();
         assert_eq!(next.loaded, 3);
         assert!(restored.nodes[&(256, false)].tier == Tier::Fast);
+        assert!(restored.nodes[&(256, false)].manual);
         assert!(restored.nodes[&(257, false)].tier == Tier::Slow);
         assert!(restored.nodes[&(258, false)].tier == Tier::Irq);
         let (_, rates, learn) = cached_game(&renamed, Some(&f.0)).unwrap().unwrap();
@@ -379,6 +382,33 @@ mod tests {
         assert!(learn);
         fs::write(&renamed, b"different executable").unwrap();
         assert!(cached_game(&renamed, Some(&f.0)).unwrap().is_none());
+    }
+    #[test]
+    fn manual_corrections_override_ordinary_base_labels_including_grey() {
+        let f = Fixture::new();
+        let mut current = profile();
+        let mut store = Persistence::game(
+            &f.exe(),
+            Some(&f.0),
+            &mut current,
+            [Some(60), Some(8), Some(16)],
+        )
+        .unwrap();
+        current.nodes.get_mut(&(256, false)).unwrap().manual = true;
+        store.changed();
+        store.finish(&current);
+        let mut base = profile();
+        base.nodes.get_mut(&(256, false)).unwrap().tier = Tier::Slow;
+        let next = Persistence::game(
+            &f.exe(),
+            Some(&f.0),
+            &mut base,
+            [Some(60), Some(8), Some(16)],
+        )
+        .unwrap();
+        assert!(next.error.is_none());
+        assert!(base.nodes[&(256, false)].tier == Tier::Grey);
+        assert!(base.nodes[&(256, false)].manual);
     }
     #[test]
     fn invalid_data_falls_back_without_partial_installation_or_writes() {

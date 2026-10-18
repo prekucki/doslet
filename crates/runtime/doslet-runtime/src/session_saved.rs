@@ -151,6 +151,10 @@ pub struct RuntimeSession {
     joystick_buttons: Vec<bool>,
     #[prost(uint64, optional, tag = "32")]
     mouse_last_relative_read: Option<u64>,
+    #[prost(message, repeated, tag = "33")]
+    patches: Vec<patches::MemoryPatch>,
+    #[prost(uint32, tag = "34")]
+    patches_applied: u32,
 }
 impl Session {
     pub(super) fn save_wire_referenced(&self) -> RuntimeSession {
@@ -164,6 +168,8 @@ impl Session {
             machine: Some(State::save(&*self.machine)),
             status: Some(State::save(&self.status)),
             steps: self.steps,
+            patches: self.patches.clone(),
+            patches_applied: self.patches_applied as u32,
             console: self.console.to_vec(),
             console_truncated: self.console_truncated,
             extended_key: self.extended_key.as_ref().map(|v| u32::from(*(v))),
@@ -217,6 +223,8 @@ impl Session {
                 "RuntimeSession.status",
             )?)?,
             steps: w.steps,
+            patches: w.patches,
+            patches_applied: w.patches_applied as usize,
             console: w.console,
             console_truncated: w.console_truncated,
             extended_key: w
@@ -317,6 +325,12 @@ impl Session {
             synchronization: Default::default(),
             analyzer: Default::default(),
         };
+        value
+            .validate_patches(&value.patches)
+            .map_err(InvalidState)?;
+        if value.patches_applied > value.patches.len() {
+            return Err(InvalidState("applied patch count exceeds plan length"));
+        }
         Ok(value)
     }
 }

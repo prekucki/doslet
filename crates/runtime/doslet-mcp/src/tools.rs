@@ -30,6 +30,7 @@ impl ComputerTools {
             Err(_) => Err("Desktop did not complete the action within 30 seconds".into()),
         };
         match result {
+            Ok(Response::CodeTags(value)) => Ok(CallToolResult::structured(value)),
             Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error)])),
             Ok(Response::Exiting) => Ok(CallToolResult::structured(
                 serde_json::json!({"status": "Exiting"}),
@@ -87,6 +88,21 @@ struct CpuClock {
 }
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct CodeRange {
+    start: u32,
+    end: u32,
+    bits: u8,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CodeTag {
+    start: u32,
+    end: u32,
+    bits: u8,
+    tier: CodeTier,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct Click {
     x: Option<u32>,
     y: Option<u32>,
@@ -139,6 +155,38 @@ fn duration(value: Option<u16>) -> Result<u16, ErrorData> {
 }
 #[tool_router]
 impl ComputerTools {
+    #[tool(
+        description = "Inspect existing speed-tier labels whose instruction starts are in [start,end), using decimal physical addresses and bits=16 or 32. Maximum span 65536 bytes. Reports current-byte matches, conflicts and confirmed IRQ labels. Does not decode unknown code or change execution.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn inspect_code_tags(
+        &self,
+        Parameters(p): Parameters<CodeRange>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.perform(Action::CodeTags {
+            start: p.start,
+            end: p.end,
+            bits: p.bits,
+            tier: None,
+        })
+        .await
+    }
+    #[tool(
+        description = "Manually tag existing matching instruction labels in [start,end) as hot, cold or grey; decimal physical addresses, bits=16 or 32, maximum 65536 bytes. Inspect first. Requires enabled speed tiers and no GDB/preparation. Skips changed code, conflict guards and confirmed IRQs. Labels are global by PC, including shared callees. Applies live without resetting time/counters, protects edits from automatic learning and saves them to the active profile cache. Does not tag unknown code, patch guest bytes or change MHz.",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn tag_code_range(
+        &self,
+        Parameters(p): Parameters<CodeTag>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.perform(Action::CodeTags {
+            start: p.start,
+            end: p.end,
+            bits: p.bits,
+            tier: Some(p.tier),
+        })
+        .await
+    }
     #[tool(
         description = "Enable bounded synchronization diagnostics or its experimental adaptive CPU controller. Resets evidence and disables competing heuristic waits. Disabled mode restores the configured MHz ceiling.",
         annotations(destructive_hint = false, open_world_hint = false)
@@ -284,6 +332,41 @@ impl ServerHandler for ComputerTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn code_tag_request_reaches_owner_and_returns_counts() {
+        let (send, receive) = mpsc::sync_channel(QUEUE);
+        let tools = ComputerTools::new(send);
+        let request = tools.tag_code_range(Parameters(CodeTag {
+            start: 256,
+            end: 272,
+            bits: 16,
+            tier: CodeTier::Hot,
+        }));
+        let owner = async {
+            tokio::task::yield_now().await;
+            let request = receive.try_recv().unwrap();
+            assert!(matches!(
+                request.action,
+                Action::CodeTags {
+                    start: 256,
+                    end: 272,
+                    bits: 16,
+                    tier: Some(CodeTier::Hot),
+                }
+            ));
+            request
+                .reply
+                .send(Ok(Response::CodeTags(serde_json::json!({"changed":2}))))
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(request, owner);
+        assert_eq!(result.unwrap().structured_content.unwrap()["changed"], 2);
+        assert!(
+            serde_json::from_str::<CodeTag>(r#"{"start":0,"end":16,"bits":16,"tier":"irq"}"#)
+                .is_err()
+        );
+    }
 
     #[test]
     fn mouse_modes_are_exclusive_and_old_coordinates_remain_supported() {

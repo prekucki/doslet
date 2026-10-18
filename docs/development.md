@@ -100,6 +100,16 @@ construct large machine states. This changes the test-thread stack limit, not
 the emulator's guest memory. The `mise test` task and CI set it for tests too.
 MCP/GDB integration tests require permission to bind local TCP sockets.
 
+The native effect accumulator regression runs 100000 owner/mailbox-style merges
+on a 256-KiB thread stack, checks all retained outputs, and drops a large pending
+queue. Run it with `cargo test -p doslet --locked native_effects`. Previously,
+repeated `Task::batch([pending, Task::none()])` created nested `SelectAll`
+streams even when no actions were pending. A 50000-iteration standalone probe
+reproduced main-thread stack exhaustion under host GDB in `poll_next`, without
+a game or guest debugger connection. The flat accumulator removes that chain;
+this reproduction identifies a concrete failure mechanism, not the missing
+historical core dump's exact stack.
+
 ## Bounded synchronization analyzer
 
 Use `--analyze-synchronization` for diagnostics and `--adaptive-cpu` for the

@@ -228,6 +228,14 @@ impl Computer {
         }
         let mut effects = Task::none();
         let result = match action {
+            Action::CodeTags {
+                start,
+                end,
+                bits,
+                tier,
+            } => app
+                .code_tags(start, end, bits, tier)
+                .map(Response::CodeTags),
             Action::Exit => {
                 self.cancel(app, "Doslet is closing");
                 self.closing = true;

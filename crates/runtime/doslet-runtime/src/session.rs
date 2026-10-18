@@ -32,6 +32,7 @@ pub use observation::IdleObservation;
 pub use synchronization::SynchronizationStats;
 mod keyboard;
 mod mouse;
+pub mod patches;
 #[cfg(feature = "save-state")]
 mod saved;
 #[cfg(feature = "save-state")]
@@ -67,6 +68,7 @@ pub enum RuntimeError {
     InvalidCdromImage,
     Storage(StorageError),
     Input(doslet_input::InputError),
+    PatchTimeout(u8),
 }
 impl From<ComError> for RuntimeError {
     fn from(error: ComError) -> Self {
@@ -115,6 +117,7 @@ impl fmt::Display for RuntimeError {
             Self::InvalidLaunch => f.write_str("launch setup requires a ready session and a printable ASCII DOS command tail of at most 126 bytes"),
             Self::InvalidWorkingDirectory(code) => write!(f, "invalid DOS working directory (DOS error {code})"),
             Self::Input(error)=>write!(f,"input error: {error:?}"),
+            Self::PatchTimeout(index) => write!(f, "memory patch #{index}: expected RAM bytes not found before the guest step deadline"),
             Self::Storage(error) => write!(f,"storage error: {error:?}"),
             Self::InvalidCdromImage => f.write_str("MSCDEX image must be a sector-aligned ISO 9660 image with a valid primary volume descriptor"),
         }
@@ -127,6 +130,8 @@ pub struct Session {
     status: SessionStatus,
     fault: Option<RuntimeError>,
     steps: u64,
+    patches: Vec<patches::MemoryPatch>,
+    patches_applied: usize,
     console: Vec<u8>,
     console_truncated: bool,
     extended_key: Option<u8>,
@@ -302,6 +307,8 @@ impl Session {
             status: SessionStatus::Ready,
             fault: None,
             steps: 0,
+            patches: Vec::new(),
+            patches_applied: 0,
             console: Vec::with_capacity(CONSOLE_CAPACITY),
             console_truncated: false,
             extended_key: None,
@@ -598,6 +605,31 @@ impl Session {
     }
     /// No wall-clock checks or allocations. Every batch is limited by execution steps.
     pub fn advance(&mut self, budget: u32) -> u32 {
+        if self.status == SessionStatus::Running
+            && budget != 0
+            && self.patches_applied < self.patches.len()
+        {
+            self.check_patches();
+            // Poll pending plans at most 4096 guest steps apart, without adding
+            // signature checks to the per-instruction execution path.
+            let remaining = self
+                .patches
+                .get(self.patches_applied)
+                .map_or(u64::MAX, |p| p.timeout_steps.saturating_sub(self.steps));
+            let completed = self.advance_inner(
+                budget
+                    .min(4096)
+                    .min(remaining.min(u64::from(u32::MAX)) as u32),
+            );
+            if self.status == SessionStatus::Running {
+                self.check_patches();
+            }
+            completed
+        } else {
+            self.advance_inner(budget)
+        }
+    }
+    fn advance_inner(&mut self, budget: u32) -> u32 {
         self.timeslice_yielded = false;
         self.apply_input();
         let mut completed = 0;
