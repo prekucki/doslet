@@ -1,5 +1,19 @@
 # Machiavelli the Prince: compatibility target
 
+## Keyboard input
+
+PRINCE requires AT keyboard input (`input.keyboard = "at"` in a version-2
+machine profile). It installs its own IRQ1 handler and reads scan codes from
+port 60h. BIOS key-ring injection leaves its name editor unchanged, and queued
+keys eventually fill that ring. This was reproduced with both the original
+DOS/4GW host and direct DPMI; the symptom alone does not identify a DPMI fault.
+
+The local `games/PRINCE.toml` selects AT input. A headless run confirmed that a
+physical key reaches the name editor under DPMI. The opt-in
+`local_prince_menu_pcm_and_keyboard` regression checks typing and Backspace in
+that editor, alongside the PCM completion check, in all three DPMI modes. It
+reads the local profile at runtime; no game files are included in the test.
+
 ## MIDI overflow when entering Doge's Palace
 
 On 2026-10-17, clicking **Doge's Palace / Politics** from Venice immediately

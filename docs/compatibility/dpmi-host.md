@@ -137,6 +137,31 @@ The reported PRINCE regression was observed live: driver coordinates changed
 while the menu cursor remained stationary; disabling the host restored movement
 according to the user. The corrected binary still requires a fresh game run.
 
+The BIOS timer's real-mode `INT 1Ch` now invokes an installed protected-mode
+handler before completing the real-mode return. This implements the timer case
+of the [DPMI software-interrupt reflection contract](https://www.delorie.com/djgpp/doc/dpmi/ch4.4.3.html).
+The runtime keeps the interrupted real-mode context on its bounded host frame
+stack, uses a private protected stack, and prevents a handler chaining to the
+default reflector from recursively invoking itself. The return restores the
+real-mode registers, flags and stack before executing the original IRET.
+This path requires the unchanged default BIOS `INT 1Ch` shim; reflection of
+`INT 23h` and `INT 24h` remains outside the implemented scope.
+
+Without that timer delivery, a PRINCE menu click left its PCM effect in the
+continuous DMA buffer. Sound Blaster block IRQs were acknowledged on time, but
+the effect repeated because the game's software mixer did not receive timer
+ticks. A local interpreter reproduction produced 644 nonzero stereo frames for
+the click, then repeated those samples with the host enabled. With timer
+reflection, the same click produces 644 nonzero frames followed by silence,
+including a further five-second observation window. This compares generated
+guest PCM without a host audio device; it does not establish audible output
+quality. The opt-in regression runs the menu sequence with the original DOS/4GW
+host, reflected DPMI and direct DPMI:
+
+```sh
+cargo test -p doslet --release --locked local_prince_menu_pcm_and_keyboard -- --ignored --nocapture
+```
+
 This is an experimental subset, not a conforming general-purpose DPMI server:
 
 - Portable save states reject sessions with this host enabled: its descriptors,

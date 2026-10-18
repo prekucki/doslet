@@ -92,6 +92,42 @@ fn direct_and_reflected_calls_return_identical_register_frames() {
 }
 
 #[test]
+fn real_bios_timer_calls_protected_tick_and_allows_chaining_to_default() {
+    for mode in [Mode::Reflect, Mode::Direct] {
+        for chain in [false, true] {
+            let mut s = prepared(mode);
+            let mut reference = prepared(mode);
+            let code = s.registers().cs;
+            let mut handler = alloc::vec![
+                0x1E, 0x66, 0xB8, DATA as u8, 0, 0x8E, 0xD8, // Save DS; load flat data.
+                0xFF, 0x05, 0, 0x10, 3, 0, // INC DWORD PTR [31000h].
+                0xB8, 0xEF, 0xBE, 0xAD, 0xDE, // Clobber EAX on the protected side.
+            ];
+            if chain {
+                handler.extend_from_slice(&[0x9C, 0x9A]); // PUSHFD; CALL FAR old handler.
+                handler.extend_from_slice(&(PM_BASE + 0x1C * 8).to_le_bytes());
+                handler.extend_from_slice(&CODE.to_le_bytes());
+            }
+            handler.extend_from_slice(&[0x1F, 0xCF]);
+            for (i, byte) in handler.into_iter().enumerate() {
+                s.machine.bus.write_u8(0x40000 + i as u32, byte).unwrap();
+            }
+            s.dpmi_gate(0x1C, code, 0x40000).unwrap();
+            for ticks in 1..=2 {
+                let expected = simulated(&mut reference, 8, 0x1234);
+                let got = simulated(&mut s, 8, 0x1234);
+                assert_eq!(got, expected, "mode={mode:?} chain={chain}");
+                assert_eq!(s.machine.bus.read_u32(0x31000).unwrap(), ticks);
+                assert_eq!(s.dpmi.as_ref().unwrap().depth, 0);
+                assert!(s.machine.cpu.protected_mode());
+                assert_eq!(s.registers(), reference.registers());
+                assert_eq!(s.eflags(), reference.eflags());
+            }
+        }
+    }
+}
+
+#[test]
 fn installed_guest_handler_and_changed_shim_are_never_bypassed() {
     for altered_shim in [false, true] {
         let mut s = prepared(Mode::Direct);

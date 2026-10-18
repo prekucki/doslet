@@ -13,6 +13,7 @@ const RAW_RM: u32 = 0x830;
 const SAVE_PM: u32 = 0x840;
 const SAVE_RM: u32 = 0x850;
 const CB_RETURN: u32 = 0x860;
+const TIMER_RETURN: u32 = 0x870;
 const CB_BASE: u32 = 0x2000;
 const PM_BASE: u32 = 0x1000;
 const GDT: u32 = 0x100000;
@@ -60,6 +61,7 @@ struct Frame {
     context: CpuContext,
     structure: Option<u32>,
     callback: bool,
+    timer: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -109,7 +111,14 @@ impl Session {
             direct_return_pending: false,
         }));
         for offset in [
-            ENTRY, RM_RETURN, RAW_PM, RAW_RM, SAVE_PM, SAVE_RM, CB_RETURN,
+            ENTRY,
+            RM_RETURN,
+            RAW_PM,
+            RAW_RM,
+            SAVE_PM,
+            SAVE_RM,
+            CB_RETURN,
+            TIMER_RETURN,
         ] {
             self.dpmi_marker(offset)?;
         }
@@ -180,10 +189,16 @@ impl Session {
         }
         let callback =
             real && (CB_BASE..CB_BASE + 32 * 8).contains(&ip) && (ip - CB_BASE).is_multiple_of(8);
+        // The BIOS invokes INT 1Ch in real mode. DPMI must deliver that tick
+        // to the installed protected handler as well. A handler chaining back
+        // to the default reflection must reach the real IRET without recursion.
+        if real && ip == 0x1C && self.machine.bus.read_u8(bios::SHIM_BASE + ip)? == 0xCF {
+            return self.dpmi_timer_tick();
+        }
         let known = if real {
             callback || matches!(ip, ENTRY | RM_RETURN | RAW_PM | SAVE_RM)
         } else {
-            matches!(ip, RAW_RM | SAVE_PM | CB_RETURN)
+            matches!(ip, RAW_RM | SAVE_PM | CB_RETURN | TIMER_RETURN)
                 || ((PM_BASE..PM_BASE + 256 * 8).contains(&ip) && (ip - PM_BASE).is_multiple_of(8))
         };
         if !known {
@@ -219,6 +234,16 @@ impl Session {
         if ip == CB_RETURN {
             return self.dpmi_callback_return();
         }
+        if ip == TIMER_RETURN {
+            let h = self.dpmi.as_mut().unwrap();
+            if h.depth == 0 || !h.frames[h.depth - 1].as_ref().unwrap().timer {
+                return Err(dpmi_error(0x8021));
+            }
+            h.depth -= 1;
+            let frame = h.frames[h.depth].take().unwrap();
+            self.machine.cpu.restore_context(&frame.context);
+            return Ok(());
+        }
         if real {
             if ip == ENTRY {
                 self.dpmi_enter()
@@ -236,6 +261,53 @@ impl Session {
                 self.dpmi_reflect(vector, None, None, false)
             }
         }
+    }
+
+    fn dpmi_timer_tick(&mut self) -> Result<(), RuntimeError> {
+        let h = self.dpmi.as_ref().unwrap();
+        if !h.stats.entered || h.frames[..h.depth].iter().flatten().any(|f| f.timer) {
+            return Ok(());
+        }
+        let at = IDT + 0x1C * 8;
+        let low = self.machine.bus.read_u32(at)?;
+        let high = self.machine.bus.read_u32(at + 4)?;
+        if low == (u32::from(CODE) << 16) | (PM_BASE + 0x1C * 8) && high & 0xFFFF0000 == 0 {
+            return Ok(());
+        }
+        let h = self.dpmi.as_mut().unwrap();
+        if h.depth == h.frames.len() {
+            return Err(dpmi_error(0x8012));
+        }
+        h.frames[h.depth] = Some(Frame {
+            context: self.machine.cpu.context(),
+            structure: None,
+            callback: false,
+            timer: true,
+        });
+        h.depth += 1;
+        let sp = POOL - h.depth as u32 * 0x400;
+        self.machine.cpu.set_protected_mode(true);
+        self.machine.cpu.set_current_privilege_level(3);
+        self.machine.cpu.control.idtr = DescriptorTable {
+            base: IDT,
+            limit: 2047,
+        };
+        for (segment, selector) in [
+            (Seg::Cs, CODE),
+            (Seg::Ss, DATA),
+            (Seg::Ds, 0),
+            (Seg::Es, 0),
+            (Seg::Fs, 0),
+            (Seg::Gs, 0),
+        ] {
+            self.machine
+                .cpu
+                .load_segment(&mut self.machine.bus, segment, selector)?;
+        }
+        self.machine.cpu.registers.set32(Gpr32::Esp, sp);
+        self.machine.cpu.registers.ip = TIMER_RETURN;
+        self.machine.cpu.interrupt(&mut self.machine.bus, 0x1C)?;
+        Ok(())
     }
 
     fn dpmi_enter(&mut self) -> Result<(), RuntimeError> {
@@ -961,6 +1033,7 @@ impl Session {
             context,
             structure,
             callback: false,
+            timer: false,
         });
         h.depth += 1;
         h.stats.reflected += 1;
@@ -1111,6 +1184,7 @@ impl Session {
             context,
             structure: Some(callback.structure),
             callback: true,
+            timer: false,
         });
         h.depth += 1;
         let sp = POOL - h.depth as u32 * 0x400;

@@ -4693,6 +4693,96 @@ enabled = false
 
     #[test]
     #[ignore = "requires the user's local PRINCE installation; run from repository root"]
+    fn local_prince_menu_pcm_and_keyboard() {
+        fn advance(session: &mut Session, millis: u64) -> u64 {
+            let until = session.emulated_nanos() + millis * 1_000_000;
+            let mut pcm = [doslet_pcm::EMPTY; 1024];
+            let mut midi = [0; 4096];
+            let mut nonzero = 0;
+            while session.emulated_nanos() < until {
+                session.advance(1000);
+                assert_eq!(
+                    session.status(),
+                    SessionStatus::Running,
+                    "{:?}",
+                    session.fault()
+                );
+                loop {
+                    let n = session.drain_pcm_timed(&mut pcm);
+                    if n == 0 {
+                        break;
+                    }
+                    nonzero += pcm[..n].iter().filter(|f| f.samples != [0; 2]).count() as u64;
+                }
+                while session.drain_midi(&mut midi) != 0 {}
+            }
+            nonzero
+        }
+        fn click(session: &mut Session, x: u16, y: u16) -> u64 {
+            session.pointer_move(x, y);
+            session.pointer_button(0, true);
+            let n = advance(session, 100);
+            session.pointer_button(0, false);
+            n
+        }
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = root.join("games/PRINCE/PRINCE.EXE");
+        let profile = crate::machine_profile::parse_machine_profile(
+            &std::fs::read_to_string(root.join("games/PRINCE.toml")).unwrap(),
+        )
+        .unwrap();
+        for mode in [
+            None,
+            Some(doslet_runtime::session::dpmi::Mode::Reflect),
+            Some(doslet_runtime::session::dpmi::Mode::Direct),
+        ] {
+            let mut session = crate::native_input::load_game_with_settings(
+                &path,
+                &crate::native_input::LaunchSettings {
+                    dpmi: mode,
+                    no_dynamic_core: true,
+                    hardware: profile.hardware,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            session.start();
+            assert_eq!(advance(&mut session, 15_000), 0);
+            click(&mut session, 320, 240); // Dismiss the intro.
+            advance(&mut session, 3000);
+            let onset = click(&mut session, 320, 150); // Start New menu sound.
+            let effect = onset + advance(&mut session, 8000);
+            assert!(effect > 0, "menu click must actually play PCM: {mode:?}");
+            assert_eq!(
+                advance(&mut session, 5000),
+                0,
+                "completed effect must not repeat: {mode:?}"
+            );
+            assert_eq!(session.audio_status().dsp.block_irq_deadline_misses, 0);
+            click(&mut session, 320, 455); // Done: open the name editor.
+            advance(&mut session, 3000);
+            // Type qzx742, then Backspace and 3. The game's IRQ1 handler must
+            // receive make/break events; BIOS-ring injection cannot edit this field.
+            for usage in [20, 29, 27, 36, 33, 31, 42, 32] {
+                let key = doslet_input::PhysicalKey(usage);
+                session.key_event(key, true).unwrap();
+                advance(&mut session, 50);
+                session.key_event(key, false).unwrap();
+                advance(&mut session, 50);
+            }
+            assert!(
+                session
+                    .ram_view(0xB0000..0x1000000)
+                    .unwrap()
+                    .windows(7)
+                    .any(|s| s == b"qzx743\0"),
+                "keyboard must edit the game's name buffer: {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the user's local PRINCE installation; run from repository root"]
     fn local_prince_reaches_intro_through_ui_batches() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let legacy = root.join("PRINCE/PRINCE.EXE");
