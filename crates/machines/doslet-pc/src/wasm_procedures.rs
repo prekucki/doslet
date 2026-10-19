@@ -6,6 +6,7 @@
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 use doslet_bus::{CodeCheck, MemoryBus};
+pub use doslet_wasm_aot::CompiledCache;
 use doslet_wasm_aot::procedure_memory::rle::{RleAdmission, RleMemory, prepare_rle};
 use doslet_wasm_aot::procedure_memory::{Exit, SharedProcedureMemory};
 use doslet_x86::procedure_calls::{
@@ -358,7 +359,17 @@ impl PcMachine {
         wasm: &[u8],
         bindings: Vec<Binding>,
     ) -> Result<(), String> {
-        self.install_procedures(Some(wasm), bindings)
+        self.install_procedures(Some(wasm), bindings, None)
+    }
+
+    /// As `install_wasm_procedures`, reusing compatible native code from the host.
+    pub fn install_wasm_procedures_cached(
+        &mut self,
+        wasm: &[u8],
+        bindings: Vec<Binding>,
+        cache: &mut dyn CompiledCache,
+    ) -> Result<(), String> {
+        self.install_procedures(Some(wasm), bindings, Some(cache))
     }
 
     /// Interpret admitted finite semantic procedures through RET before IRQ
@@ -368,13 +379,14 @@ impl PcMachine {
         &mut self,
         bindings: Vec<Binding>,
     ) -> Result<(), String> {
-        self.install_procedures(None, bindings)
+        self.install_procedures(None, bindings, None)
     }
 
     fn install_procedures(
         &mut self,
         wasm: Option<&[u8]>,
         mut bindings: Vec<Binding>,
+        cache: Option<&mut dyn CompiledCache>,
     ) -> Result<(), String> {
         if self.wasm_procedures.is_some() {
             return Err("WASM procedures already installed".into());
@@ -503,7 +515,7 @@ impl PcMachine {
             }
         }
         let mut owner = wasm
-            .map(|wasm| SharedProcedureMemory::new(wasm, &ids, self.bus.ram_size()))
+            .map(|wasm| SharedProcedureMemory::with_cache(wasm, &ids, self.bus.ram_size(), cache))
             .transpose()?;
         let mut prepared = Vec::new();
         let mut source_pages = alloc::vec![0u8; self.bus.ram_size().div_ceil(PAGE_BYTES)];

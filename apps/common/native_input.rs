@@ -30,8 +30,14 @@ pub struct LaunchSettings {
     pub no_dynamic_core: bool,
     pub dpmi: Option<doslet_runtime::session::dpmi::Mode>,
     pub core_profile: Option<PathBuf>,
+    /// Without an explicit `core_profile`, one profile per executable lives here.
+    #[allow(dead_code, reason = "headless runners select profiles explicitly")]
+    pub core_profile_cache: Option<PathBuf>,
     pub wasm_procedures: Option<PathBuf>,
     pub interpret_procedures: bool,
+    /// Native code compiled from procedure modules; `None` compiles every launch.
+    #[allow(dead_code, reason = "read only with the wasm-procedures feature")]
+    pub compiled_cache: Option<PathBuf>,
 }
 impl Default for LaunchSettings {
     fn default() -> Self {
@@ -55,8 +61,10 @@ impl Default for LaunchSettings {
             no_dynamic_core: false,
             dpmi: None,
             core_profile: None,
+            core_profile_cache: None,
             wasm_procedures: None,
             interpret_procedures: false,
+            compiled_cache: None,
         }
     }
 }
@@ -163,7 +171,12 @@ pub fn install_wasm_procedures(
     let _ = session;
     if let Some(path) = &settings.wasm_procedures {
         #[cfg(feature = "wasm-procedures")]
-        wasm_procedures::install(session, path, settings.interpret_procedures)?;
+        wasm_procedures::install(
+            session,
+            path,
+            settings.interpret_procedures,
+            settings.compiled_cache.as_deref(),
+        )?;
         #[cfg(not(feature = "wasm-procedures"))]
         return Err(format!(
             "{} requires the wasm-procedures Cargo feature",

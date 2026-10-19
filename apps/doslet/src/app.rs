@@ -743,8 +743,14 @@ impl Doslet {
                         let text = crate::machine_profile::export_machine_profile(
                             &self.configurator.draft,
                         );
+                        let path = std::path::Path::new(&self.configurator.profile_path);
                         self.configurator.message = Some(
-                            match std::fs::write(&self.configurator.profile_path, text) {
+                            match path
+                                .parent()
+                                .filter(|parent| !parent.as_os_str().is_empty())
+                                .map_or(Ok(()), std::fs::create_dir_all)
+                                .and_then(|()| std::fs::write(path, text))
+                            {
                                 Ok(()) => "Profile saved.".into(),
                                 Err(e) => e.to_string(),
                             },
@@ -1375,10 +1381,18 @@ impl Doslet {
         mut old_storage: Option<crate::native_storage::NativeStorage>,
         import_path: Option<std::path::PathBuf>,
     ) -> MachinePreparation {
+        let mut settings = settings;
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
                 let path = (!spec.game.executable.is_empty())
                     .then(|| std::path::PathBuf::from(&spec.game.executable));
+                // A cached profile belongs to one executable; never reuse the last game's.
+                if settings.core_profile_cache.is_some() {
+                    settings.core_profile = None;
+                    if let Some(path) = &path {
+                        crate::profile::select_core_profile(&mut settings, path);
+                    }
+                }
                 let mut session = match &path {
                     Some(path) => crate::native_zip::load_game_with_settings(path, &settings)
                         .map_err(|e| e.to_string())?,

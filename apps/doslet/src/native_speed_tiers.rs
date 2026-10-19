@@ -48,6 +48,10 @@ pub(crate) struct Controller {
     pending_nanos: u64,
     max_nanos: u64,
 }
+/// Lowercase hexadecimal SHA-256 of an executable, the key of per-game caches.
+pub fn executable_sha256(path: &Path) -> Result<String, std::io::Error> {
+    persistence::fingerprint(path)
+}
 impl Controller {
     pub fn profile_info(&self) -> crate::cpu_config::ProfileInfo {
         crate::cpu_config::ProfileInfo {
@@ -65,7 +69,7 @@ impl Controller {
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
             .take(48)
             .collect();
-        Ok(persistence::data_directory()?
+        Ok(persistence::default_directory()?
             .join("profiles")
             .join(format!(
                 "{}-speed-tiers.json",

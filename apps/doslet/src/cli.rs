@@ -149,11 +149,14 @@ pub struct Cli {
     #[arg(long, value_name = "IP:PORT")]
     pub mcp: Option<std::net::SocketAddr>,
 
-    /// Load/save observed JIT blocks between runs (local profile, outside game data)
+    /// Load/save observed JIT blocks between runs (default: per-game file in the user cache)
     #[arg(long, value_name = "FILE")]
     pub core_profile: Option<PathBuf>,
-    /// Use AOT procedures with embedded metadata (.wasm; legacy .json also accepted)
-    #[arg(long, value_name = "WASM_OR_JSON", requires = "no_speed_tiers")]
+    /// Neither load nor save a dynamic-core profile
+    #[arg(long, conflicts_with = "core_profile")]
+    pub no_core_profile: bool,
+    /// Use AOT procedures with embedded metadata (.wasm; legacy .json also accepted); without a path, the module cached for this executable
+    #[arg(long, value_name = "WASM_OR_JSON", requires = "no_speed_tiers", num_args = 0..=1, default_missing_value = "")]
     pub wasm_procedures: Option<PathBuf>,
     /// Interpret marked procedures with the bundle's IRQ boundary policy
     #[arg(long, requires = "wasm_procedures")]

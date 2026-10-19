@@ -248,6 +248,16 @@ fn command_tail(arguments: &[String]) -> Result<Vec<u8>, String> {
     Ok(tail)
 }
 
+/// Without an explicit file, each executable keeps its own dynamic-core profile
+/// in the cache. An unreadable executable leaves profiling off.
+pub fn select_core_profile(settings: &mut crate::native_input::LaunchSettings, executable: &Path) {
+    if let Some(directory) = &settings.core_profile_cache {
+        settings.core_profile = crate::native_speed_tiers::executable_sha256(executable)
+            .ok()
+            .map(|hash| directory.join(format!("{hash}.bin")));
+    }
+}
+
 impl Cli {
     pub fn resolve(self) -> Result<Self, Box<dyn Error>> {
         self.resolve_with_roms(crate::native_roms::detect)
@@ -439,8 +449,34 @@ impl Cli {
             .experimental_dpmi
             .unwrap_or(crate::cli::DpmiMode::Direct)
             .host_mode();
+        let dirs = crate::host_dirs::HostDirs::detect().ok();
         self.launch.core_profile = self.core_profile.clone();
-        self.launch.wasm_procedures = self.wasm_procedures.clone();
+        if self.core_profile.is_none() && !self.no_core_profile {
+            self.launch.core_profile_cache =
+                dirs.as_ref().map(crate::host_dirs::HostDirs::core_profiles);
+        }
+        if let Some(exe) = &self.game {
+            select_core_profile(&mut self.launch, exe);
+        }
+        self.launch.compiled_cache = dirs.as_ref().map(crate::host_dirs::HostDirs::aot_compiled);
+        self.launch.wasm_procedures = match &self.wasm_procedures {
+            // Without a path, use the module generated for this executable.
+            Some(path) if path.as_os_str().is_empty() => {
+                let exe = self
+                    .game
+                    .as_deref()
+                    .ok_or("--wasm-procedures without a path requires a native executable")?;
+                let dirs = dirs
+                    .as_ref()
+                    .ok_or("no user cache directory for AOT modules")?;
+                Some(
+                    dirs.aot_modules()
+                        .join(crate::native_speed_tiers::executable_sha256(exe)?)
+                        .join("procedures.wasm"),
+                )
+            }
+            path => path.clone(),
+        };
         self.launch.interpret_procedures = self.interpret_procedures;
         #[cfg(not(feature = "wasm-procedures"))]
         if self.wasm_procedures.is_some() {
@@ -828,6 +864,36 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.root).unwrap();
         }
+    }
+
+    #[test]
+    fn dynamic_core_profiles_default_to_one_cache_file_per_executable() {
+        let fixture = Fixture::new("version=1\n[game]\nexecutable='../TINY.EXE'\n");
+        let hash =
+            crate::native_speed_tiers::executable_sha256(&fixture.root.join("TINY.EXE")).unwrap();
+        let cache = crate::host_dirs::HostDirs::detect()
+            .unwrap()
+            .core_profiles();
+        let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
+        assert_eq!(
+            cli.launch.core_profile,
+            Some(cache.join(format!("{hash}.bin")))
+        );
+        let explicit = fixture
+            .cli(&["--no-audio", "--core-profile", "fixed.bin"])
+            .resolve()
+            .unwrap();
+        assert_eq!(explicit.launch.core_profile, Some("fixed.bin".into()));
+        assert!(explicit.launch.core_profile_cache.is_none());
+        let disabled = fixture
+            .cli(&["--no-audio", "--no-core-profile"])
+            .resolve()
+            .unwrap();
+        assert!(disabled.launch.core_profile.is_none());
+        // Another game never inherits this file; an unreadable one disables it.
+        let mut settings = cli.launch.clone();
+        select_core_profile(&mut settings, &fixture.root.join("MISSING.EXE"));
+        assert!(settings.core_profile.is_none());
     }
 
     #[test]

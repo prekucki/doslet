@@ -1137,7 +1137,8 @@ identical bytes may rebind existing code; changed bytes require new IR and
 compilation. RAM writes inside a slice still invalidate code before the next
 instruction/block lookup. No large RAM/VRAM buffer is cloned.
 
-Optional `--core-profile FILE` preparation stores at most 256 observed hot blocks
+Dynamic-core profile preparation (a per-executable cache file by default, or
+`--core-profile FILE`) stores at most 256 observed hot blocks
 in a versioned file of at most 62,726 bytes. It records linear address hints and
 exact post-relocation code bytes, never host code or pointers. Imports are bounded,
 fully decoded and compiled again. Runtime binding decodes the complete current

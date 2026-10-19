@@ -2,11 +2,19 @@
 """Make a private static ROTT site from the already built Trunk bundle."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import struct
 import tomllib
 import zipfile
+
+
+def user_cache() -> Path:
+    """The XDG cache directory used by the native application."""
+    value = os.environ.get("XDG_CACHE_HOME", "")
+    return Path(value) if Path(value).is_absolute() else Path.home() / ".cache"
+
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "web/dist"
@@ -14,7 +22,7 @@ OUTPUT = ROOT / "target/rott-web"
 PROFILE = ROOT / "games/ROTT.toml"
 SAVES = ROOT / "games/rott-saves"
 ROMS = Path.home() / ".config/dosbox/mt32-roms"
-TIER_BASE = Path.home() / ".local/share/doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json"
+TIER_BASE = user_cache() / "doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json"
 TIER_LEARNED = TIER_BASE.with_name(TIER_BASE.name + ".learned.json")
 ROTT_EXE_SHA256 = "2deedf54c45178792483114c017223407e3044abcc0863526aa477654a78569a"
 # Preserve native instruction labels, but pace the browser's interpreter at rates

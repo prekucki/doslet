@@ -150,11 +150,16 @@ field. ISO file access and MSCDEX sectors share one media/cache owner.
 | --- | --- |
 | Read only | Guest modifications are denied. |
 | Temporary changes | Changes live in a separate RAM overlay until discarded. |
-| Persistent changes | Changes use an explicit native save directory or browser IndexedDB namespace. |
+| Persistent changes | Changes use a native redb save store or a browser IndexedDB namespace. |
 | Legacy direct writeback | Native version-1 `rw` behavior: closed changed files replace files in the installation folder. |
 
-Persistent changes preserve the installation as the lower layer. Browser
-persistence uses **IndexedDB**; SQL storage is deferred. Each save store has a
+Persistent changes preserve the installation as the lower layer. Native
+persistence uses one [redb](https://www.redb.org/) database, `overlay.redb`, per
+save store. A store named without a path component, such as `prince`, lives in
+the per-user save directory listed under [host directories](#host-directories).
+A `native-store` binding, or a value containing a path separator, names the
+store directory explicitly. Browser persistence uses **IndexedDB**; SQL storage
+is deferred. Each save store has a
 base identity and one writer. Busy writers, mismatched installations, quota
 failures and corrupt stores produce errors. Saves become acknowledged only after
 the host transaction completes. **Info** distinguishes unsaved changes,
@@ -164,8 +169,11 @@ browser storage eviction.
 Standard writable mounts reserve a 1-MiB upper layer with 4-KiB changed chunks
 and 64 new file records; DOS shares 96 handles across its filesystems. Each ISO
 source has a 16-MiB cache of 128-KiB chunks and up to four reads in flight. Native
-stores keep a bounded ledger of 4096 acknowledged mutations and the latest two
-published snapshots; IndexedDB keeps up to 65536 mutation records. Reaching a
+stores keep a bounded ledger of 4096 acknowledged mutations and the committed
+snapshot, in database values just under 64 KiB. Copy-on-write retains the
+previous revision until the next commit is durable, and redb grows the file in
+power-of-two steps; expect a file of up to about four times the snapshot size.
+IndexedDB keeps up to 65536 mutation records. Reaching a
 limit produces a visible quota error. Export into a new store to continue after
 ledger exhaustion. Store payloads contain only the upper layer and its metadata.
 
@@ -189,6 +197,43 @@ for `Range` and `If-Match` and must expose `Content-Range`, `ETag` and
 `Content-Encoding`. Local ISO selection remains available when a server cannot
 provide this contract. Transient transport attempts are finite: at most three,
 with 250-ms/1-s delays, a 10-s limit per attempt and 35-s overall limit.
+
+Version-1 native directory stores (`manifest.bin` and `snapshot-*.bin`) are
+imported into `overlay.redb` when first opened, including their mutation ledger.
+The old files remain unchanged and are no longer updated. A store that is
+already open by another Doslet process reports a busy writer.
+
+## Host directories
+
+Native builds keep per-user files in the platform's standard directories. On
+Linux and BSD these follow the XDG Base Directory specification; relative
+`XDG_*` values are ignored, as the specification requires.
+
+| Contents | Linux / BSD default | macOS | Windows |
+| --- | --- | --- | --- |
+| Profiles saved from the configurator | `$XDG_CONFIG_HOME/doslet/profiles` (`~/.config/doslet/profiles`) | `~/Library/Application Support/doslet/profiles` | `%APPDATA%\doslet\profiles` |
+| Named save stores | `$XDG_DATA_HOME/doslet/saves/<name>` (`~/.local/share/doslet/saves/<name>`) | `~/Library/Application Support/doslet/saves/<name>` | `%LOCALAPPDATA%\doslet\saves\<name>` |
+| Save export/import file | `$XDG_DATA_HOME/doslet/exports` | `~/Library/Application Support/doslet/exports` | `%LOCALAPPDATA%\doslet\exports` |
+| Speed-tier labels and their **Save as** files | `$XDG_CACHE_HOME/doslet/speed-tiers` (`~/.cache/doslet/speed-tiers`) | `~/Library/Caches/doslet/speed-tiers` | `%LOCALAPPDATA%\doslet\cache\speed-tiers` |
+| Dynamic-core profiles, one per executable | `$XDG_CACHE_HOME/doslet/core-profiles` | `~/Library/Caches/doslet/core-profiles` | `%LOCALAPPDATA%\doslet\cache\core-profiles` |
+| Generated AOT procedure modules | `$XDG_CACHE_HOME/doslet/aot/<exe-sha256>` | `~/Library/Caches/doslet/aot/<exe-sha256>` | `%LOCALAPPDATA%\doslet\cache\aot\<exe-sha256>` |
+| Native code compiled from those modules | `$XDG_CACHE_HOME/doslet/aot-compiled` | `~/Library/Caches/doslet/aot-compiled` | `%LOCALAPPDATA%\doslet\cache\aot-compiled` |
+
+These are defaults; edited paths, profile bindings and explicit CLI paths such
+as `--config`, `--speed-tier-cache` and `--core-profile` keep their meaning.
+Machine profiles are configuration and saves are data. Everything under the
+cache directory can be regenerated, but deleting it also discards learned and
+manually corrected speed-tier labels; save those elsewhere to keep them. The
+first use moves an existing `$XDG_DATA_HOME/doslet/speed-tiers` directory into
+the cache. The browser stores saves in IndexedDB instead.
+
+Native game launches load and save a dynamic-core profile named by the SHA-256
+of the executable; `--no-core-profile` disables this and `--core-profile FILE`
+selects one file for every game. ZIP launches and the demo use no profile unless
+one is given explicitly. Compiled AOT files hold host machine code for this
+Wasmtime version, configuration and CPU. Each records a SHA-256 of its contents;
+a mismatch, or code Wasmtime rejects, is compiled again. Only one compilation per
+module is kept.
 
 ## Profiles
 
@@ -268,6 +313,10 @@ Set the executable and bindings to your own files, then launch with:
 ```sh
 cargo run -p doslet --release --locked -- --config machine.toml
 ```
+
+The `saves` location is relative to the profile and holds `overlay.redb`. Omit
+the `game-saves` binding to keep that store in the per-user save directory
+instead.
 
 For a browser C: tree, use drive kind `zip` and a ZIP binding. For browser saves,
 use binding kind `indexeddb` and a namespace in `location`. Local CD-ROM mounts

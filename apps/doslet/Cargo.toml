@@ -36,6 +36,7 @@ sha2 = "0.10.9"
 clap = { version = "4", features = ["derive"] }
 gilrs = "0.11.2"
 ureq = "3"
+redb = "4.4.0"
 cpal = "0.15.3"
 midir = "0.11.1"
 iced = { version = "0.14.0", default-features = false, features = ["wgpu", "tokio", "x11", "wayland"] }

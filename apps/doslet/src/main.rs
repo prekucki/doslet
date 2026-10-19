@@ -8,6 +8,9 @@ mod cpu_meter;
 mod desktop;
 mod disk_activity;
 #[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/host_dirs.rs"]
+mod host_dirs;
+#[cfg(not(target_arch = "wasm32"))]
 mod native_computer;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_effects;

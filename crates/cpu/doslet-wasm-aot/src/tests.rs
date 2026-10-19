@@ -125,3 +125,41 @@ fn aot_runtime_error_does_not_replay_faulting_guest_code() {
     assert!(runner.run(10).is_err());
     assert_eq!(runner.host().stats().polls, polls);
 }
+#[test]
+fn compiled_cache_reuses_compatible_code_and_replaces_rejected_entries() {
+    #[derive(Default)]
+    struct Memory {
+        entry: Option<(Vec<u8>, u64, Vec<u8>)>,
+        stores: usize,
+    }
+    impl CompiledCache for Memory {
+        fn load(&mut self, wasm: &[u8], engine: u64) -> Option<Vec<u8>> {
+            self.entry
+                .as_ref()
+                .filter(|(source, fingerprint, _)| source == wasm && *fingerprint == engine)
+                .map(|(_, _, compiled)| compiled.clone())
+        }
+        fn store(&mut self, wasm: &[u8], engine: u64, compiled: &[u8]) {
+            self.stores += 1;
+            self.entry = Some((wasm.to_vec(), engine, compiled.to_vec()));
+        }
+    }
+    let code = [0x40, 0xeb, 0xfd];
+    let translated = translation(&code);
+    let wasm = translated.wasm();
+    let mut cache = Memory::default();
+    let first = Artifact::compile_cached(&wasm, &mut cache).unwrap();
+    let second = Artifact::compile_cached(&wasm, &mut cache).unwrap();
+    assert_eq!((cache.stores, second.compile_seconds), (1, 0.0));
+    assert_eq!(second.serialized(), first.serialized());
+    let mut runner = second
+        .instantiate(Host::new(translation(&code), runtime(&code)))
+        .unwrap();
+    assert_eq!(runner.run(100).unwrap(), 100);
+    // Bytes Wasmtime cannot accept are recompiled instead of executed.
+    if let Some((_, _, compiled)) = &mut cache.entry {
+        compiled.truncate(16);
+    }
+    Artifact::compile_cached(&wasm, &mut cache).unwrap();
+    assert_eq!(cache.stores, 2);
+}

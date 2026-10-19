@@ -23,6 +23,6 @@ doslet-x86.workspace = true
 doslet-bus.workspace = true
 wasm-encoder = { version = "0.262", default-features = false }
 
-# Only the private loader for artifacts compiled by this instance may be unsafe.
+# Only the private loaders for artifacts compiled by this adapter may be unsafe.
 [lints.rust]
 unsafe_code = "deny"

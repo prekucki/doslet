@@ -826,9 +826,9 @@ expanded. Invalid/duplicate DOS paths, symbolic links, encrypted files and
 unsupported compression are rejected explicitly. Reset targets the running
 program, independently of subsequent import/selection changes. Page reload loses
 the imported ZIP mount and temporary writes. Explicit persistent stores retain
-the changed-data overlay: native versioned files use an OS writer lock and atomic
-manifest publication; browser IndexedDB uses an exclusive Web Lock and a fenced
-transaction. Close/commit/namespace changes wait for the durable acknowledgement.
+the changed-data overlay: a native redb database admits one writer through its
+file lock and publishes snapshot, revision and mutation record in one transaction;
+browser IndexedDB uses an exclusive Web Lock and a fenced transaction. Close/commit/namespace changes wait for the durable acknowledgement.
 Stores bind to the immutable base identity, so reopening requires the same game
 data. Export/import exchanges a versioned overlay with a base-identity check.
 Neither backend writes to the immutable base; legacy native `rw` retains its

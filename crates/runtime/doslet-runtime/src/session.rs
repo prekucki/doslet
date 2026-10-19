@@ -791,6 +791,18 @@ impl Session {
         self.machine.install_wasm_procedures(wasm, bindings)
     }
 
+    /// As `install_wasm_procedures`, reusing compatible native code from the host.
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub fn install_wasm_procedures_cached(
+        &mut self,
+        wasm: &[u8],
+        bindings: alloc::vec::Vec<doslet_pc::wasm_procedures::Binding>,
+        cache: &mut dyn doslet_pc::wasm_procedures::CompiledCache,
+    ) -> Result<(), alloc::string::String> {
+        self.machine
+            .install_wasm_procedures_cached(wasm, bindings, cache)
+    }
+
     #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
     pub fn install_interpreted_procedure_boundaries(
         &mut self,

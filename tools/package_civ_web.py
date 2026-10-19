@@ -2,10 +2,18 @@
 """Build a private Civilization web site from the Rust Trunk output."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import tomllib
 import zipfile
+
+
+def user_cache() -> Path:
+    """The XDG cache directory used by the native application."""
+    value = os.environ.get("XDG_CACHE_HOME", "")
+    return Path(value) if Path(value).is_absolute() else Path.home() / ".cache"
+
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "web/dist"
@@ -13,7 +21,7 @@ OUTPUT = ROOT / "target/civ-web"
 CONFIG = ROOT / "tools/civ_web"
 GAME = ROOT / "games/civ"
 ROMS = Path.home() / "games/retro/mt-32"
-TIERS = Path.home() / ".local/share/doslet/speed-tiers"
+TIERS = user_cache() / "doslet/speed-tiers"
 EXE_SHA256 = "31e35b01f4d00df81685dfcb81e6de196a3876bd2afff6e39cbbfd964f5852ad"
 ROM_SHA1 = {
     "CM32L_CONTROL.ROM": "a439fbb390da38cada95a7cbb1d6ca199cd66ef8",

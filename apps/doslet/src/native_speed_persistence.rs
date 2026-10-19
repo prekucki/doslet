@@ -216,7 +216,7 @@ fn validate_identity(
     }
     Ok(())
 }
-fn fingerprint(path: &Path) -> Result<String, std::io::Error> {
+pub(super) fn fingerprint(path: &Path) -> Result<String, std::io::Error> {
     let mut input = File::open(path)?;
     let mut hash = Sha256::new();
     let mut buf = [0; 16 * 1024];
@@ -242,33 +242,39 @@ fn game_location_hash(
 ) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
     let root = match root {
         Some(path) => path.to_owned(),
-        None => data_directory()?,
+        None => default_directory()?,
     };
     Ok((
         root.join(format!("{hash}.json")),
         format!("exe-sha256:{hash}"),
     ))
 }
-pub(super) fn data_directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    #[cfg(not(target_os = "windows"))]
-    let home = || {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or("HOME unavailable; use --speed-tier-cache")
-    };
-    #[cfg(target_os = "windows")]
-    let root = PathBuf::from(
-        std::env::var_os("LOCALAPPDATA")
-            .ok_or("LOCALAPPDATA unavailable; use --speed-tier-cache")?,
-    );
-    #[cfg(target_os = "macos")]
-    let root = home()?.join("Library/Application Support");
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let root = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        Some(path) => PathBuf::from(path),
-        None => home()?.join(".local/share"),
-    };
-    Ok(root.join("doslet/speed-tiers"))
+/// Labels are cache. Earlier versions kept them as data; the first use moves
+/// that directory, and a failed move keeps using it.
+pub(super) fn default_directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dirs = crate::host_dirs::HostDirs::detect()
+        .map_err(|error| format!("{error}; use --speed-tier-cache"))?;
+    Ok(adopt_legacy(dirs.legacy_speed_tiers(), dirs.speed_tiers()))
+}
+fn adopt_legacy(legacy: PathBuf, directory: PathBuf) -> PathBuf {
+    if directory.exists() || !legacy.is_dir() {
+        return directory;
+    }
+    let moved = directory
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| fs::rename(&legacy, &directory));
+    match moved {
+        Ok(()) => directory,
+        Err(error) => {
+            eprintln!(
+                "[WARN doslet] Cannot move {} to {}: {error}",
+                legacy.display(),
+                directory.display()
+            );
+            legacy
+        }
+    }
 }
 
 fn write(
@@ -350,6 +356,20 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_data_directory_moves_once_into_the_cache() {
+        let f = Fixture::new();
+        let legacy = f.0.join("data/speed-tiers");
+        let directory = f.0.join("cache/speed-tiers");
+        fs::create_dir_all(legacy.join("profiles")).unwrap();
+        fs::write(legacy.join("game.json"), b"{}").unwrap();
+        assert_eq!(adopt_legacy(legacy.clone(), directory.clone()), directory);
+        assert_eq!(fs::read(directory.join("game.json")).unwrap(), b"{}");
+        assert!(directory.join("profiles").is_dir() && !legacy.exists());
+        fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(adopt_legacy(legacy.clone(), directory.clone()), directory);
+        assert!(legacy.exists());
+    }
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {

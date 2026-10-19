@@ -1,5 +1,8 @@
 //! Offline original-EXE conversion for a complete native procedure test bundle.
 #[allow(dead_code)]
+#[path = "../../common/host_dirs.rs"]
+mod host_dirs;
+#[allow(dead_code)]
 #[path = "../../common/procedure_input.rs"]
 mod procedure_input;
 use doslet_aot::{
@@ -16,7 +19,12 @@ use doslet_x86_wasm::static_program::procedure_memory::{
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{error::Error, fs, io::Read, path::Path};
+use std::{
+    error::Error,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 fn read(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -30,8 +38,8 @@ fn read(path: &Path, limit: usize) -> Result<Vec<u8>> {
 }
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() < 3 {
-        return Err("usage: prepare_memory_procedures CONFIG.toml BINDINGS.json OUTPUT_DIR [--max-work-per-call N] [--hot-profile JSON --profile-bindings JSON] [--copy-kernels | --computation-kernels] [--kernels-only] [--kernel-interrupts defer|before-irq]".into());
+    if args.len() < 2 {
+        return Err("usage: prepare_memory_procedures CONFIG.toml BINDINGS.json [OUTPUT_DIR] [--max-work-per-call N] [--hot-profile JSON --profile-bindings JSON] [--copy-kernels | --computation-kernels] [--kernels-only] [--kernel-interrupts defer|before-irq]".into());
     }
     let mut max_work_per_call = None;
     let mut profile_path = None;
@@ -40,7 +48,10 @@ fn main() -> Result<()> {
     let mut computation_kernels = false;
     let mut kernels_only = false;
     let mut kernel_interrupts = None;
-    let mut options = args[3..].iter();
+    let explicit_output = args
+        .get(2)
+        .filter(|arg| !arg.to_string_lossy().starts_with("--"));
+    let mut options = args[2 + usize::from(explicit_output.is_some())..].iter();
     while let Some(option) = options.next() {
         if option == "--computation-kernels" && !computation_kernels {
             computation_kernels = true;
@@ -303,7 +314,14 @@ fn main() -> Result<()> {
             "finite_computation":finite,
             "kernel_interrupts":kernel_interrupts.unwrap_or("defer"),"sources":sources}));
     }
-    let output = Path::new(&args[2]);
+    let output = match explicit_output {
+        Some(path) => PathBuf::from(path),
+        // The desktop finds this module with `--wasm-procedures` and no path.
+        None => host_dirs::HostDirs::detect()?
+            .aot_modules()
+            .join(format!("{:x}", Sha256::digest(&exe))),
+    };
+    let output = output.as_path();
     fs::create_dir_all(output)?;
     let manifest = json!({"version":2,"memory_abi_version":doslet_x86_wasm::static_program::memory::VERSION,"code_sha256":format!("{:x}",Sha256::digest(compiled.wasm())),
         "exe_sha256":format!("{:x}",Sha256::digest(&exe)),"maximum_work_per_call":max_work_per_call,"hot_profile_selected":verified_hot.is_some(),"copy_kernels":copy_kernels,"computation_kernels":computation_kernels,"kernels_only":kernels_only,"functions":functions});

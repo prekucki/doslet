@@ -485,10 +485,13 @@ strategies also suppress automatic activation.
 
 Profiles are portable JSON files named `<sha256>.json`, stored under:
 
-- Linux: `$XDG_DATA_HOME/doslet/speed-tiers`, or
-  `$HOME/.local/share/doslet/speed-tiers` when XDG_DATA_HOME is unset.
-- macOS: `$HOME/Library/Application Support/doslet/speed-tiers`.
-- Windows: `%LOCALAPPDATA%/doslet/speed-tiers`.
+- Linux and BSD: `$XDG_CACHE_HOME/doslet/speed-tiers`, or
+  `$HOME/.cache/doslet/speed-tiers` when XDG_CACHE_HOME is unset or relative.
+- macOS: `$HOME/Library/Caches/doslet/speed-tiers`.
+- Windows: `%LOCALAPPDATA%/doslet/cache/speed-tiers`.
+
+Earlier versions used the data directory (`$XDG_DATA_HOME/doslet/speed-tiers`
+on Linux); the first use moves that directory into the cache.
 
 `--speed-tier-cache DIR` overrides this location. Without a configured executable,
 an explicit base profile uses `<profile>.learned.json`, keyed by the base file's

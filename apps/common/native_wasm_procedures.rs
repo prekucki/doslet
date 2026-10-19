@@ -7,9 +7,16 @@ use doslet_runtime::{
     },
 };
 use sha2::{Digest, Sha256};
-use std::{error::Error, fs::File, io::Read, path::Path};
+use std::{
+    error::Error,
+    fs::{self, File},
+    io::{Read, Write},
+    path::Path,
+};
 
 const MAX_MANIFEST: usize = bundle::MAX_METADATA_BYTES;
+const MAX_COMPILED: usize = 4 * MAX_WASM;
+const COMPILED_MAGIC: &[u8] = b"DCW1";
 const MAX_WASM: usize = bundle::MAX_CODE_BYTES;
 const MAX_FUNCTIONS: usize = 4096;
 const MAX_SOURCES: usize = 65_536;
@@ -116,7 +123,67 @@ fn terminals(value: &serde_json::Value, key: &str) -> Result<Vec<u32>, Box<dyn E
         .collect()
 }
 
-pub fn install(session: &mut Session, path: &Path, interpret: bool) -> Result<(), Box<dyn Error>> {
+/// Native code compiled from procedure modules, one file per module and engine.
+/// A SHA-256 of the contents turns truncation or corruption into recompilation.
+struct DiskCache<'a> {
+    directory: &'a Path,
+}
+impl DiskCache<'_> {
+    fn names(wasm: &[u8], engine: u64) -> (String, String) {
+        let source = format!("{:x}", Sha256::digest(wasm));
+        let name = format!("{source}-{engine:016x}.cwasm");
+        (source, name)
+    }
+}
+impl doslet_runtime::wasm_procedures::CompiledCache for DiskCache<'_> {
+    fn load(&mut self, wasm: &[u8], engine: u64) -> Option<Vec<u8>> {
+        let (_, name) = Self::names(wasm, engine);
+        let bytes = read(&self.directory.join(name), MAX_COMPILED).ok()?;
+        let (digest, compiled) = bytes.strip_prefix(COMPILED_MAGIC)?.split_at_checked(32)?;
+        (Sha256::digest(compiled).as_slice() == digest).then(|| compiled.to_vec())
+    }
+    fn store(&mut self, wasm: &[u8], engine: u64, compiled: &[u8]) {
+        let (source, name) = Self::names(wasm, engine);
+        let result = (|| -> std::io::Result<()> {
+            fs::create_dir_all(self.directory)?;
+            // Compilations of this module by other engines are obsolete.
+            for entry in fs::read_dir(self.directory)? {
+                let path = entry?.path();
+                if path
+                    .file_name()
+                    .and_then(|file| file.to_str())
+                    .is_some_and(|file| {
+                        file.starts_with(&source) && file.ends_with(".cwasm") && file != name
+                    })
+                {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            let temporary = self
+                .directory
+                .join(format!(".{name}.{}.tmp", std::process::id()));
+            let mut file = File::create(&temporary)?;
+            file.write_all(COMPILED_MAGIC)?;
+            file.write_all(&Sha256::digest(compiled))?;
+            file.write_all(compiled)?;
+            drop(file);
+            fs::rename(&temporary, self.directory.join(&name))
+        })();
+        if let Err(error) = result {
+            eprintln!(
+                "[WARN doslet] Cannot cache compiled AOT code in {}: {error}",
+                self.directory.display()
+            );
+        }
+    }
+}
+
+pub fn install(
+    session: &mut Session,
+    path: &Path,
+    interpret: bool,
+    compiled_cache: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
     let ProcedureBundle { manifest, module } = load(path)?;
     if word(&manifest, "memory_abi_version")? != doslet_runtime::wasm_procedures::MEMORY_ABI_VERSION
     {
@@ -261,7 +328,14 @@ pub fn install(session: &mut Session, path: &Path, interpret: bool) -> Result<()
             path.display()
         );
     } else {
-        session.install_wasm_procedures(&module, bindings)?;
+        match compiled_cache {
+            Some(directory) => session.install_wasm_procedures_cached(
+                &module,
+                bindings,
+                &mut DiskCache { directory },
+            )?,
+            None => session.install_wasm_procedures(&module, bindings)?,
+        }
         eprintln!(
             "[INFO doslet] AOT-WASM: {} procedures installed; interpreter and AOT share RAM, VRAM and page generations ({})",
             entries.len(),

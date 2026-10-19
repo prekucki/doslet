@@ -894,13 +894,16 @@ to omit the native JIT.
 Headless `--no-decode-cache` disables both engines' caches for the byte-fetching
 reference. Native CLI output reports actual compiled and executed block counts.
 
-Optionally reuse observed code on subsequent launches:
+Native game launches reuse observed code from a per-executable profile in the
+user cache (see [host directories](configuration.md#host-directories)). Select
+one file explicitly, or disable profiling with `--no-core-profile`:
 
 ```sh
 cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE --core-profile target/prince.core-profile
 ```
 
-The same `--core-profile FILE` option works with headless runners. Profiles are
+The same `--core-profile FILE` option works with headless runners, which use no
+profile by default. Profiles are
 local hints containing bounded guest code bytes, never saved host machine code.
 Keep them outside game directories and do not redistribute profiles of commercial
 games. The desktop saves on pause, reset and normal shutdown; headless saves at

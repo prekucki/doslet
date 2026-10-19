@@ -307,6 +307,12 @@ cargo build -p doslet --features wasm-procedures --release --locked --offline
 sh tools/run-rott-aot.sh
 ```
 
+Without `OUTPUT_DIR`, the generator writes `procedures.wasm` to the user cache
+under the executable's SHA-256, and `--wasm-procedures` without a path selects
+that module for the launched executable. The desktop stores the module's native
+compilation in the user cache, so later launches load it instead of compiling;
+see [host directories](../configuration.md#host-directories).
+
 The bundled checkpoint is local test input at the known loaded addresses,
 not a new game save. The existing window, input, audio and game UI are used.
 Additional native flags can be appended, for example `--midi-output PORT`.
@@ -376,7 +382,7 @@ neither executable names nor game addresses. `--kernels-only` omits ordinary
 instruction-by-instruction procedures from the generated bundle.
 
 ```sh
-cargo run -p doslet-headless --features wasm-static-test --example prepare_memory_procedures --release --locked --offline -- games/ROTT.toml target/static-rott-layout/current-bindings.json target/rott-aot-kernels --max-work-per-call 4096 --hot-profile "$HOME/.local/share/doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json.learned.json" --profile-bindings target/static-rott-layout/historical-bindings.json --copy-kernels --kernels-only
+cargo run -p doslet-headless --features wasm-static-test --example prepare_memory_procedures --release --locked --offline -- games/ROTT.toml target/static-rott-layout/current-bindings.json target/rott-aot-kernels --max-work-per-call 4096 --hot-profile "$HOME/.cache/doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json.learned.json" --profile-bindings target/static-rott-layout/historical-bindings.json --copy-kernels --kernels-only
 ```
 
 The local image produces one 2177-byte module for the complete column copy at
@@ -656,7 +662,7 @@ single-step replay. Supply the profile and its original address layout after
 the step count:
 
 ```sh
-cargo run -p doslet-headless --features wasm-static-test --example inspect_static_coverage --release --locked --offline -- games/ROTT.toml target/rott-aot/start.state target/static-rott-layout/current-bindings.json 10000000 "$HOME/.local/share/doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json.learned.json" target/static-rott-layout/historical-bindings.json
+cargo run -p doslet-headless --features wasm-static-test --example inspect_static_coverage --release --locked --offline -- games/ROTT.toml target/rott-aot/start.state target/static-rott-layout/current-bindings.json 10000000 "$HOME/.cache/doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json.learned.json" target/static-rott-layout/historical-bindings.json
 ```
 
 Historical instruction bytes and executable relocations are checked before
@@ -1554,7 +1560,7 @@ window. Evidence: `target/static-rott-native-wait-only/report.json`.
 
 ```sh
 cargo build -p doslet-static-game-probe --target wasm32-unknown-unknown --release --locked --offline
-cargo run -p doslet-headless --example compare_static_game --features wasm-static-test --release --locked --offline -- --config games/ROTT.toml --state target/rott-wasm-fixture/initial.state --bindings target/static-rott-layout/current-bindings.json --profile-bindings target/static-rott-layout/historical-bindings.json --profile /home/reqc/.local/share/doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json.learned.json --base-profile /home/reqc/.local/share/doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json --event-waits cold --out target/static-rott-cold-waits --steps 2000000 --repeats 3
+cargo run -p doslet-headless --example compare_static_game --features wasm-static-test --release --locked --offline -- --config games/ROTT.toml --state target/rott-wasm-fixture/initial.state --bindings target/static-rott-layout/current-bindings.json --profile-bindings target/static-rott-layout/historical-bindings.json --profile "$HOME/.cache/doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json.learned.json" --base-profile "$HOME/.cache/doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json" --event-waits cold --out target/static-rott-cold-waits --steps 2000000 --repeats 3
 ```
 
 `--seek-wait N` optionally executes at most 100M additional instructions (and
@@ -1674,9 +1680,15 @@ The separate native `doslet-wasm-aot` adapter uses Wasmtime 45.0.3 to precompile
 the module before execution. It selects Cranelift `OptLevel::Speed`, backtracking
 register allocation and explicit compiler inlining. `Speed` is the compiler's
 highest speed optimization preset; the adapter preserves normal WASM checks.
-One compiled artifact serves multiple instances. A private unsafe loader accepts
-only unchanged bytes just produced by the same engine's `precompile_module`;
-the public API cannot load serialized native code from a file. The diagnostic
+One compiled artifact serves multiple instances. Two private unsafe loaders
+accept native code: unchanged bytes just produced by the same engine's
+`precompile_module`, and bytes returned by a host `CompiledCache`. The adapter
+opens no files; the cache contract requires the host to return only bytes the
+adapter stored for the same WASM source and engine fingerprint (Wasmtime version,
+configuration and target). Wasmtime rejects incompatible code, which is then
+compiled again. The desktop cache lives in the per-user cache directory and
+checks a SHA-256 of each file; this detects corruption, not a local user able to
+write that directory. Headless runners compile every launch. The diagnostic
 writes `game.cwasm` for local inspection. Its contents depend on the native target
 and engine configuration and are not a browser-loadable WASM module.
 

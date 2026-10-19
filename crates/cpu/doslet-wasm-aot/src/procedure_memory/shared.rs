@@ -107,6 +107,16 @@ impl SharedProcedureMemory {
     /// `memory_procedure_<id>` once, in one instance with fixed-size memory.
     /// IDs must be sorted and unique; input caps precede compilation/allocation.
     pub fn new(wasm: &[u8], function_ids: &[u32], ram_bytes: usize) -> Result<Self, String> {
+        Self::with_cache(wasm, function_ids, ram_bytes, None)
+    }
+
+    /// As `new`, reusing native code from a host cache when it is compatible.
+    pub fn with_cache(
+        wasm: &[u8],
+        function_ids: &[u32],
+        ram_bytes: usize,
+        cache: Option<&mut dyn crate::CompiledCache>,
+    ) -> Result<Self, String> {
         if wasm.len() > MAX_MODULE_BYTES {
             return Err("shared procedure module exceeds 64 MiB".into());
         }
@@ -120,7 +130,10 @@ impl SharedProcedureMemory {
             return Err("shared procedure generations require a little-endian host".into());
         }
         let layout = SharedProcedureLayout::new(ram_bytes)?;
-        let artifact = crate::Artifact::compile(wasm)?;
+        let artifact = match cache {
+            Some(cache) => crate::Artifact::compile_cached(wasm, cache)?,
+            None => crate::Artifact::compile(wasm)?,
+        };
         let mut store = Store::new(&artifact.engine, ());
         let pages = (layout.memory_bytes / WASM_PAGE_BYTES) as u32;
         let memory = Memory::new(&mut store, MemoryType::new(pages, Some(pages)))

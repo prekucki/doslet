@@ -4,6 +4,9 @@
 #[path = "../../doslet/src/archive.rs"]
 mod archive;
 #[allow(dead_code)]
+#[path = "../../common/host_dirs.rs"]
+mod host_dirs;
+#[allow(dead_code)]
 #[path = "../../common/machine_profile.rs"]
 mod machine_profile;
 
@@ -252,10 +255,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         &json!({"learning_version":1,"identity":format!("exe-sha256:{exe_hash}"),"unknown":"grey","irq_policy":"static-grey","nodes":rows}),
     )?;
     fs::write(out.join("observed-speed-tiers.json"), &observed)?;
-    let default_cache = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
-        .map(|p| p.join(format!("doslet/speed-tiers/{exe_hash}.json")));
+    let default_cache = host_dirs::HostDirs::detect()
+        .ok()
+        .map(|dirs| dirs.speed_tiers().join(format!("{exe_hash}.json")));
     let existing = option("--profile")
         .map(PathBuf::from)
         .or_else(|| default_cache.filter(|p| p.is_file()));

@@ -158,8 +158,24 @@ pub struct ConfiguratorState {
     pub controllers: Vec<String>,
 }
 
+/// Profile and save-export paths. Native fields start in the per-user
+/// directories; the browser uses file pickers.
+fn default_files() -> (String, String) {
+    let names = ("machine.toml", "game.doslet-save");
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(dirs) = crate::host_dirs::HostDirs::detect() {
+        let path = |path: std::path::PathBuf| path.to_string_lossy().into_owned();
+        return (
+            path(dirs.profiles().join(names.0)),
+            path(dirs.save_exports().join(names.1)),
+        );
+    }
+    (names.0.into(), names.1.into())
+}
+
 impl Default for ConfiguratorState {
     fn default() -> Self {
+        let (profile_path, save_path) = default_files();
         Self {
             open: false,
             page: Page::Machine,
@@ -167,8 +183,8 @@ impl Default for ConfiguratorState {
             active: MachineSpec::default(),
             profile_text: String::new(),
             profile_editor: iced::widget::text_editor::Content::new(),
-            profile_path: "machine.toml".into(),
-            save_path: "game.doslet-save".into(),
+            profile_path,
+            save_path,
             message: None,
             pending: false,
             discard_changes: false,
@@ -685,10 +701,14 @@ impl ConfiguratorState {
                         if cfg!(target_arch = "wasm32") {
                             "Save store name"
                         } else {
-                            "Save directory"
+                            "Save store"
                         },
                         text_input(
-                            "Save store",
+                            if cfg!(target_arch = "wasm32") {
+                                "Save store"
+                            } else {
+                                "Name or folder path"
+                            },
                             c.and_then(|m| m.store.as_deref()).unwrap_or(""),
                         )
                         .on_input(Edit::Store)

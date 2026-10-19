@@ -122,3 +122,25 @@ fn legacy_manifest_cannot_select_a_module_outside_its_directory() {
         );
     }
 }
+
+#[test]
+fn compiled_code_cache_verifies_contents_and_keeps_one_engine_per_module() {
+    use doslet_runtime::wasm_procedures::CompiledCache;
+    let files = Files::new();
+    let directory = files.0.join("compiled");
+    let mut cache = DiskCache {
+        directory: &directory,
+    };
+    assert!(cache.load(EMPTY_MODULE, 1).is_none());
+    cache.store(EMPTY_MODULE, 1, b"native");
+    assert_eq!(cache.load(EMPTY_MODULE, 1).as_deref(), Some(&b"native"[..]));
+    assert!(cache.load(EMPTY_MODULE, 2).is_none());
+    cache.store(EMPTY_MODULE, 2, b"newer");
+    assert!(cache.load(EMPTY_MODULE, 1).is_none());
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+    let path = directory.join(DiskCache::names(EMPTY_MODULE, 2).1);
+    let mut bytes = std::fs::read(&path).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(cache.load(EMPTY_MODULE, 2).is_none());
+}

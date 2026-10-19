@@ -307,13 +307,13 @@ fn system_drive(app: &Doslet, narrow: bool) -> Element<'_, Message> {
     ));
     if c.is_some_and(|m| m.policy == WritePolicy::Persistent) {
         body = body.push(setting(
-            if cfg!(target_arch = "wasm32") {
-                "Save store"
-            } else {
-                "Save folder"
-            },
+            "Save store",
             text_input(
-                "Save location",
+                if cfg!(target_arch = "wasm32") {
+                    "Save location"
+                } else {
+                    "Name or folder path"
+                },
                 c.and_then(|m| m.store.as_deref())
                     .map_or("", |id| s.binding(id)),
             )
