@@ -47,6 +47,8 @@ impl WorkingState {
     pub fn restore(&self) -> Result<Session, InvalidState> {
         let mut session = Session::load_wire(self.wire.clone())?;
         session.drive = self.drive.clone();
+        // load_wire deliberately leaves persistent=None: no lease, commit queue
+        // or host writeback adapter is ever inherited by a diagnostic owner.
         session.cdrom = self.cdrom.as_ref().map(|cd| cd.fork_local().unwrap());
         session.dpmi = self.dpmi.clone();
         // Diagnostic copies start without native code, tier timing or learned proofs.
@@ -66,7 +68,7 @@ impl Session {
         })
     }
     pub fn capture_working_state(&self) -> Result<WorkingState, InvalidState> {
-        self.check_snapshot_boundary()?;
+        self.check_working_state()?;
         Ok(WorkingState {
             wire: self.save_wire_media(false),
             drive: self.drive.clone(),
@@ -75,14 +77,27 @@ impl Session {
         })
     }
 
-    fn check_snapshot_boundary(&self) -> Result<(), InvalidState> {
+    /// Check replay capture availability without copying guest state.
+    /// A persistent-store lease belongs to the live owner, not the replay.
+    /// Replays retain private RAM overlays but never publish their writes.
+    pub fn check_working_state(&self) -> Result<(), InvalidState> {
         if self.fault.is_some() || self.status == SessionStatus::Faulted {
             return Err(InvalidState("cannot save a faulted session"));
         }
         if self.storage_wait
-            || self.persistent.is_some()
+            || self.pending_commit()
             || self.cdrom.as_ref().is_some_and(|cdrom| !cdrom.portable())
         {
+            return Err(InvalidState(
+                "replay requires local media and no host storage operation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_snapshot_boundary(&self) -> Result<(), InvalidState> {
+        self.check_working_state()?;
+        if self.persistent.is_some() {
             return Err(InvalidState(
                 "save requires local media and no host storage operation/lease",
             ));

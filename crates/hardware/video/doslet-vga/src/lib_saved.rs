@@ -65,12 +65,25 @@ pub struct VgaVga {
     pixel_fraction: u64,
     #[prost(uint64, tag = "13")]
     revision: u64,
+    #[prost(uint32, tag = "14")]
+    latches: u32,
 }
 impl State for Vga {
     type Wire = VgaVga;
     fn save(&self) -> Self::Wire {
-        Self::Wire {
-            memory: self.memory.to_vec(),
+        self.save_with_memory(&self.memory)
+    }
+    fn load(w: Self::Wire) -> Result<Self, InvalidState> {
+        Self::load_owned(w)
+    }
+}
+impl Vga {
+    /// Serialize the actual physical backing selected by the machine. State
+    /// restoration always creates a fresh ordinary owner, without host bindings.
+    pub fn save_with_memory(&self, memory: &[u8]) -> VgaVga {
+        assert_eq!(memory.len(), VRAM_LEN, "physical VGA backing length");
+        VgaVga {
+            memory: memory.to_vec(),
             palette: self
                 .palette
                 .iter()
@@ -93,11 +106,13 @@ impl State for Vga {
                 + self.pixel_fraction)
                 % 1_000_000_000,
             revision: self.revision,
+            latches: u32::from_le_bytes(self.latches),
         }
     }
-    fn load(w: Self::Wire) -> Result<Self, InvalidState> {
+    fn load_owned(w: VgaVga) -> Result<Self, InvalidState> {
         let value = Self {
             memory: (w.memory).into_boxed_slice(),
+            latches: w.latches.to_le_bytes(),
             palette: doslet_state::narrow(
                 w.palette
                     .into_iter()

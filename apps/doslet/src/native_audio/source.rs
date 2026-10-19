@@ -1,6 +1,7 @@
 //! Preserve hardware sample counts/rates; fill guest-time gaps with silence.
 //! No interpolation, filtering or sample-rate conversion is performed here.
 use doslet_pcm::SourceFrame;
+const CAPACITY: usize = 16384;
 
 pub(super) struct Timeline {
     frames: Box<[SourceFrame]>,
@@ -17,7 +18,7 @@ pub(super) struct Timeline {
 impl Timeline {
     pub fn new(rate: u32, nanos: u64) -> Self {
         Self {
-            frames: vec![SourceFrame::default(); 16384].into_boxed_slice(),
+            frames: Box::default(),
             head: 0,
             len: 0,
             anchor: nanos,
@@ -29,7 +30,7 @@ impl Timeline {
         }
     }
     pub fn receive(&mut self, frames: &[SourceFrame]) -> Result<(), String> {
-        if frames.len() > self.frames.len() - self.len {
+        if frames.len() > CAPACITY - self.len {
             return Err("Native PCM input queue full".into());
         }
         let mut last = self.last;
@@ -38,6 +39,14 @@ impl Timeline {
                 return Err("Invalid native PCM rate or timestamp".into());
             }
             last = Some(frame.nanos);
+        }
+        if let Some(first) = frames.first()
+            && self.frames.is_empty()
+        {
+            self.frames = vec![SourceFrame::default(); CAPACITY].into_boxed_slice();
+            self.anchor = first.nanos;
+            self.cursor = 0;
+            self.rate = first.rate;
         }
         for &frame in frames {
             self.frames[(self.head + self.len) % self.frames.len()] = frame;
@@ -49,6 +58,9 @@ impl Timeline {
         Ok(())
     }
     pub fn render(&mut self, until: u64, output: &mut [[f32; 2]]) -> (usize, u32) {
+        if self.frames.is_empty() {
+            return (0, self.rate);
+        }
         let mut count = 0;
         while count < output.len() {
             let time = self.anchor
@@ -86,6 +98,24 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unused_source_is_dormant_and_first_late_sample_has_no_startup_silence() {
+        let mut timeline = Timeline::new(48000, 0);
+        let mut samples = [[0.0; 2]; 32];
+        timeline.receive(&[]).unwrap();
+        assert_eq!(timeline.render(2_000_000_000, &mut samples).0, 0);
+        assert!(timeline.frames.is_empty());
+        timeline
+            .receive(&[SourceFrame {
+                nanos: 2_000_000_000,
+                rate: 22050,
+                samples: [1234, -1234],
+            }])
+            .unwrap();
+        assert_eq!(timeline.render(2_000_000_001, &mut samples), (1, 22050));
+        assert_eq!(samples[0], [1234.0 / 32768.0, -1234.0 / 32768.0]);
+        assert_eq!(timeline.received, 1);
+    }
     #[test]
     fn source_rates_preserve_every_sample_across_render_partitions() {
         for rate in [11025, 22050, 32000, 44100, 48000, 49716, 96000] {

@@ -5,6 +5,7 @@ const wasm = await init();
 const engine = new WorkerEngine();
 const io = new HostIo(engine, error => self.postMessage({kind:'storage-error',error}));
 let transitioning = false, wasWaiting = false;
+let startupKeys = '', startupIndex = 0;
 let outputToken=0;
 const outputPreparations=new Map();
 function prepareOutput(output) {
@@ -19,6 +20,8 @@ let port = null, audioPort = null, audioRunning = false, epoch = 0, played = 0;
 let clockMode = 'worklet', nextPoll = 0;
 let ended = false;
 let anchor = null, nextVideo = 0, failed = false;
+let hostSpeed = {at: performance.now(), guest: engine.nanos()};
+function resetHostSpeed() { hostSpeed = {at: performance.now(), guest: engine.nanos()}; }
 let snapshotPending = null;
 // Transferable host presentation buffers. Guest RAM and VRAM never cross realms.
 let midiPool = Array.from({length: 32}, () => new ArrayBuffer(16384));
@@ -60,11 +63,12 @@ function sendSnapshot() {
         if (end === bytes.length) snapshotPending = null;
     }
 }
-function syncAudio(replay = false) {
+function syncAudio(replay = false, resetReceiver = false) {
     epoch++; played = engine.nanos(); anchor = null; ended = false;
+    resetHostSpeed();
     snapshotPending = null;
     if (!port) return;
-    audioMessage({kind: 'reset', epoch, nanos: played, active: engine.status() === 1});
+    audioMessage({kind: 'reset', epoch, nanos: played, active: engine.status() === 1, resetReceiver});
     if (audioRunning && replay) {
         const count = engine.snapshot_midi();
         snapshotPending = {bytes: new Uint8Array(wasm.memory.buffer, engine.replay_ptr(), count).slice(), offset: 0, nanos: played};
@@ -85,14 +89,14 @@ function present(force = false) {
     const now = performance.now();
     if (!force && now < nextVideo) return;
     nextVideo = now + 16;
-    const state = {kind: 'state', epoch, status: engine.status(), steps: engine.steps(),
-        nanos: engine.nanos(), waitingForIo:engine.waiting_for_io(), dirty:engine.dirty_overlay(), pendingCommit:engine.pending_commit(), cs: engine.cs(), ip: engine.ip(), ax: engine.ax(),
+    const state = {kind: 'state', epoch, status: engine.status(), steps: engine.steps(), cpuMhz: engine.cpu_mhz(), effectiveCpuMhz: engine.effective_cpu_mhz(), cpuMode: engine.cpu_mode(), tierRates: Array.from(engine.tier_rates()), tierCounts: Array.from(engine.tier_counts(), Number), keyboardMode: engine.keyboard_mode(),
+        nanos: engine.nanos(), idleNanos: engine.idle_nanos(), waitingForIo:engine.waiting_for_io(), dirty:engine.dirty_overlay(), pendingCommit:engine.pending_commit(), cs: engine.cs(), ip: engine.ip(), ax: engine.ax(),
         cx: engine.cx(), di: engine.di(), fault: engine.fault(), midiMode: engine.midi_mode(),
         midiUpgraded: engine.midi_upgraded(), midiSysex: engine.midi_sysex(),
-        guestPcmRate: engine.guest_pcm_rate(), guestPcmBits: engine.guest_pcm_bits(),
+        audioUse: engine.audio_use(), guestPcmRate: engine.guest_pcm_rate(), guestPcmBits: engine.guest_pcm_bits(),
         guestPcmChannels: engine.guest_pcm_channels(),
-        midiBytes: engine.midi_bytes(), midiNotes: engine.midi_notes(),
-        pointerInUse: engine.pointer_in_use(),
+        midiBytes: engine.midi_bytes(), midiNotes: engine.midi_notes(), midiChannels: engine.midi_channels(), diskReadBytes: engine.disk_read_bytes(),
+        pointerInUse: engine.pointer_in_use(), pointerRelative: engine.pointer_relative_in_use(), memory: JSON.parse(engine.memory_usage()), videoMode: engine.video_mode_label(),
         midiUnmapped: engine.midi_unmapped(), midiDisplay: engine.midi_display()};
     self.postMessage(state);
     if (!videoPool.length) return;
@@ -111,6 +115,23 @@ self.onmessage = ({data}) => {
         if(data.kind === 'joystick') {if(!transitioning)engine.joystick(data.x,data.y,data.buttons);return;}
         if(data.kind === 'release-input') {engine.release_input();return;}
         if(['apply-machine','start-game','reset','import-saves','export-saves','import-iso'].includes(data.kind)) { hostCommand(data); return; }
+        if(data.kind==='bundle-import') {
+            if(transitioning) throw new Error('Machine preparation is still in progress');
+            const programs=engine.import_zip(new Uint8Array(data.buffer)).split('\n');
+            self.postMessage({kind:'call-result',id:data.id,programs});
+            self.postMessage({kind:'imported',programs});
+            return;
+        }
+        if (data.kind === 'audio-hardware') {
+            try {
+                if (transitioning) throw new Error('Machine preparation is still in progress');
+                engine.configure_unused_audio(data.program);
+                self.postMessage({kind:'audio-hardware-applied'});
+            } catch (error) {
+                self.postMessage({kind:'audio-hardware-failed',message:String(error)});
+            }
+            present(true); return;
+        }
         if(transitioning && !['video-return','connect','audio-running','resync-audio'].includes(data.kind)) throw new Error('Machine preparation is still in progress');
         if (data.kind === 'key') {
             engine.key_event(data.scan, data.ascii, data.modifiers, data.pressed);
@@ -119,13 +140,28 @@ self.onmessage = ({data}) => {
         if (data.kind === 'pointer') { engine.pointer_event(data.x,data.y,data.button,data.pressed); return; }
         if (data.kind === 'pointer-relative') { engine.pointer_relative(data.dx,data.dy); return; }
         if (data.kind === 'midi-mode') { engine.set_midi_mode(data.program); syncAudio(audioRunning); present(true); return; }
+        if (data.kind === 'cpu-mhz') { engine.set_cpu_mhz(Number(data.program)); anchor = null; present(true); return; }
+        if (data.kind === 'cpu-settings') {
+            const tierMatch = /^tiers:([0-9]+):([0-9]+):([0-9]+)$/.exec(data.program);
+            if (tierMatch) {
+                engine.set_tier_settings(...tierMatch.slice(1).map(Number));
+                resetHostSpeed(); anchor = null; present(true); return;
+            }
+            const match = /^(fixed|adaptive):([0-9]+)$/.exec(data.program);
+            if (!match) throw new Error('Invalid CPU settings');
+            engine.set_cpu_settings(match[1], Number(match[2]));
+            resetHostSpeed();
+            anchor = null; present(true); return;
+        }
+        if (data.kind === 'mouse-mode') { engine.set_mouse_mode(data.program); present(true); return; }
+        if (data.kind === 'keyboard-mode') { engine.set_keyboard_mode(data.program); present(true); return; }
         if (data.kind === 'video-return') { videoPool.push(data.buffer); return; }
         if (data.kind === 'connect') {
             if (port) port.close();
             if (audioPort) audioPort.close();
             port = data.port; clockMode = data.mode || 'worklet';
             audioPort = data.audioPort || null;
-            engine.set_output_mode(clockMode === 'midi' ? data.dialect || 'gm' : 'gm');
+            engine.set_output_mode(data.dialect || 'gm');
             // A newly connected output recovers host/audio faults without
             // recreating the machine. Session::start still rejects CPU faults.
             failed = false;
@@ -146,7 +182,7 @@ self.onmessage = ({data}) => {
                     if (message.kind === 'error') report(message.error);
                 };
             }
-            syncAudio(audioRunning); return;
+            syncAudio(audioRunning, true); return;
         }
         if (data.kind === 'audio-running') {
             if (audioRunning !== data.running) {
@@ -165,10 +201,12 @@ self.onmessage = ({data}) => {
             } catch (error) { self.postMessage({kind: 'import-error', error: String(error)}); }
         } else if (data.kind === 'pause') {
             engine.pause(); anchor = null;
+            resetHostSpeed();
             audioMessage({kind: 'active', epoch, active: false});
         } else if (data.kind === 'run') {
             if (failed) throw new Error('Reset the session after an audio/worker fault');
             engine.start(); anchor = null;
+            resetHostSpeed();
             if (port && clockMode === 'midi') syncAudio(audioRunning);
             else if (port) audioMessage({kind: 'active', epoch, active: engine.status() === 1});
         } else if (data.kind === 'step') {
@@ -197,19 +235,37 @@ async function hostCommand(data) {
         if(engine.dirty_overlay() && !discard) throw new Error('Export unsaved changes or enable Discard temporary changes before replacing this session');
         const reset=!['apply-machine','start-game'].includes(data.kind);
         const metadata=JSON.parse(reset?engine.prepare_reset():data.kind==='start-game'?engine.prepare_start_game(data.program):engine.prepare_machine(data.profile,data.program||''));
+        if(data.kind==='apply-machine' && data.bundleRuntime) engine.prepare_bundle_runtime();
         prepared=await io.prepare(metadata,reset);
         if(data.kind==='import-saves') engine.candidate_import(new Uint8Array(data.buffer));
+        if(data.kind==='apply-machine' && data.seedBuffer && prepared.emptyStore)
+            engine.candidate_import(new Uint8Array(data.seedBuffer));
+        if(data.kind==='apply-machine' && data.tierProfile)
+            engine.prepare_candidate_tiers(data.tierProfile);
         if(data.kind==='apply-machine') preparedOutput=await prepareOutput(metadata.output);
         await io.install(prepared);
         prepared=null;
+        if(data.kind==='apply-machine' && data.seedBuffer && io.namespace && engine.dirty_overlay()) {
+            engine.pause();engine.request_save_commit();await io.settled();
+            if(engine.pending_commit() || engine.dirty_overlay()) throw new Error('Bundled saves could not be committed');
+            engine.start();
+        }
         if(io.namespace && data.kind==='apply-machine') self.postMessage({kind:'storage-status-request'});
+        const resetReceiver=preparedOutput===null; // A replacement initializes its new port on connect.
         if(preparedOutput!==null) {self.postMessage({kind:'commit-output',token:preparedOutput});preparedOutput=null;}
-        failed=false;syncAudio();
+        failed=false;syncAudio(false, resetReceiver);
+        if(data.kind==='apply-machine') {
+            startupKeys = data.startupKeys || '';
+            startupIndex = 0;
+        } else if(data.kind==='reset') startupIndex = 0;
         if(data.kind==='import-saves') {
             engine.pause();engine.request_save_commit();await io.settled();
             if(engine.pending_commit() || (io.namespace && engine.dirty_overlay())) throw new Error('Imported saves remain dirty; persistent commit failed');
             reply(null);
-        } else if(data.kind==='apply-machine') self.postMessage({kind:'machine-applied',message:'Machine configuration applied',output:metadata.output});
+        } else if(data.kind==='apply-machine') {
+            self.postMessage({kind:'machine-applied',message:'Machine configuration applied',output:metadata.output,profile:data.profile});
+            reply(null);
+        }
         else if(data.kind==='start-game') self.postMessage({kind:'started',name:data.program.split('/').pop()});
         else self.postMessage({kind:'reset-done'});
     } catch(error) {engine.discard_machine();try{await io.discard(prepared);}catch{}if(preparedOutput!==null)self.postMessage({kind:'discard-output',token:preparedOutput});reply(String(error));}
@@ -220,10 +276,15 @@ function tick() {
         io.pump();
         const waiting=engine.waiting_for_io();
         if(wasWaiting && !waiting && clockMode==='midi') syncAudio(audioRunning);
-        if(waiting || wasWaiting!==waiting) anchor=null;
+        if(waiting || wasWaiting!==waiting) { anchor=null; resetHostSpeed(); }
         wasWaiting=waiting;
         let behind = false;
         if (engine.status() === 1 && !failed && !snapshotPending && !transitioning && !waiting) {
+            if (startupIndex < startupKeys.length && engine.waiting_for_key()) {
+                const ascii = startupKeys.charCodeAt(startupIndex);
+                if (!engine.key_event(0, ascii, 0, true)) throw new Error('Startup selection key queue is full');
+                startupIndex++;
+            }
             const now = performance.now();
             if (!anchor) anchor = {host: now, guest: engine.nanos()};
             const wallTarget = anchor.guest + (now - anchor.host) * 1_000_000;
@@ -248,6 +309,16 @@ function tick() {
                 audioMessage({kind: 'poll', epoch}); nextPoll = now + 20;
             }
             behind = engine.nanos() < target && !engine.waiting_for_io();
+            if (engine.cpu_mode() === 'adaptive' && now - hostSpeed.at >= 250) {
+                const guestElapsed = engine.nanos() - hostSpeed.guest;
+                const hostElapsed = (now - hostSpeed.at) * 1_000_000;
+                if (behind && guestElapsed < hostElapsed * 0.9) {
+                    const current = engine.effective_cpu_mhz();
+                    const next = Math.max(1, Math.floor(current * guestElapsed / hostElapsed * 0.85));
+                    if (next < current) engine.set_host_cpu_mhz(next);
+                }
+                hostSpeed = {at: now, guest: engine.nanos()};
+            }
         }
         present();
         if (behind && midiPool.length >= 12) wake.port2.postMessage(null);

@@ -56,7 +56,7 @@ pub enum Edit {
     Dma16(u8),
     Keyboard(bool),
     Gameport(bool),
-    Capture(bool),
+    MouseMode(doslet_config::MouseMode),
     HideCursor(bool),
     PadId(String),
     Number(&'static str, String),
@@ -87,13 +87,62 @@ pub enum Edit {
     SaveProfileFile,
     Validate,
     Apply,
+    ApplyAudio,
     Discard,
     ExportSaves,
     ImportSaves,
     #[allow(dead_code, reason = "Browser-only file picker action")]
     OpenIso,
+    AddCdrom,
+    RemoveCdrom,
+    CdromKind(SourceKind),
+    CdromSource(String),
     DiscardChanges(bool),
 }
+impl Edit {
+    pub fn input_panel_edit(&self) -> bool {
+        matches!(
+            self,
+            Self::Keyboard(_) | Self::MouseMode(_) | Self::HideCursor(_)
+        )
+    }
+    pub fn drives_panel_edit(&self) -> bool {
+        matches!(
+            self,
+            Self::AddCdrom
+                | Self::RemoveCdrom
+                | Self::CdromKind(_)
+                | Self::CdromSource(_)
+                | Self::Root(_)
+                | Self::Executable(_)
+                | Self::Policy(_)
+                | Self::Store(_)
+                | Self::Iso(_)
+                | Self::Https(_)
+                | Self::OpenIso
+                | Self::Apply
+                | Self::Discard
+                | Self::DiscardChanges(_)
+                | Self::Validate
+        )
+    }
+    pub fn audio_panel_edit(&self) -> bool {
+        matches!(
+            self,
+            Self::ApplyAudio
+                | Self::Sb16(_)
+                | Self::Mpu(_)
+                | Self::Irq(_)
+                | Self::Dma8(_)
+                | Self::Dma16(_)
+                | Self::Validate
+                | Self::Apply
+                | Self::Discard
+                | Self::DiscardChanges(_)
+        )
+    }
+}
+
 pub struct ConfiguratorState {
     pub open: bool,
     pub page: Page,
@@ -128,6 +177,42 @@ impl Default for ConfiguratorState {
     }
 }
 impl ConfiguratorState {
+    pub fn audio_only_changes(&self) -> bool {
+        let mut candidate = self.active.clone();
+        candidate.hardware = candidate.hardware.with_audio(self.draft.hardware.audio());
+        candidate == self.draft && candidate != self.active
+    }
+
+    pub fn remember_midi(&mut self, game: &str, host: &str, selection: &str) {
+        let selection = match selection {
+            "Rust synth" => "rust",
+            "Apple DLS synth" => "apple",
+            "CM-32L / MT-32" => "moont",
+            other => other,
+        };
+        for (draft, active, value) in [
+            (
+                &mut self.draft.output.game_midi,
+                &mut self.active.output.game_midi,
+                game,
+            ),
+            (
+                &mut self.draft.output.host_midi,
+                &mut self.active.output.host_midi,
+                host,
+            ),
+            (
+                &mut self.draft.output.midi_output,
+                &mut self.active.output.midi_output,
+                selection,
+            ),
+        ] {
+            if draft == active {
+                *draft = value.into();
+            }
+            *active = value.into();
+        }
+    }
     #[cfg(not(target_arch = "wasm32"))]
     pub fn presentation_copy(&self) -> Self {
         Self {
@@ -180,7 +265,7 @@ impl ConfiguratorState {
                 }
             }
             Edit::Gameport(v) => self.draft.hardware.gameport = *v,
-            Edit::Capture(v) => self.draft.input.capture = *v,
+            Edit::MouseMode(v) => self.draft.input.mouse_mode = *v,
             Edit::HideCursor(v) => self.draft.input.hide_cursor = *v,
             Edit::PadId(v) => self.draft.input.pad_id = (!v.is_empty()).then(|| v.clone()),
             Edit::Number(k, v) => match v.parse::<u8>() {
@@ -198,20 +283,53 @@ impl ConfiguratorState {
             Edit::Name(v) => self.draft.name = v.clone(),
             Edit::Executable(v) => self.draft.game.executable = v.clone(),
             Edit::Root(v) => {
-                let kind = if cfg!(target_arch = "wasm32") {
-                    SourceKind::BrowserZip
-                } else {
-                    SourceKind::NativeDirectory
-                };
+                let kind =
+                    if cfg!(target_arch = "wasm32") || v.to_ascii_lowercase().ends_with(".zip") {
+                        SourceKind::BrowserZip
+                    } else {
+                        SourceKind::NativeDirectory
+                    };
                 let mount = self.c_drive();
                 mount.kind = kind;
                 mount.source = v.clone();
             }
+            Edit::AddCdrom => {
+                if !self.draft.mounts.iter().any(|m| m.letter != b'C') {
+                    self.draft.mounts.push(MountSpec {
+                        letter: b'D',
+                        source: String::new(),
+                        kind: SourceKind::LocalIso,
+                        policy: WritePolicy::ReadOnly,
+                        store: None,
+                    });
+                }
+            }
+            Edit::RemoveCdrom => self.draft.mounts.retain(|m| m.letter == b'C'),
+            Edit::CdromKind(kind) => {
+                if let Some(cd) = self.draft.mounts.iter_mut().find(|m| m.letter != b'C')
+                    && matches!(kind, SourceKind::LocalIso | SourceKind::HttpsIso)
+                    && cd.kind != *kind
+                {
+                    cd.kind = *kind;
+                    cd.source.clear();
+                }
+            }
+            Edit::CdromSource(source) => {
+                if let Some(cd) = self.draft.mounts.iter_mut().find(|m| m.letter != b'C') {
+                    cd.source = source.clone();
+                }
+            }
             Edit::Iso(v) | Edit::Https(v) => {
+                let letter = self
+                    .draft
+                    .mounts
+                    .iter()
+                    .find(|m| m.letter != b'C')
+                    .map_or(b'D', |m| m.letter);
                 self.draft.mounts.retain(|m| m.letter == b'C');
                 if !v.is_empty() {
                     self.draft.mounts.push(MountSpec {
-                        letter: b'D',
+                        letter,
                         source: v.clone(),
                         kind: if matches!(edit, Edit::Https(_)) {
                             SourceKind::HttpsIso
@@ -424,12 +542,18 @@ impl ConfiguratorState {
                             .text_size(14)
                             .on_toggle(Edit::Keyboard)
                             .into(),
-                        checkbox(s.input.capture)
-                            .label("Capture mouse on click")
-                            .size(16)
+                        field(
+                            "Mouse capture",
+                            pick_list(
+                                &doslet_config::MouseMode::ALL[..],
+                                Some(s.input.mouse_mode),
+                                Edit::MouseMode,
+                            )
+                            .width(Fill)
                             .text_size(14)
-                            .on_toggle(Edit::Capture)
+                            .padding(8)
                             .into(),
+                        ),
                         narrow,
                     ))
                     .push(
@@ -512,7 +636,7 @@ impl ConfiguratorState {
                         if cfg!(target_arch = "wasm32") {
                             "ZIP binding"
                         } else {
-                            "Installation folder"
+                            "Installation folder or ZIP"
                         },
                         text_input("Game files", c.map_or("", |m| m.source.as_str()))
                             .on_input(Edit::Root)
@@ -638,56 +762,58 @@ impl ConfiguratorState {
                 );
             }
             Page::Output => {
-                body = body
-                    .push(
-                        checkbox(s.output.audio)
-                            .label("Enable audio")
-                            .size(16)
-                            .text_size(14)
-                            .on_toggle(Edit::Audio),
-                    )
-                    .push(field(
-                        "MIDI output",
-                        text_input(
-                            if cfg!(target_os = "macos") {
-                                "rust, apple, moont, or port name"
-                            } else {
-                                "rust, moont, or port name"
-                            },
-                            &s.output.midi_output,
-                        )
-                        .on_input(Edit::Output)
-                        .size(14)
-                        .padding(8)
-                        .into(),
-                    ))
-                    .push(pair(
-                        field(
-                            "Game MIDI",
-                            pick_list(
-                                vec!["gm".to_string(), "mt32".into()],
-                                Some(s.output.game_midi.clone()),
-                                Edit::GameMidi,
+                body = body.push(
+                    checkbox(s.output.audio)
+                        .label("Enable audio")
+                        .size(16)
+                        .text_size(14)
+                        .on_toggle(Edit::Audio),
+                );
+                if h.mpu401 {
+                    body = body
+                        .push(field(
+                            "MIDI output",
+                            text_input(
+                                if cfg!(target_os = "macos") {
+                                    "rust, apple, moont, or port name"
+                                } else {
+                                    "rust, moont, or port name"
+                                },
+                                &s.output.midi_output,
                             )
-                            .width(Fill)
-                            .text_size(14)
+                            .on_input(Edit::Output)
+                            .size(14)
                             .padding(8)
                             .into(),
-                        ),
-                        field(
-                            "Output MIDI",
-                            pick_list(
-                                vec!["gm".to_string(), "mt32".into()],
-                                Some(s.output.host_midi.clone()),
-                                Edit::HostMidi,
-                            )
-                            .width(Fill)
-                            .text_size(14)
-                            .padding(8)
-                            .into(),
-                        ),
-                        narrow,
-                    ));
+                        ))
+                        .push(pair(
+                            field(
+                                "Game MIDI",
+                                pick_list(
+                                    vec!["gm".to_string(), "mt32".into()],
+                                    Some(s.output.game_midi.clone()),
+                                    Edit::GameMidi,
+                                )
+                                .width(Fill)
+                                .text_size(14)
+                                .padding(8)
+                                .into(),
+                            ),
+                            field(
+                                "Output MIDI",
+                                pick_list(
+                                    vec!["gm".to_string(), "mt32".into()],
+                                    Some(s.output.host_midi.clone()),
+                                    Edit::HostMidi,
+                                )
+                                .width(Fill)
+                                .text_size(14)
+                                .padding(8)
+                                .into(),
+                            ),
+                            narrow,
+                        ));
+                }
             }
             Page::Profile => {
                 body = body.push(field(
@@ -881,6 +1007,61 @@ fn pair<'a>(left: Element<'a, Edit>, right: Element<'a, Edit>, narrow: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdrom_add_edit_remove_is_a_draft_and_empty_source_keeps_the_card() {
+        let mut config = ConfiguratorState::default();
+        let active = config.active.clone();
+        config.edit(&Edit::AddCdrom);
+        config.edit(&Edit::CdromSource("disc.iso".into()));
+        config.edit(&Edit::CdromSource(String::new()));
+        assert_eq!(
+            config
+                .draft
+                .mounts
+                .iter()
+                .filter(|m| m.letter != b'C')
+                .count(),
+            1
+        );
+        config.edit(&Edit::CdromKind(SourceKind::HttpsIso));
+        config.edit(&Edit::CdromSource("https://example.test/disc.iso".into()));
+        assert!(
+            config
+                .draft
+                .mounts
+                .iter()
+                .any(|m| m.kind == SourceKind::HttpsIso)
+        );
+        assert_eq!(config.active, active);
+        config.edit(&Edit::RemoveCdrom);
+        assert!(config.draft.mounts.iter().all(|m| m.letter == b'C'));
+        assert_eq!(config.active, active);
+    }
+
+    #[test]
+    fn replacing_iso_preserves_the_configured_drive_letter() {
+        let mut config = ConfiguratorState::default();
+        config.edit(&Edit::AddCdrom);
+        config
+            .draft
+            .mounts
+            .iter_mut()
+            .find(|m| m.letter != b'C')
+            .unwrap()
+            .letter = b'E';
+        config.edit(&Edit::Iso("replacement.iso".into()));
+        assert_eq!(
+            config
+                .draft
+                .mounts
+                .iter()
+                .find(|m| m.letter != b'C')
+                .unwrap()
+                .letter,
+            b'E'
+        );
+    }
     #[test]
     fn edits_and_failed_profile_import_preserve_active_recipe() {
         let mut editor = ConfiguratorState::default();

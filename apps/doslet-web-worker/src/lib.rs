@@ -13,6 +13,7 @@ use doslet_runtime::{Session, SessionStatus};
 use doslet_storage::{
     CachedSource, HostCompletion, HostRequest, RequestTag, SourceId, SourceIdentity, StorageError,
 };
+use doslet_x86::ExecutionLabel;
 use doslet_x86::Gpr16;
 use std::sync::Arc;
 #[cfg(target_arch = "wasm32")]
@@ -27,6 +28,14 @@ pub struct WorkerEngine {
     candidate: Option<Session>,
     candidate_spec: Option<MachineSpec>,
     candidate_archive: Option<(archive::GameArchive, String)>,
+    bundle_runtime: bool,
+    candidate_bundle_runtime: bool,
+    adaptive_cpu: bool,
+    candidate_adaptive_cpu: bool,
+    tier_profile: Option<TierProfile>,
+    candidate_tier_profile: Option<TierProfile>,
+    tiers_active: bool,
+    candidate_tiers_active: bool,
     request: Option<HostRequest>,
     machine_epoch: u64,
     pixels: Vec<u8>,
@@ -39,6 +48,78 @@ pub struct WorkerEngine {
     routing: Routing,
     replay: Box<[u8]>,
 }
+
+#[derive(Clone)]
+struct TierProfile {
+    labels: Vec<ExecutionLabel>,
+    rates: [Option<u16>; 3],
+}
+
+fn parse_tier_profile(input: &str) -> Result<TierProfile, String> {
+    let value: serde_json::Value = serde_json::from_str(input).map_err(|e| e.to_string())?;
+    if value["unknown"] != "grey" || value["irq_policy"] != "static-grey" {
+        return Err("Speed-tier profile requires unknown=grey and irq_policy=static-grey".into());
+    }
+    let rates = value["rates"]
+        .as_array()
+        .ok_or("Missing speed-tier rates")?;
+    if rates.len() != 3 {
+        return Err("Expected HOT, COLD and GREY rates".into());
+    }
+    let rate = |value: &serde_json::Value| -> Result<Option<u16>, String> {
+        if value.is_null() {
+            return Ok(None);
+        }
+        let number = value.as_u64().ok_or("Invalid speed-tier rate")?;
+        if !(1..=1000).contains(&number) {
+            return Err("Speed-tier rates must be 1..1000 MHz".into());
+        }
+        Ok(Some(number as u16))
+    };
+    let rates = [rate(&rates[0])?, rate(&rates[1])?, rate(&rates[2])?];
+    if rates[1].is_none() || rates[2].is_none() {
+        return Err("COLD and GREY rates are required".into());
+    }
+    let nodes = value["nodes"]
+        .as_array()
+        .ok_or("Missing speed-tier labels")?;
+    if nodes.len() > 100_000 {
+        return Err("Too many speed-tier labels".into());
+    }
+    let mut labels = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let address = u32::try_from(node["pc"].as_u64().ok_or("Invalid label address")?)
+            .map_err(|_| "Invalid label address")?;
+        let code32 = match node["bits"].as_u64() {
+            Some(16) => false,
+            Some(32) => true,
+            _ => return Err("Invalid label bitness".into()),
+        };
+        let bytes = node["bytes"].as_array().ok_or("Missing label bytes")?;
+        if bytes.len() != 15 {
+            return Err("A label must guard 15 instruction bytes".into());
+        }
+        let mut guard = [0; 15];
+        for (out, byte) in guard.iter_mut().zip(bytes) {
+            *out = u8::try_from(byte.as_u64().ok_or("Invalid label byte")?)
+                .map_err(|_| "Invalid label byte")?;
+        }
+        let tier = match node["tier"].as_str() {
+            Some("fast") => 0,
+            Some("slow") => 1,
+            Some("grey") => 2,
+            Some("irq") => 3,
+            _ => return Err("Invalid speed tier".into()),
+        };
+        labels.push(ExecutionLabel {
+            address,
+            code32,
+            bytes: guard,
+            tier,
+        });
+    }
+    Ok(TierProfile { labels, rates })
+}
 impl Default for WorkerEngine {
     fn default() -> Self {
         Self::new()
@@ -46,17 +127,156 @@ impl Default for WorkerEngine {
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl WorkerEngine {
+    pub fn keyboard_mode(&self) -> String {
+        match self.session.hardware_config().keyboard {
+            doslet_config::KeyboardMode::At => "at",
+            doslet_config::KeyboardMode::Bios => "bios",
+        }
+        .into()
+    }
+    pub fn set_keyboard_mode(&mut self, mode: &str) -> Result<(), String> {
+        let mode = match mode {
+            "at" => doslet_config::KeyboardMode::At,
+            "bios" => doslet_config::KeyboardMode::Bios,
+            _ => return Err("Keyboard mode must be bios or at".into()),
+        };
+        self.session
+            .set_keyboard_mode(mode)
+            .map_err(|e| e.to_string())?;
+        self.session.release_pointer_buttons();
+        self.active_spec.hardware.keyboard = mode;
+        Ok(())
+    }
+    pub fn audio_use(&self) -> u8 {
+        let used = self.session.audio_use();
+        u8::from(used.sb16) | (u8::from(used.opl3) << 1) | (u8::from(used.mpu401) << 2)
+    }
+    pub fn configure_unused_audio(&mut self, profile: &str) -> Result<(), String> {
+        let spec = machine_profile::parse_machine_profile(profile)?;
+        let audio = spec.hardware.audio();
+        self.session
+            .configure_unused_audio(audio)
+            .map_err(|e| e.to_string())?;
+        self.active_spec.hardware = self.active_spec.hardware.with_audio(audio);
+        Ok(())
+    }
+    pub fn cpu_mhz(&self) -> u16 {
+        self.active_spec.hardware.cpu_mhz
+    }
+    pub fn effective_cpu_mhz(&self) -> u16 {
+        self.session.hardware_config().cpu_mhz
+    }
+    /// Browser pacing may lower the live rate while preserving the user's ceiling.
+    pub fn set_host_cpu_mhz(&mut self, mhz: u16) -> Result<(), String> {
+        if !self.adaptive_cpu || mhz == 0 || mhz > self.active_spec.hardware.cpu_mhz {
+            return Err("Host CPU rate must be within the adaptive ceiling".into());
+        }
+        self.session.set_cpu_mhz(mhz).map_err(|e| e.to_string())
+    }
+    pub fn cpu_mode(&self) -> String {
+        if self.tiers_active {
+            "tiers"
+        } else if self.adaptive_cpu {
+            "adaptive"
+        } else {
+            "fixed"
+        }
+        .into()
+    }
+    pub fn set_cpu_settings(&mut self, mode: &str, mhz: u16) -> Result<(), String> {
+        let adaptive = match mode {
+            "fixed" => false,
+            "adaptive" => true,
+            _ => return Err("CPU mode must be fixed or adaptive".into()),
+        };
+        if !(1..=1000).contains(&mhz) {
+            return Err("CPU rate must be 1..1000 MHz".into());
+        }
+        if self.tiers_active {
+            self.session
+                .set_execution_tiers(None, [Some(500), Some(8), Some(133)])
+                .map_err(str::to_owned)?;
+            self.tiers_active = false;
+        }
+        self.set_cpu_mhz(mhz)?;
+        self.session.set_adaptive_cpu(adaptive);
+        if !adaptive && self.bundle_runtime {
+            self.session.set_adaptive_idle(true);
+        }
+        self.adaptive_cpu = adaptive;
+        Ok(())
+    }
+    pub fn set_tier_settings(&mut self, hot: u16, cold: u16, grey: u16) -> Result<(), String> {
+        if hot > 1000 || !(1..=1000).contains(&cold) || !(1..=1000).contains(&grey) {
+            return Err("Speed-tier rates must be 1..1000 MHz".into());
+        }
+        let profile = self
+            .tier_profile
+            .as_mut()
+            .ok_or("No native speed-tier profile loaded")?;
+        let rates = [
+            if hot == 0 { None } else { Some(hot) },
+            Some(cold),
+            Some(grey),
+        ];
+        self.session.set_adaptive_cpu(false);
+        self.session.set_adaptive_idle(false);
+        self.session
+            .set_execution_tiers(Some(profile.labels.clone()), rates)
+            .map_err(str::to_owned)?;
+        profile.rates = rates;
+        self.adaptive_cpu = false;
+        self.tiers_active = true;
+        Ok(())
+    }
+    pub fn tier_rates(&self) -> Vec<u16> {
+        self.tier_profile
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.rates.map(|r| r.unwrap_or(0)).to_vec())
+    }
+    pub fn tier_counts(&self) -> Vec<u64> {
+        self.session.executed_tier_counts().to_vec()
+    }
+    pub fn prepare_candidate_tiers(&mut self, profile: &str) -> Result<(), String> {
+        let profile = parse_tier_profile(profile)?;
+        let candidate = self.candidate.as_mut().ok_or("No prepared machine")?;
+        candidate.set_adaptive_cpu(false);
+        candidate.set_adaptive_idle(false);
+        candidate
+            .set_execution_tiers(Some(profile.labels.clone()), profile.rates)
+            .map_err(str::to_owned)?;
+        self.candidate_tier_profile = Some(profile);
+        self.candidate_tiers_active = true;
+        self.candidate_adaptive_cpu = false;
+        Ok(())
+    }
+    pub fn set_cpu_mhz(&mut self, mhz: u16) -> Result<(), String> {
+        self.session.set_cpu_mhz(mhz).map_err(|e| e.to_string())?;
+        self.active_spec.hardware.cpu_mhz = mhz;
+        Ok(())
+    }
     pub fn pointer_relative(&mut self, dx: f64, dy: f64) {
-        if self.session.status() == SessionStatus::Running {
+        if self.session.status() == SessionStatus::Running && self.pointer_relative_in_use() {
             self.session.pointer_relative(dx, dy);
         }
+    }
+    pub fn pointer_relative_in_use(&self) -> bool {
+        self.active_spec
+            .input
+            .mouse_mode
+            .relative(self.session.pointer_relative_in_use())
+    }
+    pub fn set_mouse_mode(&mut self, mode: &str) -> Result<(), String> {
+        self.active_spec.input.mouse_mode = mode.parse::<doslet_config::MouseMode>()?;
+        self.session.release_pointer_buttons();
+        Ok(())
     }
     pub fn pointer_event(&mut self, x: u16, y: u16, button: i8, pressed: bool) {
         if button == -2 {
             self.session.release_pointer_buttons();
         } else if button >= 0 {
             self.session.pointer_button(button as u8, pressed);
-        } else {
+        } else if !self.pointer_relative_in_use() {
             self.session.pointer_move(x, y);
         }
     }
@@ -72,6 +292,14 @@ impl WorkerEngine {
             candidate: None,
             candidate_spec: None,
             candidate_archive: None,
+            bundle_runtime: false,
+            candidate_bundle_runtime: false,
+            adaptive_cpu: false,
+            candidate_adaptive_cpu: false,
+            tier_profile: None,
+            candidate_tier_profile: None,
+            tiers_active: false,
+            candidate_tiers_active: false,
             request: None,
             machine_epoch: 1,
             pixels: Vec::new(),
@@ -98,6 +326,10 @@ impl WorkerEngine {
         session.start();
         self.active = Some((archive.clone(), program.into()));
         self.active_spec = MachineSpec::default();
+        self.adaptive_cpu = false;
+        self.tier_profile = None;
+        self.tiers_active = false;
+        self.bundle_runtime = false;
         self.machine_epoch += 1;
         self.session = session;
         self.routing = Routing::new(self.routing.mode());
@@ -109,6 +341,17 @@ impl WorkerEngine {
     pub fn prepare_machine(&mut self, profile: &str, program: &str) -> Result<String, String> {
         let spec = machine_profile::parse_machine_profile(profile)?;
         self.prepare(spec, program, false)
+    }
+    /// Enable direct DPMI and adaptive CPU throughput for the bundled game.
+    pub fn prepare_bundle_runtime(&mut self) -> Result<(), String> {
+        let candidate = self.candidate.as_mut().ok_or("No prepared machine")?;
+        candidate
+            .enable_dpmi(doslet_runtime::session::dpmi::Mode::Direct)
+            .map_err(|error| error.to_string())?;
+        candidate.set_adaptive_cpu(true);
+        self.candidate_bundle_runtime = true;
+        self.candidate_adaptive_cpu = true;
+        Ok(())
     }
     pub fn prepare_reset(&mut self) -> Result<String, String> {
         let program = self
@@ -186,6 +429,13 @@ impl WorkerEngine {
         self.session = candidate;
         self.active = self.candidate_archive.take();
         self.active_spec = spec;
+        self.bundle_runtime = self.candidate_bundle_runtime;
+        self.candidate_bundle_runtime = false;
+        self.adaptive_cpu = self.candidate_adaptive_cpu;
+        self.candidate_adaptive_cpu = false;
+        self.tier_profile = self.candidate_tier_profile.take();
+        self.tiers_active = self.candidate_tiers_active;
+        self.candidate_tiers_active = false;
         self.machine_epoch = self.machine_epoch.wrapping_add(1);
         self.request = None;
         self.routing = Routing::new(parse_mode(&self.active_spec.output.game_midi)?);
@@ -196,6 +446,10 @@ impl WorkerEngine {
         self.candidate = None;
         self.candidate_spec = None;
         self.candidate_archive = None;
+        self.candidate_bundle_runtime = false;
+        self.candidate_adaptive_cpu = false;
+        self.candidate_tier_profile = None;
+        self.candidate_tiers_active = false;
     }
     pub fn waiting_for_io(&self) -> bool {
         self.session.storage_waiting()
@@ -377,6 +631,9 @@ impl WorkerEngine {
             Ok(true)
         }
     }
+    pub fn waiting_for_key(&self) -> bool {
+        self.session.waiting_for_key()
+    }
     pub fn status(&self) -> u32 {
         match self.session.status() {
             SessionStatus::Ready => 0,
@@ -395,6 +652,37 @@ impl WorkerEngine {
     }
     pub fn nanos(&self) -> f64 {
         self.session.emulated_nanos() as f64
+    }
+    pub fn disk_read_bytes(&self) -> f64 {
+        self.session.disk_read_bytes() as f64
+    }
+    pub fn video_mode_label(&self) -> String {
+        self.session.video_mode_label().to_string()
+    }
+    pub fn idle_nanos(&self) -> f64 {
+        self.session
+            .idle_loop_stats()
+            .skipped_nanos
+            .saturating_add(self.session.menu_idle_stats().nanos) as f64
+    }
+    pub fn memory_usage(&self) -> String {
+        let m = self.session.memory_usage();
+        serde_json::json!({
+            "installed_bytes": m.installed_bytes,
+            "protected_mode": m.protected_mode,
+            "dos_allocated": m.dos_allocated,
+            "dos_free": m.dos_free,
+            "dos_largest_free": m.dos_largest_free,
+            "dos_blocks": m.dos_blocks,
+            "dpmi_available": m.dpmi_available,
+            "dpmi_entered": m.dpmi_entered,
+            "dpmi_capacity": m.dpmi_capacity,
+            "dpmi_requested": m.dpmi_requested,
+            "dpmi_committed": m.dpmi_committed,
+            "dpmi_peak": m.dpmi_peak,
+            "dpmi_blocks": m.dpmi_blocks,
+        })
+        .to_string()
     }
     pub fn pointer_in_use(&self) -> bool {
         self.session.pointer_in_use()
@@ -499,6 +787,18 @@ impl WorkerEngine {
     pub fn midi_notes(&self) -> f64 {
         self.routing.input_note_events() as f64
     }
+    pub fn midi_channels(&self) -> Vec<u8> {
+        let mut bytes = vec![0; 16 * doslet_midi_routing::Channel::BYTES];
+        for (channel, out) in self
+            .routing
+            .channels(self.output_mode)
+            .into_iter()
+            .zip(bytes.chunks_exact_mut(doslet_midi_routing::Channel::BYTES))
+        {
+            channel.write(out);
+        }
+        bytes
+    }
     pub fn midi_unmapped(&self) -> f64 {
         self.routing.translator().stats().unmapped_notes as f64
     }
@@ -582,6 +882,38 @@ impl WorkerEngine {
                 .ok_or("Open a game ZIP first")?
                 .load_configured(program, &spec)?
         };
+        self.candidate_bundle_runtime = false;
+        self.candidate_adaptive_cpu = false;
+        self.candidate_tier_profile = if reset {
+            self.tier_profile.clone()
+        } else {
+            None
+        };
+        self.candidate_tiers_active = reset && self.tiers_active;
+        if reset && self.bundle_runtime {
+            session
+                .enable_dpmi(doslet_runtime::session::dpmi::Mode::Direct)
+                .map_err(|error| error.to_string())?;
+            if self.adaptive_cpu {
+                session.set_adaptive_cpu(true);
+            } else if !self.tiers_active {
+                session.set_adaptive_idle(true);
+            }
+            self.candidate_bundle_runtime = true;
+        }
+        if reset && self.adaptive_cpu && !self.bundle_runtime {
+            session.set_adaptive_cpu(true);
+        }
+        self.candidate_adaptive_cpu = reset && self.adaptive_cpu;
+        if self.candidate_tiers_active {
+            let profile = self
+                .candidate_tier_profile
+                .as_ref()
+                .ok_or("Missing tier profile")?;
+            session
+                .set_execution_tiers(Some(profile.labels.clone()), profile.rates)
+                .map_err(str::to_owned)?;
+        }
         session
             .set_epoch(self.machine_epoch + 1)
             .map_err(|e| e.to_string())?;
@@ -646,7 +978,191 @@ fn parse_mode(mode: &str) -> Result<Mode, String> {
 mod tests {
     include!("../../../tests/fixtures/midi.rs");
     use super::*;
+    #[test]
+    fn blaster_audio_change_requires_restart_and_preserves_worker_state() {
+        let mut engine = WorkerEngine::new();
+        engine.session = Session::new(&[0xeb, 0xfe]).unwrap();
+        engine.start();
+        engine.advance(100);
+        let before = (
+            engine.session.epoch(),
+            engine.session.steps(),
+            engine.session.emulated_nanos(),
+        );
+        let mut spec = engine.active_spec.clone();
+        spec.hardware.sb16 = false;
+        spec.hardware.mpu401 = false;
+        let error = engine
+            .configure_unused_audio(&machine_profile::export_machine_profile(&spec))
+            .unwrap_err();
+        assert!(error.contains("BLASTER"));
+        assert_eq!(
+            (
+                engine.session.epoch(),
+                engine.session.steps(),
+                engine.session.emulated_nanos()
+            ),
+            before
+        );
+        assert_eq!(engine.session.status(), SessionStatus::Running);
+        assert_eq!(engine.audio_use(), 0);
+        engine.prepare_reset().unwrap();
+        assert!(engine.candidate.as_ref().unwrap().hardware_config().sb16);
+        assert!(engine.candidate.as_ref().unwrap().hardware_config().mpu401);
+    }
+    #[test]
+    fn keyboard_mode_changes_live_and_is_retained_by_reset() {
+        let mut engine = WorkerEngine::new();
+        engine.session = Session::new(&[0x40, 0xeb, 0xfd]).unwrap();
+        engine.start();
+        engine.advance(100);
+        let before = (
+            engine.session.debug_pc(),
+            engine.session.steps(),
+            engine.session.emulated_nanos(),
+        );
+        engine.set_keyboard_mode("at").unwrap();
+        assert_eq!(engine.keyboard_mode(), "at");
+        assert_eq!(engine.session.status(), SessionStatus::Running);
+        assert_eq!(
+            (
+                engine.session.debug_pc(),
+                engine.session.steps(),
+                engine.session.emulated_nanos()
+            ),
+            before
+        );
+        assert!(engine.set_keyboard_mode("invalid").is_err());
+        assert_eq!(engine.keyboard_mode(), "at");
+        engine.prepare_reset().unwrap();
+        assert_eq!(
+            engine
+                .candidate
+                .as_ref()
+                .unwrap()
+                .hardware_config()
+                .keyboard,
+            doslet_config::KeyboardMode::At
+        );
+        engine.discard_machine();
+        engine.set_keyboard_mode("bios").unwrap();
+        assert_eq!(engine.keyboard_mode(), "bios");
+    }
     include!("../../../tests/fixtures/sb16_pcm.rs");
+    #[test]
+    fn mouse_capture_mode_selects_host_motion_without_restarting_the_worker() {
+        let mut engine = WorkerEngine::new();
+        engine.session = Session::new(&[0xb8, 0x0b, 0, 0xcd, 0x33, 0xEB, 0xFE]).unwrap();
+        engine.start();
+        engine.advance(16);
+        assert!(engine.pointer_relative_in_use());
+        let before = engine.session.pointer_position();
+        engine.pointer_event(10, 20, -1, false);
+        assert_eq!(engine.session.pointer_position(), before);
+        let steps = engine.session.steps();
+        engine.set_mouse_mode("no-capture").unwrap();
+        engine.pointer_event(10, 20, -1, false);
+        engine.pointer_relative(30.0, 30.0);
+        assert_eq!(engine.session.pointer_position(), (10, 20));
+        engine.set_mouse_mode("capture").unwrap();
+        let until = engine.session.emulated_nanos() + 1_500_000_000;
+        while engine.session.emulated_nanos() < until {
+            let remaining = until - engine.session.emulated_nanos();
+            engine.session.debug_advance_device_time(remaining).unwrap();
+        }
+        assert!(!engine.session.pointer_relative_in_use());
+        assert!(engine.pointer_relative_in_use());
+        engine.pointer_relative(2.0, 3.0);
+        assert_eq!(engine.session.pointer_position(), (12, 23));
+        engine.set_mouse_mode("auto").unwrap();
+        assert!(!engine.pointer_relative_in_use());
+        assert_eq!(engine.session.steps(), steps);
+        assert!(engine.set_mouse_mode("unknown").is_err());
+        assert_eq!(
+            engine.active_spec.input.mouse_mode,
+            doslet_config::MouseMode::Auto
+        );
+    }
+
+    #[test]
+    fn live_cpu_speed_preserves_execution_and_the_reset_recipe() {
+        let mut engine = WorkerEngine::new();
+        engine.session = Session::new(&[0x40, 0xeb, 0xfd]).unwrap();
+        engine.start();
+        engine.advance(100);
+        engine.pause();
+        let pc = engine.session.debug_pc();
+        let nanos = engine.session.emulated_nanos();
+        let steps = engine.session.steps();
+        engine.set_cpu_mhz(100).unwrap();
+        assert_eq!(engine.cpu_mhz(), 100);
+        assert_eq!(engine.session.hardware_config().cpu_mhz, 100);
+        assert_eq!(engine.session.debug_pc(), pc);
+        assert_eq!(engine.session.emulated_nanos(), nanos);
+        assert_eq!(engine.session.steps(), steps);
+        assert_eq!(engine.session.status(), SessionStatus::Paused);
+        assert!(engine.set_cpu_mhz(0).is_err());
+        assert!(engine.set_cpu_mhz(1001).is_err());
+        assert_eq!(engine.cpu_mhz(), 100);
+        engine.prepare_reset().unwrap();
+        assert_eq!(
+            engine.candidate.as_ref().unwrap().hardware_config().cpu_mhz,
+            100
+        );
+    }
+    #[test]
+    fn adaptive_cpu_setting_survives_reset_and_can_return_to_fixed() {
+        let mut engine = WorkerEngine::new();
+        engine.set_cpu_settings("adaptive", 133).unwrap();
+        assert_eq!(engine.cpu_mode(), "adaptive");
+        assert_eq!(engine.cpu_mhz(), 133);
+        assert!(engine.session.synchronization_analysis().enabled);
+        engine.set_host_cpu_mhz(33).unwrap();
+        assert_eq!(engine.cpu_mhz(), 133);
+        assert_eq!(engine.effective_cpu_mhz(), 33);
+        assert!(engine.set_host_cpu_mhz(134).is_err());
+        engine.prepare_reset().unwrap();
+        assert!(engine.candidate_adaptive_cpu);
+        assert!(
+            engine
+                .candidate
+                .as_ref()
+                .unwrap()
+                .synchronization_analysis()
+                .enabled
+        );
+        engine.discard_machine();
+        engine.set_cpu_settings("fixed", 66).unwrap();
+        assert_eq!(engine.cpu_mode(), "fixed");
+        assert_eq!(engine.cpu_mhz(), 66);
+        assert!(!engine.session.synchronization_analysis().controller_enabled);
+        assert!(engine.set_cpu_settings("invalid", 100).is_err());
+        assert_eq!(engine.cpu_mhz(), 66);
+    }
+    #[test]
+    fn native_labels_drive_browser_tiers_and_survive_reset() {
+        let guard = vec![0x90u8; 15];
+        let input = serde_json::json!({
+            "unknown":"grey", "irq_policy":"static-grey", "rates":[133,8,33],
+            "nodes":[{"pc":0x1000,"bits":16,"bytes":guard,"tier":"fast"}]
+        });
+        let profile = parse_tier_profile(&input.to_string()).unwrap();
+        assert_eq!(profile.rates, [Some(133), Some(8), Some(33)]);
+        let mut engine = WorkerEngine::new();
+        engine.tier_profile = Some(profile);
+        engine.set_tier_settings(133, 8, 33).unwrap();
+        assert_eq!(engine.cpu_mode(), "tiers");
+        assert_eq!(engine.tier_rates(), vec![133, 8, 33]);
+        engine.prepare_reset().unwrap();
+        assert!(engine.candidate_tiers_active);
+        assert!(engine.candidate_tier_profile.is_some());
+        engine.set_cpu_settings("adaptive", 133).unwrap();
+        assert_eq!(engine.cpu_mode(), "adaptive");
+        assert!(engine.set_tier_settings(133, 8, 0).is_err());
+        assert!(
+            parse_tier_profile(&input.to_string().replace("static-grey", "static-fast")).is_err()
+        );
+    }
     #[test]
     fn guest_pcm_metadata_comes_from_guest_dsp_commands() {
         let mut engine = WorkerEngine::new();
@@ -723,6 +1239,16 @@ mod tests {
         assert_eq!(engine.midi_sysex(), 1.0);
         assert_eq!(engine.midi_bytes(), message.len() as f64);
         assert_eq!(engine.midi_notes(), 1.0);
+        let channels = engine.midi_channels();
+        let stride = doslet_midi_routing::Channel::BYTES;
+        assert_eq!(channels.len(), 16 * stride);
+        assert_eq!(
+            doslet_midi_routing::Channel::read(&channels[..stride])
+                .unwrap()
+                .state
+                .notes,
+            1
+        );
         assert!(!engine.midi[..count].contains(&0xF0));
         assert!(
             engine.midi[..count]
@@ -730,6 +1256,21 @@ mod tests {
                 .any(|m| m == [0x90, 60, 100])
         );
         engine.set_output_mode("mt32").unwrap();
+        let channels = engine.midi_channels();
+        assert_eq!(
+            doslet_midi_routing::Channel::read(&channels[..stride])
+                .unwrap()
+                .state
+                .notes,
+            0
+        );
+        assert_eq!(
+            doslet_midi_routing::Channel::read(&channels[stride..2 * stride])
+                .unwrap()
+                .state
+                .notes,
+            1
+        );
         let count = engine.snapshot_midi();
         assert_eq!(engine.midi_notes(), 1.0);
         assert!(

@@ -1,0 +1,12 @@
+{
+  "profile": "CIV.toml",
+  "zip": "CIV.zip",
+  "executable": "CIV.EXE",
+  "tierProfile": "CIV-speed-tiers.json",
+  "displayFilter": "hq2x",
+  "roms": ["CM32L_CONTROL.ROM", "CM32L_PCM.ROM"],
+  "startupPatch": {
+    "executableSha256": "31e35b01f4d00df81685dfcb81e6de196a3876bd2afff6e39cbbfd964f5852ad",
+    "selections": ["1", "5", "1"]
+  }
+}

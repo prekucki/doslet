@@ -71,6 +71,7 @@ impl<A> UploadQueue<A> {
         self.error = None;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn offer(&mut self, frame: Option<PreparedFrame>) {
         let configuration_changed = match (&self.wanted, &frame) {
             (Some(old), Some(new)) => !old.same_configuration(new),

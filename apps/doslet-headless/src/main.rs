@@ -409,7 +409,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             profile.cpu += cpu_start.elapsed();
             profile.frame(&session);
         }
-        remaining -= u64::from(completed);
+        remaining = remaining.saturating_sub(u64::from(completed));
         output.after_step(&mut session)?;
     }
     let elapsed = start.elapsed();
@@ -530,8 +530,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             .ok_or("guest has not entered a supported video mode")?;
         let mut output = BufWriter::new(fs::File::create(&path)?);
         write!(output, "P6\n{} {}\n255\n", frame.width, frame.height)?;
-        for index in frame.pixels {
-            output.write_all(&frame.palette[usize::from(*index)][..3])?;
+        for index in frame.indices() {
+            output.write_all(&frame.palette[usize::from(index)][..3])?;
         }
         output.flush()?;
         println!("Frame written: {}", path.display());

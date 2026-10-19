@@ -1,0 +1,28 @@
+[package]
+name = "doslet-x86-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+native-test = ["dep:wasmi"]
+
+[dependencies]
+doslet-x86.workspace = true
+doslet-bus.workspace = true
+wasm-encoder = { version = "0.262", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+wasmi = { version = "2", default-features = false, features = ["std", "validate", "stable", "portable-dispatch"], optional = true }
+
+[dev-dependencies]
+doslet-vga.workspace = true
+allocation-counter = "0.8.1"
+wasmi = { version = "2", default-features = false, features = ["std", "validate", "stable", "portable-dispatch"] }
+
+[[example]]
+name = "translate_profile"
+
+[lints]
+workspace = true

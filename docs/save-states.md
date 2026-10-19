@@ -36,8 +36,11 @@ validates the state before returning it; failure leaves an existing session
 untouched. Files larger than 1 GiB are rejected. Native code, decode caches and
 process-local code identities are rebuilt. The RAM write instrumentation counter
 also starts empty: it counts implementation writes and differs between JIT and
-interpreter paths even when guest RAM is identical. Analyzer evidence and heuristic proofs
-start empty; saved guest time and effective CPU MHz are retained. These are guest
+interpreter paths even when guest RAM is identical. VGA status-read notifications
+and device-access proof counters are encoded as zero and restart on load;
+legacy nonzero fields remain readable. Saving leaves the live counters intact.
+Analyzer evidence and heuristic proofs start empty; saved guest time and
+effective CPU MHz are retained. These are guest
 snapshots, not snapshots of a GUI, host audio sink or external MIDI synthesizer.
 
 `Session::save_state()` writes resource references. Use

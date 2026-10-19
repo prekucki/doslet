@@ -1,0 +1,18 @@
+[package]
+name = "doslet-static-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+doslet-x86.workspace = true
+doslet-bus.workspace = true
+doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm" }
+
+# Only the private, trusted synchronous diagnostic FFI dereferences handles.
+[lints.rust]
+unsafe_code = "deny"

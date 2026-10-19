@@ -62,6 +62,16 @@ pub struct MzImage<'a> {
 
 impl<'a> MzImage<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, ExecutableError> {
+        Self::parse_inner(bytes, true)
+    }
+
+    // LE discovery must validate the DOS envelope independently of an optional
+    // extended header, so a malformed pointer cannot hide another bound image.
+    pub(crate) fn parse_envelope(bytes: &'a [u8]) -> Result<Self, ExecutableError> {
+        Self::parse_inner(bytes, false)
+    }
+
+    fn parse_inner(bytes: &'a [u8], inspect_extended: bool) -> Result<Self, ExecutableError> {
         if bytes.len() < 28 {
             return Err(ExecutableError::Truncated);
         }
@@ -113,7 +123,7 @@ impl<'a> MzImage<'a> {
         // Old MZ files can put their relocation table across offset 3Ch.
         // In that layout those four bytes are relocations, not e_lfanew.
         let has_extended_pointer = relocation_count == 0 || word(bytes, 24)? >= 64;
-        if header_bytes >= 64 && has_extended_pointer {
+        if inspect_extended && header_bytes >= 64 && has_extended_pointer {
             let offset = dword(bytes, 60)? as usize;
             if offset != 0 {
                 let signature = bytes

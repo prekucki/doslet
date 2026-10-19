@@ -28,6 +28,7 @@ pub(super) struct ResultSet {
     epoch: u64,
     pub nodes: BTreeMap<Key, Node>,
     pub seconds: f64,
+    second_skipped: bool,
     #[cfg(test)]
     direct_calls: [u64; 2],
 }
@@ -51,6 +52,7 @@ pub(super) struct Learner {
     backoff: Duration,
     pub jobs: u64,
     pub changes: u64,
+    skipped: u64,
     pub grey_percent: f64,
     pub capture_micros: u64,
 }
@@ -66,6 +68,7 @@ impl Default for Learner {
             backoff: WINDOW,
             jobs: 0,
             changes: 0,
+            skipped: 0,
             grey_percent: 0.0,
             capture_micros: 0,
         }
@@ -116,10 +119,18 @@ impl Learner {
                 Ok(result) if !cancelled && result.epoch == session.epoch() => {
                     let changed = apply(profile, session, result.nodes);
                     self.changes += changed as u64;
-                    eprintln!(
-                        "[INFO doslet] tier learning: {} new HOT/COLD/IRQ labels in {:.2}s host time",
-                        changed, result.seconds
-                    );
+                    if result.second_skipped {
+                        self.skipped += 1;
+                        eprintln!(
+                            "[INFO doslet] tier learning: window already coloured; skipped second replay ({} skipped)",
+                            self.skipped
+                        );
+                    } else {
+                        eprintln!(
+                            "[INFO doslet] tier learning: {} new HOT/COLD/IRQ labels in {:.2}s host time",
+                            changed, result.seconds
+                        );
+                    }
                     self.backoff = if changed == 0 {
                         (self.backoff * 2).min(Duration::from_secs(60))
                     } else {
@@ -138,7 +149,11 @@ impl Learner {
                 }
             }
         }
-        self.launch_pending(grey_mhz);
+        self.launch_pending(grey_mhz, profile);
+        // Pause stops new captures, but queued independent replays keep draining.
+        if session.status() != SessionStatus::Running {
+            return false;
+        }
         let now = Instant::now();
         if !startup && now.duration_since(self.sampled) < WINDOW {
             return false;
@@ -171,10 +186,10 @@ impl Learner {
             pc: session.debug_pc(),
             nanos: session.emulated_nanos(),
         });
-        self.launch_pending(grey_mhz);
+        self.launch_pending(grey_mhz, profile);
         false
     }
-    fn launch_pending(&mut self, grey_mhz: u16) {
+    fn launch_pending(&mut self, grey_mhz: u16, profile: &Profile) {
         if self.job.is_some() {
             return;
         }
@@ -190,11 +205,15 @@ impl Learner {
         let cancel = Arc::new(AtomicBool::new(false));
         let token = cancel.clone();
         let low = grey_mhz.min(333);
+        // Capture settled labels when this job starts, after applying the previous
+        // result, rather than when its guest snapshot first entered the queue.
+        let known = settled_labels(profile);
         match thread::Builder::new()
             .name("doslet-tier-profile".into())
             .stack_size(8 * 1024 * 1024)
-            .spawn(move || profile_pair(snapshot, epoch, low, low * 3, 1_000_000_000, &token))
-        {
+            .spawn(move || {
+                profile_pair_known(snapshot, epoch, low, low * 3, 1_000_000_000, &token, &known)
+            }) {
             Ok(thread) => {
                 self.jobs += 1;
                 self.job = Some(Job {
@@ -422,6 +441,23 @@ fn trace(
     }
     Ok(trace)
 }
+fn settled_labels(profile: &Profile) -> BTreeMap<Key, [u8; 15]> {
+    profile
+        .nodes
+        .iter()
+        .filter_map(|(&key, node)| {
+            (node.tier != Tier::Grey || node.locked || node.manual).then_some((key, node.code))
+        })
+        .collect()
+}
+fn already_coloured(trace: &Trace, known: &BTreeMap<Key, [u8; 15]>) -> bool {
+    !trace.nodes.is_empty()
+        && trace
+            .nodes
+            .iter()
+            .all(|(key, node)| !node.changed && known.get(key) == Some(&node.code))
+}
+#[cfg(test)]
 fn profile_pair(
     snapshot: WorkingState,
     epoch: u64,
@@ -430,14 +466,36 @@ fn profile_pair(
     nanos: u64,
     cancel: &AtomicBool,
 ) -> Result<ResultSet, String> {
+    profile_pair_known(snapshot, epoch, low, high, nanos, cancel, &BTreeMap::new())
+}
+fn profile_pair_known(
+    snapshot: WorkingState,
+    epoch: u64,
+    low: u16,
+    high: u16,
+    nanos: u64,
+    cancel: &AtomicBool,
+    known: &BTreeMap<Key, [u8; 15]>,
+) -> Result<ResultSet, String> {
     let start = Instant::now();
     let a = trace(&snapshot, low, nanos, cancel, start)?;
+    if already_coloured(&a, known) {
+        return Ok(ResultSet {
+            epoch,
+            nodes: BTreeMap::new(),
+            seconds: start.elapsed().as_secs_f64(),
+            second_skipped: true,
+            #[cfg(test)]
+            direct_calls: [a.direct_calls, 0],
+        });
+    }
     let b = trace(&snapshot, high, nanos, cancel, start)?;
     Ok(ResultSet {
         #[cfg(test)]
         direct_calls: [a.direct_calls, b.direct_calls],
         epoch,
         nodes: merge_traces(a, b),
+        second_skipped: false,
         seconds: start.elapsed().as_secs_f64(),
     })
 }
@@ -854,6 +912,122 @@ mod tests {
         assert_eq!(live.dpmi_stats(), stats);
     }
     #[test]
+    fn known_window_skips_second_replay_but_grey_missing_and_changed_code_do_not() {
+        let s = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let first = trace(
+            &s.capture_working_state().unwrap(),
+            1,
+            10_000_000,
+            &cancel,
+            Instant::now(),
+        )
+        .unwrap();
+        let known: BTreeMap<_, _> = first
+            .nodes
+            .iter()
+            .map(|(&key, node)| (key, node.code))
+            .collect();
+        let result = profile_pair_known(
+            s.capture_working_state().unwrap(),
+            s.epoch(),
+            1,
+            3,
+            10_000_000,
+            &cancel,
+            &known,
+        )
+        .unwrap();
+        assert!(result.second_skipped);
+        assert!(result.nodes.is_empty());
+        let key = *known.keys().next().unwrap();
+        let mut incomplete = known.clone();
+        incomplete.remove(&key);
+        assert!(!already_coloured(&first, &incomplete));
+        let mut changed = known.clone();
+        changed.get_mut(&key).unwrap()[0] ^= 1;
+        assert!(!already_coloured(&first, &changed));
+        assert!(!already_coloured(&Trace::default(), &known));
+        let mut unstable = first;
+        unstable.nodes.get_mut(&key).unwrap().changed = true;
+        assert!(!already_coloured(&unstable, &known));
+        let mut p = Profile::from_json(
+            &serde_json::json!({"nodes":[],"unknown":"grey","irq_policy":"static-grey"}),
+            None,
+            false,
+        )
+        .unwrap();
+        for (&key, &code) in &known {
+            p.nodes.insert(
+                key,
+                Node {
+                    code,
+                    tier: Tier::Grey,
+                    locked: false,
+                    manual: false,
+                },
+            );
+        }
+        assert!(settled_labels(&p).is_empty());
+        let result = profile_pair_known(
+            s.capture_working_state().unwrap(),
+            s.epoch(),
+            1,
+            3,
+            10_000_000,
+            &cancel,
+            &settled_labels(&p),
+        )
+        .unwrap();
+        assert!(!result.second_skipped);
+        p.nodes.get_mut(&key).unwrap().manual = true;
+        assert_eq!(settled_labels(&p).len(), 1);
+    }
+
+    #[test]
+    fn paused_guest_drains_existing_snapshots_without_capturing_or_advancing() {
+        let mut s = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
+        s.start();
+        s.pause();
+        let before = (s.steps(), s.emulated_nanos(), s.debug_pc());
+        let mut learner = Learner {
+            epoch: s.epoch(),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            learner.pending.push_back(Pending {
+                snapshot: s.capture_working_state().unwrap(),
+                epoch: s.epoch(),
+                pc: s.debug_pc(),
+                nanos: s.emulated_nanos(),
+            });
+        }
+        let mut profile = Profile::from_json(
+            &serde_json::json!({"nodes":[],"unknown":"grey","irq_policy":"static-grey"}),
+            None,
+            false,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            learner.maintain(&mut s, &mut profile, 1);
+            if !learner.running() && learner.pending() == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "paused learner did not drain");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(learner.jobs, 2);
+        assert_eq!(learner.skipped, 1);
+        assert!(learner.changes > 0);
+        assert_eq!(s.status(), SessionStatus::Paused);
+        assert_eq!((s.steps(), s.emulated_nanos(), s.debug_pc()), before);
+        assert!(!learner.maintain(&mut s, &mut profile, 1));
+        assert_eq!(learner.jobs, 2);
+        assert_eq!(learner.pending(), 0);
+    }
+
+    #[test]
     fn transient_snapshot_queue_is_bounded_and_cancelled_with_epoch() {
         let mut s = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
         s.debug_disable_accelerations();
@@ -1065,6 +1239,53 @@ mod tests {
         assert!(classify(100, 130) == Tier::Grey);
         assert!(classify(5, 100) == Tier::Grey);
     }
+    #[test]
+    fn paired_replays_keep_disk_writes_in_ram_with_a_live_persistent_store() {
+        use doslet_dos::files::ReadOnlyDrive;
+        let mut program = vec![0; 0x120];
+        let code = [
+            0xba, 0, 2, 0x31, 0xc9, 0xb4, 0x3c, 0xcd, 0x21, // create
+            0x89, 0xc3, 0xba, 0x10, 2, 0xb9, 4, 0, 0xb4, 0x40, 0xcd, 0x21, // write
+            0xb4, 0x3e, 0xcd, 0x21, // close
+            0xba, 0, 2, 0xb8, 0, 0x3d, 0xcd, 0x21, 0x89, 0xc3, // reopen
+            0xba, 0, 3, 0xb9, 4, 0, 0xb4, 0x3f, 0xcd, 0x21, // read
+            0xb4, 0x3e, 0xcd, 0x21, 0xeb, 0xfe,
+        ];
+        program[..code.len()].copy_from_slice(&code);
+        program[0x100..0x109].copy_from_slice(b"SAVE.SAV\0");
+        program[0x110..0x114].copy_from_slice(b"save");
+        let mut live = Session::new(&program)
+            .unwrap()
+            .with_drive(ReadOnlyDrive::new().with_write_overlay(16384));
+        let base = live.base_identity();
+        live.attach_persistent_store([1; 32], base, 77, 9, None)
+            .unwrap();
+        let initial = live.export_overlay().unwrap();
+        live.start();
+        let snapshot = live.capture_working_state().unwrap();
+        let result = profile_pair(
+            snapshot,
+            live.epoch(),
+            1,
+            3,
+            10_000_000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!result.nodes.is_empty());
+        assert_eq!(live.export_overlay().unwrap(), initial);
+        assert_eq!(live.committed_revision(), Some(9));
+        assert_eq!(live.steps(), 0);
+        assert!(live.next_host_request().is_none());
+        let mut replay = live.capture_working_state().unwrap().restore().unwrap();
+        replay.start();
+        replay.advance(1000);
+        assert_eq!(replay.status(), SessionStatus::Running);
+        assert_eq!(replay.ram_view(0x10300..0x10304).unwrap(), b"save");
+        assert!(replay.next_host_request().is_none());
+        assert!(!replay.pending_commit());
+    }
+
     #[test]
     fn paired_replays_leave_live_guest_unchanged() {
         let mut live = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();

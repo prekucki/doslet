@@ -30,6 +30,8 @@ pub struct LaunchSettings {
     pub no_dynamic_core: bool,
     pub dpmi: Option<doslet_runtime::session::dpmi::Mode>,
     pub core_profile: Option<PathBuf>,
+    pub wasm_procedures: Option<PathBuf>,
+    pub interpret_procedures: bool,
 }
 impl Default for LaunchSettings {
     fn default() -> Self {
@@ -53,6 +55,8 @@ impl Default for LaunchSettings {
             no_dynamic_core: false,
             dpmi: None,
             core_profile: None,
+            wasm_procedures: None,
+            interpret_procedures: false,
         }
     }
 }
@@ -113,12 +117,20 @@ pub fn load_game_with_settings(
         session = session.with_cdrom_image(*letter, fs::read(image)?)?;
     }
     session.configure_launch(&settings.command_tail, &settings.working_directory)?;
+    session.configure_patches(patch_plan)?;
+    configure_runtime(&mut session, settings)?;
+    Ok(session)
+}
+
+pub fn configure_runtime(
+    session: &mut Session,
+    settings: &LaunchSettings,
+) -> Result<(), Box<dyn Error>> {
     if let Some(mode) = settings.dpmi {
         session.enable_dpmi(mode)?;
     }
-    session.configure_patches(patch_plan)?;
     session.set_dynamic_core(!settings.no_dynamic_core);
-    set_heroes_menu_idle(&mut session, settings.heroes_menu_idle);
+    set_heroes_menu_idle(session, settings.heroes_menu_idle);
     session.set_idle_observation(settings.observe_idle);
     if settings.adaptive_idle {
         session.set_adaptive_idle(true);
@@ -128,7 +140,7 @@ pub fn load_game_with_settings(
         session.set_adaptive_cpu(true);
     }
     if let Some(path) = &settings.core_profile {
-        load_core_profile(&mut session, path);
+        load_core_profile(session, path);
     }
     if settings.heroes_timer_waits {
         session.set_memory_wait_sites(0x281098, [0x1E281C, 0x1E2881, 0x1E331A]);
@@ -136,8 +148,35 @@ pub fn load_game_with_settings(
             "[INFO doslet] Experimental Heroes timer waits enabled (three validated polling sites)"
         );
     }
-    Ok(session)
+    install_wasm_procedures(session, settings)?;
+    Ok(())
 }
+
+pub fn install_wasm_procedures(
+    session: &mut Session,
+    settings: &LaunchSettings,
+) -> Result<(), Box<dyn Error>> {
+    if settings.interpret_procedures && settings.wasm_procedures.is_none() {
+        return Err("interpreted procedure boundaries require a procedure bundle".into());
+    }
+    #[cfg(not(feature = "wasm-procedures"))]
+    let _ = session;
+    if let Some(path) = &settings.wasm_procedures {
+        #[cfg(feature = "wasm-procedures")]
+        wasm_procedures::install(session, path, settings.interpret_procedures)?;
+        #[cfg(not(feature = "wasm-procedures"))]
+        return Err(format!(
+            "{} requires the wasm-procedures Cargo feature",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wasm-procedures")]
+#[path = "native_wasm_procedures.rs"]
+mod wasm_procedures;
 pub fn set_heroes_menu_idle(session: &mut Session, enabled: bool) {
     session.set_menu_idle_site(enabled.then_some(doslet_runtime::session::MenuIdleSite {
         head: 0x217da2,

@@ -53,6 +53,10 @@ pub struct OplOpl3 {
     started: bool,
     #[prost(uint64, tag = "5")]
     fraction: u64,
+    #[prost(uint64, tag = "6")]
+    key_on_writes: u64,
+    #[prost(uint32, tag = "7")]
+    peak: u32,
 }
 impl State for Opl3 {
     type Wire = OplOpl3;
@@ -63,6 +67,8 @@ impl State for Opl3 {
             timers: self.timers.iter().map(State::save).collect(),
             started: self.started,
             fraction: self.fraction,
+            key_on_writes: self.key_on_writes,
+            peak: u32::from(self.peak),
         }
     }
     fn load(w: Self::Wire) -> Result<Self, InvalidState> {
@@ -81,6 +87,8 @@ impl State for Opl3 {
             )?,
             started: w.started,
             fraction: w.fraction,
+            key_on_writes: w.key_on_writes,
+            peak: doslet_state::narrow(w.peak, "OplOpl3.peak")?,
         };
         if !(value.fraction < 1_000_000_000) {
             return Err(InvalidState("OplOpl3 invariants"));

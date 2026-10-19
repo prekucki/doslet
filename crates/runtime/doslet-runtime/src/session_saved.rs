@@ -223,6 +223,7 @@ impl Session {
                 "RuntimeSession.status",
             )?)?,
             steps: w.steps,
+            disk_read_bytes: 0,
             patches: w.patches,
             patches_applied: w.patches_applied as usize,
             console: w.console,

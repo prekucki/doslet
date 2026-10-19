@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 default = ["dynamic-core"]
 dynamic-core = ["doslet-runtime/dynamic-core"]
+wasm-procedures = ["doslet-runtime/wasm-procedures"]
 [dependencies]
 doslet-config.workspace = true
 doslet-input.workspace = true
@@ -39,7 +40,7 @@ cpal = "0.15.3"
 midir = "0.11.1"
 iced = { version = "0.14.0", default-features = false, features = ["wgpu", "tokio", "x11", "wayland"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-iced = { version = "0.14.0", default-features = false, features = ["tiny-skia"] }
+iced = { version = "0.14.0", default-features = false, features = ["wgpu", "webgl", "tiny-skia", "web-colors"] }
 console_error_panic_hook = "0.1.7"
 web-sys = { version = "0.3.106", features = ["Blob", "File", "FileList", "HtmlInputElement", "HtmlElement", "Document", "Window", "Event", "EventTarget", "Node", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioScheduledSourceNode", "GainNode", "AudioParam", "console", "AudioContextOptions"] }
 wasm-bindgen = "0.2.129"
@@ -53,6 +54,7 @@ doslet-pulse = { path = "../../crates/runtime/doslet-pulse" }
 [lints]
 workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm" }
 serde_json = "1"
 base64 = "0.22"
 png = "0.18"

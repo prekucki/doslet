@@ -138,6 +138,11 @@ impl Session {
         })
     }
 
+    /// Extended-memory pool managed by the built-in host, excluding its tables.
+    pub fn dpmi_memory_capacity(&self) -> Option<u64> {
+        self.dpmi.as_ref().map(|h| h.memory.capacity())
+    }
+
     pub fn dpmi_blocks(&self) -> impl Iterator<Item = &Block> {
         self.dpmi
             .iter()

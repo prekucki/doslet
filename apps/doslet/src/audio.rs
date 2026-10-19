@@ -22,7 +22,7 @@ pub enum Mixer {
 impl std::fmt::Display for Mixer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Application => "Application",
+            Self::Application => "Internal",
             Self::System => "System (experimental)",
         })
     }
@@ -41,6 +41,7 @@ struct Queue {
     callback_frames: usize,
     refilling: bool,
     peak: f32,
+    gain: f32,
     spectrum: doslet_pcm::spectrum::Spectrum,
     error: Option<String>,
     generation: u64,
@@ -77,7 +78,7 @@ impl Queue {
             self.spectrum.push([0.0; 2]);
             return [0.0; 2];
         }
-        let frame = self.frames[self.head];
+        let frame = self.frames[self.head].map(|value| value * self.gain);
         self.head = (self.head + 1) % CAPACITY;
         self.len -= 1;
         self.consumed += 1;
@@ -125,9 +126,9 @@ impl Output {
         if mixer == Mixer::System {
             #[cfg(target_os = "linux")]
             {
-                let pcm = pulse::open_at_rate(c"Doslet — Sound Blaster PCM", 22050)?;
-                let fm = pulse::open_at_rate(c"Doslet — AdLib / OPL FM", 48000)?;
-                let midi = pulse::open_named(c"Doslet — MIDI")?;
+                let pcm = pulse::deferred_at_rate(c"Doslet — Sound Blaster PCM", 22050);
+                let fm = pulse::deferred_at_rate(c"Doslet — AdLib / OPL FM", 48000);
+                let midi = pulse::deferred_at_rate(c"Doslet — MIDI", 48000);
                 let mut writer = midi.writer();
                 writer.secondary = Some(Box::new(pcm.writer()));
                 writer.fm = Some(Box::new(fm.writer()));
@@ -181,6 +182,7 @@ impl Output {
             callback_frames: 0,
             refilling: true,
             peak: 0.0,
+            gain: 1.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
             error: None,
             generation: 0,
@@ -231,6 +233,11 @@ impl Output {
     }
 }
 impl Writer {
+    pub fn set_volume(&self, percent: u8) {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).gain =
+            f32::from(percent.min(100)) / 100.0;
+    }
+
     #[cfg(test)]
     pub fn mock_separate(rate: u32) -> (Self, Self, Self) {
         let pcm = Self::mock(rate);
@@ -264,6 +271,7 @@ impl Writer {
                 callback_frames: 256,
                 refilling: true,
                 peak: 0.0,
+                gain: 1.0,
                 spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
                 error: None,
                 generation: 0,
@@ -304,17 +312,19 @@ impl Writer {
     /// Refill below two callback blocks, with margin, until the high watermark.
     /// Bounded by the reserved queue and 80 ms; no audio-device reconfiguration.
     pub fn refill_nanos(&self) -> u64 {
+        self.refill_request().unwrap_or(0)
+    }
+    fn refill_request(&self) -> Option<u64> {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         let rate = q.sample_rate;
-        let nanos = q.refill_nanos(rate);
+        let mut request = (!q.frames.is_empty()).then(|| q.refill_nanos(rate));
         drop(q);
-        let nanos = self
-            .fm
-            .as_ref()
-            .map_or(nanos, |s| nanos.min(s.refill_nanos()));
-        self.secondary
-            .as_ref()
-            .map_or(nanos, |s| nanos.min(s.refill_nanos()))
+        for source in [&self.fm, &self.secondary].into_iter().flatten() {
+            if let Some(nanos) = source.refill_request() {
+                request = Some(request.map_or(nanos, |current| current.min(nanos)));
+            }
+        }
+        request
     }
 
     /// The synthesis owner is the sole producer. Both queues must have space
@@ -348,12 +358,19 @@ impl Writer {
         if !(1000..=192000).contains(&rate) {
             return Err(format!("Unsupported native audio rate: {rate}"));
         }
+        if frames.is_empty() {
+            return self.check();
+        }
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(error) = &q.error {
             return Err(error.clone());
         }
         if frames.len() > CAPACITY - q.len {
             return Err("Audio output queue full".into());
+        }
+        if q.frames.is_empty() {
+            q.frames = vec![[0.0; 2]; CAPACITY].into_boxed_slice();
+            q.rates = vec![rate; CAPACITY].into_boxed_slice();
         }
         for frame in frames {
             let index = (q.head + q.len) % CAPACITY;
@@ -365,6 +382,10 @@ impl Writer {
         drop(q);
         if let Some(waker) = waker {
             waker.wake();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(control) = &self.pulse {
+            control.ensure_started()?;
         }
         Ok(())
     }
@@ -484,6 +505,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn volume_changes_buffered_playback_without_changing_queued_audio() {
+        let output = Writer::mock(48000);
+        output.push(&[[0.8, -0.4]; 4]).unwrap();
+        output.set_volume(25);
+        assert_eq!(output.consume(1), [[0.2, -0.1]]);
+        output.set_volume(0);
+        assert_eq!(output.consume(1), [[0.0, 0.0]]);
+        output.set_volume(255);
+        assert_eq!(output.consume(1), [[0.8, -0.4]]);
+        output.set_active(false);
+        assert_eq!(output.consume(1), [[0.0, 0.0]]);
+        output.set_active(true);
+        assert_eq!(output.consume(1), [[0.8, -0.4]]);
+    }
+
+    #[test]
     fn refill_watermarks_keep_reserve_without_chattering_or_unbounded_lead() {
         let mut queue = Queue {
             rates: vec![48000; CAPACITY].into_boxed_slice(),
@@ -497,6 +534,7 @@ mod tests {
             callback_frames: 256,
             refilling: true,
             peak: 0.0,
+            gain: 1.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(48000),
             error: None,
             generation: 0,
@@ -532,6 +570,7 @@ mod tests {
             callback_frames: 0,
             refilling: true,
             peak: 0.0,
+            gain: 1.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(48000),
             error: None,
             generation: 0,

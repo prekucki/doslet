@@ -1,4 +1,4 @@
-//! VGA configuration register readback. Raster and planar-memory effects are pending.
+//! VGA register banks and selected 256-color memory/scanout controls.
 
 pub(crate) struct Registers {
     pub misc: u8,
@@ -35,6 +35,42 @@ impl Default for Registers {
     }
 }
 impl Registers {
+    pub fn chain4(&self) -> bool {
+        self.sequencer[4] & 8 != 0
+    }
+    pub fn plane_mask(&self) -> u8 {
+        self.sequencer[2]
+    }
+    pub fn read_plane(&self) -> usize {
+        usize::from(self.graphics[4] & 3)
+    }
+    pub fn write_mode(&self) -> u8 {
+        self.graphics[5] & 3
+    }
+    pub fn graphics_pipeline(&self) -> (u8, u8, u8, u8, u8) {
+        (
+            self.graphics[0],
+            self.graphics[1],
+            self.graphics[3],
+            self.graphics[8],
+            self.graphics[2],
+        )
+    }
+    pub fn read_compare(&self) -> Option<u8> {
+        (self.graphics[5] & 8 != 0).then_some(self.graphics[7])
+    }
+    pub fn layout_256(&self) -> (usize, usize, usize, usize) {
+        let width = (usize::from(self.crtc[1]) + 1) * 4;
+        let lines = usize::from(self.crtc[0x12])
+            | (usize::from(self.crtc[7] & 2) << 7)
+            | (usize::from(self.crtc[7] & 0x40) << 3);
+        let repeat =
+            (usize::from(self.crtc[9] & 31) + 1) * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
+        let height = (lines + 1).div_ceil(repeat);
+        let start = usize::from(u16::from_be_bytes([self.crtc[12], self.crtc[13]]));
+        let pitch = usize::from(self.crtc[0x13]) * 2;
+        (width, height, start, pitch)
+    }
     pub fn memory_config(&self) -> (u8, u8, u8, u16, u8, u8) {
         (
             self.sequencer[2],

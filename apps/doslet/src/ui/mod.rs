@@ -10,6 +10,12 @@ use iced::widget::{
     stack, svg, text, tooltip,
 };
 use iced::{Border, Color, Element, Fill, Theme, theme};
+mod audio;
+mod cpu;
+mod drives;
+mod input;
+mod memory;
+mod sheet;
 
 const INK: Color = Color::from_rgb8(17, 18, 21);
 pub(crate) const PANEL: Color = Color::from_rgb8(25, 27, 31);
@@ -17,12 +23,19 @@ pub(crate) const EDGE: Color = Color::from_rgb8(48, 51, 57);
 pub(crate) const MUTED: Color = Color::from_rgb8(151, 156, 165);
 pub(crate) const ACCENT: Color = Color::from_rgb8(177, 224, 190);
 pub(crate) const FOREGROUND: Color = Color::from_rgb8(235, 237, 240);
+const HOT: Color = Color::from_rgb8(255, 179, 105);
+const COLD: Color = Color::from_rgb8(125, 194, 255);
 const HOVER: Color = Color::from_rgb8(41, 44, 50);
 const DANGER: Color = Color::from_rgb8(244, 150, 146);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
+    Cpu,
     Audio,
+    Display,
+    Memory,
+    Drives,
+    Input,
     Details,
     #[cfg(target_arch = "wasm32")]
     Games,
@@ -33,11 +46,23 @@ pub enum Action {
     Open(Panel),
     Close,
     DismissNotice,
+    AudioPage(AudioPage),
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum AudioPage {
+    #[default]
+    Output,
+    Hardware,
 }
 
 #[derive(Clone, Default)]
 pub struct Workspace {
     pub panel: Option<Panel>,
+    pub audio_page: AudioPage,
+    pub cpu: Option<crate::cpu_config::Settings>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub cpu_profile_form: Option<crate::cpu_config::ProfileForm>,
 }
 
 pub fn theme() -> Theme {
@@ -85,11 +110,11 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     let identity = row![
         text("doslet").size(20),
         container(rule::vertical(1)).height(18),
-        text(shorten(&app.name, if narrow { 16 } else { 38 }))
+        text(shorten(&app.name, if narrow { 12 } else { 38 }))
             .size(13)
             .color(MUTED),
     ]
-    .spacing(16)
+    .spacing(if narrow { 8 } else { 16 })
     .align_y(iced::Center);
     let mut actions = row![run].spacing(4).align_y(iced::Center);
     if can_run {
@@ -100,7 +125,7 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         "Open…",
         Message::Ui(Action::Open(Panel::Games)),
     ));
-    let toolbar: Element<'_, Message> = if size.width < 480.0 {
+    let toolbar: Element<'_, Message> = if size.width < 370.0 {
         column![identity, actions].spacing(10).into()
     } else {
         row![identity, space::horizontal(), actions]
@@ -161,53 +186,6 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     if !compact_footer {
         bottom = bottom.push(space::horizontal());
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        bottom = bottom.push(adaptive_indicator(app));
-    }
-    bottom = bottom.push(audio_spectrum(app));
-    bottom = bottom.push(mpu_indicator(app));
-    if let Some(iced::widget::image::Handle::Rgba { width, height, .. }) = &app.display.image {
-        bottom = bottom.push(text(format!("{width} × {height}")).size(12).color(MUTED));
-    }
-    {
-        use crate::presentation::{DisplayFilter, SizingMessage};
-        let perfect = app.display_sizing.pixel_perfect;
-        bottom = bottom
-            .push(
-                button(text("Pixel perfect").size(12))
-                    .padding([3, 9])
-                    .style(move |theme, status| segment(theme, status, perfect))
-                    .on_press_maybe(
-                        app.display
-                            .dimensions()
-                            .map(|_| Message::DisplaySizing(SizingMessage::PixelPerfect)),
-                    ),
-            )
-            .push(
-                button(text("Fit").size(12))
-                    .padding([3, 9])
-                    .style(move |theme, status| segment(theme, status, !perfect))
-                    .on_press(Message::DisplaySizing(SizingMessage::Fit)),
-            );
-        bottom = bottom.push(tooltip(
-            pick_list(
-                &DisplayFilter::ALL[..],
-                Some(app.display_sizing.filter),
-                |filter| Message::DisplaySizing(SizingMessage::Filter(filter)),
-            )
-            .text_size(12)
-            .padding([3, 7]),
-            container(text("Display filter").size(12))
-                .padding([6, 10])
-                .style(panel),
-            tooltip::Position::Top,
-        ));
-    }
-    bottom = bottom.push(small_button(
-        "Info",
-        Message::Ui(Action::Open(Panel::Details)),
-    ));
     let mut shell = column![toolbar, viewport(app)].height(Fill).width(Fill);
     let notice = app
         .session
@@ -236,10 +214,62 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         }
         shell = shell.push(container(alert).padding([2, 16]).width(Fill));
     }
-    let bottom: Element<'_, Message> = if compact_footer {
-        bottom.wrap().into()
+    let details = || {
+        icon_button(
+            Icon::Info,
+            "Session information",
+            Message::Ui(Action::Open(Panel::Details)),
+            false,
+        )
+    };
+    let bottom: Element<'_, Message> = if size.width >= 370.0 && narrow {
+        column![
+            row![bottom, cpu_indicator(app, true), memory::indicator(app)]
+                .spacing(4)
+                .align_y(iced::Center),
+            row![audio_spectrum(app), video_indicator(app, true, false)].spacing(4),
+            row![drives::indicator(app), input::indicator(), details()].spacing(4),
+        ]
+        .spacing(3)
+        .into()
+    } else if narrow {
+        column![
+            bottom,
+            row![cpu_indicator(app, true), memory::indicator(app)].spacing(4),
+            row![audio_spectrum(app), video_indicator(app, true, true)].spacing(4),
+            row![drives::indicator(app), input::indicator(), details()].spacing(4),
+        ]
+        .spacing(3)
+        .into()
+    } else if compact_footer {
+        column![
+            bottom,
+            row![
+                cpu_indicator(app, false),
+                memory::indicator(app),
+                audio_spectrum(app)
+            ]
+            .spacing(4),
+            row![
+                video_indicator(app, false, false),
+                drives::indicator(app),
+                input::indicator(),
+                details()
+            ]
+            .spacing(4),
+        ]
+        .spacing(3)
+        .into()
     } else {
-        bottom.into()
+        bottom
+            .push(cpu_indicator(app, false))
+            .push(memory::indicator(app))
+            .push(audio_spectrum(app))
+            .push(video_indicator(app, false, false))
+            .push(drives::indicator(app))
+            .push(input::indicator())
+            .push(details())
+            .into()
     };
     shell = shell.push(container(bottom).padding([5, 16]).width(Fill));
     let shell: Element<'_, Message> = shell.into();
@@ -278,7 +308,12 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     }
     if let Some(kind) = app.workspace.panel {
         let (title, content) = match kind {
-            Panel::Audio => ("Audio", audio_panel(app)),
+            Panel::Cpu => return modal(shell, cpu::dialog(app, size), narrow),
+            Panel::Audio => return modal(shell, audio::dialog(app, size), narrow),
+            Panel::Drives => return modal(shell, drives::dialog(app, size), narrow),
+            Panel::Input => return modal(shell, input::dialog(app, size), narrow),
+            Panel::Display => ("Display", display_panel(app)),
+            Panel::Memory => ("Memory", memory::details(app)),
             Panel::Details => ("Session", details_panel(app)),
             #[cfg(target_arch = "wasm32")]
             Panel::Games => ("Open a game", games_panel(app)),
@@ -309,9 +344,14 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         .padding(22)
         .max_width(520)
         .width(Fill)
-        .height(
-            (size.height - 40.0).clamp(160.0, if kind == Panel::Details { 430.0 } else { 320.0 }),
-        )
+        .height((size.height - 40.0).clamp(
+            160.0,
+            match kind {
+                Panel::Details => 430.0,
+                Panel::Memory => 520.0,
+                _ => 320.0,
+            },
+        ))
         .style(panel);
         return modal(shell, dialog.into(), narrow);
     }
@@ -338,79 +378,99 @@ fn modal<'a>(
 
 fn backdrop(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Color::from_rgba8(0, 0, 0, 0.72).into()),
+        background: Some(Color::from_rgba8(0, 0, 0, 0.48).into()),
         ..Default::default()
     }
 }
 
-fn audio_panel(app: &Doslet) -> Element<'_, Message> {
-    let body = column![
+fn video_indicator(app: &Doslet, compact: bool, icon_only: bool) -> Element<'_, Message> {
+    let label = app.video_mode_label.as_str();
+    let icon = svg(svg::Handle::from_memory(Icon::Display.bytes()))
+        .width(24)
+        .height(24)
+        .style(|_, _| svg::Style {
+            color: Some(ACCENT),
+        });
+    let content: Element<'_, Message> = if icon_only {
+        icon.into()
+    } else if compact {
+        row![
+            icon,
+            text(shorten(label, 14))
+                .size(12)
+                .font(iced::Font::MONOSPACE)
+        ]
+        .spacing(9)
+        .align_y(iced::Center)
+        .into()
+    } else {
+        row![
+            icon,
+            text(label).size(12).font(iced::Font::MONOSPACE).width(140)
+        ]
+        .spacing(9)
+        .align_y(iced::Center)
+        .into()
+    };
+    tooltip(
+        button(content)
+            .padding([6, 8])
+            .style(ghost)
+            .on_press(Message::Ui(Action::Open(Panel::Display))),
+        container(text("Display settings").size(12))
+            .padding([6, 10])
+            .style(panel),
+        tooltip::Position::Top,
+    )
+    .into()
+}
+
+fn display_panel(app: &Doslet) -> Element<'_, Message> {
+    use crate::presentation::{DisplayFilter, SizingMessage};
+    let perfect = app.display_sizing.pixel_perfect;
+    let dimensions = app.display.dimensions().map_or_else(
+        || "No video output".into(),
+        |size| format!("{} × {}", size.width as u32, size.height as u32),
+    );
+    column![
+        text(dimensions).size(13).color(MUTED),
         field(
-            "Output",
-            pick_list(
-                &app.midi_choices[..],
-                Some(&app.midi_choice),
-                Message::MidiSelected
-            )
-            .width(Fill)
-            .text_size(14)
-            .padding(8)
+            "Scaling",
+            row![
+                button(text("Pixel perfect").size(13))
+                    .padding([8, 12])
+                    .style(move |theme, status| segment(theme, status, perfect))
+                    .on_press_maybe(
+                        app.display
+                            .dimensions()
+                            .map(|_| Message::DisplaySizing(SizingMessage::PixelPerfect))
+                    ),
+                button(text("Fit").size(13))
+                    .padding([8, 12])
+                    .style(move |theme, status| segment(theme, status, !perfect))
+                    .on_press(Message::DisplaySizing(SizingMessage::Fit)),
+            ]
+            .spacing(6)
             .into()
         ),
-        row![
-            field(
-                "Game MIDI",
-                pick_list(
-                    &doslet_midi_routing::Mode::ALL[..],
-                    Some(app.midi_mode),
-                    Message::MidiModeSelected
-                )
-                .width(Fill)
-                .text_size(14)
-                .padding(8)
-                .into()
-            ),
-            field(
-                "Output MIDI",
-                pick_list(
-                    &doslet_midi_routing::Mode::ALL[..],
-                    Some(app.midi_output_mode),
-                    Message::MidiOutputModeSelected
-                )
-                .width(Fill)
-                .text_size(14)
-                .padding(8)
-                .into()
-            ),
-        ]
-        .spacing(12),
-        small_button("Refresh outputs", Message::RefreshMidi),
+        field(
+            "Filter",
+            pick_list(
+                &DisplayFilter::ALL[..],
+                Some(app.display_sizing.filter),
+                |filter| Message::DisplaySizing(SizingMessage::Filter(filter))
+            )
+            .padding(8)
+            .text_size(14)
+            .width(Fill)
+            .into()
+        ),
+        text("Pixel perfect preserves whole pixels. Fit uses 4:3 proportions.")
+            .size(12)
+            .color(MUTED),
     ]
-    .spacing(18);
-    #[cfg(target_os = "linux")]
-    let body = body.push(field(
-        "Mixer",
-        pick_list(
-            [
-                crate::audio::Mixer::Application,
-                crate::audio::Mixer::System,
-            ],
-            Some(app.audio_mixer),
-            Message::AudioMixerSelected,
-        )
-        .width(Fill)
-        .text_size(14)
-        .padding(8)
-        .into(),
-    ));
-    #[cfg(target_arch = "wasm32")]
-    let body = body.push(
-        button(text(app.audio_button_label()).size(13))
-            .padding([8, 14])
-            .style(primary)
-            .on_press(Message::ToggleAudio),
-    );
-    body.into()
+    .spacing(18)
+    .into()
 }
 
 fn details_panel(app: &Doslet) -> Element<'_, Message> {
@@ -458,12 +518,15 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
         row![step, small_button("Restart", Message::Reset)].spacing(8),
         rule::horizontal(1),
         text(app.audio_label()).size(12).color(MUTED),
+        text(app.guest_audio_description()).size(12).color(MUTED),
+        text(app.midi_activity.description()).size(12).color(MUTED),
         text(app.midi_mode_label()).size(12).color(MUTED),
     ]
     .spacing(14);
     #[cfg(not(target_arch = "wasm32"))]
     {
         if let Some(tiers) = app.speed_tiers {
+            body = body.push(speed_tier_table(app));
             body = body.push(
                 column![
                     text(format!(
@@ -571,6 +634,14 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let o = app.idle_observation;
+        body = body.push(
+            text(format!(
+                "Cooperative idle · {}% of recent guest time",
+                app.adaptive_idle_percent
+            ))
+            .size(12)
+            .color(MUTED),
+        );
         body = body.push(
             column![
                 small_button(
@@ -788,6 +859,13 @@ enum Icon {
     Play,
     Pause,
     Restart,
+    Cpu,
+    Ram,
+    Audio,
+    Disk,
+    Input,
+    Display,
+    Info,
 }
 
 impl Icon {
@@ -796,6 +874,13 @@ impl Icon {
             Self::Play => include_bytes!("icons/play.svg"),
             Self::Pause => include_bytes!("icons/pause.svg"),
             Self::Restart => include_bytes!("icons/restart.svg"),
+            Self::Cpu => include_bytes!("icons/cpu.svg"),
+            Self::Ram => include_bytes!("icons/ram.svg"),
+            Self::Audio => include_bytes!("icons/audio.svg"),
+            Self::Disk => include_bytes!("icons/disk.svg"),
+            Self::Input => include_bytes!("icons/input.svg"),
+            Self::Display => include_bytes!("icons/display.svg"),
+            Self::Info => include_bytes!("icons/info.svg"),
         }
     }
 }
@@ -848,20 +933,6 @@ fn viewport(app: &Doslet) -> Element<'_, Message> {
                 .width(width)
                 .height(height)
                 .into();
-            #[cfg(not(target_arch = "wasm32"))]
-            let pixels: Element<'_, Message> = if app.speed_tiers.is_some_and(|s| s.enabled) {
-                stack![
-                    pixels,
-                    container(speed_tier_overlay(app))
-                        .width(width)
-                        .height(height)
-                        .align_x(iced::Right)
-                        .padding(10),
-                ]
-                .into()
-            } else {
-                pixels
-            };
             let content = container(
                 iced::widget::mouse_area(pixels)
                     .interaction(cursor)
@@ -932,7 +1003,7 @@ fn viewport(app: &Doslet) -> Element<'_, Message> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn speed_tier_overlay(app: &Doslet) -> Element<'_, Message> {
+fn speed_tier_table(app: &Doslet) -> Element<'_, Message> {
     let colors = [
         Color::from_rgb8(255, 179, 105),
         Color::from_rgb8(125, 194, 255),
@@ -975,7 +1046,6 @@ fn speed_tier_overlay(app: &Doslet) -> Element<'_, Message> {
             .spacing(3),
         );
     }
-    // Non-interactive: the surrounding mouse area still receives game input.
     container(column![text(heading).size(11).color(FOREGROUND), table].spacing(5))
         .padding([8, 10])
         .style(|_| container::Style {
@@ -992,101 +1062,168 @@ fn speed_tier_overlay(app: &Doslet) -> Element<'_, Message> {
 
 pub(crate) fn panel(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(PANEL.into()),
+        background: Some(Color::from_rgba8(25, 27, 31, 0.94).into()),
         border: Border {
-            color: EDGE,
+            color: Color::from_rgba8(177, 224, 190, 0.17),
             width: 1.0,
             radius: 10.0.into(),
+        },
+        shadow: iced::Shadow {
+            color: Color::from_rgba8(128, 224, 170, 0.09),
+            offset: iced::Vector::new(0.0, 2.0),
+            blur_radius: 24.0,
         },
         ..Default::default()
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn adaptive_indicator(app: &Doslet) -> Element<'_, Message> {
-    if let Some(tiers) = app.speed_tiers {
-        let label = if tiers.enabled {
-            format!(
-                "Tiers · {} / {} / {}",
-                tiers
-                    .hot_mhz
-                    .map_or_else(|| "MAX".into(), |m| m.to_string()),
-                tiers.cold_mhz,
-                tiers.grey_mhz
-            )
-        } else {
-            "Tiers off".into()
-        };
-        return button(
-            text(label)
-                .size(12)
-                .color(if tiers.enabled { ACCENT } else { MUTED }),
-        )
-        .style(button::text)
-        .on_press(Message::Ui(Action::Open(Panel::Details)))
-        .into();
+fn cpu_indicator(app: &Doslet, compact: bool) -> Element<'_, Message> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let tier_targets = app
+        .speed_tiers
+        .filter(|tiers| tiers.enabled)
+        .map(|tiers| (tiers.hot_mhz, tiers.cold_mhz, tiers.grey_mhz));
+    #[cfg(target_arch = "wasm32")]
+    let tier_targets = (app.cpu_settings.mode == crate::cpu_config::Mode::Tiers
+        && app.cpu_tiers_available)
+        .then_some((
+            app.cpu_settings.hot,
+            app.cpu_settings.cold,
+            app.cpu_settings.grey,
+        ));
+    #[cfg(not(target_arch = "wasm32"))]
+    let speed = if let Some((_, _, grey)) = tier_targets {
+        format!("{grey} MHz · Auto")
+    } else if app.analysis.controller_enabled {
+        format!("{} MHz · Auto", app.analysis.effective_mhz)
+    } else {
+        format!("{} MHz", app.configurator.active.hardware.cpu_mhz)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let speed = if let Some((_, _, grey)) = tier_targets {
+        format!("{grey} MHz · Auto")
+    } else {
+        format!("{} MHz", app.configurator.active.hardware.cpu_mhz)
+    };
+    let activity = app.cpu_activity;
+    let usage = activity.map_or_else(|| "—".into(), |a| format!("{:.0}%", a.busy()));
+    let colored = tier_targets.is_some();
+    let shares = activity.map_or([0.0; 4], |a| a.shares);
+    let colors = if colored {
+        [HOT, COLD, MUTED, EDGE]
+    } else {
+        [ACCENT, ACCENT, ACCENT, EDGE]
+    };
+    let mut track = row![];
+    if activity.is_some() {
+        for (share, color) in shares.into_iter().zip(colors) {
+            if share > 0.0 {
+                track = track.push(
+                    container(space::horizontal())
+                        .width(iced::Length::FillPortion(
+                            (share * 100.0).round().max(1.0) as u16
+                        ))
+                        .height(4)
+                        .style(move |_| container::Style {
+                            background: Some(color.into()),
+                            ..Default::default()
+                        }),
+                );
+            }
+        }
     }
-    let enabled = app.menu_idle.0;
-    let running = app.session.status() == SessionStatus::Running;
-    let percent = if enabled && running {
-        app.adaptive_idle_percent
-    } else {
-        0
-    };
-    let label = if app.idle_observation.enabled && app.idle_observation.candidate && percent == 0 {
-        "Idle candidate".to_owned()
-    } else if running
-        && app.idle_observation.enabled
-        && percent == 0
-        && app.synchronization.conditions != 0
-    {
-        if app.synchronization.port {
-            "Trace: port"
+    let track_width = if compact { 104 } else { 146 };
+    let track = container(track)
+        .width(track_width)
+        .height(4)
+        .style(|_| container::Style {
+            background: Some(EDGE.into()),
+            ..Default::default()
+        });
+    let icon = svg(svg::Handle::from_memory(Icon::Cpu.bytes()))
+        .width(20)
+        .height(20)
+        .style(|_, _| svg::Style {
+            color: Some(ACCENT),
+        });
+    let control = button(
+        row![
+            icon,
+            column![
+                row![
+                    text(speed).size(12),
+                    space::horizontal(),
+                    text(usage).size(12).color(MUTED)
+                ],
+                track
+            ]
+            .spacing(5)
+            .width(track_width),
+        ]
+        .spacing(9)
+        .align_y(iced::Center),
+    )
+    .padding([6, 8])
+    .style(ghost)
+    .on_press(Message::Ui(Action::Open(Panel::Cpu)));
+    #[allow(unused_mut)]
+    let mut description = column![
+        text("Emulated CPU").size(13),
+        text(if colored {
+            "Executed work relative to the configured Grey speed."
         } else {
-            "Trace: RAM"
+            "Guest time outside detected idle loops."
+        })
+        .size(12),
+        text("Recent 250 ms of game time · not your computer's CPU usage.")
+            .size(12)
+            .color(MUTED),
+    ]
+    .spacing(6);
+    if let Some((hot, cold, grey)) = tier_targets {
+        description = description.push(
+            text(format!(
+                "Targets: Hot {} · Cold {} MHz · Grey / IRQ {} MHz",
+                hot.map_or_else(|| "MAX".into(), |mhz| format!("{mhz} MHz")),
+                cold,
+                grey,
+            ))
+            .size(12),
+        );
+        if let Some(a) = activity {
+            description = description.push(
+                row![
+                    text(format!("Hot {:.0}%", a.shares[0])).size(12).color(HOT),
+                    text(format!("Cold {:.0}%", a.shares[1]))
+                        .size(12)
+                        .color(COLD),
+                    text(format!("Grey {:.0}%", a.shares[2]))
+                        .size(12)
+                        .color(MUTED),
+                    text(format!("Headroom {:.0}%", a.shares[3]))
+                        .size(12)
+                        .color(FOREGROUND),
+                ]
+                .spacing(10),
+            );
         }
-        .to_owned()
-    } else if app.idle_observation.enabled && percent == 0 {
-        if running {
-            "Observing"
-        } else {
-            "Observer paused"
-        }
-        .to_owned()
-    } else if !enabled {
-        "Auto off".to_owned()
-    } else if !running {
-        "Auto paused".to_owned()
-    } else if percent == 0 {
-        "Full speed".to_owned()
-    } else {
-        format!("Idle {percent}%")
-    };
-    let mut bars = iced::widget::Row::new().spacing(2).align_y(iced::Bottom);
-    for i in 0..10 {
-        let lit = u16::from(percent) > i * 10;
-        let color = if lit { ACCENT } else { EDGE };
-        bars = bars.push(
-            container(space::horizontal().width(3))
-                .height(4 + i as u32)
-                .style(move |_| container::Style {
-                    background: Some(color.into()),
-                    ..Default::default()
-                }),
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if tier_targets.is_none() && app.analysis.controller_enabled {
+        description = description.push(
+            text(format!(
+                "Configured ceiling: {} MHz",
+                app.analysis.configured_mhz
+            ))
+            .size(12),
         );
     }
     tooltip(
-        button(row![bars, text(label).size(12).color(if percent > 0 { ACCENT } else { MUTED })]
-            .spacing(6).align_y(iced::Center))
-            .padding([4, 6]).style(button::text)
-            .on_press(Message::Ui(Action::Open(Panel::Details))),
-        container(text(format!(
-            "Adaptive idle · {percent}% guest time waiting\nRecent 250 ms of emulated time · more bars = more waiting\nActive CPU: {} MHz · wait limit: {:.0} µs\nNot host CPU usage or battery savings. Click for Details.\nObserver: {} (never skips execution)",
-            app.configurator.active.hardware.cpu_mhz, app.menu_idle.2 as f64 / 1e3,
-            if app.idle_observation.enabled { app.idle_observation.reason } else { "off" },
-        )).size(12)).padding(10).style(panel),
+        control,
+        container(description).padding(12).style(panel),
         tooltip::Position::Top,
-    ).into()
+    )
+    .into()
 }
 
 fn audio_spectrum(app: &Doslet) -> Element<'_, Message> {
@@ -1106,7 +1243,7 @@ fn audio_spectrum(app: &Doslet) -> Element<'_, Message> {
             };
             bar = bar.push(
                 container(space::horizontal().width(4))
-                    .height(2)
+                    .height(1)
                     .style(move |_| container::Style {
                         background: Some(color.into()),
                         ..Default::default()
@@ -1115,16 +1252,56 @@ fn audio_spectrum(app: &Doslet) -> Element<'_, Message> {
         }
         bars = bars.push(bar);
     }
+    let h = app.configurator.active.hardware;
+    let lamp = app
+        .midi_activity
+        .lamp(app.session.status() == SessionStatus::Running);
+    let midi_color = if !h.mpu401 {
+        EDGE
+    } else {
+        match lamp {
+            crate::midi_activity::Lamp::Note => ACCENT,
+            crate::midi_activity::Lamp::Data => Color::from_rgb8(228, 193, 133),
+            crate::midi_activity::Lamp::Idle => MUTED,
+        }
+    };
+    let badges = row![
+        text(if h.sb16 { "SB16" } else { "" })
+            .size(10)
+            .width(34)
+            .color(if h.sb16 { MUTED } else { EDGE }),
+        text(if h.sb16 { "OPL3" } else { "" })
+            .size(10)
+            .width(34)
+            .color(if h.sb16 { MUTED } else { EDGE }),
+        text(if h.mpu401 { "MIDI" } else { "" })
+            .size(10)
+            .width(28)
+            .color(midi_color),
+    ];
+    let icon = svg(svg::Handle::from_memory(Icon::Audio.bytes()))
+        .width(24)
+        .height(24)
+        .style(|_, _| svg::Style {
+            color: Some(ACCENT),
+        });
     tooltip(
-        container(bars).padding([4, 6]),
-        container(
-            text(format!(
-                "Audio spectrum · bass → treble\n{}\nFM / MIDI · synthesized audio\nExternal MIDI audio is not measured.",
-                app.guest_audio_description(),
-            ))
-            .size(12),
+        button(
+            row![icon, column![bars, badges].spacing(3).width(96)]
+                .spacing(9)
+                .align_y(iced::Center),
         )
-        .padding(10)
+        .padding([4, 6])
+        .style(ghost)
+        .on_press(Message::Ui(Action::Open(Panel::Audio))),
+        container(
+            column![
+                text("Audio").size(12),
+                text(app.guest_audio_description()).size(12).color(MUTED),
+            ]
+            .spacing(4),
+        )
+        .padding([6, 10])
         .style(panel),
         tooltip::Position::Top,
     )
@@ -1135,64 +1312,13 @@ pub(crate) fn guest_pcm_description(rate: u32, bits: u8, channels: u8) -> String
     if bits == 0 {
         "Guest PCM · not configured".into()
     } else {
+        let khz = format!("{:.3}", f64::from(rate) / 1000.0);
+        let khz = khz.trim_end_matches('0').trim_end_matches('.');
         format!(
-            "Guest PCM · {rate} Hz · {bits}-bit · {}",
+            "Guest PCM · {khz} kHz · {bits}-bit · {}",
             if channels == 2 { "Stereo" } else { "Mono" },
         )
     }
-}
-
-fn mpu_indicator(app: &Doslet) -> Element<'_, Message> {
-    use crate::midi_activity::Lamp;
-    let lamp = app
-        .midi_activity
-        .lamp(app.session.status() == SessionStatus::Running);
-    let color = match lamp {
-        Lamp::Note => ACCENT,
-        Lamp::Data => Color::from_rgb8(228, 193, 133),
-        Lamp::Idle => Color::from_rgb8(79, 85, 94),
-    };
-    let light = container(space::horizontal().width(6))
-        .height(6)
-        .style(move |_| container::Style {
-            background: Some(color.into()),
-            border: Border {
-                radius: 3.0.into(),
-                ..Default::default()
-            },
-            shadow: iced::Shadow {
-                color: Color {
-                    a: if lamp == Lamp::Idle { 0.0 } else { 0.3 },
-                    ..color
-                },
-                blur_radius: 5.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-    let badge = container(
-        row![light, text("MPU").size(10).color(MUTED)]
-            .spacing(6)
-            .align_y(iced::Center),
-    )
-    .padding([4, 8])
-    .style(|_| container::Style {
-        background: Some(PANEL.into()),
-        border: Border {
-            color: EDGE,
-            width: 1.0,
-            radius: 5.0.into(),
-        },
-        ..Default::default()
-    });
-    tooltip(
-        badge,
-        container(text(app.midi_activity.description()).size(12))
-            .padding(10)
-            .style(panel),
-        tooltip::Position::Top,
-    )
-    .into()
 }
 
 pub(crate) fn primary(_: &Theme, status: button::Status) -> button::Style {

@@ -60,6 +60,15 @@ impl SessionSnapshot {
     }
 }
 pub struct Snapshot {
+    pub cpu_settings: crate::cpu_config::Settings,
+    pub cpu_profile: Option<crate::cpu_config::ProfileInfo>,
+    pub cpu_learning_available: bool,
+    pub disk_reads: (u64, u64),
+    pub video_mode_label: String,
+    pub audio_volume: u8,
+    pub audio_use: doslet_runtime::AudioUse,
+    pub memory_usage: doslet_runtime::session::MemoryUsage,
+    pub(crate) cpu_activity: Option<crate::cpu_meter::Activity>,
     pub(crate) speed_tiers: Option<crate::native_speed_tiers::Stats>,
     pub analysis: doslet_runtime::session::AnalyzerStats,
     pub host_audio_underruns: Option<u64>,
@@ -83,6 +92,7 @@ pub struct Snapshot {
     pub midi_mode: Mode,
     pub midi_output_mode: Mode,
     pub midi_activity: crate::midi_activity::MidiActivity,
+    pub midi_channels: [doslet_midi_routing::Channel; 16],
     pub spectrum: [f32; doslet_pcm::spectrum::BANDS],
     pub pointer_dimensions: (u16, u16),
     pub captured: bool,
@@ -536,11 +546,13 @@ mod tests {
         let (worker, mut state) = worker(false);
         let configurator = state.configurator.take().unwrap();
         let mut app = Doslet {
+            disk_activity: crate::disk_activity::Activity::default(),
             worker,
             state,
             configurator,
             display_sizing: DisplaySizing::default(),
             config_sequence: 0,
+            cpu_sequence: 0,
             tier_meter: crate::speed_tier_meter::Meter::default(),
         };
         let _ = app.update(Message::Config(crate::configurator::Edit::Name(
@@ -555,6 +567,17 @@ mod tests {
         });
         let _ = app.update(Message::GamepadsReady);
         assert_eq!(app.configurator.draft.name, "New name");
+        let _ = app.update(Message::Cpu(crate::cpu_config::Edit::Grey(100)));
+        let _ = app.update(Message::Cpu(crate::cpu_config::Edit::Hot(500)));
+        assert_eq!(app.workspace.cpu.unwrap().grey, 100);
+        app.worker.mailbox.publish(Packet {
+            snapshot: old.snapshot(true),
+            effects: Effects::default(),
+            sequence: 0,
+        });
+        let _ = app.update(Message::GamepadsReady);
+        assert_eq!(app.workspace.cpu.unwrap().grey, 100);
+        assert_eq!(app.workspace.cpu.unwrap().hot, Some(500));
     }
 
     #[test]
@@ -849,11 +872,13 @@ impl Worker {
 }
 
 pub struct Doslet {
+    pub(crate) disk_activity: crate::disk_activity::Activity,
     worker: Worker,
     pub state: Snapshot,
     pub configurator: crate::configurator::ConfiguratorState,
     pub display_sizing: DisplaySizing,
     config_sequence: u64,
+    cpu_sequence: u64,
     pub(crate) tier_meter: crate::speed_tier_meter::Meter,
 }
 impl std::ops::Deref for Doslet {
@@ -867,11 +892,16 @@ impl Doslet {
         let (worker, mut state) = Worker::spawn(cli)?;
         let configurator = state.configurator.take().unwrap();
         Ok(Box::new(Self {
+            disk_activity: crate::disk_activity::Activity::new(
+                state.disk_reads.0,
+                state.disk_reads.1,
+            ),
             worker,
             state,
             configurator,
             display_sizing: DisplaySizing::default(),
             config_sequence: 0,
+            cpu_sequence: 0,
             tier_meter: crate::speed_tier_meter::Meter::default(),
         }))
     }
@@ -885,6 +915,11 @@ impl Doslet {
         if matches!(message, Message::Tick | Message::GamepadsReady) {
             self.worker.signal.clear();
             let effects = if let Some(mut packet) = self.worker.mailbox.take() {
+                if packet.sequence < self.cpu_sequence {
+                    packet.snapshot.workspace.cpu = self.state.workspace.cpu;
+                    packet.snapshot.workspace.cpu_profile_form =
+                        self.state.workspace.cpu_profile_form.clone();
+                }
                 if let Some(mut configurator) = packet.snapshot.configurator.take()
                     && packet.sequence >= self.config_sequence
                 {
@@ -898,6 +933,11 @@ impl Doslet {
                     self.configurator = configurator;
                 }
                 self.state = packet.snapshot;
+                self.disk_activity.observe(
+                    self.state.disk_reads.0,
+                    self.state.disk_reads.1,
+                    web_time::Instant::now(),
+                );
                 self.tier_meter.sample(
                     std::time::Instant::now(),
                     self.state.speed_tiers,
@@ -924,6 +964,24 @@ impl Doslet {
         }
         // Editor cursor actions are presentation state; execution sees the same edits.
         let config = matches!(message, Message::Config(_));
+        let cpu = matches!(message, Message::Cpu(_) | Message::CpuProfile(_));
+        if let Message::CpuProfile(crate::cpu_config::ProfileEdit::Path(path)) = &message
+            && let Some(form) = &mut self.state.workspace.cpu_profile_form
+        {
+            form.path.clone_from(path);
+            form.error = None;
+        }
+        if let Message::Cpu(edit) = message {
+            if matches!(edit, crate::cpu_config::Edit::Revert) {
+                self.state.workspace.cpu = Some(self.state.cpu_settings);
+            } else if !matches!(edit, crate::cpu_config::Edit::Apply) {
+                self.state
+                    .workspace
+                    .cpu
+                    .get_or_insert(self.state.cpu_settings)
+                    .edit(edit);
+            }
+        }
         if let Message::Config(edit) = &message {
             self.configurator.edit(edit);
         }
@@ -936,6 +994,9 @@ impl Doslet {
             Ok(sequence) => {
                 if config {
                     self.config_sequence = sequence;
+                }
+                if cpu {
+                    self.cpu_sequence = sequence;
                 }
             }
             Err(error) => {

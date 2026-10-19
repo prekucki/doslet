@@ -42,9 +42,11 @@ fn mscdex_reports_the_mounted_drive_and_bounds_sector_reads() {
     assert_eq!(session.registers().get(Gpr16::Ax), 0);
     assert_eq!(session.flags() & 1, 0);
     assert_eq!(session.ram_view(0x10400..0x10404).unwrap(), b"data");
+    assert_eq!(session.disk_read_bytes(), 2048);
     session.advance(4);
     assert_eq!(session.registers().get(Gpr16::Ax), 15);
     assert_eq!(session.flags() & 1, 1);
+    assert_eq!(session.disk_read_bytes(), 2048);
     assert_eq!(session.ram_view(0x10400..0x10404).unwrap(), b"data");
     session.advance(3);
     assert_eq!(session.status(), SessionStatus::Exited(0));

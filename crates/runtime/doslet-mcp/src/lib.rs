@@ -94,6 +94,10 @@ pub struct Status {
     pub synchronization: String,
     pub synchronization_analysis: serde_json::Value,
     pub host_audio_underruns: Option<u64>,
+    pub guest_fm_started: bool,
+    pub guest_fm_key_on_writes: u64,
+    pub guest_fm_peak: u16,
+    pub guest_fm_levels: [u8; 4],
     pub host_process_id: u32,
     /// Linux process user+system CPU ticks; None when procfs is unavailable.
     /// Compare deltas per wall-time interval; no assumed tick frequency.

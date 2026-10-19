@@ -289,8 +289,7 @@ using crates.io `smk = 0.1.0` decodes it independently. Completed guest frames
 Smacker frame counter then advances from 109 to 111, 113, 115 and 117 without
 decoding the intervening frames. Replaying precisely that omitted-frame
 sequence through the independent decoder reproduces all 66 captured guest
-frames with zero differing pixels, including the corrupted title. The
-[frame comparison](heroes-animation-frames.csv) records both comparisons.
+frames with zero differing pixels, including the corrupted title. The frame comparison records both comparisons.
 This establishes lost delta-frame history rather than a bank/LFB or double
 buffer presentation error in this sample.
 

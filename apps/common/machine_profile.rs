@@ -178,6 +178,7 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
                 "keyboard",
                 "gameport",
                 "capture",
+                "mouse_mode",
                 "hide_cursor",
                 "pad_index",
                 "pad_id",
@@ -200,8 +201,18 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
             spec.hardware.gameport = v;
         }
         spec.input.pad_id = string(i, "pad_id")?.filter(|s| !s.is_empty());
-        if let Some(v) = boolean(i, "capture")? {
-            spec.input.capture = v;
+        let legacy_capture = boolean(i, "capture")?;
+        if let Some(value) = string(i, "mouse_mode")? {
+            if legacy_capture.is_some() {
+                return Err("input.capture and input.mouse_mode cannot be combined".into());
+            }
+            spec.input.mouse_mode = value.parse::<MouseMode>()?;
+        } else if let Some(capture) = legacy_capture {
+            spec.input.mouse_mode = if capture {
+                MouseMode::Auto
+            } else {
+                MouseMode::NoCapture
+            };
         }
         if let Some(v) = boolean(i, "hide_cursor")? {
             spec.input.hide_cursor = v;
@@ -502,7 +513,7 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
         "bios"
     });
     d["input"]["gameport"] = value(spec.hardware.gameport);
-    d["input"]["capture"] = value(spec.input.capture);
+    d["input"]["mouse_mode"] = value(spec.input.mouse_mode.as_str());
     d["input"]["hide_cursor"] = value(spec.input.hide_cursor);
     if let Some(id) = &spec.input.pad_id {
         d["input"]["pad_id"] = value(id);
@@ -627,13 +638,42 @@ mod tests {
         s.hardware.keyboard = KeyboardMode::At;
         s.hardware.cpu_mhz = 132;
         s.input.deadzone_percent = 20;
-        s.input.capture = false;
+        s.input.mouse_mode = MouseMode::NoCapture;
         s.input.hide_cursor = true;
         assert_eq!(
             parse_machine_profile(&export_machine_profile(&s)).unwrap(),
             s
         );
     }
+    #[test]
+    fn mouse_capture_modes_round_trip_and_legacy_capture_remains_readable() {
+        for mode in MouseMode::ALL {
+            let profile = format!("version=2\n[input]\nmouse_mode='{}'", mode.as_str());
+            let spec = parse_machine_profile(&profile).unwrap();
+            assert_eq!(spec.input.mouse_mode, mode);
+            assert_eq!(
+                parse_machine_profile(&export_machine_profile(&spec)).unwrap(),
+                spec
+            );
+        }
+        for (capture, mode) in [(true, MouseMode::Auto), (false, MouseMode::NoCapture)] {
+            let spec =
+                parse_machine_profile(&format!("version=2\n[input]\ncapture={capture}")).unwrap();
+            assert_eq!(spec.input.mouse_mode, mode);
+        }
+        assert_eq!(
+            parse_machine_profile("version=2").unwrap().input.mouse_mode,
+            MouseMode::Auto
+        );
+        for input in [
+            "mouse_mode='invalid'",
+            "mouse_mode=true",
+            "mouse_mode='auto'\ncapture=false",
+        ] {
+            assert!(parse_machine_profile(&format!("version=2\n[input]\n{input}")).is_err());
+        }
+    }
+
     #[test]
     fn cpu_clock_supports_both_profile_versions_and_rejects_ambiguous_values() {
         for version in [1, 2] {

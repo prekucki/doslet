@@ -2,6 +2,7 @@
 <script type="module">
 import init, {WorkerEngine} from '/browser/doslet_web_worker.js';
 import {HttpMedia, BlobMedia} from '/browser/media.js';
+import {HostMidi} from '/browser/host-midi.js';
 window.result={cases:[]};
 const assert=(condition,message)=>{if(!condition)throw new Error(message);};
 const rejects=async(action,code)=>{try{await action();}catch(error){assert(error.code===code,`Expected ${code}, got ${error.code}: ${error}`);return;}throw new Error(`Expected ${code}`);};
@@ -12,6 +13,22 @@ function storage(){
     return {worker,call:data=>new Promise((resolve,reject)=>{const id=next++;pending.set(id,{resolve,reject});worker.postMessage({...data,id});})};
 }
 try {
+    const sent=[],port={postMessage(){},close(){}};
+    const receiver=new HostMidi({clear(){},send(message){sent.push(Array.from(message));}},port,error=>{throw new Error(error);},true,'mt32');
+    receiver.receive({kind:'reset',epoch:1,nanos:0,active:false,resetReceiver:true});
+    assert(JSON.stringify(sent.at(-1))===JSON.stringify([240,65,16,22,18,127,0,0,1,0,247]),'MT-32 connection resets the receiver while paused');
+    const resets=()=>sent.filter(m=>m[0]===240).length;
+    receiver.receive({kind:'reset',epoch:2,nanos:0,active:false});
+    assert(resets()===1,'Resync and pause must preserve receiver parameters');
+    receiver.close();const closedCount=sent.length;
+    receiver.receive({kind:'reset',epoch:3,nanos:0,active:true,resetReceiver:true});
+    assert(sent.length===closedCount,'Disconnected receiver ignores stale messages');
+    const gm=[];
+    const plain=new HostMidi({clear(){},send(m){gm.push(Array.from(m));}},port,error=>{throw new Error(error);});
+    plain.receive({kind:'reset',epoch:1,nanos:0,active:false,resetReceiver:true});
+    assert(gm.some(m=>m[0]===176&&m[1]===7&&m[2]===100),'GM fallback resets old channel volume without SysEx permission');
+    assert(!gm.some(m=>m[0]===240),'GM fallback must not send unauthorized SysEx');plain.close();
+    window.result.cases.push('MIDI receiver connect/reset/disconnect');
     const first=storage(),second=storage();
     const namespace='acceptance-store',base='12'.repeat(32);
     let state=await first.call({kind:'open',namespace,base});

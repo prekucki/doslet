@@ -31,6 +31,9 @@ pub(super) struct Memory {
 }
 
 impl Memory {
+    pub fn capacity(&self) -> u64 {
+        u64::from(self.end - self.start)
+    }
     pub fn new(start: u32, end: u32) -> Self {
         Self {
             blocks: [Block::default(); 512],

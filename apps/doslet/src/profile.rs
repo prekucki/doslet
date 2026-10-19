@@ -249,17 +249,20 @@ fn command_tail(arguments: &[String]) -> Result<Vec<u8>, String> {
 }
 
 impl Cli {
-    pub fn resolve(mut self) -> Result<Self, Box<dyn Error>> {
+    pub fn resolve(self) -> Result<Self, Box<dyn Error>> {
+        self.resolve_with_roms(crate::native_roms::detect)
+    }
+    pub(crate) fn resolve_with_roms(
+        mut self,
+        discover: impl FnOnce() -> Option<PathBuf>,
+    ) -> Result<Self, Box<dyn Error>> {
         let explicit_drive_mode = self.drive_mode;
         if let Some(config) = &self.config {
             let text = std::fs::read_to_string(config)
                 .map_err(|error| format!("Cannot read {}: {error}", config.display()))?;
             let base = config.parent().unwrap_or(Path::new("."));
-            let is_v2 = text
-                .parse::<DocumentMut>()?
-                .get("version")
-                .and_then(Item::as_integer)
-                == Some(2);
+            let document = text.parse::<DocumentMut>()?;
+            let is_v2 = document.get("version").and_then(Item::as_integer) == Some(2);
             let profile = if is_v2 {
                 let mut spec = crate::machine_profile::parse_machine_profile(&text)?;
                 for path in &mut spec.game.patches {
@@ -271,6 +274,7 @@ impl Cli {
                     if matches!(
                         binding.kind,
                         doslet_config::BindingKind::NativeDirectory
+                            | doslet_config::BindingKind::BrowserZip
                             | doslet_config::BindingKind::LocalIso
                             | doslet_config::BindingKind::NativeStore
                     ) {
@@ -295,7 +299,11 @@ impl Cli {
                     } else {
                         MidiMode::Gm
                     }),
-                    output: Some(spec.output.midi_output.clone()),
+                    output: document
+                        .get("output")
+                        .and_then(Item::as_table_like)
+                        .and_then(|output| output.get("midi_output"))
+                        .map(|_| spec.output.midi_output.clone()),
                     ..Profile::default()
                 };
                 if !spec.game.executable.is_empty() {
@@ -313,6 +321,7 @@ impl Cli {
                     if matches!(
                         mount.kind,
                         doslet_config::SourceKind::NativeDirectory
+                            | doslet_config::SourceKind::BrowserZip
                             | doslet_config::SourceKind::LocalIso
                     ) && !spec.host.bindings.iter().any(|b| b.id == mount.source)
                     {
@@ -331,6 +340,14 @@ impl Cli {
                         PathBuf::from(&mount.source)
                     };
                     match mount.kind {
+                        doslet_config::SourceKind::BrowserZip => {
+                            profile.executable = Some(PathBuf::from(&spec.game.executable));
+                            profile.drive_mode = Some(match mount.policy {
+                                doslet_config::WritePolicy::ReadOnly => DriveMode::Ro,
+                                doslet_config::WritePolicy::LegacyWriteback => DriveMode::Rw,
+                                _ => DriveMode::Overlay,
+                            });
+                        }
                         doslet_config::SourceKind::NativeDirectory => {
                             profile.root = Some(source);
                             profile.drive_mode = Some(match mount.policy {
@@ -343,11 +360,6 @@ impl Cli {
                             profile.cdrom = Some((mount.letter, source))
                         }
                         doslet_config::SourceKind::HttpsIso => {}
-                        _ => {
-                            return Err(
-                                "native profiles require directory and local ISO sources".into()
-                            );
-                        }
                     }
                 }
                 self.launch.hardware = spec.hardware;
@@ -428,6 +440,12 @@ impl Cli {
             .unwrap_or(crate::cli::DpmiMode::Direct)
             .host_mode();
         self.launch.core_profile = self.core_profile.clone();
+        self.launch.wasm_procedures = self.wasm_procedures.clone();
+        self.launch.interpret_procedures = self.interpret_procedures;
+        #[cfg(not(feature = "wasm-procedures"))]
+        if self.wasm_procedures.is_some() {
+            return Err("--wasm-procedures requires cargo --features wasm-procedures".into());
+        }
         if let Some(mode) = self.drive_mode {
             self.launch.writable = mode != DriveMode::Ro;
             self.launch.persist = mode == DriveMode::Rw;
@@ -440,7 +458,14 @@ impl Cli {
         if self.midi_output.as_deref() == Some("apple") && !cfg!(target_os = "macos") {
             return Err("Apple MIDI output is available only on native macOS".into());
         }
-        if let Some(game) = &self.game {
+        if let Some(game) = &self.game
+            && self.zip.is_none()
+            && !self
+                .launch
+                .machine_spec
+                .as_ref()
+                .is_some_and(|s| crate::native_zip::mount(s).is_some())
+        {
             if !game.is_file() {
                 return Err(format!("game.executable is not a file: {}", game.display()).into());
             }
@@ -467,19 +492,39 @@ impl Cli {
             )
             .into());
         }
-        if let Some(directory) = &self.mt32_rom_dir {
-            for name in ["CM32L_CONTROL.ROM", "CM32L_PCM.ROM"] {
-                if !directory.join(name).is_file() {
-                    return Err(format!(
-                        "midi.rom_directory is missing {name}: {}",
-                        directory.display()
-                    )
-                    .into());
-                }
+        if !self.no_audio && self.mt32_rom_dir.is_none() {
+            self.mt32_rom_dir = discover();
+            if let Some(directory) = &self.mt32_rom_dir {
+                eprintln!(
+                    "[INFO doslet] CM-32L ROMs detected: {}",
+                    directory.display()
+                );
             }
         }
+        if let Some(directory) = &self.mt32_rom_dir {
+            crate::native_roms::paths(directory)?;
+            self.midi_output.get_or_insert_with(|| "moont".into());
+        }
         if self.midi_output.as_deref() == Some("moont") && self.mt32_rom_dir.is_none() {
-            return Err("midi.output=moont requires midi.rom_directory or --mt32-rom-dir".into());
+            return Err("midi.output=moont requires compatible CM-32L ROMs in a DOSBox folder, midi.rom_directory, or --mt32-rom-dir".into());
+        }
+        if let Some(zip) = &self.zip {
+            if self
+                .launch
+                .machine_spec
+                .as_ref()
+                .is_some_and(|s| !s.mounts.is_empty())
+                || self.launch.root.is_some()
+            {
+                return Err(
+                    "--zip cannot override configured drives; use a version-2 ZIP profile".into(),
+                );
+            }
+            let archive = crate::native_zip::read(zip)?;
+            self.game = Some(PathBuf::from(crate::native_zip::select(
+                &archive,
+                self.program.as_deref(),
+            )?));
         }
         let mut spec = self.launch.machine_spec.take().unwrap_or_default();
         spec.hardware = self.launch.hardware;
@@ -507,7 +552,19 @@ impl Cli {
             spec.output.rom_binding = Some(path.to_string_lossy().into_owned());
         }
         if spec.mounts.is_empty() {
-            if let Some(game) = &self.game {
+            if let Some(zip) = &self.zip {
+                spec.mounts.push(doslet_config::MountSpec {
+                    letter: b'C',
+                    source: zip.to_string_lossy().into_owned(),
+                    kind: doslet_config::SourceKind::BrowserZip,
+                    policy: if self.launch.writable {
+                        doslet_config::WritePolicy::Temporary
+                    } else {
+                        doslet_config::WritePolicy::ReadOnly
+                    },
+                    store: None,
+                });
+            } else if let Some(game) = &self.game {
                 let root = self
                     .launch
                     .root
@@ -544,6 +601,15 @@ impl Cli {
                 DriveMode::Overlay => doslet_config::WritePolicy::Temporary,
                 DriveMode::Rw => doslet_config::WritePolicy::LegacyWriteback,
             };
+        }
+        if let Some(mount) = crate::native_zip::mount(&spec) {
+            if self.launch.persist || mount.policy == doslet_config::WritePolicy::LegacyWriteback {
+                return Err("ZIP sources cannot use rw; use overlay, ro, or a separate persistent save store".into());
+            }
+            let archive = crate::native_zip::read(Path::new(spec.binding(&mount.source)))?;
+            spec.game.executable =
+                crate::native_zip::select(&archive, Some(&spec.game.executable))?;
+            self.game = Some(PathBuf::from(&spec.game.executable));
         }
         spec.resolve().map_err(|e| e.to_string())?;
         self.launch.machine_spec = Some(spec);
@@ -771,7 +837,7 @@ pub(crate) mod tests {
         );
         let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
         let spec = cli.launch.machine_spec.unwrap();
-        assert!(!spec.input.capture);
+        assert_eq!(spec.input.mouse_mode, doslet_config::MouseMode::NoCapture);
         assert!(spec.input.hide_cursor);
     }
 

@@ -4,11 +4,14 @@
 extern crate alloc;
 
 pub use engines::interpreter::analysis;
+pub use engines::interpreter::translation;
 mod decode;
 mod execution_tiers;
 pub use execution_tiers::ExecutionLabel;
 pub mod engines;
 pub mod flags;
+#[cfg(feature = "procedure-calls")]
+pub mod procedure_calls;
 pub mod state;
 pub mod x87_decode;
 pub use engines::{DYNAMIC_PROFILE_MAX_BYTES, DynamicExitReason, DynamicExitRecord, DynamicStats};

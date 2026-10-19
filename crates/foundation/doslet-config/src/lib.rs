@@ -4,7 +4,7 @@ extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
 use core::fmt;
 pub mod hardware;
-pub use hardware::{HardwareConfig, HardwareError, KeyboardMode};
+pub use hardware::{AudioHardware, HardwareConfig, HardwareError, KeyboardMode};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WritePolicy {
@@ -48,9 +48,54 @@ pub struct HostBinding {
 pub struct HostBindingManifest {
     pub bindings: Vec<HostBinding>,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MouseMode {
+    #[default]
+    Auto,
+    Capture,
+    NoCapture,
+}
+impl MouseMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Capture, Self::NoCapture];
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Capture => "capture",
+            Self::NoCapture => "no-capture",
+        }
+    }
+    pub const fn relative(self, guest_relative: bool) -> bool {
+        match self {
+            Self::Auto => guest_relative,
+            Self::Capture => true,
+            Self::NoCapture => false,
+        }
+    }
+}
+impl core::fmt::Display for MouseMode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "Auto",
+            Self::Capture => "Capture",
+            Self::NoCapture => "No capture",
+        })
+    }
+}
+impl core::str::FromStr for MouseMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "capture" => Ok(Self::Capture),
+            "no-capture" => Ok(Self::NoCapture),
+            _ => Err("input.mouse_mode must be auto, capture, or no-capture"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputSettings {
-    pub capture: bool,
+    pub mouse_mode: MouseMode,
     pub hide_cursor: bool,
     pub pad_index: u8,
     pub pad_id: Option<String>,
@@ -63,7 +108,7 @@ pub struct InputSettings {
 impl Default for InputSettings {
     fn default() -> Self {
         Self {
-            capture: true,
+            mouse_mode: MouseMode::Auto,
             hide_cursor: false,
             pad_index: 0,
             pad_id: None,

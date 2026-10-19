@@ -2,8 +2,11 @@
 mod adaptive_meter;
 #[cfg(not(target_arch = "wasm32"))]
 mod app;
+mod cpu_config;
+mod cpu_meter;
 #[cfg(not(target_arch = "wasm32"))]
 mod desktop;
+mod disk_activity;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_computer;
 #[cfg(not(target_arch = "wasm32"))]
@@ -30,7 +33,7 @@ use desktop as frontend;
 #[cfg(target_arch = "wasm32")]
 #[path = "browser_app.rs"]
 mod app;
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 mod archive;
 #[cfg(not(target_arch = "wasm32"))]
 mod audio;
@@ -55,10 +58,14 @@ mod native_input;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_midi;
 #[cfg(not(target_arch = "wasm32"))]
+mod native_roms;
+#[cfg(not(target_arch = "wasm32"))]
 #[path = "../../common/native_storage.rs"]
 mod native_storage;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_synth;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_zip;
 mod presentation;
 #[cfg(not(target_arch = "wasm32"))]
 mod profile;

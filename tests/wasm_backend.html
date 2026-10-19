@@ -1,0 +1,62 @@
+<!doctype html><meta charset="utf-8"><title>Doslet WASM translation acceptance</title>
+<script type="module">
+import init, {CpuProbe} from './pkg/doslet_wasm_probe.js';
+import {instantiateWasmCore} from './wasm-core.js';
+window.result = {done: false, cases: []};
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+function profile(records) {
+    const length = 6 + records.reduce((n, [, code]) => n + 5 + code.length, 0);
+    const bytes = new Uint8Array(length), view = new DataView(bytes.buffer);
+    bytes.set([68, 83, 74, 49]); view.setUint16(4, records.length, true);
+    let cursor = 6;
+    for (const [address, code] of records) {
+        view.setUint32(cursor, address, true); bytes[cursor + 4] = code.length;
+        bytes.set(code, cursor + 5); cursor += 5 + code.length;
+    }
+    return bytes;
+}
+try {
+    const wasm = await init();
+    async function check(name, code, records, budget, expectedNative, expectedPolls) {
+        const p = profile(records), cpu = new CpuProbe(p, code), reference = new CpuProbe(p, code);
+        try {
+            const core = await instantiateWasmCore(cpu.module_bytes(), cpu, wasm.memory);
+            assert(core.run(budget) === reference.reference_run(budget), `${name}: steps`);
+            assert(cpu.ip() === reference.ip() && cpu.flags() === reference.flags(), `${name}: IP/flags`);
+            for (let i = 0; i < 8; i++) assert(cpu.register(i) === reference.register(i), `${name}: register ${i}`);
+            assert(cpu.memory_hash() === reference.memory_hash(), `${name}: memory`);
+            assert(cpu.translated_steps() === BigInt(expectedNative), `${name}: translated count ${cpu.translated_steps()}`);
+            if (expectedPolls !== undefined) assert(cpu.polls() === BigInt(expectedPolls), `${name}: poll count`);
+            result.cases.push({name, translated: String(cpu.translated_steps()), interpreted: String(cpu.interpreted_steps()), polls: String(cpu.polls())});
+        } finally { cpu.free(); reference.free(); }
+    }
+    const a = [0x40, 0xeb, 0x0d], b = [0x43, 0xeb, 0xed], code = new Uint8Array(19).fill(0x90);
+    code.set(a); code.set(b, 16);
+    await check('two blocks, internal backedge and one grant', code, [[0x1000, a], [0x1010, b]], 4000, 4000, 2);
+    const identical = [0x40, 0x40, 0xeb, 0xfc];
+    await check('identical code at multiple addresses', identical, [[0x1000, [0x40]], [0x1001, [0x40]], [0x1002, [0xeb, 0xfc]]], 4000, 4000, 2);
+    const mixed = [0x40, 0xa3, 0, 0x30, 0, 0, 0xec, 0x43, 0xf4];
+    await check('memory, I/O and HLT fallback', mixed, [[0x1000, mixed]], 100, 2);
+    const modifying = [0xc6, 0x05, 7, 0x10, 0, 0, 0x48, 0x40, 0xeb, 0xfd];
+    await check('self modifying code rejects stale profile', modifying, [[0x1007, modifying.slice(7)]], 20, 0);
+    const loop = [0x40, 0x43, 0xeb, 0xfc];
+    await check('relocated profile', loop, [[0x5000, loop]], 3000, 3000);
+    const nodes = [0, 1, 2].map(offset => {
+        const bytes = new Array(15).fill(0x90);
+        bytes.splice(0, loop.length - offset, ...loop.slice(offset));
+        return {pc: 0x1000 + offset, bits: 32, bytes, tier: 'grey', reason: 'learned'};
+    });
+    const json = new TextEncoder().encode(JSON.stringify({learning_version: 1, identity: 'fixture', nodes}));
+    const cpu = new CpuProbe(json, loop), ref = new CpuProbe(json, loop);
+    try {
+        const core = await instantiateWasmCore(cpu.module_bytes(), cpu, wasm.memory);
+        assert(core.run(3000) === ref.reference_run(3000), 'speed-tiers JSON steps');
+        assert(cpu.ip() === ref.ip() && cpu.flags() === ref.flags() && cpu.register(0) === ref.register(0) && cpu.register(3) === ref.register(3), 'speed-tiers JSON CPU');
+        assert(cpu.translated_steps() === 3000n && cpu.polls() === 2n, 'speed-tiers JSON internal dispatch');
+        result.cases.push({name: 'learned speed-tiers JSON, observed entries, internal dispatch', translated: '3000', polls: '2'});
+    } finally { cpu.free(); ref.free(); }
+    result.ok = true;
+} catch (error) { result.error = String(error.stack || error); result.ok = false; }
+result.done = true;
+document.body.textContent = JSON.stringify(result, null, 2);
+</script>

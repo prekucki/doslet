@@ -40,8 +40,9 @@ export class Framer {
 }
 
 export class HostMidi {
-    constructor(output, port, onError, allowSysex = false) {
+    constructor(output, port, onError, allowSysex = false, dialect = 'gm') {
         this.output = output; this.port = port; this.onError = onError;
+        this.allowSysex = allowSysex; this.dialect = dialect;
         this.epoch = -1; this.active = false; this.muted = false;
         this.messages = 0; this.notes = 0; this.late = 0;
         this.canClear = typeof output.clear === 'function';
@@ -89,6 +90,22 @@ export class HostMidi {
             this.output.send([0xb0 | c, 120, 0]);
         }
     }
+    resetReceiver() {
+        if (this.allowSysex) {
+            this.output.send(this.dialect === 'mt32'
+                ? [0xf0, 0x41, 0x10, 0x16, 0x12, 0x7f, 0, 0, 1, 0, 0xf7]
+                : [0xf0, 0x7e, 0x7f, 0x09, 0x01, 0xf7]);
+        } else {
+            // GM without SysEx permission can still reset channel controls.
+            for (let c = 0; c < 16; c++) {
+                for (const [cc, value] of [[121, 0], [0, 0], [32, 0], [7, 100], [10, 64], [11, 127]]) {
+                    this.output.send([0xb0 | c, cc, value]);
+                }
+                this.output.send([0xc0 | c, 0]);
+                this.output.send([0xe0 | c, 0, 64]);
+            }
+        }
+    }
     fail(error) {
         if (this.failed) return;
         this.failed = true; this.active = false; this.used = 0;
@@ -101,7 +118,9 @@ export class HostMidi {
             if (this.closed) return;
             if (data.kind === 'reset') {
                 this.failed = false;
-                this.silence(); this.framer.reset(); this.epoch = data.epoch;
+                this.silence();
+                if (data.resetReceiver) this.resetReceiver();
+                this.framer.reset(); this.epoch = data.epoch;
                 this.baseGuest = data.nanos; this.baseHost = performance.now() + 40;
                 this.active = data.active; this.messages = 0; this.notes = 0; this.late = 0;
             } else if (data.epoch === this.epoch && !this.failed) {

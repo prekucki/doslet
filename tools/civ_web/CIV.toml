@@ -1,0 +1,38 @@
+version = 2
+name = "Civilization"
+
+[machine]
+cpu_mhz = 99
+
+[game]
+executable = "CIV.EXE"
+working_directory = 'C:\'
+
+[input]
+keyboard = "at"
+mouse_mode = "auto"
+hide_cursor = true
+
+[output]
+audio = true
+game_midi = "mt32"
+host_midi = "mt32"
+midi_output = "moont"
+rom_binding = "bundle"
+
+[[drives]]
+letter = "C"
+kind = "zip"
+source = "selected-zip"
+policy = "persistent"
+store = "civ-browser-saves"
+
+[[bindings]]
+id = "selected-zip"
+kind = "zip"
+location = "bundled/CIV.zip"
+
+[[bindings]]
+id = "civ-browser-saves"
+kind = "indexeddb"
+location = "civ-bundled-saves"

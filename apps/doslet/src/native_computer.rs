@@ -386,7 +386,8 @@ impl Computer {
 }
 fn status(app: &Doslet) -> Status {
     let frame = app.session.presentation_frame();
-    let audio = app.session.audio_status().dsp;
+    let guest_audio = app.session.audio_status();
+    let audio = guest_audio.dsp;
     let audio_deadline_observed = audio.block_irq_deadlines != 0;
     Status {
         speed_tiers: app.speed_tier_stats().map(|s| {
@@ -427,6 +428,10 @@ fn status(app: &Doslet) -> Status {
             app.session.synchronization_caller_effects(),
         ),
         host_audio_underruns: app.audio_underruns(),
+        guest_fm_started: guest_audio.opl_started,
+        guest_fm_key_on_writes: guest_audio.opl_key_on_writes,
+        guest_fm_peak: guest_audio.opl_peak,
+        guest_fm_levels: guest_audio.fm_levels,
         host_process_id: std::process::id(),
         host_process_cpu_ticks: process_cpu_ticks(),
         guest_audio_service_deadline_misses: audio_deadline_observed

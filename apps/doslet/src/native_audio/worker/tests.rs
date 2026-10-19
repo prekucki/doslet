@@ -43,7 +43,8 @@ fn native_pcm_keeps_hardware_sample_count_and_values() {
     worker.submit().unwrap();
     complete(&worker, 100_000_000);
     assert_eq!(pcm.available(), 16384 - 2205);
-    assert_eq!(midi.available(), 16384 - 4800);
+    // No MIDI input: the separate MIDI sink must remain unused.
+    assert_eq!(midi.available(), 16384);
     assert_eq!(
         pcm.consume(2205),
         frames
@@ -272,4 +273,64 @@ fn external_port_mode_renders_pcm_without_a_second_midi_synth() {
     complete(&worker, 1_000_000);
     assert_eq!(worker.stats().notes, 0);
     assert_eq!(output.consume(48), vec![[0.5, -0.5]; 48]);
+}
+
+#[test]
+#[ignore = "requires local DOSBox CM-32L ROMs; no audio device is opened"]
+fn local_mt32_restart_forgets_volume_expression_sustain_and_program() {
+    let directory = crate::native_roms::detect().expect("local supported ROMs");
+    let setup = || Config {
+        source: Source::Mt32 {
+            directory: directory.clone(),
+            mode: doslet_midi_routing::Mode::Mt32,
+        },
+        rate: 48000,
+        nanos: 0,
+        replay: Vec::new(),
+    };
+    let mut fresh = Renderer::new(&setup()).unwrap();
+    fresh.push_midi(0, &[0x91, 60, 100]).unwrap();
+    let mut expected = Vec::new();
+    loop {
+        let count = fresh.render(100_000_000).unwrap();
+        if count == 0 {
+            break;
+        }
+        expected.extend_from_slice(&fresh.samples[..count]);
+    }
+    let output = Writer::mock(48000);
+    let mut worker = Worker::new(setup(), output.clone()).unwrap();
+    assert!(worker.ready().unwrap());
+    worker.render_until(0).unwrap();
+    worker
+        .push_midi(&[
+            0xb1, 7, 0, 0xb1, 11, 0, 0xb1, 64, 127, 0xc1, 48, 0x91, 60, 100,
+        ])
+        .unwrap();
+    worker.submit().unwrap();
+    wait(|| worker.stats().notes == 1);
+    assert!(worker.ready().unwrap());
+    worker.render_until(100_000_000).unwrap();
+    worker.submit().unwrap();
+    complete(&worker, 100_000_000);
+    let previous = output.consume(4800);
+    worker.configure(setup()).unwrap();
+    assert_eq!(worker.stats().notes, 0);
+    assert_eq!(output.available(), 16384);
+    assert!(worker.ready().unwrap());
+    worker.render_until(0).unwrap();
+    worker.push_midi(&[0x91, 60, 100]).unwrap();
+    worker.submit().unwrap();
+    wait(|| worker.stats().notes == 1);
+    assert!(worker.ready().unwrap());
+    worker.render_until(100_000_000).unwrap();
+    worker.submit().unwrap();
+    complete(&worker, 100_000_000);
+    let actual = output.consume(4800);
+    assert!(expected.iter().flatten().any(|v| v.abs() > 0.0001));
+    assert_ne!(
+        previous, actual,
+        "the previous instrument/controllers must not survive"
+    );
+    assert_eq!(actual, expected);
 }

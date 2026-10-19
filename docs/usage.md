@@ -39,6 +39,26 @@ cargo run -p doslet --locked
 
 ### Launch a game
 
+Launch a ZIP installation without extracting it:
+
+```sh
+cargo run -p doslet --release --locked -- --zip /home/reqc/games/retro/dos/ROTT.zip --program ROTT.EXE
+# Equivalent local profile:
+cargo run -p doslet --release --locked -- --config games/ROTT.toml
+```
+
+Use `--program` to choose an EXE or COM path inside the archive, ignoring case.
+If the archive contains one program, Doslet selects it automatically; otherwise
+it reports the available programs. The selected program's directory becomes C:,
+including its subdirectories. ZIP data remains unchanged. Writes use a temporary
+RAM overlay by default; `--drive-mode ro` denies writes, and `rw` is rejected.
+Version-2 profiles support `kind = "zip"` with a profile-relative source or a
+`kind = "zip"` host binding. A separate persistent save store can retain saves.
+Reset reloads the archive with the active machine settings. ZIP limits are
+64 MiB compressed, 4096 entries, 64 MiB per file and 256 MiB expanded. Memory
+patch manifests are currently unsupported for native ZIP launches. Successful
+archive loading alone does not establish game compatibility.
+
 Launch your local game directly in the desktop window:
 
 ```sh
@@ -56,19 +76,19 @@ be off; in-process profiling copies support both host modes.
 The recorded PRINCE HDI logo appears around
 7.3 seconds of emulated time. Host speed may affect how long startup takes.
 BIOS/DOS keyboard input is available. DOS mouse input includes position, buttons, ranges, a graphics cursor and guest callbacks.
-On native builds, a guest read of relative motion counters (INT 33h, AX=000Bh)
-selects relative input for one emulated second after the latest read. Absolute
-reads during that interval do not cancel it. Hover movement is blocked until you
-click the guest display to capture the mouse. After one second without relative
-reads, capture is released automatically and absolute movement resumes. Absolute
-input does not require capture. **Ctrl+Esc** releases capture; **Esc** reaches
-the game even while the mouse is captured. Focus loss, pause, reset and game
-termination also release capture.
-The host cursor stays visible while relative input is waiting for capture.
-**Hide cursor over the game** controls visibility during uncaptured absolute input.
-Leave **Capture mouse on click** enabled for games using relative counters.
-Browser capture still uses explicit click-to-lock Pointer Lock; disabling capture
-there selects absolute input.
+Open **Mouse & keyboard** using the icon after Drives on the bottom bar. Choose
+**Auto**, **Capture**, or **No capture**, cursor visibility, and BIOS/AT keyboard
+delivery. Changes apply immediately without restarting. Keyboard changes release
+held keys; the selected settings survive Reset. The mouse and keyboard controls
+are also available in **Settings → Input**.
+**Auto** follows relative-motion reads by the game: click the display to capture,
+and the lock releases after one guest second without relative reads. **Capture**
+keeps relative input active after a display click. **No capture** always uses
+absolute motion. **Ctrl+Esc** releases native capture; plain **Esc** reaches the
+game. In a browser, Pointer Lock requires a display click and Escape releases it.
+Focus loss, pause, settings panels, reset and game termination also release
+capture. **Hide cursor over the game** controls the host cursor during absolute
+input; the cursor stays visible while relative input is waiting for capture.
 
 By default, MIDI from the guest is rendered by a basic procedural synthesizer
 and mixed with Sound Blaster PCM and AdLib/OPL3 FM on the default audio device.
@@ -78,6 +98,8 @@ FM through an external MIDI device. No OPL instrument ROM is required.
 The bottom bar shows a 16-band spectrum of the local audio output, from bass
 on the left to treble on the right. It fades during silence and clears on pause
 or mute. Audio produced by an external MIDI synthesizer is not measured.
+Hover over the audio indicator to see the guest PCM format, for example
+`22.05 kHz · 8-bit · Mono`, or whether PCM has not been configured yet.
 Hover over the spectrum to see the guest's Sound Blaster PCM rate, bit depth
 and mono/stereo format. The last configured format remains visible between
 effects and clears on DSP reset; FM and MIDI have no guest PCM format.
@@ -114,23 +136,24 @@ over its lifetime. After exhaustion, `auto` pauses the game and attempts CPAL;
 resume after the notice confirms the switch. Explicit `pulse` reports failure
 without switching backends. `cpal` selects the previous path directly.
 
-Choose **Info → Audio… → Mixer** on Linux, or pass `--audio-mixer application|system`.
-**Application** is the default and combines sources inside Doslet. **System
+Choose **Audio → Playback → Mixer** on Linux, or pass `--audio-mixer application|system`.
+**Internal** is the default and combines sources inside Doslet. **System
 (experimental)** sends three independent stereo float streams to the
 PulseAudio-compatible server: **Sound Blaster PCM** at the guest DSP rate,
 **AdLib / OPL FM** at 48 kHz, and **MIDI synthesizer** at 48 kHz.
 PCM is decoded and converted to float without application-side resampling.
 The existing FM and MIDI engines retain their internal rate conversion.
 Changing the PCM rate drains and recreates its server stream; a brief gap is
-possible. External MIDI ports retain their separate
-routing, with silence in the local MIDI stream.
+possible. Each stream and its sample buffers are created on its first source
+samples. External MIDI ports retain their separate routing and do not open the
+local MIDI stream. Sources that have never produced samples remain dormant.
 
 ```sh
 cargo run -p doslet --release --locked -- --audio-backend pulse --audio-mixer system
 ```
 
 System mixing requires the Rust PulseAudio adapter regardless of the backend
-selected for application mixing. Initial setup failure is reported without
+selected for application mixing. First-use stream setup failure is reported without
 silently selecting a different mixer. With `--audio-backend auto`, exhaustion
 of any stream's three-attempt recovery budget pauses and attempts CPAL with
 application mixing. Switching in the UI pauses the game; resume after the
@@ -148,11 +171,81 @@ See [the audio probe procedure](development.md#linux-pulseaudio-protocol-probes)
 
 ### Workspace controls and display
 
-The small **MPU** lamp in the bottom bar lights green for new MIDI notes and
-amber for other MIDI traffic. Hover over it for byte/note counts and the time
-since the last note. It tracks game output, independently of the selected
-synthesizer; a dark lamp does not mean that a sustained note has stopped sounding.
-The lamp stays dim while paused and adds no separate refresh timer.
+The CPU indicator shows the configured MHz in normal mode, the current target
+in adaptive CPU mode, or the Grey target in speed-tier mode. Automatic modes
+add **Auto**. Hot is the turbo rate for selected code; it appears in the tooltip
+alongside the Cold and Grey targets. Hover for these targets or the adaptive
+CPU ceiling; click to configure CPU execution.
+
+The CPU panel offers fixed speed, Hot/Grey/Cold rates, and the experimental
+adaptive mode. Logarithmic sliders cover 1–1000 MHz; Hot can also run uncapped.
+Grey is the reference speed. Native builds with dynamic-core support offer
+Cranelift JIT and interpreter execution. Browser builds offer fixed speed and
+the interpreter. **Apply** changes execution without restarting the program;
+**Revert** discards the draft. Controls are unavailable during machine
+preparation or an attached GDB session.
+
+On native builds, choose **Create profile** in the CPU panel, enter a JSON file
+path, then **Create & use**. This saves a speed-tier profile and activates it
+without restarting. Learning remains off; enable **Background learning** and
+apply when ready to classify code. **Save profile as…** saves a copy of the
+current labels and tier speeds. Existing files are preserved; choose another
+name or use **Open profile…**. Opening a profile restores its labels and saved
+speeds without enabling learning. Profiles without saved rates use the draft
+tier speeds. The JSON is also accepted by native `--speed-tier-profile`;
+CLI rate options retain their existing defaults and overrides. Learned changes
+are persisted separately in the game cache or the profile's `.learned.json`;
+use **Save profile as…** to export the current combined labels.
+
+Background tier learning is **off by default**, including when cached labels
+are restored. Enable it explicitly in Hot/Grey/Cold mode. Turning it off cancels
+queued replays while keeping existing labels. Rates and core selection remain
+active across an in-session restart.
+
+In speed-tier mode, CPU activity is measured against the Grey throughput budget
+for a recent 250-ms guest-time window. Each executed scheduling unit costs four
+clocks at the Grey rate. This weights Hot and Cold by their speed relative to
+Grey, including uncapped Hot through actual execution counts. Accelerated idle
+passes are excluded. With Hot/Grey/Cold at 500/100/8 MHz, all-Cold execution shows
+**8% activity / 92% Idle**, while all-Grey shows **100% activity**. Hot can consume
+more than the reference budget; the displayed value is clamped to **0–100%**.
+The bar partitions activity into orange Hot, blue Cold and grey unclassified
+code (including IRQ-labelled code); dark space is unused Grey capacity, labelled
+Idle. On overload the bar is full and scales active colors proportionally.
+
+Normal mode retains **100% minus detected idle**, including proven loop skips
+and enabled cooperative waits. These values do not measure host CPU utilization.
+A dash means no current sample, including while paused, waiting for storage or
+collecting the first window. Hover for the breakdown; the execution table is
+under **Info**.
+
+The RAM indicator follows CPU and shows installed guest RAM in a fixed-width
+label. Click to inspect DOS allocated/free memory, the largest free conventional
+block and block count, plus CPU mode and DPMI status.
+For the built-in DPMI host it also shows pool capacity, requested and committed
+bytes, available bytes, peak allocation and block count. An available host is
+distinct from a client that has entered DPMI. Guest-managed extended-memory
+allocation is unknown; protected mode alone does not prove DPMI use. These
+counters exclude allocator headers and system reservations and do not measure
+host RAM usage.
+
+Audio follows RAM. Its fixed-width **SB16 / OPL3 / MIDI** labels show enabled
+interfaces; disabled interfaces are hidden. MIDI turns green for new notes and
+amber for other traffic. The spectrum measures local output, excluding external
+MIDI sound. Click to open **Audio**:
+
+- **Playback** selects internal or Linux system mixing, local output
+  volume, synthesizer/MIDI port, game format and external receiver format.
+  MIDI routing controls appear only when MPU-401 is enabled in the active
+  machine. Internal volume applies to local PCM, FM and synthesized MIDI; external MIDI
+  devices retain their own volume. CM-32L synthesis follows the selected game
+  format; a GM synth translates MT-32 input to GM. Changing the Linux mixer
+  pauses the game. Use the toolbar to resume after closing the panel.
+- **Hardware** keeps Revert and Apply in a fixed footer and edits a draft: SB16 with OPL3, MPU-401 MIDI, IRQ and DMA.
+  SB16 and OPL3 share their enable switch. Ports are currently fixed (SB16 220h,
+  OPL3 220h/388h, MIDI 330h). **Apply & restart** validates and recreates the
+  machine; **Revert** restores active settings. Unsaved changes require export
+  or explicit discard. Live MIDI choices are retained when applying hardware.
 
 Press the play icon to start or resume, the pause icon to suspend execution,
 or the restart icon to create a fresh session. Hover over each icon for its
@@ -169,6 +262,11 @@ lag means execution is falling behind; increasing the configured MHz also
 increases the required host work. A stalled window does not stop emulation:
 presentation resumes with the latest image instead of replaying queued frames.
 
+Click the monitor icon to open **Display**, then choose scaling and filtering.
+The adjacent fixed-width label reports the guest mode: **80×25 VGA text**,
+**320×200×8 VGA** or **640×480×8 SVGA**. Graphics depth is in bits per pixel;
+the label does not depend on window scaling or display filters. MDA, CGA and
+EGA modes are not currently implemented.
 **Pixel perfect** selects the largest whole-number zoom that fits the available
 display area, measured in physical pixels, including on HiDPI displays. It does
 not resize the window. A 320×200 frame can become 640×400 or 960×600; a 640×480
@@ -176,7 +274,7 @@ frame can become 1280×960. The raw raster proportions are preserved, including
 720×400 text. If even 1× does not fit, the display scrolls. **Fit** fills the
 available area at 4:3 proportions and permits fractional scaling.
 
-The small filter selector beside these buttons works on desktop and in the
+The filter selector in the same panel works on desktop and in the
 browser, including while paused:
 
 - **Nearest** preserves the original colors and pixel edges. Use it with
@@ -202,6 +300,16 @@ filter or scaling mode retries the upload.
 
 ### Machine configuration and saves
 
+The drive icon after Display opens **Drives**. Its lamp pulses for 120 ms after
+guest data reads from C: or CD-ROM, including cached data and MSCDEX sector
+reads. It indicates guest I/O, not physical host disk access, and goes dark
+while paused. C: is the startup drive: edit its folder/program (desktop) or
+choose a replacement ZIP/program (browser), plus its write policy and save store.
+**Add CD-ROM** mounts a local ISO or HTTPS ISO; **Remove** disconnects that image
+without deleting files. Doslet currently supports C: and one optional CD-ROM.
+Edits remain a draft until **Apply & restart**; **Revert** restores active
+mounts. Unsaved game changes retain the usual export/discard protection.
+
 To resume a portable machine snapshot in the native window, use
 `target/release/doslet --load-state target/heroes-states/city.pb.gz`.
 See [portable states](save-states.md#resume-in-the-native-window) for restore
@@ -212,7 +320,7 @@ resources and **Apply and restart**. The editor configures RAM, x87, SB16 and
 MPU-401 hardware, AT/BIOS keyboard input, a two-axis/two-button gameport, host
 output, installation media and save policy. Native Apply prepares sources on a
 separate thread; failed preparation preserves the active session and reset
-settings. **Fit**, **Pixel perfect** and display filters remain available.
+settings. **Fit**, **Pixel perfect** and display filters remain available in **Display**.
 
 Profiles import version 1 or 2 and export version 2. Persistent overlays use an
 explicit native save directory or browser **IndexedDB** namespace. Save
@@ -324,19 +432,35 @@ cargo run -p doslet --release --locked -- --game games/CIV.EXE --midi-mode mt32 
 Mark a real MT-32 or Munt port using **HOST PORT DIALECT → MT-32**, or the CLI
 `--midi-mode mt32 --midi-output PORT --midi-output-mode mt32`. These outputs
 receive the original SysEx. GM input to an MT-32 host port is unsupported.
-With a ROM directory, the default native output is moont; `--midi-output rust`,
+Native Doslet automatically discovers compatible CM-32L ROMs in DOSBox folders.
+On Linux it searches `$XDG_DATA_HOME/dosbox/mt32-roms`,
+`$XDG_DATA_HOME/mt32-rom-data`, `$XDG_CONFIG_HOME/dosbox/mt32-roms`, and
+`mt32-rom-data` under `$XDG_DATA_DIRS`. Unset XDG variables use the standard
+`~/.local/share`, `~/.config`, `/usr/local/share` and `/usr/share` locations.
+It also checks `~/.dosbox/mt32-roms` and `~/.dosbox`. On macOS it checks
+`~/Library/Preferences/DOSBox/mt32-roms`, `~/Library/Audio/Sounds/MT32-Roms` and
+the system `mt32-rom-data` folders. On Windows it checks
+`%LOCALAPPDATA%/DOSBox/mt32-roms` and `%APPDATA%/DOSBox/mt32-roms`.
+See the [DOSBox Staging ROM lookup paths](https://www.dosbox-staging.org/preview/dev/0.83/manual/sound/sound-devices/roland-mt-32/#rom-lookup-paths).
+
+`--mt32-rom-dir` or a profile ROM directory takes precedence over discovery.
+Automatic discovery skips incomplete or unsupported ROM pairs and retains the
+Rust synth when none is found. `--no-audio` skips discovery. With a detected or
+explicit ROM directory, the default native output is moont; `--midi-output rust`,
 `--midi-output apple` or a port explicitly selects another output. The ROM path
 remains available when switching back to moont. In GM mode, moont uses GmDevice: CM-32L instruments
 and eight melodic parts, rather than a complete General MIDI sound bank.
 
 The ROM directory must contain `CM32L_CONTROL.ROM` (v1.02) and
-`CM32L_PCM.ROM`. Doslet validates their SHA-1 fingerprints and loads them at
-startup; ROMs are never embedded or distributed. The optional `no_std` Rust
+`CM32L_PCM.ROM` (names are case-insensitive; symlinks are supported).
+Doslet validates their SHA-1 fingerprints and loads them at
+startup. The ordinary Doslet builds do not embed or distribute ROMs. The optional `no_std` Rust
 [moont engine](https://crates.io/crates/moont/1.0.0) emulates CM-32L, an MT-32
 family module. It processes the game's custom instrument SysEx and renders
 32-kHz stereo, resampled to the output device. MT-32 Control ROM variants and
-the module's LCD are not emulated by this backend. `--mt32-rom-dir` currently
-selects native audio; browser ROM selection is pending.
+the module's LCD are not emulated by this backend. `--mt32-rom-dir` selects
+native audio. The private ROTT browser package built below includes the user's
+local ROM pair and uses it in an AudioWorklet; a general browser ROM picker is pending.
 
 The recorded local run reaches a new Roman game with its first Settler.
 Another real run processes 11 startup SysEx messages and 23 note events,
@@ -426,6 +550,14 @@ font. No backend service is required for the demo.
 The browser uses iced's tiny-skia software renderer and presents through
 Canvas2D. The native frontend uses wgpu. Browser startup diagnostics are logged
 to the console.
+
+To build a private ROTT page using the local `games/ROTT.toml`, the latest
+`games/rott-saves` overlay and the CM-32L ROMs in the DOSBox configuration
+folder, run `mise run web-build` followed by `python3 tools/package_rott_web.py`.
+The result is `target/rott-web`; serve that directory at the web root over
+localhost or HTTPS and click **Uruchom grę**. Its first run seeds IndexedDB with
+the bundled sound configuration overlay. Later runs keep the browser's newer
+saves. The package contains the commercial game and ROMs, so keep it private.
 
 To mount a local game in the browser, pack its complete installation directory
 as a ZIP, including DOS4GW, graphics drivers, music and other data files. The

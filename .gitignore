@@ -16,3 +16,4 @@ __pycache__/
 # Guest memory and learned code profiles stay local
 *.pb.gz
 *.core-profile
+*.csv

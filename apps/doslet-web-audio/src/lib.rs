@@ -1,5 +1,7 @@
 //! Small WASM audio module, independent of iced, the PC and browser APIs.
 use doslet_midi_synth::stream::Stream;
+mod mt32_stream;
+use mt32_stream::Mt32Stream;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 const BLOCK: usize = 2048;
@@ -8,6 +10,8 @@ const MIDI: usize = 1024;
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct AudioEngine {
     stream: Stream,
+    mt32: Option<Mt32Stream>,
+    use_mt32: bool,
     pcm: doslet_pcm::Mixer,
     pcm_wire: [f64; 128 * 4],
     midi: [u8; MIDI],
@@ -24,6 +28,8 @@ impl AudioEngine {
     pub fn new(rate: u32) -> Self {
         Self {
             stream: Stream::new(rate).expect("validated audio rate"),
+            mt32: None,
+            use_mt32: false,
             pcm: doslet_pcm::Mixer::new(rate).expect("validated audio rate"),
             pcm_wire: [0.0; 128 * 4],
             midi: [0; MIDI],
@@ -34,6 +40,21 @@ impl AudioEngine {
             spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
             frames: 0,
         }
+    }
+    /// Install the caller's validated local CM-32L ROM pair before rendering.
+    /// Returns 0 on success; a nonzero result leaves the current output intact.
+    pub fn set_mt32(&mut self, control: &[u8], pcm: &[u8], gm: bool) -> u32 {
+        match Mt32Stream::new(control, pcm, self.stream.sample_rate(), gm) {
+            Ok(stream) => {
+                self.mt32 = Some(stream);
+                self.use_mt32 = true;
+                0
+            }
+            Err(_) => 1,
+        }
+    }
+    pub fn set_rust_synth(&mut self) {
+        self.use_mt32 = false;
     }
     // Pointers expose owned, fixed host buffers. No guest memory and no unsafe
     // Rust; JS creates views only after all setup allocations have completed.
@@ -59,7 +80,13 @@ impl AudioEngine {
         BLOCK
     }
     pub fn reset(&mut self, nanos: f64) {
-        self.stream.reset(nanos as u64);
+        if self.use_mt32 {
+            if let Some(mt32) = &mut self.mt32 {
+                mt32.reset(nanos as u64);
+            }
+        } else {
+            self.stream.reset(nanos as u64);
+        }
         self.pcm
             .reset(self.stream.sample_rate(), nanos as u64)
             .expect("existing sample rate");
@@ -73,7 +100,14 @@ impl AudioEngine {
         if count > MIDI {
             return 1;
         }
-        match self.stream.receive(nanos as u64, &self.midi[..count]) {
+        let result = if let Some(mt32) = self.mt32.as_mut().filter(|_| self.use_mt32) {
+            mt32.receive(nanos as u64, &self.midi[..count])
+        } else {
+            self.stream
+                .receive(nanos as u64, &self.midi[..count])
+                .map_err(|_| ())
+        };
+        match result {
             Ok(()) => 0,
             Err(_) => 2,
         }
@@ -82,7 +116,13 @@ impl AudioEngine {
         if count > BLOCK {
             return 1;
         }
-        let rendered = match self.stream.render(&mut self.stereo[..count]) {
+        let rendered = match if let Some(mt32) = self.mt32.as_mut().filter(|_| self.use_mt32) {
+            mt32.render(&mut self.stereo[..count])
+        } else {
+            self.stream
+                .render(&mut self.stereo[..count])
+                .map_err(|_| ())
+        } {
             Ok(n) => n,
             Err(_) => return 3,
         };
@@ -130,10 +170,16 @@ impl AudioEngine {
         }
     }
     pub fn nanos(&self) -> f64 {
-        self.stream.nanos() as f64
+        self.mt32
+            .as_ref()
+            .filter(|_| self.use_mt32)
+            .map_or_else(|| self.stream.nanos(), Mt32Stream::nanos) as f64
     }
     pub fn notes(&self) -> f64 {
-        self.stream.notes() as f64
+        self.mt32
+            .as_ref()
+            .filter(|_| self.use_mt32)
+            .map_or_else(|| self.stream.notes(), Mt32Stream::notes) as f64
     }
     pub fn frames(&self) -> f64 {
         self.frames as f64
@@ -148,7 +194,10 @@ impl AudioEngine {
         self.spectrum.reset();
     }
     pub fn underruns(&self) -> f64 {
-        self.stream.underruns() as f64
+        self.mt32
+            .as_ref()
+            .filter(|_| self.use_mt32)
+            .map_or_else(|| self.stream.underruns(), Mt32Stream::underruns) as f64
     }
 }
 

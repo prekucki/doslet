@@ -43,7 +43,7 @@ impl DpmiMode {
 #[derive(Debug, Default, Parser)]
 #[command(
     version,
-    after_help = "Without --game, opens the built-in color-bar demo.\nGame support is experimental. Keyboard/mouse input and in-memory saves are available; persistent saves are pending."
+    after_help = "Without a game source, opens the built-in color-bar demo.\nGame support is experimental. Use --game EXE, --zip ZIP [--program EXE], or --config TOML."
 )]
 pub struct Cli {
     /// Load a TOML launch profile; explicit CLI options override profile values
@@ -67,6 +67,12 @@ pub struct Cli {
     /// DOS executable; its containing directory is mounted as C:
     #[arg(long, value_name = "EXE")]
     pub game: Option<PathBuf>,
+    /// ZIP game installation mounted in memory as C:
+    #[arg(long, value_name = "ZIP", conflicts_with = "game")]
+    pub zip: Option<PathBuf>,
+    /// EXE or COM path inside the ZIP; optional when it contains one program
+    #[arg(long, value_name = "EXE", requires = "zip")]
+    pub program: Option<String>,
     /// C: writes: ro denies, overlay keeps in memory (default), rw persists closed files
     #[arg(long, value_enum)]
     pub drive_mode: Option<DriveMode>,
@@ -146,6 +152,12 @@ pub struct Cli {
     /// Load/save observed JIT blocks between runs (local profile, outside game data)
     #[arg(long, value_name = "FILE")]
     pub core_profile: Option<PathBuf>,
+    /// Use AOT procedures with embedded metadata (.wasm; legacy .json also accepted)
+    #[arg(long, value_name = "WASM_OR_JSON", requires = "no_speed_tiers")]
+    pub wasm_procedures: Option<PathBuf>,
+    /// Interpret marked procedures with the bundle's IRQ boundary policy
+    #[arg(long, requires = "wasm_procedures")]
+    pub interpret_procedures: bool,
 
     /// MIDI port index/name, timidity, rust, apple (macOS), or moont
     #[arg(long, value_name = "PORT")]
@@ -159,7 +171,7 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub midi_output_mode: Option<MidiMode>,
 
-    /// Load CM32L_CONTROL.ROM and CM32L_PCM.ROM for MT-32-family audio
+    /// Override automatic DOSBox ROM discovery for CM-32L / MT-32 audio
     #[arg(long, value_name = "DIR", conflicts_with = "no_audio")]
     pub mt32_rom_dir: Option<PathBuf>,
 
@@ -176,6 +188,31 @@ pub struct Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wasm_procedure_launch_requires_explicit_tier_policy() {
+        assert!(Cli::try_parse_from(["doslet", "--wasm-procedures", "procedures.wasm"]).is_err());
+        let cli = Cli::try_parse_from([
+            "doslet",
+            "--wasm-procedures",
+            "procedures.wasm",
+            "--no-speed-tiers",
+        ])
+        .unwrap();
+        assert_eq!(cli.wasm_procedures, Some(PathBuf::from("procedures.wasm")));
+        assert!(cli.no_speed_tiers);
+        assert!(!cli.interpret_procedures);
+        assert!(Cli::try_parse_from(["doslet", "--interpret-procedures"]).is_err());
+        let reference = Cli::try_parse_from([
+            "doslet",
+            "--wasm-procedures",
+            "procedures.json",
+            "--no-speed-tiers",
+            "--interpret-procedures",
+        ])
+        .unwrap();
+        assert!(reference.interpret_procedures);
+    }
     use clap::error::ErrorKind;
     #[test]
     fn application_mixing_is_default_and_system_is_explicit() {

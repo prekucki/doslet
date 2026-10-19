@@ -195,3 +195,87 @@ fn fragmented_guest_memory_snapshot_fits_the_declared_transport_capacity() {
         bytes + doslet_midi_synth::wire::REPLAY_CAPACITY < doslet_midi_routing::SNAPSHOT_CAPACITY
     );
 }
+
+#[test]
+fn channel_monitor_follows_sustain_expression_and_receiver_dialect() {
+    let mut router = Routing::new(Mode::Mt32);
+    push(
+        &mut router,
+        &[
+            0xC1, 48, 0xB1, 7, 127, 11, 0, 64, 127, 0x91, 60, 100, 0x81, 60, 0,
+        ],
+        Mode::Mt32,
+    );
+    let raw = router.channels(Mode::Mt32);
+    assert!(!raw[0].enabled);
+    assert_eq!(raw[1].state.program, 48);
+    assert_eq!(&raw[1].instrument[..10], b"Str Sect 1");
+    assert_eq!(raw[1].state.volume, 127);
+    assert_eq!(raw[1].state.expression, 0);
+    assert_eq!(raw[1].state.notes, 1);
+    assert_eq!(raw[1].state.velocity, 100);
+    assert!(raw[1].state.sustain);
+    let gm = router.channels(Mode::Gm);
+    assert_eq!(gm[0].state.notes, 1);
+    assert_eq!(gm[0].state.expression, 0);
+    for channel in raw {
+        let mut bytes = [0; doslet_midi_routing::Channel::BYTES];
+        channel.write(&mut bytes);
+        assert_eq!(doslet_midi_routing::Channel::read(&bytes), Some(channel));
+    }
+    push(&mut router, &[0xB1, 64, 0], Mode::Mt32);
+    assert_eq!(router.channels(Mode::Mt32)[1].state.notes, 0);
+    push(&mut router, Mode::Mt32.reset_message(), Mode::Mt32);
+    assert_eq!(router.channels(Mode::Mt32)[1].state.expression, 127);
+}
+
+#[test]
+fn channel_monitor_tracks_sysex_assignments_and_master_volume_without_allocating() {
+    use doslet_mt32_gm::memory::{CHANNEL_ASSIGN, MASTER_VOLUME, SYSTEM};
+    let mut router = Routing::new(Mode::Mt32);
+    push(
+        &mut router,
+        &dt1(SYSTEM + CHANNEL_ASSIGN as u32, &[15]),
+        Mode::Mt32,
+    );
+    push(
+        &mut router,
+        &dt1(SYSTEM + MASTER_VOLUME as u32, &[0]),
+        Mode::Mt32,
+    );
+    push(&mut router, &[0x9F, 60, 100], Mode::Mt32);
+    let count = allocation_counter::measure(|| {
+        let channels = router.channels(Mode::Mt32);
+        assert!(!channels[1].enabled);
+        assert!(channels[15].enabled);
+        assert_eq!(channels[15].state.notes, 1);
+        assert_eq!(channels[15].state.volume, 0);
+    });
+    assert_eq!(count.count_total, 0);
+}
+
+#[test]
+fn gm_reset_does_not_replay_stale_muted_channels_after_an_output_switch() {
+    let mut router = Routing::new(Mode::Gm);
+    push(
+        &mut router,
+        &[
+            0xC0, 48, 0xB0, 7, 0, 11, 0, 64, 127, 0x90, 60, 100, 0x80, 60, 0,
+        ],
+        Mode::Gm,
+    );
+    assert_eq!(router.channels(Mode::Gm)[0].state.expression, 0);
+    push(&mut router, Mode::Gm.reset_message(), Mode::Gm);
+    let mut replay = Vec::new();
+    router.replay(Mode::Gm, &mut |m| replay.push(m.to_vec()));
+    assert!(replay.contains(&vec![0xB0, 7, 100]));
+    assert!(replay.contains(&vec![0xB0, 11, 127]));
+    assert!(replay.contains(&vec![0xC0, 0]));
+    assert!(!replay.iter().any(|m| m[0] & 0xF0 == 0x90));
+    assert_eq!(router.channels(Mode::Gm)[0].state.notes, 0);
+
+    let mut mt32 = Routing::new(Mode::Mt32);
+    push(&mut mt32, &[0x91, 60, 100], Mode::Mt32);
+    push(&mut mt32, Mode::Gm.reset_message(), Mode::Mt32);
+    assert_eq!(mt32.channels(Mode::Mt32)[1].state.notes, 1);
+}

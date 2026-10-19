@@ -32,6 +32,7 @@ impl CodeOwnerId {
 pub enum BusError {
     UnmappedMemory(u32),
     UnmappedPort(u16),
+    UnsupportedPortRegister { port: u16, index: u8 },
 }
 
 impl fmt::Display for BusError {
@@ -39,6 +40,9 @@ impl fmt::Display for BusError {
         match self {
             Self::UnmappedMemory(address) => write!(f, "unmapped memory at {address:#x}"),
             Self::UnmappedPort(port) => write!(f, "unmapped I/O port {port:#x}"),
+            Self::UnsupportedPortRegister { port, index } => {
+                write!(f, "unsupported I/O register {index:#x} at port {port:#x}")
+            }
         }
     }
 }

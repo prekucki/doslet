@@ -159,6 +159,12 @@ fn memory_abi_preserves_live_blocks_and_counts_failed_allocations() {
     assert_eq!(s.flags() & 1, 0);
     let handle = (s.registers().get(Gpr16::Si), s.registers().get(Gpr16::Di));
     assert_eq!(s.dpmi_stats().unwrap().memory.committed_bytes, 8192);
+    let usage = s.memory_usage();
+    assert!(usage.dpmi_entered && usage.protected_mode);
+    assert_eq!(usage.dpmi_requested, 4097);
+    assert_eq!(usage.dpmi_committed, 8192);
+    assert_eq!(usage.dpmi_blocks, 1);
+    assert_eq!(usage.dpmi_peak, 8192);
     s.machine.cpu.registers.set(Gpr16::Bx, 0xFFFF);
     s.machine.cpu.registers.set(Gpr16::Cx, 0xFFFF);
     call(&mut s, 0x503);
@@ -170,6 +176,10 @@ fn memory_abi_preserves_live_blocks_and_counts_failed_allocations() {
     assert_eq!(s.flags() & 1, 0);
     assert_eq!(s.dpmi_stats().unwrap().memory.committed_bytes, 0);
     assert_eq!(s.dpmi_stats().unwrap().memory.peak_requested_bytes, 4097);
+    let freed = s.memory_usage();
+    assert_eq!(freed.dpmi_committed, 0);
+    assert_eq!(freed.dpmi_blocks, 0);
+    assert_eq!(freed.dpmi_peak, 8192);
 }
 
 #[test]
@@ -277,6 +287,7 @@ fn host_services_allocate_nothing_after_setup() {
             s.machine.cpu.registers.set(Gpr16::Bx, 0);
             s.machine.cpu.registers.set(Gpr16::Cx, 4096);
             call(&mut s, 0x501);
+            assert!(s.memory_usage().dpmi_committed > 0);
             call(&mut s, 0x502);
         }
     });

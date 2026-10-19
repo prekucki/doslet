@@ -26,7 +26,7 @@ existing accelerated waits; they are not host instruction latency.
 | Prince | 300,000,000 | 9.30 | 7.20 | 22.6% | 9.267 | 7.120 |
 | CIV | 100,000,000 | 9.40 | 8.30 | 11.7% | 9.472 | 8.283 |
 
-[Raw paired samples](interpreter-handlers.csv) include warmup rows (`round=-1`).
+Raw paired samples include warmup rows (`round=-1`).
 Heroes uses the local ISO and a fixed 390-million-step endpoint; this probe does
 not detect the first menu frame, so it does not establish a new exact
 startup-to-menu timing. CIV uses keys `151` (VGA, Roland, keyboard), reaches

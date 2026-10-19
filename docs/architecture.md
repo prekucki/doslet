@@ -94,10 +94,23 @@ state copy for paired one-second guest-time replays at the GREY rate (capped at
 333 MHz) and three times that rate. Only the background copy disables idle/VGA
 acceleration and traces instructions. Immutable media are shared; guest RAM and
 mutable devices/filesystem state are copied explicitly at a batch boundary.
+Diagnostic copies retain private file overlays and handle positions but omit
+persistent-store leases and host writeback. Guest writes and later reads operate
+in that copy's RAM; profiling never publishes those changes. Capture waits for
+an in-flight host storage operation to settle, while an idle persistent lease
+no longer blocks learning. Portable state-file restrictions are unchanged.
 Fresh entry is captured before the first live batch; at most four further
 high-GREY snapshots wait for the single worker. The worker yields periodically,
 has a 120-second host deadline, and cancels on session replacement or policy disable.
-Results require the same session epoch. Stored instruction-byte guards validate
+Pausing the guest drains already captured replays and applies their results;
+no new snapshots are captured while paused. Progress changes wake presentation
+without advancing guest execution. An attached, stopped debugger retains its
+existing freeze behavior. Each queued job takes the latest settled instruction labels when it starts.
+After its first, lower-throughput replay, it skips the second replay if every
+observed instruction has matching code bytes and an established or manual label.
+Unknown/GREY sites, changed code and empty traces keep the paired check. This
+checks the observed window, not every possible future game path. Results require
+the same session epoch. Stored instruction-byte guards validate
 labels on decode, so evidence for unloaded startup code can survive until restart. Interrupt frames are tracked only in the diagnostic
 copy; new IRQ instructions receive a distinct IRQ label. Learning adds HOT/COLD/IRQ to GREY
 sites and never revokes an established colour. Installation invalidates decoded/native labels without resetting clock fractions
@@ -164,6 +177,29 @@ graph TD
 ```
 
 ## Ownership and borrowing
+
+The native experimental `wasm-procedures` feature gives PC RAM one concrete
+backing selector. Its ordinary variant owns boxed RAM and page generations;
+its WASM variant owns one fixed Wasmtime linear memory containing RAM,
+generations and physical VRAM. VGA retains its device controls and borrows the
+selected backing through explicit memory APIs; its old allocation is released
+after setup migration. Bus
+reads, device writes, decoder guards, state serialization and generated
+procedures borrow slices from the selected owner. Selection uses an enum rather
+than a trait object in memory hot paths. Enabling an offline module migrates
+existing RAM and generations once during setup and invalidates old owner
+proofs; procedure calls exchange only their small CPU frame and descriptor.
+Ordinary interpreter batches borrow RAM, generations and physical VRAM once
+from this owner, alongside the VGA controller. A concrete slice-backed bus
+admits both RAM and VGA operands until the bounded batch ends. VGA byte
+operations retain their normal plane/latch/revision semantics and access
+counts. The borrow ends before generated code or port I/O runs. This avoids
+Wasmtime memory lookups per interpreted access and per-pixel batch exits;
+instrumented accesses and boundary-crossing operands retain the full PC bus.
+The CPU still depends on generic bus/procedure contracts, while PC wiring
+selects the optional native owner. This feature adds no Wasmtime dependency to
+ordinary or browser builds. See the native ROTT test in
+[the WASM core notes](compatibility/wasm-core.md).
 
 `Session` owns one boxed `PcMachine`, allocated during setup to bound host stack
 usage. Its CPU and `PcBus` are separate fields, so the
@@ -425,6 +461,12 @@ explicit BIOS glyph tables. No guest RAM or VRAM clone is required.
 The SB16 DSP and CT1745 mixer have independent `no_std` crates and fixed state.
 PC ports 220h-based DSP/mixer accesses route to them. The DSP owns command
 parameters and two response bytes; the mixer owns its configuration registers.
+Mixer register 83h retains interrupt enables: byte/word DMA bits gate delivery
+without clearing DSP pending status, and reenabling a pending source raises its
+IRQ. ROTT's Wave Blaster mask 0Bh leaves both DMA sources enabled; the independent
+MPU-401 UART does not currently generate IRQs. Older save states without the
+enable-register marker retain their previous unmasked DMA behavior. Unsupported
+mixer accesses report the selected register as well as the data port.
 The DSP consumes explicit byte/word DMA units and returns stereo PCM/block IRQ
 events. A preallocated machine queue owns produced frames until the host drains
 them. Full hardware timing and applying digital-PCM mixer gain remain pending.
@@ -438,9 +480,18 @@ start sample production. Synthesis writes start a guest-clock 48-kHz FM stream;
 the chip's resampler converts its native output. The machine sums FM and held
 DMA samples into a single timestamp-ordered PCM queue, with saturating addition.
 The CT1745 master/FM levels apply approximate 2-dB attenuation steps to FM;
-digital-PCM mixer gain remains pending. Native and browser output consume the
-existing PCM transport. Register writes are immediate; chip busy/write-delay
-timing and OPL interrupt delivery remain unimplemented.
+master, DAC, FM and CD faders reset to unity. The PC applies the same 1.5x
+OPL output calibration as DOSBox Staging after guest attenuation, with saturation
+at the PCM boundary.
+Mixer gain for digital PCM remains pending. Native and browser output consume the
+existing PCM transport. Executed CPU accesses to these OPL ports charge an
+additional 1 microsecond per byte transaction on the shared device timeline,
+a functional approximation of ISA access time independent of CPU MHz and
+execution tiers. This preserves timer-based detection loops at high CPU rates;
+observed and ordinary execution use the same timing. Direct bus setup accesses
+do not consume CPU time, and external-clock experiments supply their own time.
+Register writes are immediate; chip busy/write-delay timing and OPL interrupt
+delivery remain unimplemented.
 
 The published `nuked-opl3` dependency requires `std`. This is an explicit
 exception for the FM integration, including the transitive PC/runtime graph;
@@ -769,6 +820,162 @@ depend on OPL, while the PC machine connects it to DMA and interrupts.
 
 ## Native dynamic core
 
+The required static EXE-to-WASM path reconstructs executable images and
+relocations offline, analyzes statically recoverable control flow, and emits one
+large program module. Profiles guide optimization; code coverage comes from the
+executable. Static entry/relocation tables replace runtime translated-block cache
+management. The module shares runtime memory through an explicit owner contract
+and calls WASM runtime functions directly. Host budgets are soft, with accounting
+at block ends, checks hoisted before proven finite narrow loops, and infrequent
+bounded checkpoints for unknown-duration loops. Actual completed work, including
+overshoot, is returned in counted mode. An optional uncounted HOT code-generation
+policy omits instruction/statistics counters and instruction-budget charges in
+HOT regions, while retaining independent bounded runtime service points and
+device-time progression. Reports distinguish charged work from unavailable total
+instruction counts. The counted static slice has an experimental shared
+Rust WASM runtime, code guards and device-horizon admission. Opt-in byte/word/dword
+MOV and ALU lowering reads RAM/VGA and writes ordinary RAM directly in shared
+WASM memory. Register/immediate PUSH and register POP also use direct RAM with
+live SS.B stack addressing. Other stack operations, memory shifts, finite-loop hoisting and production
+frontend selection remain incomplete. See
+[WASM core](compatibility/wasm-core.md).
+
+The offline preparation already has two independent system components.
+`doslet-executable` borrows the source file and validates supported LE metadata
+and direct internal fixup records without allocation. `doslet-aot` reconstructs
+immutable object bytes, distinguishes file-backed spans from implicit BSS and
+canonicalizes symbolic relocations with source provenance. Its static CFG starts
+at explicit entries, follows recoverable transfers and preserves independently
+reachable overlapping instruction streams. Unknown exits remain explicit.
+An explicit bound traversal follows relocated near CALL/JMP/Jcc targets under
+a full flat32 source CS. It can reach file-backed data32 objects while retaining
+that CS; a destination object's data selector does not replace the executing
+code context. Unreachable fixups and pointer values never become roots. Other
+code contexts remain explicit stopped paths in this mode; the original unbound
+code16 analysis remains available. A bound graph borrows its exact immutable
+binding plan, and lowering rejects another plan even for the same source image.
+Explicit offline binding plans validate load extents and selector views before
+encoding supported relocations. Straight-line grouping preserves joins and
+overlapping instruction identities under a fixed region-length bound.
+Allocations and decode work have limits. Neither component chooses runtime selectors,
+loads machine RAM or introduces executable-format dependencies into the CPU.
+
+The optional system-layer `doslet-aot/wasm` adapter lowers original, explicitly
+relocated instruction windows to the CPU-only `doslet-x86-wasm::static_program`
+IR. That separate compiler emits direct tail calls between bounded regions,
+passing registers/flags without frame flushes on known edges. Initial entry,
+near returns and runtime callbacks use a static address dispatcher. Imported memory holds a
+72-byte boundary frame; counted budgets are soft and HOT can be uncounted.
+Independent structural checkpoints retain runtime control. The initial slice
+handles register aliases, LEA, shifts/rotates, direct branches and optional MOV/ALU
+memory operands; unsupported instructions exit before effects. Native acceptance adapters cover Wasmtime and direct WASM-to-WASM
+callbacks sharing one imported memory. The application-level `StaticSession`
+owns the Rust DOS/PC runtime and admits whole counted regions against exact
+relocated source bytes, the live CS descriptor and event-free device grants.
+Admission only reserves work; callbacks and final returns commit its actual
+effects and device time. The direct shared-memory acceptance wrapper runs this
+runtime under Wasmtime without a native callback trampoline.
+
+An optional 384-byte descriptor follows the unchanged 72-byte CPU frame. It
+exposes borrowed RAM, page generations, protected source-page markers, segment
+windows and actual VGA backing bytes. Direct accesses check the full operand
+span before effects; the PC excludes low-memory accounting and the VGA aperture
+from the ordinary RAM span and requires A20 enabled. One internal WASM admission
+helper checks immutable code guards and reserves the device grant without a
+runtime import. RAM stores update distinct touched page generations immediately.
+VGA reads implement linear banking or planar/chain4 selection and read-compare
+against backing bytes, retaining the resulting latches in the descriptor.
+If a source-page generation changes but every expected source byte still
+matches, the owner renews the proof and retries the same static entry once.
+A subsequent memory refusal executes normally through the interpreter;
+changed source bytes never authorize a retry. Both the previous and refreshed
+hardware grants must cover the complete region.
+At service/final boundaries the owner commits reservations, RAM-write counters,
+VGA latches and device-access counters before advancing device time. No borrowed
+Rust reference survives entry to generated execution; no guest RAM/VRAM is copied.
+By default, VGA writes and unsupported memory instructions enter the ordinary
+interpreter. The optional `memory_write_helper` compiler mode requires inline
+admission and adds a direct WASM-to-WASM memory-store import. An isolated MOV
+store that fails its direct RAM proof can use that helper after segment/source
+and grant validation. The helper first validates the complete bus span, commits
+staged direct effects and accumulates reservations, then performs the ordinary
+bus store and refreshes the descriptor. Live GPRs/flags remain in generated code;
+neither instruction interpretation nor device-time accounting occurs in the
+helper. A later callback/final return reconciles all accumulated work. Declined
+helpers have no effects; generated code removes only the current reservation
+before ordinary fallback. The runtime accepts byte/word/dword stores wholly in
+RAM or VGA, including compiled source pages whose generations the bus updates.
+Mixed RAM/VGA spans retain ordinary fallback. This is a memory-only slow path,
+not a software TLB or larger-region optimization.
+Direct memory ALU supports register destinations, memory CMP/TEST, and ordinary
+RAM read-modify-write arithmetic, logic, INC/DEC/NEG/NOT. Each memory instruction
+has a separate counted region; complete operand validation precedes its effects.
+MOVSX/MOVZX extend byte/word sources into word/dword register aliases, including
+guarded RAM/VGA sources whose access width is independent of the destination.
+CBW/CWDE reuse pure register sign extension. These instructions preserve flags.
+Two- and three-operand IMUL use captured word/dword operands and a signed 64-bit
+product, replacing only CF/OF. Guarded RAM/VGA IMUL uses the operand width and
+the same isolated counted region as other memory reads.
+One-operand MUL/IMUL retain the full byte/word/dword product in AX, DX:AX or
+EDX:EAX. Both inputs are captured before writing either destination, preserving
+aliased source registers; guarded RAM/VGA forms use the same read contract.
+Register/immediate PUSH and register POP support word/dword operands with an
+independent 16/32-bit stack pointer, supplied explicitly by the owner in the
+descriptor. Missing stack capability declines before effects. SS permissions,
+complete RAM spans and write generation checks precede stack-pointer changes;
+PUSH SP/ESP captures its old value and POP SP/ESP assigns after increment.
+Bound fullflat32 direct rel32 CALL uses one guarded PUSH of the linear return
+EIP followed by an internal subdivision edge. It charges one guest instruction;
+the continuation is a separate static entry. Far, indirect and unresolved rel16
+calls retain ordinary fallback.
+Bound near RET/RET imm16 pops a word/dword EIP using live SS.B and transfers
+through immutable linear aliases of existing regions. Known targets stay inside
+the module; unknown targets delegate after completing RET. Source, stack or
+hardware admission failures delegate before effects. The compiler preserves
+soft-budget exits and structural service quotas across returns. Alias tables
+create no new code and retain each target's existing source/context admission.
+Large address tables use bounded internal dispatcher helpers within the same
+module. Each helper handles at most 8192 sorted entries; a balanced range tree
+selects it without a runtime call. This keeps individual function bodies below
+the engine's parsing limit while retaining original region function IDs and
+known-target service/admission checks.
+Register shifts and rotates preserve byte/word aliases and masked counts;
+word SHLD/SHRD with CL remains a fallback because the count cannot be proved
+statically. Immediate masked word counts above 16 also retain the reference
+CPU's explicit unsupported boundary. LEA computes only an offset, with independent operand/address widths
+and no segment checks, memory access or flag changes. Optional offline partitioning isolates immediate operands and likely
+mutable source instructions, retaining exact byte guards for every region.
+
+`doslet-aot::waits` discovers bounded straight-line memory/compare loops as
+candidates. An optional policy selects all candidates or only complete verified
+COLD bodies, then emits runtime stubs at their existing CFG entries. The runtime
+executes those slices through the interpreter, immediately starting the ordinary
+CPU/RAM recurrence proof. Only proven passes may be omitted, strictly before
+hardware events; same-value writes are allowed. Temporary proofs end before
+returning to generated code. This saves host work without selecting a lower CPU
+rate. HOT/COLD labels alone never authorize skipping. The independent adaptive
+and speed-tier policies remain available.
+
+The separate experimental `doslet-x86-wasm` compiler emits one WebAssembly module
+from observed speed-tiers JSON or DSJ1 code profiles. It uses the shared CPU
+decoder and a runtime callback interface, with internal dispatch between guarded
+register blocks. Its CPU test adapters run natively and in a browser; production
+selection remains pending. A diagnostic Session adapter uses the PC's device
+horizon and ordinary IRQ/service fallback for bounded ROTT comparisons.
+The optional native `doslet-wasm-aot` adapter precompiles those modules through
+Wasmtime/Cranelift with the Speed preset, backtracking register allocation and
+compiler inlining. It measures warmed execution separately from generation and
+loading. Its private unsafe loader accepts only the same engine's freshly
+compiled artifact; no public API accepts serialized native code for loading.
+The standalone `doslet-wasm-game-probe` application also compiles the complete
+interpreter/runtime to WASM for comparisons under that engine. Its private unsafe
+FFI boundary transfers owned setup buffers and opaque owner handles to a trusted
+synchronous diagnostic driver. One probe owns each Session; the shared Session
+adapter and emulation libraries retain safe interfaces. A native trampoline
+bridges fixed scratch state between runtime and translated WASM memories.
+See [WASM core](compatibility/wasm-core.md).
+It does not replace the execution or adaptive scheduling strategies below.
+
 The native frontends enable `dynamic-core` by default on x86-64 and AArch64.
 `doslet-x86` remains a `no_std` CPU library with static bus dispatch. Its optional
 `doslet-x86-jit` dependency is a host compiler adapter using `std` and Cranelift;
@@ -777,8 +984,9 @@ no PC, DOS or filesystem dependency and never owns guest RAM. Its small unsafe b
 converts finalized compiler output to private function pointers, invokes them
 with borrowed general registers, EFLAGS and EIP, optionally borrowing a bounded
 RAM span for a trace, and frees executable storage on drop. The rest
-of the emulation workspace retains `unsafe_code = forbid`; the macOS Audio Unit
-host adapter has its own private FFI boundary described above.
+of the emulation workspace retains `unsafe_code = forbid`; the native WASM AOT
+loader and macOS Audio Unit host adapter have their own private boundaries
+described above.
 
 There are two distinct representations. Address-independent prepared blocks
 contain decoded register IR or a bounded RAM/control-flow trace and at most 240

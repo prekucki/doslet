@@ -176,7 +176,7 @@ describe these design rules in detail.
 - Real-game acceptance of Sound Blaster digital audio and OPL (AdLib) music
 - More VGA/SVGA modes and register-level effects
 - A fuller DOS kernel and support for more DOS extenders
-- MT-32 ROM selection and launch profiles in the browser
+- General user-selected MT-32 ROM loading in the browser
 - More games verified beyond startup, into actual gameplay
 
 ## Development

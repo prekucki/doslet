@@ -11,6 +11,8 @@ pub use recurrence::RecurrenceMark;
 pub mod resources;
 mod timing;
 mod vga_wait;
+#[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+pub mod wasm_procedures;
 pub use memory_wait::MemoryWaitSites;
 
 use core::fmt;
@@ -19,6 +21,8 @@ pub use doslet_mc146818::Snapshot as CmosSnapshot;
 use doslet_x86::{Cpu, CpuError, StepOutcome};
 pub use idle_loop::IdleProofMark;
 pub use io::PcBus;
+mod audio_config;
+pub use audio_config::{AudioConfigError, AudioUse};
 #[cfg(test)]
 mod config_tests;
 #[cfg(test)]
@@ -30,6 +34,11 @@ pub struct AudioStatus {
     pub format: Option<doslet_sb_dsp::Format>,
     pub configured_format: Option<doslet_sb_dsp::Format>,
     pub speaker: bool,
+    pub opl_started: bool,
+    pub opl_key_on_writes: u64,
+    pub opl_peak: u16,
+    pub fm_levels: [u8; 4],
+    pub irq_enabled_sources: u8,
     pub irq: Option<u8>,
     pub dma8: Option<u8>,
     pub dma16: Option<u8>,
@@ -69,6 +78,8 @@ pub enum MachineError {
     UnsupportedAudioRouting,
     AudioQueueFull,
     ClockOverflow,
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    WasmProcedure(wasm_procedures::ExecutionError),
 }
 impl From<CpuError> for MachineError {
     fn from(error: CpuError) -> Self {
@@ -103,6 +114,8 @@ impl fmt::Display for MachineError {
             Self::UnsupportedAudioRouting => f.write_str("unsupported SB16 DMA/IRQ routing"),
             Self::AudioQueueFull => f.write_str("PCM queue full; host must drain produced audio"),
             Self::ClockOverflow => f.write_str("emulated clock overflow"),
+            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            Self::WasmProcedure(error) => write!(f, "WASM procedure failed: {error:?}"),
         }
     }
 }
@@ -111,11 +124,21 @@ impl core::error::Error for MachineError {}
 /// Per-instruction diagnostics, collected only by the observed specialization.
 #[derive(Default)]
 pub struct StepObservation {
+    /// Actual CPU entry after runtime services; absent for IRQ-only/HLT steps.
+    pub instruction: Option<InstructionObservation>,
     pub trace: doslet_bus::observation::Trace,
     pub irq: Option<u8>,
     pub device_writes_unobserved: bool,
     pub service_writes_unobserved: bool,
     pub service_device_accesses_unobserved: bool,
+}
+#[derive(Clone, Copy)]
+pub struct InstructionObservation {
+    pub linear: u32,
+    pub ip: u32,
+    pub code32: bool,
+    pub bytes: [u8; 15],
+    pub available: u8,
 }
 
 pub struct PcMachine {
@@ -127,6 +150,8 @@ pub struct PcMachine {
     memory_wait_steps: u64,
     batch_yield_ip: Option<[u32; 2]>,
     interrupt_entries: u64,
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    wasm_procedures: Option<wasm_procedures::Plan>,
 }
 impl Default for PcMachine {
     fn default() -> Self {
@@ -161,6 +186,8 @@ impl PcMachine {
             memory_wait_steps: 0,
             batch_yield_ip: None,
             interrupt_entries: 0,
+            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            wasm_procedures: None,
         })
     }
 }
@@ -174,6 +201,16 @@ impl PcMachine {
     }
     pub fn hardware_config(&self) -> doslet_config::HardwareConfig {
         self.bus.hardware_config()
+    }
+    pub fn set_keyboard_mode(
+        &mut self,
+        mode: doslet_config::KeyboardMode,
+    ) -> Result<(), MachineError> {
+        if mode != self.hardware_config().keyboard {
+            self.release_keys()?;
+            self.bus.set_keyboard_mode(mode);
+        }
+        Ok(())
     }
     pub fn key_event(
         &mut self,
@@ -241,6 +278,38 @@ impl PcMachine {
     pub fn step(&mut self) -> Result<StepOutcome, MachineError> {
         self.step_with_idle_budget(1).map(|(outcome, _)| outcome)
     }
+    /// Diagnostic foreign engine: grant only the existing event-free batching
+    /// horizon. Its exclusive owner must validate memory accesses, commit their
+    /// effects before device time, and forbid unhandled I/O or CPU control changes.
+    pub fn debug_register_engine_budget(&self, budget: u32) -> u32 {
+        if self.vga_wait.candidate.is_some()
+            || self.memory_wait_sites.is_some()
+            || self.batch_yield_ip.is_some()
+            || self.cpu.is_halted()
+            || self.cpu.execution_labels_enabled()
+            || self.bus.ram.recurrence_recording()
+            || (self.cpu.accepts_maskable_interrupt() && self.bus.pic.has_interrupt())
+        {
+            return 0;
+        }
+        self.timing
+            .steps_to_event_nanos(&self.bus, budget.saturating_add(1), 1_000_000)
+            .saturating_sub(1)
+            .min(budget)
+    }
+    /// Commit already-executed register work; never execute guest code here.
+    pub fn debug_account_register_engine(&mut self, steps: u32) -> Result<(), MachineError> {
+        assert!(
+            steps <= self.debug_register_engine_budget(steps),
+            "foreign engine exceeded device horizon"
+        );
+        self.advance_hardware_steps(steps)?;
+        #[cfg(feature = "profiling")]
+        {
+            self.bus.stats.cpu_steps += u64::from(steps);
+        }
+        Ok(())
+    }
     /// Account for one instruction replaced by a runtime service. The caller
     /// must preserve its CPU effects and the interrupt boundary separately.
     /// Execution labels classify it at the current CS:IP, just like a CPU step.
@@ -285,6 +354,43 @@ impl PcMachine {
         budget: u32,
         mut observation: Option<&mut StepObservation>,
     ) -> Result<(StepOutcome, u32), MachineError> {
+        #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+        self.check_wasm_procedure_failure()?;
+        if OBSERVE {
+            observation.as_mut().unwrap().instruction = None;
+        }
+        if OBSERVE
+            && !self.cpu.is_halted()
+            && !(self.cpu.accepts_maskable_interrupt() && self.bus.pic.has_interrupt())
+        {
+            use doslet_bus::MemoryBus;
+            use doslet_x86::{Access, SegmentRegister};
+            let r = &self.cpu.registers;
+            let linear = r.segment_cache(SegmentRegister::Cs).base.wrapping_add(r.ip);
+            let mut entry = InstructionObservation {
+                linear,
+                ip: r.ip,
+                code32: r.code32(),
+                bytes: [0; 15],
+                available: 0,
+            };
+            for length in 1..=15 {
+                if r.address(SegmentRegister::Cs, r.ip, length, Access::Execute)
+                    .is_err()
+                {
+                    break;
+                }
+                let Some(code) = self.bus.code_bytes(linear, length) else {
+                    break;
+                };
+                if code.len() < usize::from(length) {
+                    break;
+                }
+                entry.bytes[..usize::from(length)].copy_from_slice(&code[..usize::from(length)]);
+                entry.available = length;
+            }
+            observation.as_mut().unwrap().instruction = Some(entry);
+        }
         if !OBSERVE
             && self
                 .memory_wait_sites
@@ -299,7 +405,20 @@ impl PcMachine {
         {
             return Ok((StepOutcome::Continue, consumed));
         }
+        #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+        let wasm_zero_exit = if !OBSERVE {
+            match self.try_wasm_procedure(budget)? {
+                Some(0) => true,
+                Some(consumed) => return Ok((StepOutcome::Continue, consumed)),
+                None => false,
+            }
+        } else {
+            false
+        };
+        #[cfg(not(all(feature = "wasm-procedures", not(target_arch = "wasm32"))))]
+        let wasm_zero_exit = false;
         if !OBSERVE
+            && !wasm_zero_exit
             && budget > 1
             && self.vga_wait.candidate.is_none()
             && self.memory_wait_sites.is_none()
@@ -319,8 +438,51 @@ impl PcMachine {
             // batch path once instead of repeatedly attempting writable native
             // traces which cannot obtain RAM. Overflow and completed intervals
             // immediately restore the ordinary native path.
-            let native = self.cpu.dynamic_core_enabled() && !self.bus.ram.recurrence_recording();
-            let consumed = if let Some(head) = self.batch_yield_ip {
+            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            let prepared_entries = self.wasm_procedures.is_some();
+            #[cfg(all(feature = "wasm-procedure-diagnostics", not(target_arch = "wasm32")))]
+            let prepared_entries = prepared_entries && self.wasm_procedure_dispatch_enabled();
+            #[cfg(not(all(feature = "wasm-procedures", not(target_arch = "wasm32"))))]
+            let prepared_entries = false;
+            let native = self.cpu.dynamic_core_enabled()
+                && !self.bus.ram.recurrence_recording()
+                && !prepared_entries;
+            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            let borrowed_ready = !native
+                && self.bus.a20_enabled()
+                && matches!(self.bus.ram.storage, memory::storage::Storage::Wasm(_))
+                && self.bus.ram.direct_execution_ready();
+            #[cfg(all(feature = "wasm-procedure-diagnostics", not(target_arch = "wasm32")))]
+            let borrowed_ready = borrowed_ready && self.wasm_procedure_borrowed_bus_enabled();
+            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            let borrowed = if borrowed_ready {
+                // Resolve the hardware deadline before exclusively borrowing
+                // the backing. Device state cannot change inside this batch.
+                let grant = limit(&self.bus);
+                let mut bus = self
+                    .bus
+                    .interpreter_batch_bus()
+                    .expect("ready identity-mapped interpreter RAM");
+                let consumed = if let Some(head) = self.batch_yield_ip {
+                    self.cpu
+                        .interpret_batch_until_blocks(&mut bus, budget, |_| grant, head)
+                } else if prepared_entries {
+                    self.cpu
+                        .interpret_batch_until_prepared_entry(&mut bus, budget, |_| grant)
+                } else {
+                    self.cpu.interpret_batch(&mut bus, budget, |_| grant)
+                };
+                let effects = bus.finish();
+                self.bus.complete_interpreter_batch(effects);
+                Some(consumed)
+            } else {
+                None
+            };
+            #[cfg(not(all(feature = "wasm-procedures", not(target_arch = "wasm32"))))]
+            let borrowed: Option<u32> = None;
+            let consumed = if let Some(consumed) = borrowed {
+                consumed
+            } else if let Some(head) = self.batch_yield_ip {
                 if native {
                     self.cpu
                         .dynamic_batch_until_blocks(&mut self.bus, budget, limit, head)
@@ -328,6 +490,9 @@ impl PcMachine {
                     self.cpu
                         .interpret_batch_until_blocks(&mut self.bus, budget, limit, head)
                 }
+            } else if prepared_entries {
+                self.cpu
+                    .interpret_batch_until_prepared_entry(&mut self.bus, budget, limit)
             } else if native {
                 self.cpu.dynamic_batch(&mut self.bus, budget, limit)
             } else {
@@ -343,6 +508,7 @@ impl PcMachine {
             }
         }
         let read_generation = self.bus.vga_status_read_generation;
+        let opl_accesses = self.bus.opl_accesses;
         let candidate_valid = self.vga_wait.candidate.is_some() && self.validate_vga_wait();
         let mut interrupted = false;
         #[cfg(feature = "profiling")]
@@ -401,6 +567,7 @@ impl PcMachine {
         };
         let before_writes = if OBSERVE { self.bus.ram_writes() } else { 0 };
         self.advance_hardware()?;
+        self.advance_opl_bus_time(self.bus.opl_accesses.wrapping_sub(opl_accesses))?;
         if OBSERVE {
             observation.as_mut().unwrap().device_writes_unobserved =
                 before_writes != self.bus.ram_writes();
@@ -450,6 +617,11 @@ impl PcMachine {
             format: self.bus.dsp.playback_format(),
             configured_format: self.bus.dsp.configured_format(),
             speaker: self.bus.dsp.speaker_enabled(),
+            opl_started: self.bus.opl.started(),
+            opl_key_on_writes: self.bus.opl.key_on_writes(),
+            opl_peak: self.bus.opl.peak(),
+            fm_levels: self.bus.mixer.fm_levels(),
+            irq_enabled_sources: self.bus.mixer.enabled_irq_sources(),
             irq: self
                 .hardware_config()
                 .sb16

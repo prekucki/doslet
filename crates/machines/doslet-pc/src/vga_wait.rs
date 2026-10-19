@@ -143,7 +143,8 @@ impl PcMachine {
             return Ok(None);
         }
         // A whole taken iteration restores exactly the same AL, flags and IP.
-        // VGA status reads currently have no other architectural side effects.
+        // The confirming IN already reset the VGA attribute flip-flop; further
+        // status reads repeat that reset without changing the device state.
         if self.cpu.execution_labels_enabled() {
             let base = candidate.cs.base.wrapping_add(candidate.start);
             let mut counts = [0; 4];
@@ -405,6 +406,23 @@ mod tests {
                         "wide={wide} jump={jump:X} dma={dma}: {dispatched}/{total}"
                     );
                 }
+            }
+        }
+    }
+    #[cfg(feature = "save-state")]
+    #[test]
+    fn waiting_and_real_port_polling_have_identical_portable_guest_state() {
+        use doslet_state::State;
+        for wide in [false, true] {
+            for jump in [0x74, 0x75] {
+                let mut fast = machine(wide, jump, true);
+                let mut reference = machine(wide, jump, true);
+                reference.set_vga_wait_acceleration(false);
+                assert!(advance(&mut fast, 50_000) < advance(&mut reference, 50_000));
+                assert!(fast.bus.device_accesses < reference.bus.device_accesses);
+                // Recognition policy is not part of this CPU/device comparison.
+                reference.set_vga_wait_acceleration(true);
+                assert!(fast.save() == reference.save());
             }
         }
     }

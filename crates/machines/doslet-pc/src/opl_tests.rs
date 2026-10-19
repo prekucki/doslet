@@ -50,6 +50,42 @@ fn adlib_and_sb_aliases_share_timer_and_register_latches() {
 }
 
 #[test]
+#[cfg(feature = "save-state")]
+fn observed_and_restored_fm_polls_keep_the_same_bus_and_timer_time() {
+    use doslet_state::State;
+    let mut ordinary = PcMachine::default();
+    let mut observed = PcMachine::default();
+    for machine in [&mut ordinary, &mut observed] {
+        for (address, byte) in [0xec, 0xeb, 0xfd].into_iter().enumerate() {
+            machine.bus.write_u8(address as u32, byte).unwrap();
+        }
+        machine.cpu.registers.set(doslet_x86::Gpr16::Dx, 0x388);
+        write(machine, 2, 0xff);
+        write(machine, 4, 0x21);
+    }
+    for step in 0..200 {
+        ordinary.step().unwrap();
+        observed
+            .step_observed(&mut StepObservation::default())
+            .unwrap();
+        assert_eq!(ordinary.time(), observed.time());
+        assert_eq!(ordinary.cpu.registers.ip, observed.cpu.registers.ip);
+        assert_eq!(
+            ordinary.cpu.registers.get(doslet_x86::Gpr16::Ax),
+            observed.cpu.registers.get(doslet_x86::Gpr16::Ax)
+        );
+        if step == 50 {
+            observed = PcMachine::load(observed.save()).unwrap();
+        }
+    }
+    assert_eq!(
+        ordinary.cpu.registers.get(doslet_x86::Gpr16::Ax) as u8,
+        0xc0
+    );
+    assert!(ordinary.time().as_nanos() >= 100_000);
+}
+
+#[test]
 fn absent_pas_filter_probe_does_not_touch_opl_bank_one_or_hide_other_ports() {
     let mut m = PcMachine::default();
     // Deliberately leave OPL bank one pointing at NEW before the PAS probe.

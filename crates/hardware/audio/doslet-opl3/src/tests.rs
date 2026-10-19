@@ -12,6 +12,24 @@ fn write(opl: &mut Opl3, register: u16, value: u8, time: u64) {
 }
 
 #[test]
+fn note_diagnostics_distinguish_initialization_and_both_banks() {
+    let mut opl = Opl3::default();
+    write(&mut opl, 0x105, 1, 0);
+    write(&mut opl, 0xb0, 0, 0);
+    assert!(opl.started());
+    assert_eq!(opl.key_on_writes(), 0);
+    write(&mut opl, 0xb0, 0x20, 0);
+    write(&mut opl, 0x1b8, 0x31, 0);
+    write(&mut opl, 0xb9, 0x20, 0);
+    assert_eq!(opl.key_on_writes(), 2);
+    #[cfg(feature = "save-state")]
+    {
+        use doslet_state::State;
+        assert_eq!(Opl3::load(opl.save()).unwrap().key_on_writes(), 2);
+    }
+}
+
+#[test]
 fn adlib_detection_timers_use_guest_time_and_bank_one_is_not_a_timer() {
     let mut opl = Opl3::default();
     write(&mut opl, 4, 0x60, 0);

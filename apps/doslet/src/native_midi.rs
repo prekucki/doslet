@@ -35,6 +35,9 @@ pub struct Output {
     active: bool,
 }
 impl Ports {
+    pub fn selection_name(&self, selection: &str) -> Option<&str> {
+        port_index(&self.names, selection).map(|index| self.names[index].as_str())
+    }
     pub fn connect(self, selection: &str) -> Result<Output, String> {
         let index = port_index(&self.names, selection)
             .ok_or_else(|| if selection.eq_ignore_ascii_case("timidity") {
@@ -122,8 +125,9 @@ impl Output {
     pub fn start_clock(&self, nanos: u64, now: Instant) {
         self.scheduler.start_clock(nanos, now);
     }
-    pub fn clear(&mut self) -> Result<(), String> {
-        self.scheduler.clear();
+    /// A cable reconnect initializes the receiver even while playback is paused.
+    pub fn reset(&mut self, mode: doslet_midi_routing::Mode) -> Result<(), String> {
+        self.scheduler.reset(mode.reset_message());
         self.decoder = Decoder::new();
         self.scheduler.check()
     }

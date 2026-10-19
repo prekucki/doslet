@@ -121,6 +121,7 @@ message CmosCmos {
 message SbMixerMixer {
   uint32 index = 1;
   bytes registers = 2;
+  bool irq_enable_initialized = 3;
 }
 
 message SbDspFormat {
@@ -213,6 +214,7 @@ message VgaVga {
   uint64 pending_nanos = 11;
   uint64 pixel_fraction = 12;
   uint64 revision = 13;
+  uint32 latches = 14;
 }
 
 message VgaRegisters {
@@ -774,6 +776,8 @@ message OplOpl3 {
   repeated OplTimer timers = 3;
   bool started = 4;
   uint64 fraction = 5;
+  uint64 key_on_writes = 6;
+  uint32 peak = 7;
 }
 
 message PcA20Gate {
@@ -814,6 +818,7 @@ message PcPcBus {
   CmosCmos cmos = 27;
   uint32 system_control = 28;
   uint64 awe_writes = 29;
+  optional uint32 audio_use = 30;
 }
 
 message PcPcMachine {

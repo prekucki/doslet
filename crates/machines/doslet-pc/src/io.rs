@@ -20,11 +20,15 @@ fn opl_offset(port: u16) -> u8 {
 }
 
 pub struct PcBus {
+    pub(crate) audio_use: crate::AudioUse,
     config: HardwareConfig,
     routes: Routes,
     memory_routes: MemoryRoutes,
     pub gameport: doslet_gameport::Gameport,
     pub(crate) guest_nanos: u64,
+    /// Transient transaction generation; sampled across a CPU instruction only.
+    /// No pending timing state exists at save/batch boundaries.
+    pub(crate) opl_accesses: u64,
     keyboard_irq_line: bool,
     /// CPU-independent notification generation. Only successful active VGA
     /// status reads increment it; the PC compares before/after one CPU step.
@@ -32,6 +36,14 @@ pub struct PcBus {
     /// Port and device-memory accesses, for idle proofs to reject passes
     /// whose results could depend on device state.
     pub(crate) device_accesses: u64,
+    /// Last native procedure's small diagnostic counters; portable device state
+    /// excludes compiler statistics and starts them fresh after restoration.
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub(crate) wasm_device_effects: doslet_x86_wasm::static_program::memory::Effects,
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub(crate) wasm_call_windows: crate::wasm_procedures::CallWindows,
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub(crate) wasm_rle_call: Option<crate::wasm_procedures::PreparedRleCall>,
     /// Writes to the CMOS shutdown-status scratch register (no live device
     /// effect). Used only to classify actually executed recurring intervals.
     pub(crate) cmos_scratch_writes: u64,
@@ -58,12 +70,112 @@ pub struct PcBus {
     system_control: u8,
     pub(crate) awe_writes: u64,
 }
+
+/// Borrowed backing only; exporting it to a foreign engine belongs to the
+/// application. No Rust borrow may span that engine's exclusive execution.
+pub struct DirectMemoryView<'a> {
+    pub ram: doslet_bus::NativeRamMut<'a>,
+    pub video: Option<doslet_vga::MemoryReadView<'a>>,
+}
+
+#[cfg(test)]
+mod direct_memory_tests;
 impl Default for PcBus {
     fn default() -> Self {
         Self::from_config(HardwareConfig::default()).expect("valid default hardware")
     }
 }
 impl PcBus {
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub(crate) fn interpreter_batch_bus(
+        &mut self,
+    ) -> Option<crate::memory::batch::BorrowedRamBus<'_>> {
+        if !self.a20.enabled {
+            return None;
+        }
+        self.ram.interpreter_batch_bus_with_video(&mut self.vga)
+    }
+
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub(crate) fn complete_interpreter_batch(&mut self, effects: crate::memory::batch::Effects) {
+        self.device_accesses = self.device_accesses.wrapping_add(effects.device_accesses);
+        #[cfg(feature = "profiling")]
+        {
+            self.stats.bda_tick_reads += effects.bda_tick_reads;
+        }
+        self.ram.complete_interpreter_batch(effects);
+    }
+
+    pub fn direct_memory_view(&mut self) -> Option<DirectMemoryView<'_>> {
+        // This legacy export borrows two independent owners. Installed native
+        // procedures instead execute directly over their one Store allocation.
+        if !self.a20.enabled || self.ram.storage.video().is_some() {
+            return None;
+        }
+        let length = self.ram.len();
+        let mut ram = self.ram.direct_view_mut(0x500..length)?;
+        ram.excluded_start = APERTURE_START;
+        ram.excluded_len = APERTURE_LEN as u32;
+        Some(DirectMemoryView {
+            ram,
+            video: self.vga.direct_read_view(),
+        })
+    }
+
+    /// Borrow the actual physical video backing selected during setup.
+    pub fn vram_view(&self) -> &[u8] {
+        self.ram
+            .storage
+            .video()
+            .unwrap_or_else(|| self.vga.vram_view())
+    }
+
+    pub fn video_frame(&self) -> Option<doslet_vga::IndexedFrame<'_>> {
+        self.vga.frame_with_memory(self.vram_view())
+    }
+
+    pub fn set_video_mode_13h(&mut self) {
+        if let Some(memory) = self.ram.storage.video_mut() {
+            self.vga.set_mode_13h_with_memory(memory);
+        } else {
+            self.vga.set_mode_13h();
+        }
+    }
+
+    pub fn set_video_vbe_101h(&mut self, preserve: bool) {
+        if let Some(memory) = self.ram.storage.video_mut() {
+            self.vga.set_vbe_101h_with_memory(memory, preserve);
+        } else {
+            self.vga.set_vbe_101h(preserve);
+        }
+    }
+
+    fn read_video_memory(&mut self, offset: usize) -> Option<u8> {
+        if let Some(memory) = self.ram.storage.video() {
+            self.vga.read_memory_with_memory(memory, offset)
+        } else {
+            self.vga.read_memory(offset)
+        }
+    }
+
+    fn write_video_memory(&mut self, offset: usize, value: u8) -> bool {
+        if let Some(memory) = self.ram.storage.video_mut() {
+            self.vga.write_memory_with_memory(memory, offset, value)
+        } else {
+            self.vga.write_memory(offset, value)
+        }
+    }
+
+    /// Actual write generations were changed inline, before another admission
+    /// can validate code. Reconcile only small counters/latches at boundaries.
+    pub fn complete_direct_memory(&mut self, reads: u64, latches: [u8; 4], writes: u64) {
+        if reads != 0 {
+            self.device_accesses = self.device_accesses.wrapping_add(reads);
+            self.vga.complete_direct_reads(latches);
+        }
+        self.ram.complete_direct_writes(writes);
+    }
+
     pub fn from_config(config: HardwareConfig) -> Result<Self, crate::MachineError> {
         config.validate().map_err(crate::MachineError::Hardware)?;
         let routes = Routes::build(config).map_err(crate::MachineError::Resource)?;
@@ -75,14 +187,22 @@ impl PcBus {
         let mut slave_pic = Pic::new(0x70);
         slave_pic.write_data(0xFF);
         Ok(Self {
+            audio_use: crate::AudioUse::default(),
             config,
             routes,
             memory_routes: MemoryRoutes::new(config.memory_bytes()),
             gameport: doslet_gameport::Gameport::default(),
             guest_nanos: 0,
+            opl_accesses: 0,
             keyboard_irq_line: false,
             vga_status_read_generation: 0,
             device_accesses: 0,
+            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            wasm_device_effects: Default::default(),
+            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            wasm_call_windows: Default::default(),
+            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            wasm_rle_call: None,
             cmos_scratch_writes: 0,
             observe_vga_status: true,
             #[cfg(feature = "profiling")]
@@ -114,11 +234,46 @@ impl PcBus {
     }
 }
 impl PcBus {
+    pub(crate) fn configure_unused_audio(
+        &mut self,
+        audio: doslet_config::AudioHardware,
+    ) -> Result<(), crate::MachineError> {
+        let config = self.config.with_audio(audio);
+        config.validate().map_err(crate::MachineError::Hardware)?;
+        let routes = Routes::build(config).map_err(crate::MachineError::Resource)?;
+        // Only untouched mixer state may receive new resource defaults.
+        if !self.audio_use.sb16 {
+            self.mixer = doslet_sb_mixer::Mixer::with_routing(audio.irq, audio.dma8, audio.dma16);
+        }
+        self.config = config;
+        self.routes = routes;
+        Ok(())
+    }
+    fn touch_audio(&mut self, endpoint: Endpoint) {
+        match endpoint {
+            Endpoint::Opl => self.audio_use.opl3 = true,
+            Endpoint::MidiData | Endpoint::MidiCommand => self.audio_use.mpu401 = true,
+            Endpoint::MixerIndex
+            | Endpoint::MixerData
+            | Endpoint::DspReset
+            | Endpoint::DspData
+            | Endpoint::DspCommand
+            | Endpoint::DspStatus
+            | Endpoint::DspWordAck => self.audio_use.sb16 = true,
+            _ => {}
+        }
+    }
     pub(crate) fn set_cpu_mhz(&mut self, mhz: u16) {
         self.config.cpu_mhz = mhz;
     }
     pub fn hardware_config(&self) -> HardwareConfig {
         self.config
+    }
+    pub(crate) fn set_keyboard_mode(&mut self, mode: KeyboardMode) {
+        // The motherboard owns ports 60h/64h and IRQ1 in both delivery modes.
+        // Preserve controller commands, A20, PIC masks and in-flight IRQ state.
+        self.config.keyboard = mode;
+        self.update_keyboard_irq();
     }
     pub fn ram_size(&self) -> usize {
         self.ram.len()
@@ -394,8 +549,7 @@ impl MemoryBus for PcBus {
         }
         match endpoint {
             MemoryEndpoint::Vga => self
-                .vga
-                .read_memory((address - APERTURE_START) as usize)
+                .read_video_memory((address - APERTURE_START) as usize)
                 .ok_or(BusError::UnmappedMemory(address)),
             MemoryEndpoint::Ram => self.ram.read(address),
             MemoryEndpoint::Absent => Err(BusError::UnmappedMemory(address)),
@@ -409,10 +563,7 @@ impl MemoryBus for PcBus {
         }
         match endpoint {
             MemoryEndpoint::Vga => {
-                if self
-                    .vga
-                    .write_memory((address - APERTURE_START) as usize, value)
-                {
+                if self.write_video_memory((address - APERTURE_START) as usize, value) {
                     Ok(())
                 } else {
                     Err(BusError::UnmappedMemory(address))
@@ -432,7 +583,9 @@ impl PortBus for PcBus {
             self.stats.vga_status_reads += u64::from(matches!(port, 0x3BA | 0x3DA));
             self.stats.pit_reads += u64::from((0x40..=0x42).contains(&port));
         }
-        match self.routes.read(port) {
+        let endpoint = self.routes.read(port);
+        self.touch_audio(endpoint);
+        match endpoint {
             Endpoint::Absent => Err(BusError::UnmappedPort(port)),
             Endpoint::Probe | Endpoint::AweProbe | Endpoint::DspReset => Ok(0xFF),
             Endpoint::SystemControl => {
@@ -464,10 +617,18 @@ impl PortBus for PcBus {
                 .map_err(|_| BusError::UnmappedPort(port)),
             Endpoint::DmaPage => Ok(self.dma_pages[Self::dma_page_channel(port)]),
             Endpoint::MixerIndex => Ok(self.mixer.index()),
-            Endpoint::Opl => Ok(self.opl.read(opl_offset(port), self.guest_nanos)),
+            Endpoint::Opl => {
+                self.opl_accesses = self.opl_accesses.wrapping_add(1);
+                Ok(self.opl.read(opl_offset(port), self.guest_nanos))
+            }
             Endpoint::MixerData => {
                 self.mixer.set_interrupt_status(self.dsp.irq_status());
-                self.mixer.read().map_err(|_| BusError::UnmappedPort(port))
+                self.mixer
+                    .read()
+                    .map_err(|error| BusError::UnsupportedPortRegister {
+                        port,
+                        index: error.0,
+                    })
             }
             Endpoint::DspData => Ok(self.dsp.read_data()),
             Endpoint::DspCommand => Ok(self.dsp.write_status()),
@@ -500,7 +661,9 @@ impl PortBus for PcBus {
     }
     fn write_port_u8(&mut self, port: u16, value: u8) -> Result<(), BusError> {
         self.device_accesses = self.device_accesses.wrapping_add(1);
-        match self.routes.write(port) {
+        let endpoint = self.routes.write(port);
+        self.touch_audio(endpoint);
+        match endpoint {
             Endpoint::Absent => return Err(BusError::UnmappedPort(port)),
             Endpoint::Probe => {}
             Endpoint::AweProbe => self.awe_writes += 1,
@@ -526,18 +689,35 @@ impl PortBus for PcBus {
                 .map_err(|_| BusError::UnmappedPort(port))?,
             Endpoint::DmaPage => self.dma_pages[Self::dma_page_channel(port)] = value,
             Endpoint::MixerIndex => self.mixer.select(value),
-            Endpoint::Opl => self.opl.write(opl_offset(port), value, self.guest_nanos),
+            Endpoint::Opl => {
+                self.opl_accesses = self.opl_accesses.wrapping_add(1);
+                self.opl.write(opl_offset(port), value, self.guest_nanos);
+            }
             Endpoint::MixerData => {
+                let pending_before = self.dsp.irq_status() & self.mixer.enabled_irq_sources();
                 if let Some((irq, dma8, dma16)) = self.mixer.proposed_routing(value)
                     && (!irq.is_some_and(|v| self.routes.allows_irq(v))
                         || !dma8.is_some_and(|v| self.routes.allows_dma(v))
                         || !dma16.is_some_and(|v| self.routes.allows_dma(v)))
                 {
-                    return Err(BusError::UnmappedPort(port));
+                    return Err(BusError::UnsupportedPortRegister {
+                        port,
+                        index: self.mixer.index(),
+                    });
                 }
                 self.mixer
                     .write(value)
-                    .map_err(|_| BusError::UnmappedPort(port))?;
+                    .map_err(|error| BusError::UnsupportedPortRegister {
+                        port,
+                        index: error.0,
+                    })?;
+                if self.mixer.index() == 0x83
+                    && pending_before == 0
+                    && self.dsp.irq_status() & self.mixer.enabled_irq_sources() != 0
+                    && let Some(irq) = self.mixer.interrupt_line()
+                {
+                    self.pic.raise_edge(irq);
+                }
             }
             Endpoint::DspReset => self.dsp.write_reset(value),
             Endpoint::DspCommand => self

@@ -59,6 +59,19 @@ persists closed modified files with bounded streaming and atomic replacement
 in the native adapter; the core retains its sparse RAM write budget. See
 [launch-profiles.md](launch-profiles.md).
 
+Native `--zip FILE --program PATH` and version-2 `kind = "zip"` C: mounts reuse
+the bounded browser archive reader. They mount the selected EXE/COM directory
+without extracting files. ZIP sources support read-only, temporary overlay and
+separate persistent save stores; legacy rw writeback is rejected. Reset preserves
+machine and launch settings. Native ZIP memory patch manifests remain unsupported.
+
+Native audio setup can discover the supported CM-32L v1.02 ROM pair in standard
+DOSBox configuration/data folders. Discovery performs bounded reads and validates
+the existing SHA-1 identities before selecting a directory. Explicit ROM paths
+and MIDI output selections take precedence; disabled audio skips discovery.
+Unsupported or absent automatic candidates retain the ROM-free default. This
+does not expand the synthesizer's supported ROM revisions or add browser ROM access.
+
 ## Memory and performance requirements
 
 - CPU execution must not allocate per instruction or execution step.
@@ -319,6 +332,66 @@ reference path. The profiling feature exposes hits, misses, invalidations and
 fallbacks. Differential tests cover dynamic operands, faults and invalidation;
 the opt-in local PRINCE test compares bounded execution through 300 million
 steps, including full final RAM/VRAM, scanout/palette, MIDI, PCM and guest time.
+
+The required [static EXE-to-WASM backend](compatibility/wasm-core.md) analyzes
+executable images and relocations offline and emits one large program module;
+profiles guide optimization rather than defining code coverage. The target has
+no runtime translated-block cache. It accounts work at block ends and may hoist
+accounting/checks before proven finite narrow loops. Host scheduling budgets are
+soft: a completed block or bounded loop chunk may overshoot the request and must
+return its actual work count without overflow. Unknown-duration loops retain
+infrequent bounded checkpoints and runtime service points. Architectural effects
+and accounted guest-work totals remain correct. An optional uncounted HOT
+variant emits no instruction/statistics counter updates or instruction-budget
+charges inside HOT regions. Bounded runtime service and device-time progression
+remain independent requirements. Exact total step counts are unavailable in that
+variant and reports must say so; counted instrumentation remains selectable.
+Adaptive and speed-tier policies remain independent. Borrowed LE inspection,
+internal fixup decoding, bounded symbolic image reconstruction and conservative
+static control-flow discovery are implemented in `doslet-executable` and
+`doslet-aot`. The CFG preserves valid overlapping instruction streams and reports
+unresolved paths. Offline relocation plans validate explicitly declared load and
+selector bindings; bounded region grouping preserves graph entry identities.
+An optional `doslet-aot/wasm` adapter now lowers register operations and direct
+branches to one module through the format-independent
+`doslet-x86-wasm::static_program` IR. Its separate 72-byte ABI has soft counted
+budgets, optional uncounted regions and bounded structural callbacks. Actual WASM
+tests cover byte/word/dword aliases and partial static coverage; unsupported
+instructions enter the runtime before effects. An experimental application
+adapter now admits counted regions against actual relocated bytes, CS context
+and hard device horizons, with direct WASM callbacks into the Rust runtime.
+Opt-in direct memory lowering supports byte/word/dword MOV loads and RAM stores.
+Generated WASM accesses the runtime's actual RAM and VGA backing storage without
+per-access runtime callbacks. VGA reads preserve planar selection, compare mode
+and latches; VGA stores and other memory/stack operations still use the interpreter.
+Inline region admission uses shared grants and source-page generation guards. Compiled
+source pages reject direct stores; ordinary RAM stores immediately update page
+generations. Loop-accounting hoisting and production frontend selection remain
+incomplete; the profile-only prototype below does not implement this contract.
+
+Static wait-loop candidates may create explicit runtime boundaries. COLD can
+guide their selection; it does not establish inactivity or require a CPU-rate
+change. The runtime must prove recurring CPU state and unchanged RAM effects
+before omitting any pass, and stop skipping before hardware events. Candidate
+proofs are bounded and cannot survive a return to generated execution.
+
+The optional experimental [profile-only WASM compiler](compatibility/wasm-core.md) translates
+observed speed-tiers JSON or DSJ1 entries into one module with internal dispatch,
+bounded host grants and interpreter fallback. Its current scope is selected
+protected 32-bit register operations and relative branches. Native Wasmi,
+Wasmtime AOT and real browser CPU fixtures validate this experimental backend;
+machine/session selection and browser performance remain pending. A diagnostic Session adapter
+also compares real ROTT intro execution with complete saved-state and audio
+equality. The optional native AOT adapter precompiles with Cranelift Speed,
+backtracking register allocation and compiler inlining; complete warmup passes
+precede timed execution, with compilation/loading measured separately. A private
+unsafe loader accepts only unchanged native bytes freshly compiled by the same
+engine. The portable compiler/host stays `no_std` and forbids unsafe Rust.
+The standalone diagnostic game probe also compiles the complete interpreter and
+runtime to WASM for paired Wasmtime replays, with and without the decode cache.
+All variants compare full saved states and PCM/MIDI digests against the same
+native oracle, separately from measured execution time.
+Existing execution and adaptive scheduling strategies keep their current defaults.
 
 Native x86-64/AArch64 frontends enable a Cranelift dynamic core by default through
 the `dynamic-core` feature. Its first scope is bounded blocks of 2–16 register-only
@@ -591,6 +664,8 @@ that RAM and expands CP437 glyphs directly into caller RGBA storage at 720x400,
 with attributes, blink and cursor. Full VGA text-memory mapping remains pending.
 INT 10h/AH=01h/05h sets cursor shape/active page; AH=06h/07h scrolls/clears a text
 window; AH=08h/09h/0Ah reads/writes cells and AH=0Eh performs text teletype output.
+AH=01h reads CH/CL independently of BH and updates the BDA shape and VGA CRTC
+cursor-start/end registers, including cursor hiding through CH bit 5.
 INT 10h/AH=02h/03h
 sets/queries the BDA cursor position for pages 0-7; setting the active text page's
 cursor also updates the VGA CRTC cursor address. The query returns the BDA cursor
@@ -647,7 +722,15 @@ Only the first sixteen bootstrap palette entries are EGA colors; the remaining
 entries form a test color cube. This is not complete VGA BIOS palette emulation.
 VGA configuration banks retain defined register fields, enforce CRTC protection
 and color/mono port selection, and report absent SVGA extension registers as FFh.
-Programmable register effects on raster/planar memory are not yet implemented.
+The mode-13h family supports Chain-4 and unchained 256-color (Mode X) memory:
+plane write masks, read-map selection, four-byte read latches, read comparison
+and VGA write modes 0–3. Four interleaved planes share the existing VRAM owner.
+Scanout borrows that storage and applies CRTC start address, offset/pitch,
+display dimensions and scan-line repeats during conversion, including 16-bit
+plane-address wrapping. Register-only page flips invalidate presentation.
+This selected 256-color layout does not implement general EGA/16-color scanout,
+odd/even graphics addressing, split screens, pixel panning or programmable
+raster timing. Text-mode B800h handling and banked VBE 101h remain separate.
 INT 10h AX=1000h/1001h updates the attribute palette/overscan registers with
 six-bit values. Selected extension BIOS probes (6F00h, 5F00h with BX=0 and
 AH=12h/BX=0080h) retain registers rather than returning an installed-vendor
@@ -704,7 +787,12 @@ MIDI sample synthesis and PCM resampling/mixing run on `doslet-audio`. Eight rec
 packets carry timed PCM and MIDI without sharing the Session. Packet exhaustion
 or 80 ms of pending synthesis yields before the next CPU chunk. Reset/output
 changes cancel old packets and queued frames only after replacement setup succeeds;
-pause preserves them. The no-device renderer remains synchronous. The worker waits only when
+pause preserves them. Native playback opens on the first configured PCM,
+OPL programming or MIDI bytes; the MIDI renderer initializes on MIDI data or
+restored MIDI replay. Port controllers and queues remain prepared during setup.
+Audio-only hardware edits can replace routes between batches while the affected
+card has never received guest I/O. First-access flags persist across states;
+legacy states conservatively require restart. The no-device renderer remains synchronous. The worker waits only when
 caught up or blocked. The browser Worker owns its Session and runs at most 400000
 steps and about 8 ms of host work per turn, yielding between turns. A host
 monotonic clock paces native and silent browser execution; active worklet playback
@@ -758,7 +846,11 @@ to release capture; plain Esc reaches the guest. Focus loss, pause, reset and
 termination release it too.
 Capture generations reject delayed events from a previous session. Native and
 browser profiles independently support `input.hide_cursor` over the running
-game image; disabling capture preserves absolute movement and passes Esc to DOS.
+game image. `input.mouse_mode` selects Auto, Capture or No capture. Auto follows
+recent guest relative reads, Capture forces relative input after a display click,
+and No capture forces absolute motion. The toolbar and Input settings apply this
+host policy immediately without restarting, releasing existing capture and buttons.
+Legacy `input.capture` profiles remain readable.
 Browser capture uses DOM Pointer Lock from a display click and sends relative movement
 directly to the machine Worker. Raw INT 33h/000Bh motion counters continue at
 guest cursor bounds; only logical cursor coordinates are clamped. Fractional
@@ -818,6 +910,13 @@ visible independently of the host synth's own buffering. Failures pause the
 machine and report once; selecting a working output permits Run without
 resetting guest RAM. Sound Blaster PCM and OPL3 FM share the PCM output path;
 internal GM/MT-32 fidelity remains a separate limitation.
+
+The Audio playback sheet shows all 16 routed MIDI channels on native and browser
+frontends, including external MIDI: program (MT-32 timbre names where available),
+held/sustained note count, peak velocity, volume, expression and sustain. MT-32
+channel assignment and volume also include tracked SysEx parameters and master
+volume. Bars estimate note level from MIDI state; they do not measure receiver
+PCM, voice allocation, envelopes or output latency.
 
 The ROM-free MT-32-to-GM translator library accepts Roland DT1 SysEx (device
 10h and channel-addressed 00h–0Fh, checksum-validated), the all-parameters

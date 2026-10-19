@@ -16,6 +16,14 @@ pub struct ExecutionSettings {
 #[derive(Clone, Copy)]
 pub struct CodeVersion(doslet_bus::CodeCheck);
 
+impl CodeVersion {
+    /// Copy a validated span identity for a foreign engine's explicit guard
+    /// table. The actual owner/mapping and page generations remain authoritative.
+    pub fn parts(self) -> doslet_bus::CodeCheck {
+        self.0
+    }
+}
+
 pub const GENERAL: [Gpr32; 8] = [
     Gpr32::Eax,
     Gpr32::Ecx,
@@ -28,6 +36,109 @@ pub const GENERAL: [Gpr32; 8] = [
 ];
 
 impl Session {
+    /// Experimental shared-memory backend snapshot. The application exports
+    /// only bounded wasm32 offsets, ends these borrows before generated entry,
+    /// and refreshes after every callback; native host pointers are not offsets.
+    pub fn debug_direct_memory(&mut self) -> Option<doslet_pc::io::DirectMemoryView<'_>> {
+        self.machine.bus.direct_memory_view()
+    }
+
+    pub fn debug_complete_direct_memory(&mut self, reads: u64, latches: [u8; 4], writes: u64) {
+        self.machine
+            .bus
+            .complete_direct_memory(reads, latches, writes);
+    }
+
+    /// Complete, nonwrapping bus span whose accesses cannot change mappings or
+    /// observe/raise hardware events. The foreign engine must reserve its work
+    /// before accessing it and account device time separately.
+    pub fn debug_register_engine_memory_span(&self, address: u32, bytes: u32) -> bool {
+        use doslet_bus::MemoryBus;
+        matches!(bytes, 1 | 2 | 4)
+            && address.checked_add(bytes - 1).is_some()
+            && self.machine.bus.is_batch_memory(address, bytes as u8)
+    }
+
+    /// Bus-only foreign-engine store: no instruction decoding, register update
+    /// or clock advance. Refusal has no effects; an accepted span uses the same
+    /// wide bus operation as the interpreter, including VGA and code versions.
+    pub fn debug_register_engine_write_memory(
+        &mut self,
+        address: u32,
+        bytes: u32,
+        value: u32,
+    ) -> Result<bool, super::RuntimeError> {
+        use doslet_bus::MemoryBus;
+        if !self.debug_register_engine_memory_span(address, bytes) {
+            return Ok(false);
+        }
+        match bytes {
+            1 => self.machine.bus.write_u8(address, value as u8)?,
+            2 => self.machine.bus.write_u16(address, value as u16)?,
+            4 => self.machine.bus.write_u32(address, value)?,
+            _ => unreachable!("validated memory width"),
+        }
+        Ok(true)
+    }
+
+    /// Exclusive diagnostic engine integration; ownership stays with this session.
+    pub fn debug_cpu(&self) -> &doslet_x86::Cpu {
+        &self.machine.cpu
+    }
+    pub fn debug_cpu_mut(&mut self) -> &mut doslet_x86::Cpu {
+        &mut self.machine.cpu
+    }
+    pub fn debug_prepare_register_engine(&mut self) {
+        self.apply_input();
+    }
+    /// One real runtime step with the actual post-service CPU entry recorded.
+    /// This deliberately uses the observed interpreter path, never batching.
+    /// Disable competing acceleration/observation policies before using it.
+    pub fn debug_observed_step(&mut self) -> Option<doslet_pc::InstructionObservation> {
+        if self.status != SessionStatus::Running {
+            return None;
+        }
+        let mut observation = doslet_pc::StepObservation::default();
+        match self.execute_step_observed(&mut observation) {
+            Ok(steps) => {
+                self.steps += u64::from(steps);
+            }
+            Err(error) => {
+                self.fault = Some(error);
+                self.status = SessionStatus::Faulted;
+            }
+        }
+        observation.instruction
+    }
+    pub fn debug_code_bytes(&self, address: u32, length: u8) -> Option<&[u8]> {
+        use doslet_bus::MemoryBus;
+        self.machine.bus.code_bytes(address, length)
+    }
+    /// Bounded experimental register translation. Competing tracing/idle
+    /// policies retain ordinary execution through a zero grant.
+    pub fn debug_register_engine_budget(&self, remaining: u32) -> u32 {
+        if self.status != SessionStatus::Running
+            || self.storage_wait
+            || self.timeslice_yielded
+            || self.continuation.is_some()
+            || self.patches_applied < self.patches.len()
+            || self.analyzer.enabled
+            || self.observer.enabled
+            || self.idle.enabled
+            || self.menu_idle_enabled()
+            || self.adaptive_idle_enabled()
+            || self.mouse.pending & self.mouse.callback.0 != 0
+            || self.dpmi.as_ref().is_some_and(|h| h.direct_return_pending)
+        {
+            return 0;
+        }
+        self.machine.debug_register_engine_budget(remaining)
+    }
+    pub fn debug_account_register_engine(&mut self, steps: u32) -> Result<(), super::RuntimeError> {
+        self.machine.debug_account_register_engine(steps)?;
+        self.steps += u64::from(steps);
+        Ok(())
+    }
     pub fn debug_code_version(&self, address: u32, length: u8) -> Option<CodeVersion> {
         use doslet_bus::MemoryBus;
         self.machine
@@ -56,6 +167,15 @@ impl Session {
 
     pub fn debug_irq_pending(&self) -> bool {
         self.machine.interrupt_pending()
+    }
+
+    /// Experimental static-backend wait boundary. The CPU/frame must already
+    /// be reconciled. Runs at most 65536 ordinary guest steps, starting a bounded
+    /// recurrence proof immediately at this candidate instead of waiting for
+    /// periodic discovery. No profile label or static shape authorizes skipping.
+    /// Does not select a CPU rate; proof state never survives this interpreter slice.
+    pub fn debug_advance_wait_candidate(&mut self, budget: u32, proof_steps: u32) -> u32 {
+        self.idle_candidate_advance(budget, proof_steps)
     }
 
     pub fn debug_irq_entries(&self) -> u64 {
@@ -215,6 +335,76 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_engine_accounting_preserves_cpu_and_device_clock() {
+        let program = [0x40; 32];
+        let mut translated = Session::new(&program).unwrap();
+        #[cfg(feature = "save-state")]
+        let mut reference = translated
+            .capture_working_state()
+            .unwrap()
+            .restore()
+            .unwrap();
+        #[cfg(not(feature = "save-state"))]
+        let mut reference = Session::new(&program).unwrap();
+        for s in [&mut translated, &mut reference] {
+            s.debug_disable_accelerations();
+            s.start();
+        }
+        translated.debug_prepare_register_engine();
+        let grant = translated.debug_register_engine_budget(20);
+        assert!(grant > 0 && grant <= 20);
+        for _ in 0..grant {
+            translated
+                .machine
+                .cpu
+                .step(&mut translated.machine.bus)
+                .unwrap();
+        }
+        translated.debug_account_register_engine(grant).unwrap();
+        assert_eq!(reference.advance(grant), grant);
+        assert!(
+            translated
+                .debug_cpu()
+                .matches(&reference.debug_cpu().snapshot())
+        );
+        assert_eq!(translated.emulated_nanos(), reference.emulated_nanos());
+        assert_eq!(translated.steps(), reference.steps());
+        #[cfg(feature = "save-state")]
+        {
+            let a = translated.save_state().unwrap();
+            let b = reference.save_state().unwrap();
+            assert!(
+                a == b,
+                "wire states differ at {:?}; lengths {}/{}",
+                a.iter().zip(&b).position(|(a, b)| a != b),
+                a.len(),
+                b.len()
+            );
+        }
+        translated.machine.bus.pic.raise_edge(0);
+        assert_eq!(translated.debug_register_engine_budget(20), 0);
+    }
+
+    #[test]
+    fn observed_cpu_entry_excludes_irq_and_intercepted_exit_service() {
+        let mut s = Session::new(&[0xb8, 0, 0x4c, 0xcd, 0x21]).unwrap();
+        s.debug_disable_accelerations();
+        s.start();
+        let mov = s.debug_observed_step().unwrap();
+        assert_eq!(mov.bytes[..3], [0xb8, 0, 0x4c]);
+        let int = s.debug_observed_step().unwrap();
+        assert_eq!(int.bytes[..2], [0xcd, 0x21]);
+        assert!(s.debug_observed_step().is_none());
+        assert_eq!(s.status(), SessionStatus::Exited(0));
+        let mut s = Session::new(&[0x90]).unwrap();
+        s.debug_disable_accelerations();
+        s.start();
+        s.machine.bus.pic.raise_edge(0);
+        assert!(s.debug_observed_step().is_none());
+        assert_eq!(s.debug_irq_entries(), 1);
+    }
 
     #[test]
     fn external_execution_is_bounded_and_restores_ordinary_clock() {

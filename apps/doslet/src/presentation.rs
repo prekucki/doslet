@@ -75,6 +75,8 @@ pub struct DisplaySizing {
     scale_factor: f32,
     filtered: filter::FilterCache,
     uploads: upload::UploadQueue,
+    #[cfg(target_arch = "wasm32")]
+    web_image: Option<PreparedFrame>,
 }
 
 impl Default for DisplaySizing {
@@ -86,6 +88,8 @@ impl Default for DisplaySizing {
             scale_factor: 1.0,
             filtered: filter::FilterCache::default(),
             uploads: upload::UploadQueue::default(),
+            #[cfg(target_arch = "wasm32")]
+            web_image: None,
         }
     }
 }
@@ -110,6 +114,9 @@ impl DisplaySizing {
     }
 
     pub fn image(&self) -> Option<&PreparedFrame> {
+        #[cfg(target_arch = "wasm32")]
+        return self.web_image.as_ref();
+        #[cfg(not(target_arch = "wasm32"))]
         self.uploads.frame()
     }
 
@@ -132,8 +139,11 @@ impl DisplaySizing {
         });
         self.filtered
             .refresh(frame.image.as_ref(), self.filter, target);
-        self.uploads
-            .offer(frame.dimensions().and_then(|source_size| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // WGPU on WASM uploads raster textures when they are first drawn.
+            // Waiting for an explicit allocation before drawing deadlocks it.
+            self.web_image = frame.dimensions().and_then(|source_size| {
                 self.filtered
                     .image()
                     .or(frame.image.as_ref())
@@ -143,8 +153,25 @@ impl DisplaySizing {
                         source_size,
                         filter: self.filter,
                     })
-            }));
-        self.start_upload()
+            });
+            return iced::Task::none();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.uploads
+                .offer(frame.dimensions().and_then(|source_size| {
+                    self.filtered
+                        .image()
+                        .or(frame.image.as_ref())
+                        .map(|image| PreparedFrame {
+                            image: image.clone(),
+                            generation: frame.generation,
+                            source_size,
+                            filter: self.filter,
+                        })
+                }));
+            self.start_upload()
+        }
     }
 
     fn start_upload(&mut self) -> iced::Task<SizingMessage> {

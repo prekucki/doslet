@@ -8,6 +8,15 @@ pub enum KeyboardMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioHardware {
+    pub sb16: bool,
+    pub mpu401: bool,
+    pub irq: u8,
+    pub dma8: u8,
+    pub dma16: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HardwareConfig {
     /// Nominal functional CPU clock; each execution step costs four clocks.
     pub cpu_mhz: u16,
@@ -49,6 +58,23 @@ pub enum HardwareError {
 }
 
 impl HardwareConfig {
+    pub const fn audio(self) -> AudioHardware {
+        AudioHardware {
+            sb16: self.sb16,
+            mpu401: self.mpu401,
+            irq: self.sb_irq,
+            dma8: self.sb_dma8,
+            dma16: self.sb_dma16,
+        }
+    }
+    pub const fn with_audio(mut self, audio: AudioHardware) -> Self {
+        self.sb16 = audio.sb16;
+        self.mpu401 = audio.mpu401;
+        self.sb_irq = audio.irq;
+        self.sb_dma8 = audio.dma8;
+        self.sb_dma16 = audio.dma16;
+        self
+    }
     pub fn validate(self) -> Result<(), HardwareError> {
         if !(1..=1000).contains(&self.cpu_mhz) {
             return Err(HardwareError::CpuClock);

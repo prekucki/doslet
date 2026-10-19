@@ -1,20 +1,50 @@
+#[derive(Clone, Copy)]
+pub enum PixelLayout {
+    Linear,
+    /// Four adjacent bytes hold the planes at one 16-bit VGA address.
+    Vga256 {
+        start: usize,
+        pitch: usize,
+    },
+}
+
 /// Read-only view. It cannot outlive or overlap mutable access to the VGA device.
 #[derive(Clone, Copy)]
 pub struct IndexedFrame<'a> {
     pub width: usize,
     pub height: usize,
+    /// Borrowed backing storage; use `indices` for visible pixels with any layout.
     pub pixels: &'a [u8],
     pub palette: &'a [[u8; 4]; 256],
     pub revision: u64,
     pub pixel_mask: u8,
+    pub layout: PixelLayout,
 }
 impl IndexedFrame<'_> {
+    pub fn indices(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..self.width * self.height).map(|index| {
+            let offset = match self.layout {
+                PixelLayout::Linear => index,
+                PixelLayout::Vga256 { start, pitch } => {
+                    let (y, x) = (index / self.width, index % self.width);
+                    ((start + y * pitch + x / 4) & 0xFFFF) * 4 + x % 4
+                }
+            };
+            self.pixels[offset] & self.pixel_mask
+        })
+    }
     pub fn write_rgba(&self, output: &mut [u8]) -> Result<(), FrameSizeError> {
-        if output.len() != self.pixels.len() * 4 {
+        if output.len() != self.width * self.height * 4 {
             return Err(FrameSizeError);
         }
-        for (pixel, rgba) in self.pixels.iter().zip(output.as_chunks_mut::<4>().0) {
-            *rgba = self.palette[usize::from(*pixel & self.pixel_mask)];
+        if matches!(self.layout, PixelLayout::Linear) {
+            for (pixel, rgba) in self.pixels.iter().zip(output.as_chunks_mut::<4>().0) {
+                *rgba = self.palette[usize::from(*pixel & self.pixel_mask)];
+            }
+        } else {
+            for (pixel, rgba) in self.indices().zip(output.as_chunks_mut::<4>().0) {
+                *rgba = self.palette[usize::from(pixel)];
+            }
         }
         Ok(())
     }

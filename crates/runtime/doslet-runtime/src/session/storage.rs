@@ -69,6 +69,19 @@ impl Session {
     pub fn physical_key(&mut self, usage: u16, pressed: bool) -> Result<(), RuntimeError> {
         self.key_event(doslet_input::PhysicalKey(usage), pressed)
     }
+    /// Switch input delivery at a batch boundary without replacing the machine.
+    pub fn set_keyboard_mode(
+        &mut self,
+        mode: doslet_config::KeyboardMode,
+    ) -> Result<(), RuntimeError> {
+        if mode != self.hardware_config().keyboard {
+            self.release_keys()?;
+            let toggles = self.machine.bus.read_u8(0x417)? & 0xf0;
+            self.set_key_modifiers(toggles)?;
+            self.machine.set_keyboard_mode(mode)?;
+        }
+        Ok(())
+    }
     pub fn release_keys(&mut self) -> Result<(), RuntimeError> {
         self.input.release_all();
         self.machine.release_keys()?;
@@ -588,6 +601,7 @@ impl Session {
                     };
                     self.machine.bus.write_u8(address, self.staging[offset])?;
                 }
+                self.disk_read_bytes = self.disk_read_bytes.saturating_add((end - copied) as u64);
                 copied = end;
                 if copied < length {
                     self.continuation = Some(Continuation::Copy {

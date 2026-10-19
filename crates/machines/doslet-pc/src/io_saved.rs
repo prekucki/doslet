@@ -15,6 +15,8 @@ pub struct PcPcBus {
     guest_nanos: u64,
     #[prost(bool, tag = "6")]
     keyboard_irq_line: bool,
+    // Legacy observer fields remain decodable. New snapshots use zero because
+    // every dependent instruction/proof mark is recreated after restoration.
     #[prost(uint32, tag = "7")]
     vga_status_read_generation: u32,
     #[prost(uint64, tag = "8")]
@@ -59,6 +61,8 @@ pub struct PcPcBus {
     system_control: u32,
     #[prost(uint64, tag = "29")]
     awe_writes: u64,
+    #[prost(uint32, optional, tag = "30")]
+    audio_use: Option<u32>,
 }
 impl State for PcBus {
     type Wire = PcPcBus;
@@ -68,12 +72,12 @@ impl State for PcBus {
             gameport: Some(State::save(&self.gameport)),
             guest_nanos: self.guest_nanos,
             keyboard_irq_line: self.keyboard_irq_line,
-            vga_status_read_generation: self.vga_status_read_generation,
-            device_accesses: self.device_accesses,
+            vga_status_read_generation: 0,
+            device_accesses: 0,
             cmos_scratch_writes: self.cmos_scratch_writes,
             observe_vga_status: self.observe_vga_status,
             ram: Some(State::save(&self.ram)),
-            vga: Some(State::save(&self.vga)),
+            vga: Some(self.vga.save_with_memory(self.vram_view())),
             pic: Some(State::save(&self.pic)),
             slave_pic: Some(State::save(&self.slave_pic)),
             pit: Some(State::save(&self.pit)),
@@ -90,6 +94,11 @@ impl State for PcBus {
             cmos: Some(State::save(&self.cmos)),
             system_control: u32::from(self.system_control),
             awe_writes: self.awe_writes,
+            audio_use: Some(
+                u32::from(self.audio_use.sb16)
+                    | u32::from(self.audio_use.opl3) << 1
+                    | u32::from(self.audio_use.mpu401) << 2,
+            ),
         }
     }
     fn load(w: Self::Wire) -> Result<Self, InvalidState> {
@@ -109,8 +118,8 @@ impl State for PcBus {
             )?)?;
             value.guest_nanos = w.guest_nanos;
             value.keyboard_irq_line = w.keyboard_irq_line;
-            value.vga_status_read_generation = w.vga_status_read_generation;
-            value.device_accesses = w.device_accesses;
+            value.vga_status_read_generation = 0;
+            value.device_accesses = 0;
             value.cmos_scratch_writes = w.cmos_scratch_writes;
             value.observe_vga_status = w.observe_vga_status;
             value.ram = <Ram as State>::load(doslet_state::required(w.ram, "PcPcBus.ram")?)?;
@@ -156,11 +165,69 @@ impl State for PcBus {
             value.system_control =
                 doslet_state::narrow(w.system_control, "PcPcBus.system_control")?;
             value.awe_writes = w.awe_writes;
+            // Older states cannot establish that a device has never been used.
+            let used = w.audio_use.unwrap_or(7);
+            if used > 7 {
+                return Err(InvalidState("PcPcBus audio use"));
+            }
+            value.audio_use = crate::AudioUse {
+                sb16: used & 1 != 0,
+                opl3: used & 2 != 0,
+                mpu401: used & 4 != 0,
+            };
             value
         };
         if !(value.config.memory_bytes() == value.ram.len()) {
             return Err(InvalidState("PcPcBus invariants"));
         }
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_canonicalize_observers_without_mutating_the_live_bus() {
+        let mut bus = PcBus::default();
+        bus.write_port_u8(0x3c8, 7).unwrap();
+        let canonical = bus.save();
+        bus.vga_status_read_generation = u32::MAX;
+        bus.device_accesses = u64::MAX;
+        assert!(bus.save() == canonical);
+        assert_eq!(bus.vga_status_read_generation, u32::MAX);
+        assert_eq!(bus.device_accesses, u64::MAX);
+
+        // Old snapshots can contain arbitrary absolute observer values. Their
+        // guest state survives, while new marks start with fresh counters.
+        let mut legacy = canonical.clone();
+        legacy.vga_status_read_generation = u32::MAX;
+        legacy.device_accesses = u64::MAX;
+        let restored = PcBus::load(legacy).unwrap();
+        assert_eq!(restored.vga_status_read_generation, 0);
+        assert_eq!(restored.device_accesses, 0);
+        assert!(restored.save() == canonical);
+    }
+}
+
+#[cfg(test)]
+mod audio_use_tests {
+    use super::*;
+    #[test]
+    fn legacy_states_conservatively_lock_audio_and_reject_unknown_usage_bits() {
+        let mut wire = PcBus::default().save();
+        wire.audio_use = None;
+        let restored = PcBus::load(wire.clone()).unwrap();
+        assert_eq!(
+            restored.audio_use,
+            crate::AudioUse {
+                sb16: true,
+                opl3: true,
+                mpu401: true
+            }
+        );
+        wire.audio_use = Some(8);
+        assert!(PcBus::load(wire).is_err());
     }
 }

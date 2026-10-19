@@ -62,10 +62,8 @@ The compilation count was 1,316 prepared representations, with no failures.
 
 All eight sessions matched CPU/control state, guest time, RAM/VRAM, scanout,
 execution counters and MIDI/PCM hashes at every 100-million-step checkpoint.
-[Raw timing observations](native-core-expanded-profile.csv) retain all windows.
 The intermediate run before memory XCHG measured 10.010 s versus 24.182 s,
-with total 11.647 s; [its raw data](native-core-opcodes-profile.csv) is retained
-separately. These sequential series do not isolate XCHG's contribution.
+with total 11.647 s. These sequential series do not isolate XCHG's contribution.
 The earlier implementation used its own contemporaneous interpreter comparison;
 absolute cross-series differences do not isolate the contribution of each change.
 
@@ -131,11 +129,8 @@ including far-away call targets/return sites and the unchanged 16-node/240-byte
 window. Linking separate blocks and expanding discovery are distinct remaining
 work; implemented CALL/RET only stay in one native function when targets belong
 to its prepared graph. Event frequencies are not shares of host CPU time.
-
-[Final raw exit observations](native-core-expanded-exits.csv) retain all phases.
 The intermediate profile before memory XCHG had 9,576,351 exits at the newly
-exposed `001F8ACE` exchange site, 8.317% of its 115,140,619 actual exits; see
-[intermediate observations](native-core-before-xchg-exits.csv). Implementing that
+exposed `001F8ACE` exchange site, 8.317% of its 115,140,619 actual exits. Implementing that
 measured form removed it from the unsupported category. No further opcode scope
 was added after that final bounded extension.
 
@@ -156,7 +151,7 @@ statistics. Successful native calls numbered 86,833,599; adding those 743
 zero-step calls accounts for every actual exit. A separate 1,418 segment-guard
 refusals did not invoke native code and are excluded from the percentages.
 The 8,192-slot setup-allocated table retained 1,185 unique event keys without
-dropping observations. [Raw window/entry/exit/reason counts](native-core-exits.csv)
+dropping observations. Window/entry/exit/reason counts
 contain addresses and metadata, not guest code bytes.
 
 | Actual native exit | Count | Share of actual exits |
@@ -287,7 +282,6 @@ Median preparation was 0.501 s; observed totals were 20.207 s for JIT and
 loading is outside the measured windows. This measures the combined writable
 traces, cached segment validation and current code generator; it does not isolate
 the gain from stores alone or compare directly against a simultaneous old JIT.
-Raw observations: [native-core-stores-profile.csv](native-core-stores-profile.csv).
 
 Each JIT session executed 406,539,103 native steps, of which 395,246,882 were
 RAM-trace steps over 81,354,830 RAM-trace entries (4.86 instructions per entry).
@@ -338,8 +332,7 @@ current representation and uses the prepared pool's fingerprint plus full
 byte/length comparison. Imported templates already enter that pool during
 preparation, so no separate linear runtime search is needed. A regression test
 covers both migration from a short prefix and immediate reuse of a current
-complete profile. Raw observations before the fix are in
-[native-core-ram-before-profile-fix.csv](native-core-ram-before-profile-fix.csv).
+complete profile.
 
 Three rotated rounds of five million logical steps, after warmup, measured:
 
@@ -418,8 +411,7 @@ four balanced rounds with only interpreter/profile sessions, each through one
 billion steps, gave median execution times of 24.620 s and 21.474 s respectively
 (**12.78% less time**). Including observed preparation gave 24.632 s versus
 21.843 s (**11.32% less time**). All eight sessions matched at every 100-million
-step checkpoint. [Raw observations](native-core-ram-profile.csv) retain all
-windows; the warmup example's optional fourth argument `profile-pair` selects
+step checkpoint; the warmup example's optional fourth argument `profile-pair` selects
 this comparison. Absolute timings should not be compared directly with the
 four-resident-mode experiment above.
 
@@ -477,8 +469,7 @@ reached one billion steps with the same window-by-window comparison checks as
 the experiment below. Native-step, native-entry and slice counts stayed
 unchanged from the earlier run: this observed PRINCE path does not use the new
 register-only native backedge. Its identified loop still needs memory
-operations and internal conditional exits. Raw observations are in
-[native-core-loops.csv](native-core-loops.csv).
+operations and internal conditional exits.
 
 ## Separating native execution from batching
 
@@ -516,8 +507,6 @@ registers, flags, control state, guest time, exposed ordinary RAM, VRAM,
 scanout/palette, execution counters and MIDI/PCM stream hashes against the
 cached interpreter. These are the exposed checks listed in the diagnostic,
 not equality checks for every internal device state or stream timestamp.
-Raw numeric observations are in
-[native-core-batching-ablation.csv](native-core-batching-ablation.csv).
 
 ## Warmup and scheduling: one billion steps
 
@@ -563,9 +552,7 @@ These small differences do not support a general warmup or game-speedup claim.
 Every window compared registers, flags, control state, guest time, complete
 exposed ordinary RAM, VRAM, scanout/palette, execution counters and MIDI/PCM stream
 hashes. All three experiments reached one billion steps in each mode without
-mismatches or compiler failures. Raw observations are retained as
-[before](native-core-warmup-before.csv) and [after](native-core-warmup-after.csv)
-CSV files. Game bytes and the private profile are excluded.
+mismatches or compiler failures. Game bytes and the private profile are excluded.
 
 The synthetic loop also improved after these changes: three alternating pairs
 measured interpreter/JIT execution at 100.160/14.484, 103.731/15.225 and
@@ -670,10 +657,7 @@ does not establish many iterations per entry. That iteration distribution is
 the next measurement needed before claiming this is a dominant tight loop.
 Another hot loop near `001D7E17` contains an indirect call; the frequently
 sampled `001F8AE1` fragment is a helper with RAM comparisons and returns.
-
-The address/count-only observations are in
-[native-core-hotspots.csv](native-core-hotspots.csv). Guest code bytes remain
-outside the repository.
+Guest code bytes remain outside the repository.
 
 ## Remaining optimization tasks
 

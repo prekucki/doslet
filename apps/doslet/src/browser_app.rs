@@ -32,6 +32,8 @@ extern "C" {
     fn release_input(this: &Browser);
     #[wasm_bindgen(method, js_name = inputCapture)]
     fn input_capture(this: &Browser, enabled: bool);
+    #[wasm_bindgen(method, js_name = mouseMode)]
+    fn mouse_mode(this: &Browser, mode: &str);
     #[wasm_bindgen(method, catch, js_name = chooseProfile)]
     fn choose_profile(this: &Browser) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(method, catch, js_name = downloadProfile)]
@@ -70,6 +72,8 @@ extern "C" {
     fn resume_audio(this: &Browser) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(method, js_name = toggleMute)]
     fn toggle_mute(this: &Browser);
+    #[wasm_bindgen(method, js_name = setVolume)]
+    fn set_volume(this: &Browser, volume: u8);
     #[wasm_bindgen(method, catch, js_name = listMidi)]
     fn list_midi(this: &Browser) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(method, catch, js_name = selectMidi)]
@@ -77,6 +81,7 @@ extern "C" {
         this: &Browser,
         selection: &str,
         dialect: &str,
+        game: &str,
     ) -> Result<js_sys::Promise, JsValue>;
 }
 pub struct Graphics {
@@ -123,6 +128,15 @@ pub struct Archive {
     pub programs: Vec<String>,
 }
 pub struct Doslet {
+    pub cpu_settings: crate::cpu_config::Settings,
+    pub cpu_tiers_available: bool,
+    pub(crate) disk_activity: crate::disk_activity::Activity,
+    pub video_mode_label: String,
+    pub audio_volume: u8,
+    pub audio_use: doslet_runtime::AudioUse,
+    pub memory_usage: doslet_runtime::session::MemoryUsage,
+    pub(crate) cpu_activity: Option<crate::cpu_meter::Activity>,
+    cpu_meter: crate::cpu_meter::Meter,
     pub session: Snapshot,
     pub workspace: crate::ui::Workspace,
     pub configurator: crate::configurator::ConfiguratorState,
@@ -138,6 +152,7 @@ pub struct Doslet {
     pub midi_mode: Mode,
     pub midi_output_mode: Mode,
     pub midi_activity: crate::midi_activity::MidiActivity,
+    pub midi_channels: [doslet_midi_routing::Channel; 16],
     midi_summary: String,
     bridge: Option<Browser>,
     audio_state: String,
@@ -152,10 +167,12 @@ pub struct Doslet {
     host_messages: u64,
     pcm_frames: u64,
     mouse_captured: bool,
+    mouse_relative: bool,
     storage_policy: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub enum Message {
+    Cpu(crate::cpu_config::Edit),
     DisplaySizing(SizingMessage),
     Ui(crate::ui::Action),
     Config(crate::configurator::Edit),
@@ -178,6 +195,7 @@ pub enum Message {
     AudioResumed(Result<(), String>),
     RefreshMidi,
     MidiPorts(Result<Vec<String>, String>),
+    AudioVolume(u8),
     MidiSelected(String),
     MidiModeSelected(Mode),
     MidiOutputModeSelected(Mode),
@@ -190,6 +208,15 @@ impl Doslet {
             Err(error) => (None, Some(format!("Worker startup failed: {error:?}"))),
         };
         Self {
+            cpu_settings: crate::cpu_config::Settings::default(),
+            cpu_tiers_available: false,
+            cpu_activity: None,
+            disk_activity: crate::disk_activity::Activity::new(0, 0),
+            video_mode_label: "—".into(),
+            audio_volume: 100,
+            audio_use: doslet_runtime::AudioUse::default(),
+            memory_usage: doslet_runtime::session::MemoryUsage::default(),
+            cpu_meter: crate::cpu_meter::Meter::default(),
             workspace: crate::ui::Workspace::default(),
             configurator: crate::configurator::ConfiguratorState::default(),
             session: Snapshot {
@@ -215,6 +242,7 @@ impl Doslet {
             midi_mode: Mode::Gm,
             midi_output_mode: Mode::Gm,
             midi_activity: crate::midi_activity::MidiActivity::default(),
+            midi_channels: [doslet_midi_routing::Channel::default(); 16],
             midi_summary: String::new(),
             bridge,
             audio_state: "inactive".into(),
@@ -229,6 +257,7 @@ impl Doslet {
             host_messages: 0,
             pcm_frames: 0,
             mouse_captured: false,
+            mouse_relative: false,
             storage_policy: None,
         }
     }
@@ -281,6 +310,9 @@ impl Doslet {
         match message {
             Message::Ui(action) => match action {
                 crate::ui::Action::Open(panel) => {
+                    if panel == crate::ui::Panel::Cpu {
+                        self.workspace.cpu = Some(self.cpu_settings);
+                    }
                     self.workspace.panel = Some(panel);
                     self.configurator.open = false;
                     if let Some(bridge) = &self.bridge {
@@ -293,11 +325,80 @@ impl Doslet {
                     self.configurator.open = false;
                 }
                 crate::ui::Action::DismissNotice => self.notice = None,
+                crate::ui::Action::AudioPage(page) => self.workspace.audio_page = page,
             },
+            Message::Cpu(edit) => {
+                use crate::cpu_config::{Core, Edit, Mode};
+                match edit {
+                    Edit::Revert => self.workspace.cpu = Some(self.cpu_settings),
+                    Edit::Apply => {
+                        if let Some(settings) = self.workspace.cpu
+                            && !self.configurator.pending
+                            && settings.valid()
+                            && (settings.mode != Mode::Tiers || self.cpu_tiers_available)
+                            && settings.core == Core::Interpreter
+                            && !settings.learning
+                        {
+                            let program = if settings.mode == Mode::Tiers {
+                                format!(
+                                    "tiers:{}:{}:{}",
+                                    settings.hot.unwrap_or(0),
+                                    settings.cold,
+                                    settings.grey
+                                )
+                            } else {
+                                format!(
+                                    "{}:{}",
+                                    if settings.mode == Mode::Adaptive {
+                                        "adaptive"
+                                    } else {
+                                        "fixed"
+                                    },
+                                    settings.mhz
+                                )
+                            };
+                            self.command("cpu-settings", &program);
+                        }
+                    }
+                    _ => self
+                        .workspace
+                        .cpu
+                        .get_or_insert(self.cpu_settings)
+                        .edit(edit),
+                }
+            }
             Message::Config(edit) => {
                 use crate::configurator::Edit;
-                self.workspace.panel = None;
+                let keep_panel = match self.workspace.panel {
+                    Some(crate::ui::Panel::Audio) => edit.audio_panel_edit(),
+                    Some(crate::ui::Panel::Drives) => edit.drives_panel_edit(),
+                    Some(crate::ui::Panel::Input) => edit.input_panel_edit(),
+                    Some(crate::ui::Panel::Memory) => matches!(edit, Edit::Memory(_)),
+                    _ => false,
+                };
+                if !keep_panel {
+                    self.workspace.panel = None;
+                }
+                if self.configurator.pending && !matches!(edit, Edit::Toggle) {
+                    return Task::none();
+                }
                 self.configurator.edit(&edit);
+                if let Edit::Keyboard(at) = edit {
+                    self.command("keyboard-mode", if at { "at" } else { "bios" });
+                    return Task::none();
+                }
+                if let Edit::HideCursor(hidden) = edit {
+                    self.configurator.active.input.hide_cursor = hidden;
+                    return Task::none();
+                }
+                if let Edit::MouseMode(mode) = edit {
+                    self.configurator.active.input.mouse_mode = mode;
+                    self.mouse_relative = mode == doslet_config::MouseMode::Capture;
+                    if let Some(bridge) = &self.bridge {
+                        bridge.mouse_mode(mode.as_str());
+                    }
+                    return Task::none();
+                }
                 if matches!(edit, Edit::Toggle)
                     && self.configurator.open
                     && let Some(bridge) = &self.bridge
@@ -359,6 +460,20 @@ impl Doslet {
                         }
                         _ => {}
                     }
+                }
+                if matches!(edit, Edit::ApplyAudio) && self.configurator.audio_only_changes() {
+                    let profile =
+                        crate::machine_profile::export_machine_profile(&self.configurator.draft);
+                    if let Some(bridge) = &self.bridge {
+                        match bridge.command("audio-hardware", &profile) {
+                            Ok(()) => self.configurator.pending = true,
+                            Err(error) => {
+                                self.configurator.message =
+                                    Some(format!("Audio hardware: {error:?}"))
+                            }
+                        }
+                    }
+                    return Task::none();
                 }
                 if matches!(edit, Edit::Apply) {
                     let audio = if self.configurator.draft.output.audio {
@@ -435,7 +550,7 @@ impl Doslet {
                 if pressed
                     && !self.mouse_captured
                     && self.session.status() == SessionStatus::Running
-                    && self.configurator.active.input.capture
+                    && self.mouse_relative
                 {
                     if let Some(bridge) = &self.bridge
                         && let Err(error) = bridge.capture_mouse()
@@ -482,6 +597,11 @@ impl Doslet {
             Message::MidiPorts(result) => match result {
                 Ok(ports) => {
                     self.midi_choices = vec!["Rust synth".into()];
+                    if self.configurator.active.output.rom_binding.as_deref() == Some("bundle")
+                        || self.midi_choice == "CM-32L / MT-32"
+                    {
+                        self.midi_choices.push("CM-32L / MT-32".into());
+                    }
                     self.midi_choices.extend(ports);
                     self.notice = None;
                 }
@@ -490,18 +610,35 @@ impl Doslet {
             Message::MidiModeSelected(mode) => {
                 self.midi_mode = mode;
                 self.command("midi-mode", mode.as_str());
+                self.configurator.remember_midi(
+                    self.midi_mode.as_str(),
+                    self.midi_output_mode.as_str(),
+                    &self.midi_choice,
+                );
+                if self.midi_choice == "CM-32L / MT-32" {
+                    return self.update(Message::MidiSelected(self.midi_choice.clone()));
+                }
             }
             Message::MidiOutputModeSelected(mode) => {
                 self.midi_output_mode = mode;
                 // Reopen through the bridge so raw MT-32 requests SysEx access.
                 self.command("output-mode", mode.as_str());
-                if self.midi_choice != "Rust synth" {
+                self.configurator.remember_midi(
+                    self.midi_mode.as_str(),
+                    self.midi_output_mode.as_str(),
+                    &self.midi_choice,
+                );
+                if !matches!(self.midi_choice.as_str(), "Rust synth" | "CM-32L / MT-32") {
                     return self.update(Message::MidiSelected(self.midi_choice.clone()));
                 }
             }
             Message::MidiSelected(selection) => {
                 if let Some(bridge) = &self.bridge {
-                    match bridge.select_midi(&selection, self.midi_output_mode.as_str()) {
+                    match bridge.select_midi(
+                        &selection,
+                        self.midi_output_mode.as_str(),
+                        self.midi_mode.as_str(),
+                    ) {
                         Ok(promise) => {
                             return Task::perform(
                                 async move {
@@ -521,10 +658,21 @@ impl Doslet {
             Message::MidiSwitched(selection, result) => match result {
                 Ok(()) => {
                     self.midi_choice = selection;
+                    self.configurator.remember_midi(
+                        self.midi_mode.as_str(),
+                        self.midi_output_mode.as_str(),
+                        &self.midi_choice,
+                    );
                     self.notice = None;
                 }
                 Err(error) => self.notice = Some(error),
             },
+            Message::AudioVolume(volume) => {
+                self.audio_volume = volume.min(100);
+                if let Some(bridge) = &self.bridge {
+                    bridge.set_volume(self.audio_volume);
+                }
+            }
             Message::DisplaySizing(message) => {
                 return self
                     .display_sizing
@@ -596,9 +744,7 @@ impl Doslet {
                 return self.update(Message::Config(crate::configurator::Edit::Apply));
             }
             Message::ToggleAudio => {
-                if self.midi_choice != "Rust synth"
-                    || (self.audio_ready && self.audio_state == "running")
-                {
+                if !self.uses_local_audio() || (self.audio_ready && self.audio_state == "running") {
                     if let Some(bridge) = &self.bridge {
                         bridge.toggle_mute();
                     }
@@ -658,12 +804,60 @@ impl Doslet {
             .collect();
         self.mouse_captured = field(&packet, "mouseCaptured").as_bool().unwrap_or(false);
         let state = field(&packet, "state");
+        self.mouse_relative = field(&state, "pointerRelative").as_bool().unwrap_or(false);
         self.guest_pcm = (
             number(&state, "guestPcmRate") as u32,
             number(&state, "guestPcmBits") as u8,
             number(&state, "guestPcmChannels") as u8,
         );
         if !state.is_null() && !state.is_undefined() {
+            let used = number(&state, "audioUse") as u8;
+            self.audio_use = doslet_runtime::AudioUse {
+                sb16: used & 1 != 0,
+                opl3: used & 2 != 0,
+                mpu401: used & 4 != 0,
+            };
+            let keyboard =
+                field(&state, "keyboardMode")
+                    .as_string()
+                    .and_then(|mode| match mode.as_str() {
+                        "at" => Some(doslet_config::KeyboardMode::At),
+                        "bios" => Some(doslet_config::KeyboardMode::Bios),
+                        _ => None,
+                    });
+            if let Some(mode) = keyboard
+                && self.configurator.active.hardware.keyboard != mode
+            {
+                self.configurator.active.hardware.keyboard = mode;
+                self.configurator.draft.hardware.keyboard = mode;
+            }
+            let mhz = number(&state, "cpuMhz") as u16;
+            if (1..=1000).contains(&mhz) && self.cpu_settings.mhz != mhz {
+                self.cpu_settings.mhz = mhz;
+                self.configurator.active.hardware.cpu_mhz = mhz;
+                self.configurator.draft.hardware.cpu_mhz = mhz;
+            }
+            if let Some(mode) = field(&state, "cpuMode").as_string() {
+                self.cpu_settings.mode = if mode == "adaptive" {
+                    crate::cpu_config::Mode::Adaptive
+                } else if mode == "tiers" {
+                    crate::cpu_config::Mode::Tiers
+                } else {
+                    crate::cpu_config::Mode::Fixed
+                };
+            }
+            let rates = field(&state, "tierRates");
+            self.cpu_tiers_available =
+                js_sys::Array::is_array(&rates) && js_sys::Array::from(&rates).length() == 3;
+            if self.cpu_tiers_available {
+                let rates = js_sys::Array::from(&rates);
+                self.cpu_settings.hot = match rates.get(0).as_f64().unwrap_or(0.0) as u16 {
+                    0 => None,
+                    value => Some(value),
+                };
+                self.cpu_settings.cold = rates.get(1).as_f64().unwrap_or(8.0) as u16;
+                self.cpu_settings.grey = rates.get(2).as_f64().unwrap_or(133.0) as u16;
+            }
             self.session.status = match number(&state, "status") as u32 {
                 0 => SessionStatus::Ready,
                 1 => SessionStatus::Running,
@@ -673,11 +867,31 @@ impl Doslet {
                 code => SessionStatus::Exited((code - 256) as u8),
             };
             self.session.steps = number(&state, "steps") as u64;
+            self.disk_activity.observe(
+                number(&state, "epoch") as u64,
+                number(&state, "diskReadBytes") as u64,
+                web_time::Instant::now(),
+            );
+            self.video_mode_label = field(&state, "videoMode")
+                .as_string()
+                .unwrap_or_else(|| "—".into());
             self.midi_activity.observe(
                 number(&state, "nanos") as u64,
                 number(&state, "midiBytes") as u64,
                 number(&state, "midiNotes") as u64,
             );
+            let channels = js_sys::Uint8Array::new(&field(&state, "midiChannels")).to_vec();
+            if channels.len() == 16 * doslet_midi_routing::Channel::BYTES {
+                for (out, bytes) in self
+                    .midi_channels
+                    .iter_mut()
+                    .zip(channels.chunks_exact(doslet_midi_routing::Channel::BYTES))
+                {
+                    if let Some(channel) = doslet_midi_routing::Channel::read(bytes) {
+                        *out = channel;
+                    }
+                }
+            }
             self.session.registers.cs = number(&state, "cs") as u16;
             self.session.registers.ip = number(&state, "ip") as u32;
             self.session
@@ -694,13 +908,72 @@ impl Doslet {
             self.session.pending_commit = field(&state, "pendingCommit").as_bool().unwrap_or(false);
             self.session.dirty = field(&state, "dirty").as_bool().unwrap_or(false);
             self.session.pointer_in_use = field(&state, "pointerInUse").as_bool().unwrap_or(false);
+            let memory = field(&state, "memory");
+            self.memory_usage = doslet_runtime::session::MemoryUsage {
+                installed_bytes: number(&memory, "installed_bytes") as u64,
+                protected_mode: field(&memory, "protected_mode").as_bool().unwrap_or(false),
+                dos_allocated: number(&memory, "dos_allocated") as u64,
+                dos_free: number(&memory, "dos_free") as u64,
+                dos_largest_free: number(&memory, "dos_largest_free") as u64,
+                dos_blocks: number(&memory, "dos_blocks") as u32,
+                dpmi_available: field(&memory, "dpmi_available").as_bool().unwrap_or(false),
+                dpmi_entered: field(&memory, "dpmi_entered").as_bool().unwrap_or(false),
+                dpmi_capacity: number(&memory, "dpmi_capacity") as u64,
+                dpmi_requested: number(&memory, "dpmi_requested") as u64,
+                dpmi_committed: number(&memory, "dpmi_committed") as u64,
+                dpmi_peak: number(&memory, "dpmi_peak") as u64,
+                dpmi_blocks: number(&memory, "dpmi_blocks") as u32,
+            };
+            let tier_counts = field(&state, "tierCounts");
+            let tier_counts = js_sys::Array::is_array(&tier_counts)
+                .then(|| js_sys::Array::from(&tier_counts))
+                .filter(|counts| counts.length() == 4);
+            let tiered = self.cpu_settings.mode == crate::cpu_config::Mode::Tiers
+                && self.cpu_tiers_available
+                && tier_counts.is_some();
+            let executed = tier_counts.map_or([0; 4], |counts| {
+                std::array::from_fn(|i| counts.get(i as u32).as_f64().unwrap_or(0.0) as u64)
+            });
+            self.cpu_activity = self.cpu_meter.sample(
+                self.session.status == SessionStatus::Running && !self.session.waiting_for_io,
+                crate::cpu_meter::Counters {
+                    epoch: number(&state, "epoch") as u64,
+                    guest: number(&state, "nanos") as u64,
+                    idle: number(&state, "idleNanos") as u64,
+                    executed,
+                    grey_mhz: tiered.then_some(self.cpu_settings.grey),
+                },
+            );
         }
         let event = field(&packet, "event");
         match field(&event, "kind").as_string().as_deref() {
+            Some("bundle-display") => {
+                if field(&event, "filter").as_string().as_deref() == Some("hq2x") {
+                    self.display_sizing.filter = crate::presentation::DisplayFilter::Hq2x;
+                }
+            }
             Some("storage-policy") => {
                 self.storage_policy = field(&event, "message").as_string();
             }
+            Some("audio-hardware-applied") => {
+                let audio = self.configurator.draft.hardware.audio();
+                self.configurator.active.hardware =
+                    self.configurator.active.hardware.with_audio(audio);
+                self.configurator.pending = false;
+                self.configurator.message =
+                    Some("Audio hardware updated without restarting.".into());
+            }
+            Some("audio-hardware-failed") => {
+                self.configurator.pending = false;
+                self.configurator.message = field(&event, "message").as_string();
+            }
             Some("machine-applied") => {
+                if let Some(profile) = field(&event, "profile").as_string()
+                    && let Ok(spec) = crate::machine_profile::parse_machine_profile(&profile)
+                {
+                    self.name = spec.name.clone();
+                    self.configurator.draft = spec;
+                }
                 self.configurator.open = false;
                 self.workspace.panel = None;
                 self.midi_mode = if self.configurator.draft.output.game_midi == "mt32" {
@@ -715,8 +988,17 @@ impl Doslet {
                 };
                 self.midi_choice = match self.configurator.draft.output.midi_output.as_str() {
                     "rust" => "Rust synth".into(),
+                    "moont" => "CM-32L / MT-32".into(),
                     v => v.into(),
                 };
+                if self.configurator.draft.output.rom_binding.as_deref() == Some("bundle")
+                    && !self
+                        .midi_choices
+                        .iter()
+                        .any(|choice| choice == "CM-32L / MT-32")
+                {
+                    self.midi_choices.push("CM-32L / MT-32".into());
+                }
                 if let Some(name) = field(&event, "name").as_string() {
                     self.name = name;
                 }
@@ -727,8 +1009,13 @@ impl Doslet {
                 self.configurator.message = Some("Machine applied and restarted.".into());
             }
             Some("machine-failed") => {
-                self.configurator.open = true;
-                self.workspace.panel = None;
+                if !matches!(
+                    self.workspace.panel,
+                    Some(crate::ui::Panel::Audio | crate::ui::Panel::Drives)
+                ) {
+                    self.configurator.open = true;
+                    self.workspace.panel = None;
+                }
                 self.configurator.pending = false;
                 self.configurator.message = Some(
                     field(&event, "message")
@@ -786,7 +1073,8 @@ impl Doslet {
         self.midi_summary = format!(
             "{} · {} SysEx · {} unmapped notes · {}{}",
             if self.midi_mode == Mode::Mt32
-                && (self.midi_choice == "Rust synth" || self.midi_output_mode == Mode::Gm)
+                && (self.midi_choice == "Rust synth"
+                    || (self.midi_choice != "CM-32L / MT-32" && self.midi_output_mode == Mode::Gm))
             {
                 "MT-32 → GM (approximation)"
             } else {
@@ -847,7 +1135,7 @@ impl Doslet {
         }
     }
     pub fn audio_label(&self) -> String {
-        if self.midi_choice != "Rust synth" {
+        if !self.uses_local_audio() {
             return format!(
                 "Host MIDI · {} · {} sent messages · SB {} frames · peak {:.2}",
                 self.midi_choice, self.host_messages, self.pcm_frames, self.peak
@@ -865,14 +1153,19 @@ impl Doslet {
         )
     }
     pub fn audio_button_label(&self) -> &'static str {
-        if self.midi_choice == "Rust synth" && (!self.audio_ready || self.audio_state != "running")
-        {
+        if self.uses_local_audio() && (!self.audio_ready || self.audio_state != "running") {
             "Enable audio"
         } else if self.muted {
             "Unmute"
         } else {
             "Mute"
         }
+    }
+    fn uses_local_audio(&self) -> bool {
+        matches!(
+            self.midi_choice.as_str(),
+            "Rust synth" | "moont" | "CM-32L / MT-32"
+        )
     }
     pub fn view(&self) -> Element<'_, Message> {
         crate::ui::view(self)
@@ -914,6 +1207,7 @@ impl Doslet {
     pub fn hide_host_cursor(&self) -> bool {
         self.has_mouse_capture()
             || self.configurator.active.input.hide_cursor
+                && !self.mouse_relative
                 && self.session.pointer_in_use
                 && self.session.status() == SessionStatus::Running
                 && !self.configurator.open

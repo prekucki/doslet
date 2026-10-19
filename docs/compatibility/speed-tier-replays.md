@@ -475,8 +475,10 @@ the latest capture duration in microseconds and `pending_snapshots` (0..4).
 
 Native CLI launches identify the game by SHA-256 of the executable contents.
 Once a game has been launched with `--speed-tier-profile`, subsequent launches
-of the same executable automatically restore its labels, HOT/COLD/GREY rates
-and learning setting. Renaming or moving the executable preserves its identity;
+of the same executable automatically restore its labels and HOT/COLD/GREY rates.
+Background learning starts disabled, even if the saved profile records learning
+as enabled. Opt in through the CPU panel or an explicit `--learn-speed-tiers`
+launch with `--speed-tier-profile`. Renaming or moving the executable preserves its identity;
 changing its contents selects a different profile. IRQ retains the GREY rate.
 Use `--no-speed-tiers` to skip automatic activation. Explicit adaptive/analysis
 strategies also suppress automatic activation.

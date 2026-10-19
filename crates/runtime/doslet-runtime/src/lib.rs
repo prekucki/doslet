@@ -12,3 +12,8 @@ pub use session::{IdleLoopStats, RuntimeError, Session, SessionStatus};
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use doslet_x86::DynamicCompilation;
+
+pub use doslet_pc::{AudioConfigError, AudioUse};
+
+#[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+pub use doslet_pc::wasm_procedures;

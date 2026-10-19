@@ -5,6 +5,7 @@ use core::fmt;
 use doslet_bus::{BusError, CpuBus, MemoryBus};
 mod cache;
 pub use cache::analysis;
+pub use cache::translation;
 #[cfg(all(
     feature = "dynamic-core",
     not(target_arch = "wasm32"),

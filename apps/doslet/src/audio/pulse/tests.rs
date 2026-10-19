@@ -1,6 +1,75 @@
 use super::*;
 use doslet_pulse::connect;
 
+fn assert_dormant(writer: &Writer) {
+    let queue = writer.queue.lock().unwrap();
+    assert!(queue.frames.is_empty());
+    assert!(queue.rates.is_empty());
+    assert_eq!(queue.len, 0);
+    drop(queue);
+    let control = writer.pulse.as_ref().unwrap();
+    assert!(matches!(
+        *control.launch.lock().unwrap(),
+        Launch::Pending { .. }
+    ));
+    assert!(control.thread.get().is_none());
+}
+
+#[test]
+fn unused_system_outputs_survive_controls_without_connecting_or_allocating_samples() {
+    let output = Output::new(super::super::Backend::Pulse, super::super::Mixer::System).unwrap();
+    let writer = output.writer();
+    writer.set_volume(35);
+    writer.set_active(false);
+    writer.clear().unwrap();
+    writer.set_active(true);
+    writer.push(&[]).unwrap();
+    writer.push_hardware(false, 11025, &[]).unwrap();
+    writer.push_hardware(true, 48000, &[]).unwrap();
+    writer.check().unwrap();
+    assert_eq!(writer.available(), CAPACITY);
+    assert_eq!(writer.refill_nanos(), 0);
+    assert_dormant(&writer);
+    assert_dormant(writer.secondary.as_ref().unwrap());
+    assert_dormant(writer.fm.as_ref().unwrap());
+}
+
+#[test]
+fn external_midi_only_worker_never_starts_any_local_system_output() {
+    use crate::native_audio::{Config, Source, Worker};
+    let output = Output::new(super::super::Backend::Pulse, super::super::Mixer::System).unwrap();
+    let writer = output.writer();
+    let mut worker = Worker::new(
+        Config {
+            source: Source::External,
+            rate: RATE,
+            nanos: 0,
+            replay: Vec::new(),
+        },
+        writer.clone(),
+    )
+    .unwrap();
+    for nanos in [10_000_000, 1_000_000_000, 2_000_000_000] {
+        assert!(worker.ready().unwrap());
+        worker.push_midi(&[0xc0, 20, 0x90, 60, 100]).unwrap();
+        worker.render_until(nanos).unwrap();
+        worker.submit().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.pending_nanos() != 0 {
+            worker.check().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "external MIDI batch did not complete"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(worker.stats(), Default::default());
+    assert_dormant(&writer);
+    assert_dormant(writer.secondary.as_ref().unwrap());
+    assert_dormant(writer.fm.as_ref().unwrap());
+}
+
 #[test]
 #[ignore = "requires PULSE_SINK=doslet-audio-probe-output, a dedicated null sink"]
 fn native_rate_changes_preserve_segment_duration_and_reset_interrupts_drain() {
@@ -37,7 +106,9 @@ fn native_rate_changes_preserve_segment_duration_and_reset_interrupts_drain() {
         },
     ))
     .unwrap();
-    let output = open_at_rate(c"Doslet native-rate test", 11025).unwrap();
+    let output = deferred_at_rate(c"Doslet native-rate test", 11025);
+    output.clear().unwrap();
+    assert_dormant(&output.writer());
     output.push_at_rate(11025, &vec![[0.2; 2]; 1103]).unwrap();
     output.push_at_rate(22050, &vec![[-0.3; 2]; 2205]).unwrap();
     output.push_at_rate(32000, &vec![[0.4; 2]; 3200]).unwrap();

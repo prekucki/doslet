@@ -34,6 +34,10 @@ pub struct IdleLoopStats {
     pub poll_failures: u64,
     pub skips: u64,
     pub skipped_steps: u64,
+    /// Guest time advanced by proven idle passes, independent of the analyzer.
+    pub skipped_nanos: u64,
+    /// The same idle time already included in execution-tier counters.
+    pub skipped_tier_nanos: [u64; 4],
     pub last_failure: &'static str,
 }
 
@@ -58,6 +62,7 @@ struct Proof {
     mark: IdleProofMark,
     device_accesses: u64,
     steps: u32,
+    limit: u32,
     failure: Option<&'static str>,
     tier_counts: [u64; 4],
 }
@@ -145,6 +150,56 @@ pub(super) fn repeatable_service(vector: u8, ax: u16, dl: u8, motion: (i16, i16)
 }
 
 impl Session {
+    /// Bounded interpreter execution starting at a statically suggested wait.
+    /// A suggestion only starts the ordinary CPU/RAM recurrence proof: every
+    /// omitted pass must still be proven, and skips stop before hardware events.
+    /// Other execution policies remain selected by the caller. When they are
+    /// active, this operation simply takes the ordinary runtime path.
+    pub(super) fn idle_candidate_advance(&mut self, budget: u32, proof_steps: u32) -> u32 {
+        let budget = budget.min(65_536);
+        if budget == 0 {
+            return 0;
+        }
+        if self.idle.enabled
+            || self.analyzer.enabled
+            || self.observer.enabled
+            || self.menu_idle_enabled()
+            || self.adaptive_idle_enabled()
+            || self.continuation.is_some()
+            || self.storage_wait
+        {
+            return self.advance(budget);
+        }
+        // Keep the normal strategy's proof/backoff state intact. This temporary
+        // interpreter slice owns its proof; none survives generated execution.
+        let previous = core::mem::take(&mut self.idle);
+        self.idle.next_attempt = u64::MAX;
+        self.idle_start_bounded(false, false, proof_steps.clamp(1, PROOF_STEPS));
+        let completed = self.advance(budget);
+        self.idle_abandon();
+        let stats = self.idle.stats;
+        self.idle = previous;
+        let total = &mut self.idle.stats;
+        total.proofs = total.proofs.saturating_add(stats.proofs);
+        total.failures = total.failures.saturating_add(stats.failures);
+        total.head_failures = total.head_failures.saturating_add(stats.head_failures);
+        total.poll_failures = total.poll_failures.saturating_add(stats.poll_failures);
+        total.skips = total.skips.saturating_add(stats.skips);
+        total.skipped_steps = total.skipped_steps.saturating_add(stats.skipped_steps);
+        total.skipped_nanos = total.skipped_nanos.saturating_add(stats.skipped_nanos);
+        for (total, extra) in total
+            .skipped_tier_nanos
+            .iter_mut()
+            .zip(stats.skipped_tier_nanos)
+        {
+            *total = total.saturating_add(extra);
+        }
+        if stats.failures != 0 {
+            total.last_failure = stats.last_failure;
+        }
+        completed
+    }
+
     pub fn set_idle_loops(&mut self, enabled: bool) {
         if !enabled {
             self.cancel_menu_idle();
@@ -232,13 +287,21 @@ impl Session {
                     && self.input_state() == proven.input
                 {
                     let before = self.machine.time().as_nanos();
+                    let tiers_before = self.machine.execution_tier_stats().1;
                     let skipped = self.machine.skip_idle_passes_counted(
                         proven.pass,
                         budget,
                         proven.tier_counts,
                     )?;
                     if skipped != 0 {
-                        self.analyzer_proven_idle(self.machine.time().as_nanos() - before);
+                        let elapsed = self.machine.time().as_nanos() - before;
+                        self.idle.stats.skipped_nanos += elapsed;
+                        let tiers_after = self.machine.execution_tier_stats().1;
+                        for i in 0..4 {
+                            self.idle.stats.skipped_tier_nanos[i] +=
+                                tiers_after[i].saturating_sub(tiers_before[i]);
+                        }
+                        self.analyzer_proven_idle(elapsed);
                         if skipped >= USEFUL_SKIP {
                             self.idle.backoff = BACKOFF_MIN;
                         }
@@ -311,7 +374,7 @@ impl Session {
                 self.idle.proof = Some(proof);
                 Some(reason)
             }
-        } else if proof.steps >= PROOF_STEPS {
+        } else if proof.steps >= proof.limit {
             Some("length")
         } else {
             None
@@ -323,6 +386,10 @@ impl Session {
     }
 
     fn idle_start(&mut self, at_head: bool, from_poll: bool) {
+        self.idle_start_bounded(at_head, from_poll, PROOF_STEPS);
+    }
+
+    fn idle_start_bounded(&mut self, at_head: bool, from_poll: bool, limit: u32) {
         if self.machine.interrupt_pending() || self.machine.cpu.is_halted() {
             return;
         }
@@ -334,6 +401,7 @@ impl Session {
             mark: self.machine.begin_idle_proof(),
             device_accesses: self.machine.device_accesses(),
             steps: 0,
+            limit,
             failure: None,
             tier_counts: self.machine.cpu.execution_counts(),
         });
@@ -359,3 +427,6 @@ impl Session {
         }
     }
 }
+
+#[cfg(test)]
+mod candidate_tests;

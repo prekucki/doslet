@@ -38,6 +38,7 @@ impl Stats {
     }
 }
 pub(crate) struct Controller {
+    profile_path: Option<std::path::PathBuf>,
     profile: Profile,
     learner: Option<learning::Learner>,
     persistence: Option<persistence::Persistence>,
@@ -48,13 +49,117 @@ pub(crate) struct Controller {
     max_nanos: u64,
 }
 impl Controller {
+    pub fn profile_info(&self) -> crate::cpu_config::ProfileInfo {
+        crate::cpu_config::ProfileInfo {
+            path: self
+                .profile_path
+                .as_deref()
+                .or_else(|| self.persistence.as_ref().map(|p| p.path()))
+                .map(|p| p.to_string_lossy().into_owned()),
+            labels: self.profile.nodes.len(),
+        }
+    }
+    pub fn suggested_path(name: &str) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let name: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .take(48)
+            .collect();
+        Ok(persistence::data_directory()?
+            .join("profiles")
+            .join(format!(
+                "{}-speed-tiers.json",
+                if name.is_empty() { "game" } else { &name }
+            )))
+    }
+    pub fn export_new(
+        &self,
+        path: &Path,
+        rates: [Option<u16>; 3],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        persistence::export_new(path, rates, &self.profile.nodes)
+    }
+    pub fn load_ui(
+        path: &Path,
+        fallback: [Option<u16>; 3],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let value = persistence::read_value(path)?.ok_or("Profile file does not exist")?;
+        let rates: [Option<u16>; 3] = match value.get("rates") {
+            Some(value) => serde_json::from_value(value.clone())?,
+            None => fallback,
+        };
+        let cold = rates[1].ok_or("Cold speed is required")?;
+        let grey = rates[2].ok_or("Grey speed is required")?;
+        Self::from_profile(
+            path,
+            Profile::from_json(&value, None, false)?,
+            cold,
+            rates[0],
+            grey,
+        )
+    }
+    /// MAX execution can leave device time to settle after a profile switch.
+    pub fn inherit_pending(&mut self, old: &mut Self, session: &Session) {
+        if old.epoch == session.epoch() {
+            self.epoch = old.epoch;
+            self.pending_nanos = core::mem::take(&mut old.pending_nanos);
+        }
+    }
+    pub fn untrained() -> Self {
+        Self {
+            profile_path: None,
+            profile: Profile::from_json(
+                &serde_json::json!({"unknown":"grey", "irq_policy":"static-grey", "nodes":[]}),
+                None,
+                false,
+            )
+            .expect("empty grey profile"),
+            learner: None,
+            persistence: None,
+            stats: Stats {
+                hot_mhz: Some(500),
+                cold_mhz: 8,
+                grey_mhz: 133,
+                ..Stats::default()
+            },
+            settings: None,
+            epoch: 0,
+            pending_nanos: 0,
+            max_nanos: 0,
+        }
+    }
+    /// Change rates while disabled; the next enable installs them together.
+    pub fn configure(&mut self, hot: Option<u16>, grey: u16, cold: u16, learn: bool) {
+        debug_assert!(!self.stats.enabled);
+        self.stats.hot_mhz = hot;
+        self.stats.grey_mhz = grey;
+        self.stats.cold_mhz = cold;
+        if let Some(p) = &mut self.persistence {
+            p.set_rates([hot, Some(cold), Some(grey)]);
+        }
+        self.set_learning(learn);
+    }
     pub fn load(
         path: &Path,
         cold_mhz: u16,
         hot_mhz: Option<u16>,
         grey_mhz: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut profile = Profile::load_labels(path)?;
+        Self::from_profile(
+            path,
+            Profile::load_labels(path)?,
+            cold_mhz,
+            hot_mhz,
+            grey_mhz,
+        )
+    }
+    fn from_profile(
+        path: &Path,
+        mut profile: Profile,
+        cold_mhz: u16,
+        hot_mhz: Option<u16>,
+        grey_mhz: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         if profile.unknown != Tier::Grey
             || !profile.irq_grey
             || [Some(cold_mhz), hot_mhz, Some(grey_mhz)]
@@ -81,6 +186,7 @@ impl Controller {
         }
         let restored_labels = persistence.loaded;
         Ok(Self {
+            profile_path: Some(path.into()),
             profile,
             learner: None,
             persistence: Some(persistence),
@@ -117,18 +223,36 @@ impl Controller {
         self.persistence = Some(persistence);
         Ok(())
     }
+    pub fn bind_game_bytes(
+        &mut self,
+        bytes: &[u8],
+        directory: Option<&Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut persistence = persistence::Persistence::game_bytes(
+            bytes,
+            directory,
+            &mut self.profile,
+            [
+                self.stats.hot_mhz,
+                Some(self.stats.cold_mhz),
+                Some(self.stats.grey_mhz),
+            ],
+        )?;
+        persistence.changed();
+        self.stats.restored_labels = persistence.loaded;
+        self.persistence = Some(persistence);
+        Ok(())
+    }
     pub fn cached_game(
         exe: &Path,
         directory: Option<&Path>,
     ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
-        let Some((path, rates, learning)) = persistence::cached_game(exe, directory)? else {
+        let Some((path, rates, _learning)) = persistence::cached_game(exe, directory)? else {
             return Ok(None);
         };
         let mut controller = Self::load(&path, rates[1].unwrap(), rates[0], rates[2].unwrap())?;
         controller.bind_game(exe, directory)?;
-        if learning {
-            controller.learn_in_background();
-        }
+        // Restoring labels is passive. Background replays always require opt-in.
         eprintln!(
             "[INFO doslet] automatic speed-tier profile: {}",
             path.display()
@@ -191,10 +315,23 @@ impl Controller {
         self.maintain_learning(session);
     }
     pub fn learn_in_background(&mut self) {
-        self.learner = Some(learning::Learner::default());
-        self.stats.learning = true;
-        if let Some(p) = &mut self.persistence {
-            p.learning = true;
+        self.set_learning(true);
+    }
+    pub fn set_learning(&mut self, enabled: bool) {
+        if enabled && self.learner.is_none() {
+            self.learner = Some(learning::Learner::default());
+        } else if !enabled {
+            if let Some(mut learner) = self.learner.take() {
+                learner.cancel();
+            }
+            self.stats.learning_running = false;
+            self.stats.learning_pending = 0;
+        }
+        self.stats.learning = enabled;
+        if let Some(p) = &mut self.persistence
+            && p.learning != enabled
+        {
+            p.learning = enabled;
             p.changed();
         }
     }
@@ -350,6 +487,67 @@ mod tests {
     use doslet_x86::Gpr32;
     use std::collections::{BTreeMap, BTreeSet};
     #[test]
+    fn exported_profiles_roundtrip_rates_labels_and_manual_guards() {
+        let fixture = crate::profile::tests::Fixture::new("");
+        let path = fixture.root.join("snapshot.json");
+        let mut c = grey_controller();
+        for (i, tier) in [Tier::Fast, Tier::Slow, Tier::Grey, Tier::Irq]
+            .into_iter()
+            .enumerate()
+        {
+            c.profile.nodes.insert(
+                (0x10000 + i as u32, false),
+                crate::speed_tiers::Node {
+                    tier,
+                    code: [0x90; 15],
+                    manual: i == 0,
+                    locked: i == 2,
+                },
+            );
+        }
+        c.export_new(&path, [Some(500), Some(8), Some(100)])
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(c.export_new(&path, [None, Some(8), Some(133)]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let loaded = Controller::load_ui(&path, [None, Some(16), Some(33)]).unwrap();
+        assert_eq!(
+            (
+                loaded.stats.hot_mhz,
+                loaded.stats.cold_mhz,
+                loaded.stats.grey_mhz
+            ),
+            (Some(500), 8, 100)
+        );
+        assert!(!loaded.stats.learning);
+        for (key, expected) in &c.profile.nodes {
+            let node = &loaded.profile.nodes[key];
+            assert!(node.tier == expected.tier);
+            assert_eq!(
+                (node.code, node.manual, node.locked),
+                (expected.code, expected.manual, expected.locked)
+            );
+        }
+    }
+    #[test]
+    fn replacing_a_profile_retains_max_device_time_debt_without_advancing_the_guest() {
+        let mut session = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
+        let mut old = grey_controller();
+        old.enable(&mut session);
+        old.pending_nanos = 10_000;
+        let nanos = session.emulated_nanos();
+        old.disable(&mut session);
+        let mut new = grey_controller();
+        new.inherit_pending(&mut old, &session);
+        new.enable(&mut session);
+        assert!(!old.has_pending_time());
+        assert!(new.has_pending_time());
+        assert_eq!(session.emulated_nanos(), nanos);
+        new.settle(&mut session).unwrap();
+        assert!(!new.has_pending_time());
+        assert_eq!(session.emulated_nanos(), nanos + 10_000);
+    }
+    #[test]
     fn manual_tags_are_guarded_live_and_preserve_guest_state_and_counters() {
         use crate::speed_tiers::Node;
         let mut s = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
@@ -407,6 +605,7 @@ mod tests {
     }
     fn grey_controller() -> Controller {
         Controller {
+            profile_path: None,
             learner: None,
             persistence: None,
             profile: Profile {
@@ -481,6 +680,15 @@ mod tests {
         assert_eq!(nanos, [8000, 500000, 40000, 40000]);
         assert_eq!(s.emulated_nanos() - before, 588000);
         assert!(s.idle_loop_stats().skipped_steps > 0);
+        let idle = s.idle_loop_stats();
+        assert_eq!(
+            idle.skipped_tier_nanos.iter().sum::<u64>(),
+            idle.skipped_nanos
+        );
+        assert!(idle.skipped_nanos <= s.emulated_nanos() - before);
+        for (skipped, total) in idle.skipped_tier_nanos.into_iter().zip(nanos) {
+            assert!(skipped <= total);
+        }
     }
 
     #[test]

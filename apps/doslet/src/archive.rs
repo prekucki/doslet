@@ -58,6 +58,28 @@ impl GameArchive {
         programs.sort();
         Ok(Self { bytes, programs })
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn program_bytes(&self, program: &str) -> Result<Vec<u8>, String> {
+        let mut zip =
+            zip::ZipArchive::new(Cursor::new(self.bytes.as_slice())).map_err(|e| e.to_string())?;
+        for i in 0..zip.len() {
+            let mut file = zip.by_index(i).map_err(|e| e.to_string())?;
+            if file.is_dir() || checked_name(file.name())? != program {
+                continue;
+            }
+            let mut data = Vec::new();
+            file.by_ref()
+                .take(MAX_ZIP_BYTES as u64 + 1)
+                .read_to_end(&mut data)
+                .map_err(|e| e.to_string())?;
+            if data.len() as u64 != file.size() || data.len() > MAX_ZIP_BYTES {
+                return Err(format!("Invalid expanded size: {program}"));
+            }
+            return Ok(data);
+        }
+        Err("Choose a program from the ZIP".into())
+    }
+    #[allow(dead_code)] // Convenience API used by browser and archive tests.
     pub fn load(&self, program: &str) -> Result<Session, String> {
         self.load_configured(program, &doslet_config::MachineSpec::default())
     }

@@ -26,6 +26,9 @@ pub(super) struct Persistence {
     pub error: Option<String>,
 }
 impl Persistence {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
     pub fn open(
         path: &Path,
         profile: &mut Profile,
@@ -43,6 +46,16 @@ impl Persistence {
         rates: [Option<u16>; 3],
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (path, identity) = game_location(exe, root)?;
+        Ok(Self::at(path, identity, profile, rates))
+    }
+    pub fn game_bytes(
+        bytes: &[u8],
+        root: Option<&Path>,
+        profile: &mut Profile,
+        rates: [Option<u16>; 3],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let (path, identity) = game_location_hash(&hash, root)?;
         Ok(Self::at(path, identity, profile, rates))
     }
     fn at(path: PathBuf, identity: String, profile: &mut Profile, rates: [Option<u16>; 3]) -> Self {
@@ -94,6 +107,12 @@ impl Persistence {
     }
     pub fn changed(&mut self) {
         self.dirty = true;
+    }
+    pub fn set_rates(&mut self, rates: [Option<u16>; 3]) {
+        if self.rates != rates {
+            self.rates = rates;
+            self.changed();
+        }
     }
     pub fn pending(&self) -> bool {
         self.dirty || self.writer.is_some()
@@ -171,7 +190,9 @@ pub(super) fn cached_game(
         .ok_or("missing learning setting")?;
     Ok(Some((path, rates, learning)))
 }
-fn read_value(path: &Path) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+pub(super) fn read_value(
+    path: &Path,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -213,6 +234,12 @@ fn game_location(
     root: Option<&Path>,
 ) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
     let hash = fingerprint(exe)?;
+    game_location_hash(&hash, root)
+}
+fn game_location_hash(
+    hash: &str,
+    root: Option<&Path>,
+) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
     let root = match root {
         Some(path) => path.to_owned(),
         None => data_directory()?,
@@ -222,7 +249,7 @@ fn game_location(
         format!("exe-sha256:{hash}"),
     ))
 }
-fn data_directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(super) fn data_directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "windows"))]
     let home = || {
         std::env::var_os("HOME")
@@ -251,12 +278,37 @@ fn write(
     learning: bool,
     nodes: &Nodes,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let rows: Vec<_> = nodes.iter().map(|(&(pc, wide), n)| serde_json::json!({
-        "pc":pc, "bits":if wide {32} else {16}, "bytes":n.code, "tier":n.tier.name(),
-        "reason":if n.manual {"manual"} else if n.tier == Tier::Irq {"interrupt-frame"} else if n.locked {"code-conflict"} else {"learned"}
-    })).collect();
+    let rows = node_rows(nodes);
     let bytes = serde_json::to_vec(&serde_json::json!({"learning_version":1,
         "identity":identity, "rates":rates, "learning":learning, "unknown":"grey", "irq_policy":"static-grey", "nodes":rows}))?;
+    write_bytes(path, &bytes)
+}
+fn node_rows(nodes: &Nodes) -> Vec<serde_json::Value> {
+    nodes.iter().map(|(&(pc, wide), n)| serde_json::json!({
+        "pc":pc, "bits":if wide {32} else {16}, "bytes":n.code, "tier":n.tier.name(),
+        "reason":if n.manual {"manual"} else if n.tier == Tier::Irq {"interrupt-frame"} else if n.locked {"code-conflict"} else {"learned"}
+    })).collect()
+}
+/// Export a standalone profile. Existing files are never replaced by Save as.
+pub(super) fn export_new(
+    path: &Path,
+    rates: [Option<u16>; 3],
+    nodes: &Nodes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({"version":1,
+        "rates":rates, "learning":false, "unknown":"grey", "irq_policy":"static-grey", "nodes":node_rows(nodes)}))?;
+    if bytes.len() as u64 > LIMIT {
+        return Err("profile exceeds 64 MiB".into());
+    }
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error.into());
+    }
+    Ok(())
+}
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     if bytes.len() as u64 > LIMIT {
         return Err("learned profile exceeds 64 MiB".into());
     }
@@ -276,7 +328,7 @@ fn write(
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;

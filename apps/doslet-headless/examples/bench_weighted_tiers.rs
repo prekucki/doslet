@@ -1,5 +1,8 @@
 //! Same portable state, ordinary/weighted clocks, no instruction profiler or audio device.
 #[allow(dead_code)]
+#[path = "../../doslet/src/cpu_config.rs"]
+mod cpu_config;
+#[allow(dead_code)]
 #[path = "../../doslet/src/native_speed_tiers.rs"]
 mod native_speed_tiers;
 #[allow(dead_code)]

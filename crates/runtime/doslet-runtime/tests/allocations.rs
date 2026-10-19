@@ -360,7 +360,12 @@ fn decoded_instruction_cache_misses_hits_and_ram_writes_allocate_nothing() {
     assert_eq!(measured.count_total, 0);
     assert_eq!(measured.bytes_total, 0);
     #[cfg(feature = "profiling")]
-    assert!(cached.decode_cache_stats().hits > 90_000);
+    {
+        let stats = cached.decode_cache_stats();
+        // Prepared blocks bypass single-instruction cache lookups. Both paths
+        // must retain allocation-free execution with the cache enabled.
+        assert!(stats.hits + stats.batched_steps > 90_000);
+    }
 }
 #[test]
 fn confirmed_vga_waits_allocate_nothing_and_keep_logical_time_and_budget() {

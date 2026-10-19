@@ -39,6 +39,8 @@ impl State for PcMachine {
             memory_wait_sites: None,
             memory_wait_steps: 0,
             batch_yield_ip: None,
+            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            wasm_procedures: None,
         };
         if !value
             .timing

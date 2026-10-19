@@ -19,14 +19,82 @@ pub(super) struct Control {
     thread: OnceLock<thread::Thread>,
     applied: Mutex<Result<u64, String>>,
     changed: Condvar,
+    launch: Mutex<Launch>,
+}
+enum Launch {
+    Pending {
+        queue: Arc<Mutex<Queue>>,
+        name: &'static std::ffi::CStr,
+    },
+    Running(JoinHandle<()>),
+    Failed(String),
+    Stopped,
 }
 impl Control {
+    pub fn ensure_started(self: &Arc<Self>) -> Result<(), String> {
+        let mut launch = self.launch.lock().unwrap_or_else(|e| e.into_inner());
+        let (queue, name) = match &*launch {
+            Launch::Pending { queue, name } => (queue.clone(), *name),
+            Launch::Running(_) => return Ok(()),
+            Launch::Failed(error) => return Err(error.clone()),
+            Launch::Stopped => return Err("Audio output was closed".into()),
+        };
+        let control = self.clone();
+        let (ready, initialized) = mpsc::sync_channel(1);
+        let spawned = thread::Builder::new().name("doslet-pulse".into()).spawn(move || {
+            let _ = control.thread.set(thread::current());
+            let generation = queue.lock().unwrap_or_else(|e| e.into_inner()).generation;
+            let setup = connect_named(name).and_then(|client| {
+                let stream = create(&client, queue.clone(), generation, name)?;
+                Ok((client, stream))
+            });
+            match setup {
+                Ok((client, stream)) => {
+                    let rate = stream.sample_spec().sample_rate;
+                    control.acknowledge(Ok(generation));
+                    eprintln!("[INFO doslet] Audio output: {name:?}, {rate} Hz stereo f32 (Rust PulseAudio)");
+                    let _ = ready.send(Ok(()));
+                    if let Err(error) = recoverable_run(client, stream, &queue, &control, name, generation) {
+                        queue.lock().unwrap_or_else(|e| e.into_inner()).error = Some(error.clone());
+                        control.acknowledge(Err(error));
+                    }
+                }
+                Err(error) => { let _ = ready.send(Err(error)); }
+            }
+        });
+        let result = match spawned {
+            Ok(thread) => {
+                *launch = Launch::Running(thread);
+                initialized
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| format!("PulseAudio setup: {e}"))
+                    .and_then(|result| result)
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = &result {
+            self.stop.store(true, Ordering::Release);
+            self.wake();
+            let previous = std::mem::replace(&mut *launch, Launch::Failed(error.clone()));
+            if let Launch::Running(thread) = previous {
+                let _ = thread.join();
+            }
+            self.acknowledge(Err(error.clone()));
+        }
+        result
+    }
     pub fn wake(&self) {
         if let Some(thread) = self.thread.get() {
             thread.unpark();
         }
     }
     pub fn wait_for(&self, generation: u64) -> Result<(), String> {
+        match &*self.launch.lock().unwrap_or_else(|e| e.into_inner()) {
+            Launch::Pending { .. } => return Ok(()),
+            Launch::Failed(error) => return Err(error.clone()),
+            Launch::Stopped => return Err("Audio output was closed".into()),
+            Launch::Running(_) => {}
+        }
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut applied = self.applied.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -54,13 +122,20 @@ impl Control {
 
 pub(super) struct Driver {
     control: Arc<Control>,
-    thread: Option<JoinHandle<()>>,
 }
 impl Drop for Driver {
     fn drop(&mut self) {
         self.control.stop.store(true, Ordering::Release);
         self.control.wake();
-        if let Some(thread) = self.thread.take() {
+        let previous = std::mem::replace(
+            &mut *self
+                .control
+                .launch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            Launch::Stopped,
+        );
+        if let Launch::Running(thread) = previous {
             let _ = thread.join();
         }
     }
@@ -106,9 +181,21 @@ pub(super) fn open_named(name: &'static std::ffi::CStr) -> Result<Output, String
     open_at_rate(name, RATE)
 }
 pub(super) fn open_at_rate(name: &'static std::ffi::CStr, rate: u32) -> Result<Output, String> {
+    let output = deferred_at_rate(name, rate);
+    output
+        .writer
+        .pulse
+        .as_ref()
+        .expect("Pulse control")
+        .ensure_started()?;
+    Ok(output)
+}
+
+/// No connection, stream, driver thread or sample buffers until first publish.
+pub(super) fn deferred_at_rate(name: &'static std::ffi::CStr, rate: u32) -> Output {
     let queue = Arc::new(Mutex::new(Queue {
-        frames: vec![[0.0; 2]; CAPACITY].into_boxed_slice(),
-        rates: vec![rate; CAPACITY].into_boxed_slice(),
+        frames: Box::default(),
+        rates: Box::default(),
         sample_rate: rate,
         head: 0,
         len: 0,
@@ -118,6 +205,7 @@ pub(super) fn open_at_rate(name: &'static std::ffi::CStr, rate: u32) -> Result<O
         callback_frames: 480,
         refilling: true,
         peak: 0.0,
+        gain: 1.0,
         spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
         error: None,
         generation: 0,
@@ -128,41 +216,15 @@ pub(super) fn open_at_rate(name: &'static std::ffi::CStr, rate: u32) -> Result<O
         thread: OnceLock::new(),
         applied: Mutex::new(Ok(0)),
         changed: Condvar::new(),
+        launch: Mutex::new(Launch::Pending {
+            queue: queue.clone(),
+            name,
+        }),
     });
-    let q = queue.clone();
-    let c = control.clone();
-    let (ready, initialized) = mpsc::sync_channel(1);
-    let thread = thread::Builder::new()
-        .name("doslet-pulse".into())
-        .spawn(move || {
-            let _ = c.thread.set(thread::current());
-            let setup = connect_named(name).and_then(|client| {
-                let stream = create(&client, q.clone(), 0, name)?;
-                Ok((client, stream))
-            });
-            match setup {
-                Ok((client, stream)) => {
-                    let _ = ready.send(Ok(()));
-                    if let Err(error) = recoverable_run(client, stream, &q, &c, name) {
-                        q.lock().unwrap_or_else(|e| e.into_inner()).error = Some(error.clone());
-                        c.acknowledge(Err(error));
-                    }
-                }
-                Err(error) => {
-                    let _ = ready.send(Err(error));
-                }
-            }
-        })
-        .map_err(|e| e.to_string())?;
     let driver = Driver {
         control: control.clone(),
-        thread: Some(thread),
     };
-    initialized
-        .recv_timeout(Duration::from_secs(5))
-        .map_err(|e| format!("PulseAudio setup: {e}"))??;
-    eprintln!("[INFO doslet] Audio output: {name:?}, {rate} Hz stereo f32 (Rust PulseAudio)");
-    Ok(Output {
+    Output {
         _stream: Stream::Pulse { _driver: driver },
         writer: Writer {
             queue,
@@ -171,7 +233,7 @@ pub(super) fn open_at_rate(name: &'static std::ffi::CStr, rate: u32) -> Result<O
             rate,
             pulse: Some(control),
         },
-    })
+    }
 }
 
 fn create(
@@ -339,8 +401,9 @@ fn recoverable_run(
     queue: &Arc<Mutex<Queue>>,
     control: &Control,
     name: &'static std::ffi::CStr,
+    generation: u64,
 ) -> Result<(), String> {
-    let mut connection = (client, stream, 0);
+    let mut connection = (client, stream, generation);
     // A finite budget for this output's lifetime, including repeated short-lived
     // reconnections. Explicitly reopening audio creates a new budget.
     let mut retries = 0;

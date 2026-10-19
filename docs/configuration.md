@@ -5,16 +5,22 @@ manifests. See [memory patches](memory-patches.md) for configuration and lifecyc
 
 Open **Info → Settings…** in the desktop or browser workspace. Edit the draft,
 select **Validate**, then **Apply & restart** to construct a new session.
-Changing hardware restarts the guest. Closing the editor retains the draft;
+Most hardware changes restart the guest. Unused sound hardware can be applied live
+from the Audio panel, as described below. Closing the editor retains the draft;
 **Revert** restores the active settings. **Restart** uses the active
 configuration. Failed source preparation preserves the old session and its
 reset settings.
 
 The display fills the workspace. The toolbar has play/pause and restart icons;
 hover over an icon to see its action. **Info** opens diagnostics and provides
-access to **Audio…** and **Settings…**. **Pixel perfect / Fit** selects the display
-scale, and the adjacent selector switches **Nearest / Sharp Bilinear / HQ2x**
-filtering. Settings use
+access to **Audio…** and **Settings…**. The monitor icon opens **Display**, with
+**Pixel perfect / Fit** scaling and **Nearest / Sharp Bilinear / HQ2x** filtering.
+The CPU indicator shows the target speed and recent activity; hover for its
+breakdown or click for diagnostics. The video indicator reports register-derived
+guest geometry and depth, such as `320×240×8 VGA`, using the current scanout
+rather than the original BIOS mode or a generic Mode X name.
+Clicking the audio spectrum opens **Audio**.
+Settings use
 horizontal tabs with a fixed action bar. **Close** or Escape returns to the
 display; a successful Apply also closes settings. On narrow windows, additional
 tabs scroll horizontally. The restart icon remains available in the toolbar.
@@ -34,9 +40,47 @@ Browser preparation runs through the emulation Worker and host adapters.
 | Resources | Resolved I/O ownership and sound resources; invalid assignments identify their configuration field |
 | Output | Host audio, MIDI renderer/port and game/host MIDI dialects, independently of installed guest sound hardware |
 
+The DOS environment supplied to named MZ/extended executable launches includes
+`BLASTER` when SB16 is enabled, for example `A220 I7 D1 H5 T6 P330`.
+IRQ and DMA values follow the machine configuration; `P330` is included only
+when MPU-401 is enabled. Disabling host audio output does not hide guest hardware.
+
 `output.midi_output` accepts `rust`, `apple` (native macOS system GM synth),
 `moont` (requires CM-32L ROMs) or a MIDI port name/index. Apple output uses the
 system sound bank and mixes with Sound Blaster PCM; it always receives GM.
+
+The **Audio → Hardware** page reports whether the guest has accessed SB16/OPL3
+and MPU-401. Changes that affect `BLASTER` require **Apply & restart**: enabling
+or disabling SB16, changing its IRQ/DMA resources while enabled, or toggling
+MPU-401 while SB16 is enabled. A guest may already have read `BLASTER` before
+its first audio port access. Other audio changes can use **Apply** when the
+affected device has never been accessed, preserving execution, RAM, guest time
+and saves. After first access, including a probe, use **Apply & restart**.
+SB16 and OPL3 share their enable switch.
+This history survives saved states. Older states lack that history and require
+a restart for hardware changes.
+
+Native host output opens on the first PCM configuration, OPL programming or MIDI
+data. Before then, selecting a MIDI renderer or mixer retains the choice without
+opening playback devices. MIDI synthesizers and the ROM-backed MT-32 emulator wait for MIDI
+data; PCM/FM playback does not construct a MIDI synth. Automatic ROM discovery
+still reads and validates candidate ROM files at startup. Restoring active MIDI
+state initializes its renderer during replay. Emulated port controllers and
+fixed queues remain prepared so first guest I/O and synthesis do not allocate
+inside the machine execution batch. With system mixing, each source opens its
+own host stream and allocates its playback buffers only when that source first
+publishes samples. Unused sources do not generate placeholder silence. External
+MIDI does not open a local MIDI stream; an external-MIDI-only game opens none of
+the three system playback streams. Pause/reset and mixer telemetry do not
+activate dormant streams. Stream setup errors are reported on first use.
+
+Changing MIDI outputs cancels the previous receiver's queued messages and
+silences its voices. The new receiver starts with a GM/MT-32 reset before the
+current game's parameter and note replay. Restart clears guest MIDI state,
+automatic dialect detection and the internal synth; pause/resume keeps that state.
+Native external receivers are initialized even while paused. Browser receivers
+without SysEx permission can reset channel controllers, programs and pitch bend,
+but cannot reset device-wide SysEx parameters such as GM master volume.
 
 Only the current CPU, timing and video implementations are selectable. The
 interpreter and x87 implement documented subsets, rather than complete historical
@@ -55,16 +99,34 @@ retains scan-code/ASCII injection. Text entered in application controls stays
 out of the guest. Pause, focus/capture loss and disconnect release guest input;
 held controls require a physical release before they can act again.
 
-Native mouse capture follows guest reads: relative motion counters keep relative
-input active for one emulated second after the latest read, blocking hover movement
-until capture. Without recent relative reads, absolute input works without locking
-and an existing lock is released. `input.capture = false` disables capture; leave
-it enabled for relative-input games. `input.hide_cursor = true` hides the host
-cursor over a running game using absolute input. The cursor remains visible in
-application panels, while paused, and while relative input is waiting for capture.
-Ctrl+Esc releases an active native capture; plain Esc reaches the game.
-`hide_cursor` defaults to false. Browser input retains explicit capture selection:
-`capture = false` selects absolute movement.
+The **Mouse & keyboard** icon on the bottom bar opens the input panel. Mouse
+capture, cursor visibility and BIOS/AT keyboard delivery change immediately,
+without restarting or advancing the program. Keyboard delivery changes release
+held keys and clear held BIOS modifiers while retaining lock flags, controller configuration,
+PIC masks and guest state. These choices remain active after Reset. Input
+settings are unavailable during machine preparation or an attached GDB session.
+
+Choose **Auto**, **Capture**, or **No capture** in **Mouse & keyboard** or under
+**Settings → Input → Mouse capture**. This host input setting takes effect
+immediately, without restarting the guest. Changing it releases the current
+capture and any held mouse buttons.
+
+- **Auto** (default) follows guest reads of relative motion counters: capture is
+  requested on a display click while relative input is active. After one guest
+  second without relative reads, the lock is released and absolute motion resumes.
+- **Capture** requests a lock on a display click and keeps relative motion active
+  regardless of the guest's recent reads.
+- **No capture** always uses absolute motion and never requests a lock.
+
+Set `input.mouse_mode` to `"auto"`, `"capture"`, or `"no-capture"` in a version-2
+profile. Legacy `input.capture = true/false` imports as Auto/No capture; do not
+combine the legacy field with `mouse_mode`. Export writes `mouse_mode`.
+**Ctrl+Esc** releases native capture; plain Escape reaches the guest. Pause,
+focus loss, settings panels and session replacement release capture too. Browser
+capture requires a display click to enter DOM Pointer Lock; Escape releases it.
+`input.hide_cursor = true` hides the host cursor only over a running game using
+absolute input. It defaults to false. The cursor remains visible in application
+panels, while paused, and while relative input is waiting for capture.
 
 Native controllers use gilrs; browser controllers use the Gamepad API. The Input
 page lists available controller identities. A stable ID is optional; leave it
@@ -163,7 +225,7 @@ dma16 = 5
 [input]
 keyboard = "bios"
 gameport = false
-capture = true
+mouse_mode = "auto"
 hide_cursor = false
 pad_index = 0
 deadzone_percent = 12

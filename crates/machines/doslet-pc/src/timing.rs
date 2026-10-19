@@ -36,6 +36,11 @@ impl StepClock {
             u64::from(steps) * self.whole + fraction / self.mhz
         }
     }
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    fn nanos_for_steps(&self, steps: u32) -> u64 {
+        let fraction = self.fraction + u64::from(steps) * self.remainder;
+        u64::from(steps) * self.whole + fraction / self.mhz
+    }
     fn steps_until_nanos(&self, nanos: u64) -> u64 {
         (u128::from(nanos) * u128::from(self.mhz))
             .saturating_sub(u128::from(self.fraction))
@@ -81,6 +86,18 @@ impl Timing {
     }
 }
 impl PcMachine {
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub(crate) fn procedure_fits_before_irq(&self, steps: u32) -> bool {
+        if !self.cpu.accepts_maskable_interrupt() || self.timing.external_cpu {
+            return true;
+        }
+        self.timing.tiers.is_none()
+            && self
+                .diagnostic_service_horizon()
+                .0
+                .is_none_or(|nanos| self.timing.cpu.nanos_for_steps(steps) <= nanos)
+    }
+
     /// Install native scheduling labels and rates; None is zero-cost/MAX.
     /// Device clocks are charged once from completed CPU counters per batch.
     pub fn set_execution_tiers(
@@ -316,12 +333,45 @@ impl Timing {
     }
 }
 impl PcMachine {
+    pub(crate) fn advance_opl_bus_time(&mut self, accesses: u64) -> Result<(), MachineError> {
+        if accesses != 0 && !self.timing.external_cpu {
+            // Functional ISA approximation: eight bus clocks at 8 MHz per
+            // transaction, independent of CPU throughput and execution tiers.
+            // I/O ends native slices; observed execution uses this same path.
+            self.debug_advance_device_time(accesses * 1_000)?;
+        }
+        Ok(())
+    }
+
     #[inline]
     pub(crate) fn advance_hardware_steps(&mut self, steps: u32) -> Result<(), MachineError> {
         if self.timing.external_cpu {
             return Ok(());
         }
-        let nanos = if let Some(tiers) = &mut self.timing.tiers {
+        let nanos = self.charge_cpu_steps(steps);
+        self.advance_hardware_nanos(nanos)
+    }
+
+    /// A finite computation may finish before delivering its next IRQ. Device
+    /// events still run at their own deadlines, including every DMA/FM sample.
+    /// This policy is used only by explicitly admitted atomic procedures.
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub(crate) fn advance_procedure_hardware_steps(
+        &mut self,
+        steps: u32,
+    ) -> Result<(), MachineError> {
+        if self.timing.external_cpu {
+            return Ok(());
+        }
+        let mut remaining = self.charge_cpu_steps(steps);
+        while remaining != 0 {
+            remaining -= self.debug_advance_device_time(remaining)?;
+        }
+        Ok(())
+    }
+
+    fn charge_cpu_steps(&mut self, steps: u32) -> u64 {
+        if let Some(tiers) = &mut self.timing.tiers {
             let counts = self.cpu.execution_counts();
             let mut delta = core::array::from_fn::<_, 4, _>(|i| counts[i] - tiers.previous[i]);
             // IRQ entry, HLT and explicit hardware-only skips are GREY unless
@@ -344,8 +394,7 @@ impl PcMachine {
             total / tiers.denominator
         } else {
             self.timing.cpu.advance(steps)
-        };
-        self.advance_hardware_nanos(nanos)
+        }
     }
 
     fn advance_hardware_nanos(&mut self, nanos: u64) -> Result<(), MachineError> {
@@ -439,7 +488,9 @@ impl PcMachine {
                     self.bus.pcm.push(frame);
                 }
             }
-            if event.raised_irq {
+            if event.raised_irq
+                && self.bus.mixer.enabled_irq_sources() & (if format.word { 2 } else { 1 }) != 0
+            {
                 let irq = self
                     .bus
                     .mixer
@@ -460,7 +511,11 @@ impl PcMachine {
         let bus = &mut self.bus;
         let mut full = false;
         bus.opl.advance(nanos as u32, bus.guest_nanos, |time, fm| {
-            let fm = bus.mixer.fm_samples(fm);
+            // Match DOSBox Staging's OPL analog-output calibration (1.5x).
+            // Apply it after guest attenuation so quieter voices retain headroom.
+            let fm = bus.mixer.fm_samples(fm).map(|sample| {
+                (i32::from(sample) * 3 / 2).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+            });
             if let Some(sources) = &mut bus.audio_sources
                 && !sources[1].push(doslet_pcm::SourceFrame {
                     nanos: time,
@@ -823,6 +878,42 @@ pub(crate) mod tests {
             }
         }
     }
+
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[test]
+    fn atomic_procedure_time_services_every_dma_sample_and_timer_event() {
+        let mut reference = idle_machine(true);
+        let mut fast = idle_machine(true);
+        reference.set_cpu_mhz(8).unwrap();
+        fast.set_cpu_mhz(8).unwrap();
+        // Advance hardware without entering the guest IRQ handler. The atomic
+        // computation does the same after returning to its single CPU owner.
+        for _ in 0..4096 {
+            reference.advance_hardware_steps(1).unwrap();
+        }
+        fast.advance_procedure_hardware_steps(4096).unwrap();
+        assert_eq!(fast.time(), reference.time());
+        assert_eq!(fast.timing.cpu.fraction, reference.timing.cpu.fraction);
+        assert_eq!(fast.timing.pit_fraction, reference.timing.pit_fraction);
+        assert_eq!(fast.timing.pcm_fraction, reference.timing.pcm_fraction);
+        assert_eq!(fast.bus.dsp.diagnostics(), reference.bus.dsp.diagnostics());
+        assert_eq!(
+            fast.bus.pic.read_command(),
+            reference.bus.pic.read_command()
+        );
+        assert_eq!(
+            fast.bus.vga.read_port(0x3da),
+            reference.bus.vga.read_port(0x3da)
+        );
+        let mut a = [doslet_pcm::EMPTY; 64];
+        let mut b = [doslet_pcm::EMPTY; 64];
+        assert!(fast.audio_status().pcm_frames > 0);
+        assert_eq!(
+            fast.drain_pcm_timed(&mut a),
+            reference.drain_pcm_timed(&mut b)
+        );
+        assert_eq!(a, b);
+    }
     #[test]
     fn idle_is_bounded_and_does_not_skip_pending_irqs_or_disabled_interrupts() {
         let mut machine = idle_machine(false);
@@ -834,6 +925,22 @@ pub(crate) mod tests {
         machine.cpu.flags = 2;
         assert_eq!(machine.advance_idle(10000).unwrap(), 0);
     }
+    #[test]
+    fn mixer_irq_mask_blocks_dma_delivery_without_dropping_pending_completion() {
+        for mask in [0x0b, 0, 1] {
+            let mut machine = idle_machine(true);
+            machine.bus.write_port_u8(0x224, 0x83).unwrap();
+            machine.bus.write_port_u8(0x225, mask).unwrap();
+            machine.advance_hardware_steps(8250).unwrap();
+            assert_eq!(machine.bus.dsp.irq_status(), 2);
+            assert_eq!(machine.bus.pic.read_command() & 0x80 != 0, mask & 2 != 0);
+            machine.bus.write_port_u8(0x225, 0x0b).unwrap();
+            assert_ne!(machine.bus.pic.read_command() & 0x80, 0);
+            machine.bus.read_port_u8(0x22f).unwrap();
+            assert_eq!(machine.bus.dsp.irq_status(), 0);
+        }
+    }
+
     #[test]
     fn clocked_stereo_dma_generates_samples_blocks_and_terminal_count() {
         let mut machine = PcMachine::default();

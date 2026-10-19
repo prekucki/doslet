@@ -6,8 +6,8 @@ export class Browser {
         this.ready = false; this.queue = []; this.events = [];
         this.state = null; this.frame = null;
         this.context = null; this.node = null; this.gain = null;
-        this.initializing = null; this.muted = false;
-        this.backend = 'Rust synth'; this.connectedBackend = null;
+        this.initializing = null; this.muted = false; this.volume = 1;
+        this.backend = 'Rust synth'; this.connectedBackend = null; this.workletDialect = 'gm';
         this.midiAccess = null; this.midiLabels = new Map(); this.hostMidi = null;
         this.stats = {frames: 0, notes: 0, peak: 0, underruns: 0};
         this.mouseCanvas = null; this.mouseWanted = false; this.mousePending = false;
@@ -15,6 +15,16 @@ export class Browser {
         this.padInFlight = false; this.inputEnabled = true; this.pendingCalls = new Map(); this.nextCall = 1;
         this.heldKeys = new Set(); this.suppressedKeys = new Set();
         this.preparedOutputs = new Map();
+        this.mt32Roms = null; this.requestedMt32 = false;
+        this.nodeSynth = 'Rust synth'; this.nodeGm = false;
+        this.nextSynthRequest = 1; this.synthRequests = new Map();
+        window.addEventListener('doslet-launch-bundle', () => {
+            this.launchBundle().catch(error => {
+                this.events.push({kind:'error',error:`Bundled game: ${error}`});
+                window.dispatchEvent(new CustomEvent('doslet-bundle-status',{detail:{error:String(error)}}));
+            });
+        });
+        if (document.querySelector('#doslet-bundle-launch')) window.dosletBundleBridge = this;
         window.addEventListener('gamepadconnected', event => {
             this.padGeneration.set(event.gamepad.index, (this.padGeneration.get(event.gamepad.index) || 0) + 1);
         });
@@ -93,7 +103,7 @@ export class Browser {
                 console.info('Doslet machine ready in Web Worker');
             } else if (data.kind === 'state') {
                 this.state = data;
-                if (data.status !== 1 && this.mouseWanted) this.releaseMouse();
+                if ((data.status !== 1 || !data.pointerRelative) && this.mouseWanted) this.releaseMouse();
             }
             else if (data.kind === 'frame') {
                 if (this.frame) this.returnFrame(this.frame);
@@ -109,11 +119,13 @@ export class Browser {
         }
     }
     command(kind, program) {
-        if (['pause','reset','import','start'].includes(kind)) { this.releaseMouse(); this.releaseInput(); }
+        if (['pause','reset','import','start','keyboard-mode'].includes(kind)) { this.releaseMouse(); this.releaseInput(); }
         this.send({kind, program});
     }
     applyMachine(profile, program, discardChanges = false) {
-        this.releaseInput(); this.releaseMouse(); this.send({kind:'apply-machine', profile, program, discardChanges});
+        const bundle = this.bundleSession?.program === program ? this.bundleSession : {};
+        this.releaseInput(); this.releaseMouse(); this.send({kind:'apply-machine', profile, program, discardChanges,
+            bundleRuntime:bundle.bundleRuntime, tierProfile:bundle.tierProfile, startupKeys:bundle.startupKeys});
     }
     physicalKey(usage, pressed, enabled=true) {
         if (!pressed) { this.heldKeys.delete(usage); this.suppressedKeys.delete(usage); }
@@ -129,7 +141,11 @@ export class Browser {
         });
         this.send({kind:'release-input'});
     }
-    inputCapture(enabled) { if (this.inputEnabled && !enabled) this.releaseInput(); this.inputEnabled = enabled; }
+    inputCapture(enabled) {
+        if (this.inputEnabled && !enabled) { this.releaseInput(); this.releaseMouse(); }
+        this.inputEnabled = enabled;
+    }
+    mouseMode(mode) { this.releaseMouse(); this.send({kind:'mouse-mode',program:mode}); }
     sampleGamepads() {
         const pads = [...(navigator.getGamepads?.() || [])].filter(Boolean).slice(0, 16);
         if (!this.padInFlight) {
@@ -173,6 +189,76 @@ export class Browser {
     }
     downloadProfile(text) { this.download(text, 'doslet-machine.toml', 'application/toml'); }
     async chooseIso() { const blob = await this.pickFile('.iso,application/x-iso9660-image'); if (blob) await this.call('import-iso', {blob}); }
+    async loadMt32Roms() {
+        if (this.mt32Roms) return;
+        const names = this.bundleRomNames || ['CM32L_CONTROL.ROM','CM32L_PCM.ROM'];
+        const bytes = await Promise.all(names.map(async name => {
+            const response = await fetch(new URL(`bundle/${name}`, document.baseURI));
+            if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
+            return new Uint8Array(await response.arrayBuffer());
+        }));
+        this.mt32Roms = {control:bytes[0],pcm:bytes[1]};
+    }
+    async launchBundle() {
+        if (this.bundleLaunching) return;
+        if (!window.isSecureContext)
+            throw new Error('Ta strona wymaga HTTPS albo http://localhost / http://127.0.0.1. Zwykły HTTP pod adresem IP w sieci LAN nie udostępnia zapisu i syntezy audio.');
+        if (!globalThis.crypto?.subtle || !navigator.locks)
+            throw new Error('Przeglądarka nie udostępnia Web Crypto lub Web Locks potrzebnych do zapisów gry.');
+        this.bundleLaunching = true;
+        // The click that launches the package grants Web Audio permission.
+        if (!this.context) {
+            this.context = new AudioContext({sampleRate:48000});
+            this.gain = this.context.createGain();this.gain.connect(this.context.destination);
+            this.context.onstatechange = () => this.syncAudioState();
+        }
+        const resumed = this.context.resume();
+        const fetchAsset = async (name, kind) => {
+            const response = await fetch(new URL(`bundle/${name}`,document.baseURI));
+            if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
+            return kind === 'text' ? response.text() : response.arrayBuffer();
+        };
+        try {
+            const manifestResponse = await fetch(new URL('bundle/launch.json',document.baseURI));
+            if (!manifestResponse.ok && manifestResponse.status !== 404)
+                throw new Error(`Bundle manifest: HTTP ${manifestResponse.status}`);
+            const bundle = manifestResponse.ok ? await manifestResponse.json() : {
+                profile:'ROTT.toml',zip:'ROTT.zip',executable:'ROTT.EXE',
+                tierProfile:'ROTT-speed-tiers.json',saves:'saves.dsv',bundleRuntime:true,
+            };
+            if (!bundle.profile || !bundle.zip || !bundle.executable || !bundle.tierProfile)
+                throw new Error('Incomplete bundled game manifest');
+            const selections = bundle.startupPatch?.selections || [];
+            if (!Array.isArray(selections) || selections.length > 16 ||
+                selections.some(value => !/^[1-9]$/.test(value)))
+                throw new Error('Invalid startup selection patch');
+            if (bundle.roms) {
+                if (!Array.isArray(bundle.roms) || bundle.roms.length !== 2 ||
+                    bundle.roms.some(name => !/^(CM32L|MT32)_(CONTROL|PCM)\.ROM$/.test(name)))
+                    throw new Error('Invalid bundled ROM names');
+                this.bundleRomNames = bundle.roms;
+                this.mt32Roms = null;
+            }
+            const [profile,zip,saves,tierProfile] = await Promise.all([
+                fetchAsset(bundle.profile,'text'),fetchAsset(bundle.zip),
+                bundle.saves ? fetchAsset(bundle.saves) : null,
+                fetchAsset(bundle.tierProfile,'text'),resumed,
+            ]);
+            if (bundle.startupPatch?.executableSha256 &&
+                JSON.parse(tierProfile).identity !== `exe-sha256:${bundle.startupPatch.executableSha256}`)
+                throw new Error('Startup patch and native CPU profile target different executables');
+            const imported = await this.call('bundle-import',{buffer:zip},[zip]);
+            const program = imported.programs.find(value => value === bundle.executable || value.endsWith('/'+bundle.executable));
+            if (!program) throw new Error(`${bundle.executable} is missing from the bundled ZIP`);
+            const fields = {profile,program,tierProfile,bundleRuntime:!!bundle.bundleRuntime,
+                startupKeys:selections.join('')};
+            if (saves) fields.seedBuffer = saves;
+            await this.call('apply-machine',fields,saves ? [saves] : []);
+            this.bundleSession = {program,tierProfile,bundleRuntime:!!bundle.bundleRuntime,startupKeys:selections.join('')};
+            if (bundle.displayFilter) this.events.push({kind:'bundle-display',filter:bundle.displayFilter});
+            window.dispatchEvent(new CustomEvent('doslet-bundle-status',{detail:{ready:true}}));
+        } finally { this.bundleLaunching = false; }
+    }
     importIso(bytes) { this.send({kind:'import-iso',blob:new Blob([bytes])}); }
     call(kind, fields = {}, transfer = []) {
         if (this.pendingCalls.size >= 8) return Promise.reject(new Error('Too many pending storage commands'));
@@ -192,7 +278,13 @@ export class Browser {
         if(!output.audio) return {disabled:true};
         const selection=output.midi_output;
         if(selection==='apple') throw new Error('Apple MIDI output is available only on native macOS; choose rust or an exposed MIDI port in the browser');
-        if(selection==='moont') throw new Error('CM-32L ROM synthesis is available on desktop; choose rust or an exposed MIDI port in the browser');
+        if(selection==='moont') {
+            await this.loadMt32Roms();
+            this.requestedMt32 = true;
+            this.mt32Gm = output.game_midi === 'gm';
+            await this.startRustAudio();
+            return {selection:'CM-32L / MT-32',output};
+        }
         if(selection==='rust') {await this.startRustAudio();return {selection:'Rust synth',output};}
         const id=this.midiLabels.get(selection);
         if(!id) throw new Error('Find MIDI outputs and choose an available port before applying the profile');
@@ -205,15 +297,22 @@ export class Browser {
     }
     commitOutput(prepared) {
         if(prepared.disabled) {
-            this.muted=true;if(this.gain)this.gain.gain.value=0;if(this.hostMidi)this.hostMidi.mute(true);
+            this.muted=true;if(this.gain)this.gain.gain.value=0;if(this.hostMidi){this.hostMidi.close();this.hostMidi=null;}
             this.send({kind:'audio-running',running:false});return;
         }
+        if(prepared.selection==='Rust synth' || prepared.selection==='CM-32L / MT-32') {
+            this.send({kind:'audio-running',running:false});
+            this.selectLocalSynth(prepared.selection, prepared.output.game_midi).catch(error => {
+                this.events.push({kind:'audio-error',error:`Audio output switch failed: ${error}`});
+                this.send({kind:'audio-running',running:false});
+            });
+            return;
+        }
         if(this.hostMidi) {this.hostMidi.close();this.hostMidi=null;}
-        this.muted=false;this.gain.gain.value=1;this.backend=prepared.selection;
-        if(prepared.selection==='Rust synth') {this.attachWorklet();this.syncAudioState();return;}
+        this.muted=false;this.gain.gain.value=this.volume;this.backend=prepared.selection;
         const pcm=new MessageChannel(),midi=new MessageChannel();
         this.node.port.postMessage({kind:'connect',port:pcm.port1},[pcm.port1]);
-        this.hostMidi=new prepared.HostMidi(prepared.device,midi.port1,error=>this.events.push({kind:'audio-error',error}),prepared.output.host_midi==='mt32');
+        this.hostMidi=new prepared.HostMidi(prepared.device,midi.port1,error=>this.events.push({kind:'audio-error',error}),!!this.midiAccess?.sysexEnabled,prepared.output.host_midi);
         this.connectedBackend='midi';
         this.send({kind:'connect',mode:'midi',dialect:prepared.output.host_midi,port:midi.port2,audioPort:pcm.port2},[midi.port2,pcm.port2]);
         this.syncAudioState();
@@ -245,12 +344,13 @@ export class Browser {
     importZip(bytes) {
         // A setup transfer of compressed input. The worker then owns the source
         // and decompressed drive; no game data is retained in window state.
+        this.bundleSession = null;
         const buffer = bytes.slice().buffer;
         this.send({kind: 'import', buffer}, [buffer]);
     }
     poll() {
         const data = {state: this.state, gamepads:this.sampleGamepads(), mouseCaptured: this.mouseCaptured(), event: this.events.shift() || null,
-            audio: {state: this.backend === 'Rust synth' ? this.context?.state || 'inactive' : 'MIDI port', ready: !!this.node,
+            audio: {state: ['Rust synth','CM-32L / MT-32'].includes(this.backend) ? this.context?.state || 'inactive' : 'MIDI port', ready: !!this.node,
                 muted: this.muted, ...this.stats}};
         if (this.hostMidi) data.audio = {...this.stats, state: 'MIDI port', ready: true, muted: this.muted,
             messages: this.hostMidi.messages, notes: this.hostMidi.notes, late: this.hostMidi.late};
@@ -267,13 +367,17 @@ export class Browser {
         if (this.frame) { this.returnFrame(this.frame); this.frame = null; }
     }
     returnFrame(frame) { this.worker.postMessage({kind: 'video-return', buffer: frame.buffer}, [frame.buffer]); }
+    setVolume(percent) {
+        this.volume = Math.max(0, Math.min(100, percent)) / 100;
+        if (this.gain) this.gain.gain.value = this.muted ? 0 : this.volume;
+    }
     toggleMute() {
         this.muted = !this.muted;
         if (this.hostMidi) {
             this.hostMidi.mute(this.muted);
             if (!this.muted) this.send({kind: 'resync-audio'});
         }
-        if (this.gain) this.gain.gain.value = this.muted ? 0 : 1;
+        if (this.gain) this.gain.gain.value = this.muted ? 0 : this.volume;
     }
     resumeAudio() {
         if (this.hostMidi) { this.syncAudioState(); return Promise.resolve(); }
@@ -300,15 +404,16 @@ export class Browser {
     syncAudioState() {
         this.send({kind: 'audio-running', running: this.hostMidi ? true : !!this.node && this.context.state === 'running'});
     }
-    attachWorklet() {
-        if (this.connectedBackend === 'worklet') return;
+    attachWorklet(dialect = this.workletDialect) {
+        if (this.connectedBackend === 'worklet' && this.workletDialect === dialect) return;
         const channel = new MessageChannel();
         this.node.port.postMessage({kind: 'connect', port: channel.port1}, [channel.port1]);
-        this.send({kind: 'connect', mode: 'worklet', port: channel.port2}, [channel.port2]);
+        this.send({kind: 'connect', mode: 'worklet', dialect, port: channel.port2}, [channel.port2]);
+        this.workletDialect = dialect;
         this.connectedBackend = 'worklet';
     }
     async listMidi() {
-        if (!navigator.requestMIDIAccess) throw new Error('Web MIDI is unavailable in this browser');
+        if (!navigator.requestMIDIAccess) return [];
         // Permission is requested only by the explicit Find MIDI outputs button.
         this.midiAccess = await navigator.requestMIDIAccess({sysex: false});
         this.midiAccess.onstatechange = () => {
@@ -322,20 +427,35 @@ export class Browser {
         for (const output of this.midiAccess.outputs.values()) {
             if (output.state === 'connected') this.midiLabels.set(`${index++}: ${output.name || output.id}`, output.id);
         }
-        if (!this.midiLabels.size) throw new Error('No MIDI output ports. A system synthesizer must expose a MIDI port.');
         return [...this.midiLabels.keys()];
     }
-    selectMidi(selection, dialect = 'gm') {
-        if (selection === 'Rust synth') {
-            // Resume remains synchronous with this user gesture, before await.
-            return this.startRustAudio().then(() => {
-                if (this.hostMidi) { this.hostMidi.close(); this.hostMidi = null; }
-                this.backend = selection; this.muted = false;
-                this.gain.gain.value = 1;
-                this.attachWorklet(); this.syncAudioState();
-            });
-        }
+    selectMidi(selection, dialect = 'gm', game = 'gm') {
+        if (selection === 'Rust synth' || selection === 'CM-32L / MT-32')
+            return this.selectLocalSynth(selection, game);
         return this.selectHostMidi(selection, dialect);
+    }
+    async selectLocalSynth(selection, game) {
+        // Resume synchronously with the click; ROM fetch may finish later.
+        const ready = this.startRustAudio();
+        const roms = selection === 'CM-32L / MT-32' ? this.loadMt32Roms() : Promise.resolve();
+        await Promise.all([ready, roms]);
+        const gm = game === 'gm';
+        if (this.nodeSynth !== selection || (selection === 'CM-32L / MT-32' && this.nodeGm !== gm)) {
+            const id = this.nextSynthRequest++;
+            await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => { this.synthRequests.delete(id); reject(new Error('Audio synth switch timed out')); }, 15000);
+                this.synthRequests.set(id, {resolve, reject, timer});
+                this.node.port.postMessage({kind:'select-synth', id, selection,
+                    ...(selection === 'CM-32L / MT-32' ? {...this.mt32Roms, gm} : {})});
+            });
+            this.nodeSynth = selection; this.nodeGm = gm;
+        }
+        if (this.hostMidi) { this.hostMidi.close(); this.hostMidi = null; }
+        this.backend = selection; this.muted = false;
+        this.gain.gain.value = this.volume;
+        this.connectedBackend = null;
+        this.attachWorklet(selection === 'Rust synth' ? 'gm' : game);
+        this.syncAudioState();
     }
     async selectHostMidi(selection, dialect = 'gm') {
         let audioReady;
@@ -359,13 +479,13 @@ export class Browser {
         if (this.hostMidi) this.hostMidi.close();
         let pcmChannel = null;
         if (pcmReady) {
-            this.gain.gain.value = 1; // The worklet keeps playing Sound Blaster PCM.
+            this.gain.gain.value = this.volume; // The worklet keeps playing Sound Blaster PCM.
             pcmChannel = new MessageChannel();
             this.node.port.postMessage({kind: 'connect', port: pcmChannel.port1}, [pcmChannel.port1]);
         } else if (this.node) this.node.port.postMessage({kind: 'disconnect'});
         const channel = new MessageChannel();
         this.hostMidi = new HostMidi(output, channel.port1,
-            error => this.events.push({kind: 'audio-error', error}), dialect === 'mt32');
+            error => this.events.push({kind: 'audio-error', error}), !!this.midiAccess?.sysexEnabled, dialect);
         this.backend = selection; this.muted = false; this.connectedBackend = 'midi';
         this.send({kind: 'connect', mode: 'midi', dialect, port: channel.port2, audioPort: pcmChannel?.port2}, pcmChannel ? [channel.port2, pcmChannel.port2] : [channel.port2]);
         this.syncAudioState();
@@ -377,7 +497,7 @@ export class Browser {
         await this.context.audioWorklet.addModule(new URL('worklet.js', this.assets));
         const node = new AudioWorkletNode(this.context, 'doslet-midi', {
             numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
-            processorOptions: {module},
+            processorOptions: {module, ...(this.requestedMt32 ? {...this.mt32Roms,gm:this.mt32Gm} : {})},
         });
         try {
             await new Promise((resolve, reject) => {
@@ -392,11 +512,21 @@ export class Browser {
                 node.port.onmessage = ({data}) => {
                     if (data.kind === 'ready') { clearTimeout(timeout); resolve(); }
                     if (data.kind === 'progress') this.stats = data;
+                    if (data.kind === 'synth-selected' || data.kind === 'synth-failed') {
+                        const request = this.synthRequests.get(data.id);
+                        if (request) {
+                            clearTimeout(request.timer); this.synthRequests.delete(data.id);
+                            if (data.kind === 'synth-selected') request.resolve();
+                            else request.reject(new Error(data.error));
+                        }
+                    }
                     if (data.kind === 'error') { this.events.push({kind: 'audio-error', error: data.error}); clearTimeout(timeout); reject(new Error(data.error)); }
                 };
             });
             node.connect(this.gain);
             this.node = node;
+            this.nodeSynth = this.requestedMt32 ? 'CM-32L / MT-32' : 'Rust synth';
+            this.nodeGm = !!this.mt32Gm;
             console.info('Doslet MIDI ready in AudioWorklet (Rust/WASM)');
         } catch (error) {
             node.disconnect(); node.port.close(); throw error;

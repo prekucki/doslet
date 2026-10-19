@@ -114,6 +114,17 @@ completes. A miss is independent of host queue starvation. Zero checks and a
 `null` miss count mean no complete observation; zero misses with nonzero checks
 do not establish timely guest buffer refills or smooth OPL/MIDI playback.
 
+`guest_fm_started` reports OPL synthesis-register access, including initialization.
+`guest_fm_key_on_writes` counts writes with the key-on bit set to B0h–B8h in
+either OPL bank. It survives save/restore and distinguishes initialization from
+melodic note commands; it does not count BDh percussion triggers or prove audible
+output. Mixed PCM counters and host stream activity alone cannot establish that
+FM music is playing.
+`guest_fm_peak` is the maximum absolute raw OPL sample before the card mixer
+and output calibration, on the 0–32768 scale. `guest_fm_levels` contains the
+raw left/right master and FM fader registers, in that order. These values help
+separate synthesis activity, guest attenuation and host-output problems.
+
 ## Headless: stop at an exact step
 
 Build and stop Heroes after a repeatable startup:

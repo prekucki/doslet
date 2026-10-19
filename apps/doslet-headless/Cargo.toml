@@ -9,6 +9,11 @@ default = ["dynamic-core", "save-state"]
 save-state = ["doslet-runtime/save-state"]
 dynamic-core = ["doslet-runtime/dynamic-core"]
 profiling = ["doslet-runtime/profiling"]
+wasm-procedures = ["doslet-runtime/wasm-procedures", "dep:zip"]
+wasm-procedure-diagnostics = ["wasm-procedures", "doslet-runtime/wasm-procedure-diagnostics"]
+wasm-core-test = ["dep:doslet-x86-wasm", "dep:zip"]
+wasm-aot-test = ["wasm-core-test", "dep:doslet-wasm-aot", "dep:doslet-wasm-game-probe"]
+wasm-static-test = ["wasm-aot-test", "dep:doslet-aot", "dep:doslet-static-game-probe"]
 [dependencies]
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 doslet-config.workspace = true
@@ -25,6 +30,28 @@ flate2 = "1"
 png = "0.18"
 serde_json = "1"
 sha2 = "0.10.9"
+doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm", features = ["native-test"], optional = true }
+zip = { version = "2.4.2", default-features = false, features = ["deflate"], optional = true }
+doslet-wasm-aot = { path = "../../crates/cpu/doslet-wasm-aot", optional = true }
+doslet-wasm-game-probe = { path = "../doslet-wasm-game-probe", optional = true }
+doslet-aot = { path = "../../crates/system/doslet-aot", features = ["wasm"], optional = true }
+doslet-static-game-probe = { path = "../doslet-static-game-probe", optional = true }
+
+[[example]]
+name = "inspect_static_layout"
+required-features = ["wasm-static-test", "save-state"]
+
+[[example]]
+name = "compare_static_game"
+required-features = ["wasm-static-test", "save-state"]
+
+[[example]]
+name = "compare_wasm_game"
+required-features = ["wasm-core-test", "save-state"]
+
+[[example]]
+name = "compare_wasmtime_game"
+required-features = ["wasm-aot-test", "save-state"]
 
 [[example]]
 name = "heroes_states"
@@ -45,3 +72,27 @@ required-features = ["save-state"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "check_static_memory"
+required-features = ["wasm-static-test", "save-state"]
+
+[[example]]
+name = "inspect_static_coverage"
+required-features = ["wasm-static-test", "save-state"]
+
+[[example]]
+name = "prepare_memory_procedures"
+required-features = ["wasm-static-test", "save-state"]
+
+[[example]]
+name = "check_native_procedures"
+required-features = ["wasm-procedures", "save-state"]
+
+[[example]]
+name = "capture_procedure_layout"
+required-features = ["wasm-static-test", "save-state"]
+
+[[example]]
+name = "rott_column_contract_probe"
+required-features = ["wasm-static-test", "save-state"]

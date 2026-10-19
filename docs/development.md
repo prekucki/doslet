@@ -3,6 +3,9 @@
 Validation commands, implementation status, headless diagnostics and
 execution-engine details. For everyday use, see [using Doslet](usage.md).
 
+For the optional profile-guided x86-to-WebAssembly compiler, native differential
+runner and browser CPU acceptance, see [the experimental WASM core](compatibility/wasm-core.md).
+
 For native desktop/headless remote debugging, RAM patches and mixed 16/32-bit guest
 inspection, see [debugging with GDB](debugging.md).
 
@@ -29,8 +32,8 @@ enabled. MCP exposes the same diagnostics in `synchronization`. **Provisional bu
 shows the observed recurrence peak, reserve, next known service source and
 remaining time/nominal steps. It requires four recent samples at unchanged MHz.
 It does not measure useful-work demand or prove that the condition waits for that
-service. The toolbar shows **Trace: port** or **Trace: RAM** when trace evidence
-exists even if the display-based candidate test rejects the screen. Disable the
+service. Session Details retains the RAM/port trace evidence even if the
+display-based candidate test rejects the screen. Disable the
 Heroes idle recipe when comparing guest state with reference execution.
 A local Heroes menu trace independently discovered the dword comparison at
 206FC0h against RAM 2810A8h (value 2 compared with zero), and VGA port 3DAh tests
@@ -46,8 +49,9 @@ sleeping, map behavior or battle compatibility.
 
 To try actual address-independent waiting, use `--adaptive-idle` or **Enable
 learned idle** in Details. It enables tracing automatically and replaces the
-fixed Heroes recipe. `Trace: RAM/port` means observation; `Idle N%` reports actual
-time advanced without executing the CPU. This experimental heuristic learns
+fixed Heroes recipe. RAM/port trace evidence means observation. The CPU indicator reports active
+guest time; its Idle portion includes actual time advanced without executing
+the CPU, rather than idle candidacy alone. This experimental heuristic learns
 changing countdown guards and caps each wait at 250 us. Disable it for exact
 reference comparisons or if game responsiveness changes.
 Details also reports **Learned guards** arrivals and the last checked IP and eligibility reason:
