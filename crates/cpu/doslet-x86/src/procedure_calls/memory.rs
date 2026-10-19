@@ -148,6 +148,11 @@ pub enum MemoryProcedureError<E> {
     InvalidResult(MemoryProcedureResultError),
 }
 
+enum TierAccounting {
+    Uniform(u8),
+    Complete([u64; 4]),
+}
+
 impl Cpu {
     /// Try a registered whole procedure after its entering CALL. The owner
     /// first services pending IRQs, excludes an attached debugger and selects
@@ -168,6 +173,63 @@ impl Cpu {
         registry: &MemoryProcedureRegistry<'_>,
         budget: u32,
     ) -> Result<MemoryProcedureOutcome, MemoryProcedureError<B::Error>> {
+        self.try_call_memory_procedure_inner(bus, registry, budget, None)
+    }
+
+    /// The owner has classified every reachable source instruction against the
+    /// current byte-guarded execution profile and proved one common tier. This
+    /// trusted proof includes loops, RET and every possible side-exit prefix;
+    /// an entry/caller label alone does not satisfy it. Charge only the exact
+    /// completed work after validating and committing the backend's result.
+    pub fn try_call_memory_procedure_in_tier<B: MemoryProcedureBus>(
+        &mut self,
+        bus: &mut B,
+        registry: &MemoryProcedureRegistry<'_>,
+        budget: u32,
+        tier: u8,
+    ) -> Result<MemoryProcedureOutcome, MemoryProcedureError<B::Error>> {
+        assert!(tier < 4 && self.execution_labels_enabled());
+        self.try_call_memory_procedure_inner(
+            bus,
+            registry,
+            budget,
+            Some(TierAccounting::Uniform(tier)),
+        )
+    }
+
+    /// Trusted exact per-tier counts for an all-or-decline finite computation.
+    /// A complete result must match their sum; an ordinary side exit may commit
+    /// zero instructions only. No counts are charged for that refusal. The owner
+    /// derives this proof from original instruction sites and live arguments.
+    pub fn try_call_memory_procedure_with_tier_counts<B: MemoryProcedureBus>(
+        &mut self,
+        bus: &mut B,
+        registry: &MemoryProcedureRegistry<'_>,
+        budget: u32,
+        counts: [u64; 4],
+    ) -> Result<MemoryProcedureOutcome, MemoryProcedureError<B::Error>> {
+        assert!(self.execution_labels_enabled());
+        assert!(
+            counts
+                .into_iter()
+                .try_fold(0u64, u64::checked_add)
+                .is_some_and(|total| (1..=u64::from(u32::MAX)).contains(&total))
+        );
+        self.try_call_memory_procedure_inner(
+            bus,
+            registry,
+            budget,
+            Some(TierAccounting::Complete(counts)),
+        )
+    }
+
+    fn try_call_memory_procedure_inner<B: MemoryProcedureBus>(
+        &mut self,
+        bus: &mut B,
+        registry: &MemoryProcedureRegistry<'_>,
+        budget: u32,
+        tier: Option<TierAccounting>,
+    ) -> Result<MemoryProcedureOutcome, MemoryProcedureError<B::Error>> {
         use MemoryProcedureOutcome::{Complete, Declined, SideExit};
         use ProcedureDecline as Decline;
 
@@ -183,7 +245,7 @@ impl Cpu {
         if self.has_interrupt_shadow() {
             return Ok(Declined(Decline::InterruptShadow));
         }
-        if self.execution_labels_enabled() {
+        if self.execution_labels_enabled() && tier.is_none() {
             return Ok(Declined(Decline::ExecutionLabels));
         }
         if ProcedureContext::capture(self) != Some(entry.context) {
@@ -205,6 +267,9 @@ impl Cpu {
             .map_err(MemoryProcedureError::Backend)?;
         let invalid = if result.instructions > entry.maximum_instructions
             || (result.completed && result.instructions == 0)
+            || matches!(&tier, Some(TierAccounting::Complete(counts))
+                if (result.completed && counts.iter().sum::<u64>() != u64::from(result.instructions))
+                    || (!result.completed && result.instructions != 0))
         {
             Some(MemoryProcedureResultError::InstructionCount)
         } else if (self.flags ^ result.registers.flags)
@@ -242,6 +307,18 @@ impl Cpu {
         }
         self.registers.ip = result.instruction_pointer;
         self.flags = result.registers.flags;
+        if let Some(tier) = tier {
+            let counts = match tier {
+                TierAccounting::Uniform(tier) => {
+                    let mut counts = [0; 4];
+                    counts[usize::from(tier)] = u64::from(result.instructions);
+                    counts
+                }
+                TierAccounting::Complete(counts) if result.completed => counts,
+                TierAccounting::Complete(_) => [0; 4],
+            };
+            self.account_execution(counts);
+        }
         Ok(if result.completed {
             Complete {
                 instructions: result.instructions,

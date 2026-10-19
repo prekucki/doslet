@@ -102,6 +102,10 @@ export class Browser {
                 this.queue = [];
                 console.info('Doslet machine ready in Web Worker');
             } else if (data.kind === 'state') {
+                if (data.aot?.active && (!this.state?.aot?.active || data.steps < this.state.steps))
+                    console.info(`Doslet AOT ready: ${data.aot.entries} guarded entries`);
+                if (data.aot?.translatedSteps > 0 && (!this.state?.aot?.translatedSteps || data.steps < this.state.steps))
+                    console.info('Doslet AOT executing generated WASM code');
                 this.state = data;
                 if ((data.status !== 1 || !data.pointerRelative) && this.mouseWanted) this.releaseMouse();
             }
@@ -125,7 +129,7 @@ export class Browser {
     applyMachine(profile, program, discardChanges = false) {
         const bundle = this.bundleSession?.program === program ? this.bundleSession : {};
         this.releaseInput(); this.releaseMouse(); this.send({kind:'apply-machine', profile, program, discardChanges,
-            bundleRuntime:bundle.bundleRuntime, tierProfile:bundle.tierProfile, startupKeys:bundle.startupKeys});
+            bundleRuntime:bundle.bundleRuntime, tierProfile:bundle.tierProfile, aot:bundle.aot, startupKeys:bundle.startupKeys});
     }
     physicalKey(usage, pressed, enabled=true) {
         if (!pressed) { this.heldKeys.delete(usage); this.suppressedKeys.delete(usage); }
@@ -226,12 +230,16 @@ export class Browser {
                 profile:'ROTT.toml',zip:'ROTT.zip',executable:'ROTT.EXE',
                 tierProfile:'ROTT-speed-tiers.json',saves:'saves.dsv',bundleRuntime:true,
             };
-            if (!bundle.profile || !bundle.zip || !bundle.executable || !bundle.tierProfile)
+            if (!bundle.profile || !bundle.zip || !bundle.executable)
                 throw new Error('Incomplete bundled game manifest');
             const selections = bundle.startupPatch?.selections || [];
             if (!Array.isArray(selections) || selections.length > 16 ||
                 selections.some(value => !/^[1-9]$/.test(value)))
                 throw new Error('Invalid startup selection patch');
+            const startupKeys = bundle.startupKeys ?? selections.join('');
+            if (typeof startupKeys !== 'string' || startupKeys.length > 15 ||
+                !/^[\x08\x09\x0a\x0d\x1b\x20-\x7e]*$/.test(startupKeys))
+                throw new Error('Invalid startup keyboard sequence');
             if (bundle.roms) {
                 if (!Array.isArray(bundle.roms) || bundle.roms.length !== 2 ||
                     bundle.roms.some(name => !/^(CM32L|MT32)_(CONTROL|PCM)\.ROM$/.test(name)))
@@ -242,19 +250,33 @@ export class Browser {
             const [profile,zip,saves,tierProfile] = await Promise.all([
                 fetchAsset(bundle.profile,'text'),fetchAsset(bundle.zip),
                 bundle.saves ? fetchAsset(bundle.saves) : null,
-                fetchAsset(bundle.tierProfile,'text'),resumed,
+                bundle.tierProfile ? fetchAsset(bundle.tierProfile,'text') : null,resumed,
             ]);
             if (bundle.startupPatch?.executableSha256 &&
-                JSON.parse(tierProfile).identity !== `exe-sha256:${bundle.startupPatch.executableSha256}`)
+                (!tierProfile || JSON.parse(tierProfile).identity !== `exe-sha256:${bundle.startupPatch.executableSha256}`))
                 throw new Error('Startup patch and native CPU profile target different executables');
+            let aot = null;
+            if (bundle.aot) {
+                const [module, profile] = await Promise.all([
+                    fetchAsset(bundle.aot.module), bundle.aot.profile ? fetchAsset(bundle.aot.profile) : null,
+                ]);
+                const digest = async bytes => [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
+                    .map(value => value.toString(16).padStart(2,'0')).join('');
+                const moduleLimit = bundle.aot.kind === 'procedure-memory' ? 80*1024*1024 + 64 : 64*1024*1024;
+                if (module.byteLength > moduleLimit || (profile && profile.byteLength > 64*1024*1024) ||
+                    await digest(module) !== bundle.aot.moduleSha256 ||
+                    (profile && await digest(profile) !== bundle.aot.profileSha256))
+                    throw new Error('Bundled AOT assets are damaged or mismatched');
+                aot = {kind: bundle.aot.kind || 'register', module, profile};
+            }
             const imported = await this.call('bundle-import',{buffer:zip},[zip]);
             const program = imported.programs.find(value => value === bundle.executable || value.endsWith('/'+bundle.executable));
             if (!program) throw new Error(`${bundle.executable} is missing from the bundled ZIP`);
-            const fields = {profile,program,tierProfile,bundleRuntime:!!bundle.bundleRuntime,
-                startupKeys:selections.join('')};
+            const fields = {profile,program,tierProfile,aot,bundleRuntime:!!bundle.bundleRuntime,
+                startupKeys};
             if (saves) fields.seedBuffer = saves;
             await this.call('apply-machine',fields,saves ? [saves] : []);
-            this.bundleSession = {program,tierProfile,bundleRuntime:!!bundle.bundleRuntime,startupKeys:selections.join('')};
+            this.bundleSession = {program,tierProfile,aot,bundleRuntime:!!bundle.bundleRuntime,startupKeys};
             if (bundle.displayFilter) this.events.push({kind:'bundle-display',filter:bundle.displayFilter});
             window.dispatchEvent(new CustomEvent('doslet-bundle-status',{detail:{ready:true}}));
         } finally { this.bundleLaunching = false; }

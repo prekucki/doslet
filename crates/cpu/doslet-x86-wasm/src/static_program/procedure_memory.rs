@@ -71,6 +71,8 @@ pub mod bundle;
 pub(super) mod copy_kernel;
 #[path = "procedure_memory_graph.rs"]
 pub(super) mod graph;
+#[path = "procedure_memory_rle.rs"]
+pub mod rle;
 #[path = "rle_kernel.rs"]
 pub(super) mod rle_kernel;
 pub use copy_kernel::CopyKernel;

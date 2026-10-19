@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use doslet_bus::{BusError, MemoryBus};
 use doslet_config::HardwareConfig;
-use doslet_dos::files::ReadOnlyDrive;
+use doslet_dos::files::{ReadOnlyDrive, VisibleFile};
 use doslet_dos::memory::MemoryArena;
 use doslet_dos::{ComError, MzError, ProcessMemory, load_com, load_mz, load_mz_stub};
 use doslet_pc::PcMachine;
@@ -373,6 +373,16 @@ impl Session {
         self.drive = drive;
         self
     }
+    /// Inspect the effective C: file tree during host-side packaging.
+    pub fn visible_drive_files(&self) -> impl Iterator<Item = VisibleFile<'_>> {
+        self.drive.visible_files()
+    }
+    pub fn drive_has_empty_directories(&self) -> bool {
+        self.drive.has_empty_directories()
+    }
+    pub fn drive_base_identity(&self) -> [u8; 32] {
+        self.base_identity
+    }
     /// Attach an immutable ISO 9660 image as a DOS CD-ROM drive before execution.
     /// `letter` is the drive letter (D through Z); the MSCDEX unit is zero-based.
     pub fn with_cdrom_image(mut self, letter: u8, image: Vec<u8>) -> Result<Self, RuntimeError> {
@@ -668,6 +678,11 @@ impl Session {
     /// No wall-clock checks or allocations. A proved whole computation may
     /// finish past this soft step budget, returning its actual completed work.
     pub fn advance(&mut self, budget: u32) -> u32 {
+        self.advance_with(budget, false)
+    }
+    /// With `stop_at_entries`, return once execution arrives at a registered
+    /// prepared entry after completing work, for a foreign engine to dispatch.
+    pub(crate) fn advance_with(&mut self, budget: u32, stop_at_entries: bool) -> u32 {
         if self.status == SessionStatus::Running
             && budget != 0
             && self.patches_applied < self.patches.len()
@@ -683,20 +698,21 @@ impl Session {
                 budget
                     .min(4096)
                     .min(remaining.min(u64::from(u32::MAX)) as u32),
+                stop_at_entries,
             );
             if self.status == SessionStatus::Running {
                 self.check_patches();
             }
             completed
         } else {
-            self.advance_inner(budget)
+            self.advance_inner(budget, stop_at_entries)
         }
     }
-    fn advance_inner(&mut self, budget: u32) -> u32 {
+    fn advance_inner(&mut self, budget: u32, stop_at_entries: bool) -> u32 {
         // Leave enough room in the u32 result for one complete computation
         // beyond the requested budget. This is a representation bound, not an
         // instruction checkpoint inside generated code.
-        #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+        #[cfg(feature = "wasm-procedures")]
         let budget = budget.min(u32::MAX - doslet_pc::wasm_procedures::MAX_ATOMIC_PROCEDURE_WORK);
         self.timeslice_yielded = false;
         self.apply_input();
@@ -705,6 +721,9 @@ impl Session {
             && self.status == SessionStatus::Running
             && !self.storage_wait
             && !self.timeslice_yielded
+            && !(stop_at_entries
+                && completed != 0
+                && self.machine.cpu.prepared_entry_index().is_some())
         {
             let now = self.steps + u64::from(completed);
             let idle = self
@@ -791,6 +810,17 @@ impl Session {
         self.machine.install_wasm_procedures(wasm, bindings)
     }
 
+    /// Browser exports borrow this worker's one linear memory synchronously.
+    #[cfg(all(feature = "wasm-procedures", target_arch = "wasm32"))]
+    pub fn install_browser_wasm_procedures(
+        &mut self,
+        callback: doslet_pc::wasm_procedures::BrowserCall,
+        bindings: alloc::vec::Vec<doslet_pc::wasm_procedures::Binding>,
+    ) -> Result<(), alloc::string::String> {
+        self.machine
+            .install_browser_wasm_procedures(callback, bindings)
+    }
+
     /// As `install_wasm_procedures`, reusing compatible native code from the host.
     #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
     pub fn install_wasm_procedures_cached(
@@ -803,7 +833,7 @@ impl Session {
             .install_wasm_procedures_cached(wasm, bindings, cache)
     }
 
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub fn install_interpreted_procedure_boundaries(
         &mut self,
         bindings: alloc::vec::Vec<doslet_pc::wasm_procedures::Binding>,
@@ -822,12 +852,30 @@ impl Session {
         self.machine.set_wasm_procedure_diagnostic_mode(mode)
     }
 
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub fn wasm_procedure_stats(&self) -> Option<doslet_pc::wasm_procedures::Stats> {
         self.machine.wasm_procedure_stats()
     }
 
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedure_entry_count(&self) -> usize {
+        self.machine.wasm_procedure_entry_count()
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedure_copy_tier_entries(&self) -> impl Iterator<Item = u32> + '_ {
+        self.machine.wasm_procedure_copy_tier_entries()
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn set_wasm_procedure_tier_accounting(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        self.machine.set_wasm_procedure_tier_accounting(enabled)
+    }
+
+    #[cfg(feature = "wasm-procedures")]
     pub fn wasm_procedure_last_error(&self) -> Option<&str> {
         self.machine.wasm_procedure_last_error()
     }

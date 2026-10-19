@@ -393,8 +393,9 @@ All variants compare full saved states and PCM/MIDI digests against the same
 native oracle, separately from measured execution time.
 Existing execution and adaptive scheduling strategies keep their current defaults.
 
-Native x86-64/AArch64 frontends enable a Cranelift dynamic core by default through
-the `dynamic-core` feature. Its first scope is bounded blocks of 2–16 register-only
+Native x86-64/AArch64 frontends can include a Cranelift dynamic core through the
+`dynamic-core` feature. The headless frontend enables it by default; the desktop
+app does not, because on ROTT gameplay it was slower than the interpreter. Its first scope is bounded blocks of 2–16 register-only
 dword MOV/ALU/CMP/TEST, INC/DEC, XCHG and NEG/NOT in protected 32-bit code. A final
 short/near relative Jcc/JMP back to the block's start can form a native loop;
 the 16-instruction bound includes that branch. A separate RAM trace
@@ -487,8 +488,8 @@ freeing code; execution never compiles or evicts. Trace and register fallback
 capacity is checked together. Cold imported templates are eagerly attempted once,
 then evicted blocks are prepared again only when execution makes them eligible.
 Compiler failures latch once and preserve interpreter fallback.
-`--no-dynamic-core` disables JIT at runtime; `--no-default-features` omits it from
-native application builds. WASM has no Cranelift dependency and stays interpreted.
+A desktop build with `--features dynamic-core` runs it only with `--dynamic-core`;
+`--no-dynamic-core` is accepted for older commands and has no effect. WASM has no Cranelift dependency and stays interpreted.
 
 Opt-in exit profiling, configured before native compilation, aggregates reasons,
 entry/exit addresses, counts and native steps in a fixed 8,192-slot table allocated
@@ -799,7 +800,10 @@ monotonic clock paces native and silent browser execution; active worklet playba
 paces the browser Worker with bounded lookahead. The machine's own
 deterministic clock drives guest devices. Audio queue capacity can defer a
 batch. Pause/resume resets the host pacing anchor. It does not require browser
-shared memory.
+shared memory. In adaptive CPU mode, a browser host that falls behind caps the
+controller's rate at measured capacity without changing the user's MHz ceiling.
+After about a second of headroom the cap rises by 10%, and it is removed at the
+ceiling, so a loading spike does not slow later gameplay.
 The native CLI uses clap derive: `--game EXE` starts a session with the containing
 directory preloaded as C: and a 1-MiB RAM write overlay; no arguments retain the
 demo. Invalid arguments and game-load errors exit before opening a window.
@@ -858,7 +862,9 @@ host movement is retained without allocating or retaining offscreen movement
 debt. The selected relative adapter uses one logical unit per motion unit;
 full historical mouse-driver acceleration and mickey-ratio scaling are pending.
 
-Browser presentation uses iced's tiny-skia renderer with Canvas2D. A small
+Browser presentation prefers iced's wgpu renderer through WebGPU or WebGL2,
+with tiny-skia/Canvas2D as a fallback. The xBRZ filter runs in the GPU renderer;
+Canvas2D retains the current filter and reports that xBRZ is unavailable. A small
 separate Rust/WASM AudioWorklet module pulls samples from a fixed 16384-byte
 MIDI event queue on the guest timeline. The Worker sends bounded wire packets
 and time watermarks directly through a MessageChannel; window timers do not

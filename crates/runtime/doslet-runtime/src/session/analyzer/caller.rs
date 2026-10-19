@@ -105,6 +105,9 @@ impl Default for CallerProbe {
     }
 }
 impl CallerProbe {
+    pub(super) fn idle(&self) -> bool {
+        self.active.is_none()
+    }
     pub fn stop(&mut self, reason: &'static str, now: u64) {
         if let Some(active) = self.active.take() {
             self.stats.last_steps = active.steps;

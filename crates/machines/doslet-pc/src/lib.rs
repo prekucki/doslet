@@ -11,7 +11,7 @@ pub use recurrence::RecurrenceMark;
 pub mod resources;
 mod timing;
 mod vga_wait;
-#[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+#[cfg(feature = "wasm-procedures")]
 pub mod wasm_procedures;
 pub use memory_wait::MemoryWaitSites;
 
@@ -78,7 +78,7 @@ pub enum MachineError {
     UnsupportedAudioRouting,
     AudioQueueFull,
     ClockOverflow,
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     WasmProcedure(wasm_procedures::ExecutionError),
 }
 impl From<CpuError> for MachineError {
@@ -114,7 +114,7 @@ impl fmt::Display for MachineError {
             Self::UnsupportedAudioRouting => f.write_str("unsupported SB16 DMA/IRQ routing"),
             Self::AudioQueueFull => f.write_str("PCM queue full; host must drain produced audio"),
             Self::ClockOverflow => f.write_str("emulated clock overflow"),
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             Self::WasmProcedure(error) => write!(f, "WASM procedure failed: {error:?}"),
         }
     }
@@ -150,7 +150,7 @@ pub struct PcMachine {
     memory_wait_steps: u64,
     batch_yield_ip: Option<[u32; 2]>,
     interrupt_entries: u64,
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     wasm_procedures: Option<wasm_procedures::Plan>,
 }
 impl Default for PcMachine {
@@ -186,7 +186,7 @@ impl PcMachine {
             memory_wait_steps: 0,
             batch_yield_ip: None,
             interrupt_entries: 0,
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             wasm_procedures: None,
         })
     }
@@ -282,11 +282,19 @@ impl PcMachine {
     /// horizon. Its exclusive owner must validate memory accesses, commit their
     /// effects before device time, and forbid unhandled I/O or CPU control changes.
     pub fn debug_register_engine_budget(&self, budget: u32) -> u32 {
+        self.register_engine_budget(budget, false)
+    }
+    /// Foreign register engine with live, homogeneous execution-tier guards.
+    /// The existing slowest-tier event horizon bounds every admitted tier.
+    pub fn debug_tiered_register_engine_budget(&self, budget: u32) -> u32 {
+        self.register_engine_budget(budget, true)
+    }
+    fn register_engine_budget(&self, budget: u32, allow_tiers: bool) -> u32 {
         if self.vga_wait.candidate.is_some()
             || self.memory_wait_sites.is_some()
             || self.batch_yield_ip.is_some()
             || self.cpu.is_halted()
-            || self.cpu.execution_labels_enabled()
+            || (self.cpu.execution_labels_enabled() && !allow_tiers)
             || self.bus.ram.recurrence_recording()
             || (self.cpu.accepts_maskable_interrupt() && self.bus.pic.has_interrupt())
         {
@@ -303,6 +311,28 @@ impl PcMachine {
             steps <= self.debug_register_engine_budget(steps),
             "foreign engine exceeded device horizon"
         );
+        self.advance_hardware_steps(steps)?;
+        #[cfg(feature = "profiling")]
+        {
+            self.bus.stats.cpu_steps += u64::from(steps);
+        }
+        Ok(())
+    }
+    /// Charge a tier-uniform, already executed register grant. Classifications
+    /// are checked before dispatch, not inferred from the committed destination.
+    pub fn debug_account_tiered_register_engine(
+        &mut self,
+        steps: u32,
+        tier: u8,
+    ) -> Result<(), MachineError> {
+        assert!(tier < 4 && self.cpu.execution_labels_enabled());
+        assert!(
+            steps <= self.debug_tiered_register_engine_budget(steps),
+            "tiered foreign engine exceeded device horizon"
+        );
+        let mut counts = [0; 4];
+        counts[usize::from(tier)] = u64::from(steps);
+        self.cpu.account_execution(counts);
         self.advance_hardware_steps(steps)?;
         #[cfg(feature = "profiling")]
         {
@@ -354,7 +384,7 @@ impl PcMachine {
         budget: u32,
         mut observation: Option<&mut StepObservation>,
     ) -> Result<(StepOutcome, u32), MachineError> {
-        #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+        #[cfg(feature = "wasm-procedures")]
         self.check_wasm_procedure_failure()?;
         if OBSERVE {
             observation.as_mut().unwrap().instruction = None;
@@ -405,7 +435,7 @@ impl PcMachine {
         {
             return Ok((StepOutcome::Continue, consumed));
         }
-        #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+        #[cfg(feature = "wasm-procedures")]
         let wasm_zero_exit = if !OBSERVE {
             match self.try_wasm_procedure(budget)? {
                 Some(0) => true,
@@ -415,7 +445,7 @@ impl PcMachine {
         } else {
             false
         };
-        #[cfg(not(all(feature = "wasm-procedures", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "wasm-procedures"))]
         let wasm_zero_exit = false;
         if !OBSERVE
             && !wasm_zero_exit
@@ -438,23 +468,26 @@ impl PcMachine {
             // batch path once instead of repeatedly attempting writable native
             // traces which cannot obtain RAM. Overflow and completed intervals
             // immediately restore the ordinary native path.
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
-            let prepared_entries = self.wasm_procedures.is_some();
-            #[cfg(all(feature = "wasm-procedure-diagnostics", not(target_arch = "wasm32")))]
+            // Foreign engines such as the register AOT host register entries
+            // directly; batches then yield there instead of running through.
+            #[cfg(feature = "wasm-procedures")]
+            let prepared_entries =
+                self.wasm_procedures.is_some() || self.cpu.has_prepared_entries();
+            #[cfg(feature = "wasm-procedure-diagnostics")]
             let prepared_entries = prepared_entries && self.wasm_procedure_dispatch_enabled();
-            #[cfg(not(all(feature = "wasm-procedures", not(target_arch = "wasm32"))))]
-            let prepared_entries = false;
+            #[cfg(not(feature = "wasm-procedures"))]
+            let prepared_entries = self.cpu.has_prepared_entries();
             let native = self.cpu.dynamic_core_enabled()
                 && !self.bus.ram.recurrence_recording()
                 && !prepared_entries;
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             let borrowed_ready = !native
                 && self.bus.a20_enabled()
                 && matches!(self.bus.ram.storage, memory::storage::Storage::Wasm(_))
                 && self.bus.ram.direct_execution_ready();
-            #[cfg(all(feature = "wasm-procedure-diagnostics", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedure-diagnostics")]
             let borrowed_ready = borrowed_ready && self.wasm_procedure_borrowed_bus_enabled();
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             let borrowed = if borrowed_ready {
                 // Resolve the hardware deadline before exclusively borrowing
                 // the backing. Device state cannot change inside this batch.
@@ -478,7 +511,7 @@ impl PcMachine {
             } else {
                 None
             };
-            #[cfg(not(all(feature = "wasm-procedures", not(target_arch = "wasm32"))))]
+            #[cfg(not(feature = "wasm-procedures"))]
             let borrowed: Option<u32> = None;
             let consumed = if let Some(consumed) = borrowed {
                 consumed

@@ -303,7 +303,8 @@ fn speed_tiers_stitches_observed_nodes_but_does_not_decode_unobserved_windows() 
         value["nodes"] = serde_json::json!(nodes);
         let json = serde_json::to_vec(&value).unwrap();
         let t = Translation::from_bytes(&json).unwrap();
-        assert_eq!(t.blocks().len(), 3);
+        // The backedge target leads one block; suffixes are not separate entries.
+        assert_eq!(t.blocks().len(), 1);
         assert_eq!(t.blocks()[0].instructions.len(), 3);
         let mut runner = Runner::new(Host::new(t, runtime(&code, 0x203))).unwrap();
         let mut reference = runtime(&code, 0x203);
@@ -417,10 +418,10 @@ fn a_runtime_deadline_commits_state_and_rechecks_code_before_more_translation() 
             self.account(steps);
             Ok(())
         }
-        fn interpret(&mut self) -> Result<StepOutcome, Self::Error> {
-            let result = self.inner.interpret()?;
-            self.account(1);
-            Ok(result)
+        fn interpret(&mut self, budget: u32) -> Result<u32, Self::Error> {
+            let steps = self.inner.interpret(budget)?;
+            self.account(steps);
+            Ok(steps)
         }
     }
     let code = [0x40, 0xeb, 0xfd];
@@ -439,7 +440,7 @@ fn a_runtime_deadline_commits_state_and_rechecks_code_before_more_translation() 
     };
     runner.run(30).unwrap();
     for _ in 0..30 {
-        reference.interpret().unwrap();
+        reference.interpret(1).unwrap();
     }
     let actual = runner.host().runtime();
     assert_eq!(actual.ticks, reference.ticks);
@@ -481,4 +482,60 @@ fn identical_code_at_multiple_profile_addresses_keeps_all_successors_bound() {
     compare(&runner, &reference);
     assert_eq!(runner.host().stats().translated_steps, 4000);
     assert_eq!(runner.host().stats().polls, 2);
+}
+
+#[test]
+fn declared_region_binds_only_after_its_live_delta_is_verified() {
+    // Two blocks at preferred image addresses; the loader placed them 0x1000 lower.
+    let code = [0x40, 0x43, 0x41, 0x90, 0x42, 0xeb, 0xf9];
+    let value = serde_json::json!({
+        "relocatable":[{"base":0x2000,"size":0x100}],
+        "nodes":[json_node(0x2000, 32, &code), json_node(0x2001, 32, &code[1..]),
+            json_node(0x2002, 32, &code[2..]), json_node(0x2003, 32, &code[3..]),
+            json_node(0x2004, 32, &code[4..]), json_node(0x2005, 32, &code[5..])]});
+    let t = Translation::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(
+        t.regions(),
+        [crate::Region {
+            base: 0x2000,
+            size: 0x100
+        }]
+    );
+    let mut runner = Runner::new(Host::new(t, runtime(&code, 0x203))).unwrap();
+    let mut reference = runtime(&code, 0x203);
+    assert_eq!(runner.run(3000).unwrap(), step(&mut reference, 3000));
+    compare(&runner, &reference);
+    let regions: Vec<_> = runner.host().regions().collect();
+    assert_eq!(regions[0].1, Some(0x1000u32.wrapping_sub(0x2000)));
+    assert!(runner.host().stats().translated_steps >= 2990);
+    for bad in [
+        serde_json::json!({"relocatable":[{"base":0,"size":0}],"nodes":[]}),
+        serde_json::json!({"relocatable":[{"base":0xffff_ffffu32,"size":2}],"nodes":[]}),
+        serde_json::json!({"relocatable":[{"base":0,"size":16},{"base":8,"size":16}],"nodes":[]}),
+    ] {
+        assert!(Translation::from_bytes(&serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+}
+
+#[test]
+fn an_unaligned_copy_of_the_image_does_not_win_over_the_page_aligned_load() {
+    // The executing loop at 0x3000 also exists, unaligned, at 0x1010.
+    let code = [0x40, 0x43, 0x41, 0xeb, 0xfb];
+    let layout = || {
+        let mut rt = runtime(&[0xe9, 0xfb, 0x1f, 0, 0], 0x203); // jmp 0x3000
+        rt.bus.0[0x1010..0x1015].copy_from_slice(&code);
+        rt.bus.0[0x3000..0x3005].copy_from_slice(&code);
+        rt
+    };
+    let rt = layout();
+    let mut reference = layout();
+    let value = serde_json::json!({
+        "relocatable":[{"base":0x10000,"size":0x10}],
+        "nodes":[json_node(0x10000, 32, &code)]});
+    let t = Translation::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let mut runner = Runner::new(Host::new(t, rt)).unwrap();
+    assert_eq!(runner.run(1000).unwrap(), step(&mut reference, 1000));
+    compare(&runner, &reference);
+    let regions: Vec<_> = runner.host().regions().collect();
+    assert_eq!(regions[0].1, Some(0x3000u32.wrapping_sub(0x10000)));
 }

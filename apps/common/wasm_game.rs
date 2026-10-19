@@ -1,7 +1,7 @@
 //! Shared diagnostic Session adapter for native and WASM comparisons.
 use doslet_runtime::{Session, SessionStatus};
-use doslet_x86::{Cpu, StepOutcome};
-use doslet_x86_wasm::host::Runtime;
+use doslet_x86::Cpu;
+use doslet_x86_wasm::host::{CodeCheck, Runtime};
 
 pub struct Game {
     pub session: Session,
@@ -42,18 +42,19 @@ impl Runtime for Game {
             .debug_account_register_engine(steps)
             .map_err(|e| e.to_string())
     }
-    fn interpret(&mut self) -> Result<StepOutcome, String> {
-        if self.session.advance(1) != 1 {
-            return Err(format!(
-                "runtime made no progress: {:?} {:?}",
-                self.session.status(),
-                self.session.fault()
-            ));
-        }
-        Ok(if self.session.status() == SessionStatus::Running {
-            StepOutcome::Continue
-        } else {
-            StepOutcome::Halted
-        })
+    fn code_check(&self, address: u32, length: u8) -> Option<CodeCheck> {
+        self.session.debug_code_check(address, length)
+    }
+    fn code_valid(&self, check: &CodeCheck) -> bool {
+        self.session.debug_code_check_valid(check)
+    }
+    fn set_entries(&mut self, sorted: Vec<u32>) -> Result<(), String> {
+        self.session
+            .debug_set_prepared_entries(sorted)
+            .map_err(str::to_owned)
+    }
+    fn interpret(&mut self, budget: u32) -> Result<u32, String> {
+        // Faults and stops end the run through `running`; zero ends it too.
+        Ok(self.session.debug_advance_to_prepared_entry(budget))
     }
 }

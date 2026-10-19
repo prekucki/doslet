@@ -3,6 +3,9 @@
 #[path = "../../doslet/src/cpu_config.rs"]
 mod cpu_config;
 #[allow(dead_code)]
+#[path = "../../common/host_dirs.rs"]
+mod host_dirs;
+#[allow(dead_code)]
 #[path = "../../doslet/src/native_speed_tiers.rs"]
 mod native_speed_tiers;
 #[allow(dead_code)]

@@ -36,7 +36,7 @@ impl StepClock {
             u64::from(steps) * self.whole + fraction / self.mhz
         }
     }
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     fn nanos_for_steps(&self, steps: u32) -> u64 {
         let fraction = self.fraction + u64::from(steps) * self.remainder;
         u64::from(steps) * self.whole + fraction / self.mhz
@@ -86,16 +86,34 @@ impl Timing {
     }
 }
 impl PcMachine {
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
-    pub(crate) fn procedure_fits_before_irq(&self, steps: u32) -> bool {
+    #[cfg(feature = "wasm-procedures")]
+    pub(crate) fn procedure_fits_before_irq_with_counts(
+        &self,
+        steps: u32,
+        counts: Option<[u64; 4]>,
+    ) -> bool {
         if !self.cpu.accepts_maskable_interrupt() || self.timing.external_cpu {
             return true;
         }
-        self.timing.tiers.is_none()
-            && self
-                .diagnostic_service_horizon()
-                .0
-                .is_none_or(|nanos| self.timing.cpu.nanos_for_steps(steps) <= nanos)
+        let nanos = if let Some(tiers) = &self.timing.tiers {
+            let Some(counts) =
+                counts.filter(|counts| counts.iter().sum::<u64>() == u64::from(steps))
+            else {
+                return false;
+            };
+            (tiers.fraction
+                + counts
+                    .into_iter()
+                    .zip(tiers.costs)
+                    .map(|(count, cost)| count * cost)
+                    .sum::<u64>())
+                / tiers.denominator
+        } else {
+            self.timing.cpu.nanos_for_steps(steps)
+        };
+        self.diagnostic_service_horizon()
+            .0
+            .is_none_or(|deadline| nanos <= deadline)
     }
 
     /// Install native scheduling labels and rates; None is zero-cost/MAX.
@@ -355,7 +373,7 @@ impl PcMachine {
     /// A finite computation may finish before delivering its next IRQ. Device
     /// events still run at their own deadlines, including every DMA/FM sample.
     /// This policy is used only by explicitly admitted atomic procedures.
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn advance_procedure_hardware_steps(
         &mut self,
         steps: u32,
@@ -879,7 +897,7 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     #[test]
     fn atomic_procedure_time_services_every_dma_sample_and_timer_event() {
         let mut reference = idle_machine(true);

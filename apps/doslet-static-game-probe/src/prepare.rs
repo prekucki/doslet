@@ -95,15 +95,31 @@ fn select_waits(
 /// The offline selector properties do not establish live CPU presence/rights.
 /// `selector: null` explicitly declares an address-only object; the field is
 /// still required, and normal selector fixups cannot target such an object.
+/// The DPMI mode the captured layout ran under. DOS4GW places code at other
+/// addresses with a DPMI host; captures without the field ran without one.
+pub fn bindings_dpmi(bytes: &[u8]) -> Result<&'static str, String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    match value.get("dpmi") {
+        None => Ok("off"),
+        Some(mode) => match mode.as_str() {
+            Some("off") => Ok("off"),
+            Some("reflect") => Ok("reflect"),
+            Some("direct") => Ok("direct"),
+            _ => Err("dpmi must be off, reflect or direct".into()),
+        },
+    }
+}
+
 pub fn bindings_from_json(exe: &[u8], bytes: &[u8]) -> Result<Vec<DosFlatObjectBinding>, String> {
     if bytes.len() > 64 * 1024 {
         return Err("binding declarations exceed64KiB".into());
     }
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     let root = value.as_object().ok_or("bindings must be an object")?;
-    if root.len() != 1 || !root.contains_key("objects") {
-        return Err("bindings require only objects".into());
+    if !root.contains_key("objects") || root.keys().any(|k| k != "objects" && k != "dpmi") {
+        return Err("bindings require only objects and an optional dpmi mode".into());
     }
+    bindings_dpmi(bytes)?;
     let le = LeImage::discover(exe, LeLimits::default()).map_err(|e| e.to_string())?;
     let rows = value["objects"]
         .as_array()
@@ -605,6 +621,22 @@ mod tests {
         ] {
             assert!(bindings_from_json(&exe, &declaration(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn binding_json_names_the_dpmi_mode_of_its_layout() {
+        let exe = binding_exe();
+        let objects = r#""objects":[{"object_number":1,"linear_base":4096,"selector":null}]"#;
+        let json = |extra: &str| format!("{{{objects}{extra}}}").into_bytes();
+        assert_eq!(bindings_dpmi(&json("")).unwrap(), "off");
+        for mode in ["off", "reflect", "direct"] {
+            let bytes = json(&format!(r#","dpmi":"{mode}""#));
+            assert_eq!(bindings_dpmi(&bytes).unwrap(), mode);
+            assert!(bindings_from_json(&exe, &bytes).is_ok());
+        }
+        assert!(bindings_from_json(&exe, &json(r#","dpmi":"on""#)).is_err());
+        assert!(bindings_from_json(&exe, &json(r#","dpmi":true"#)).is_err());
+        assert!(bindings_from_json(&exe, &json(r#","other":1"#)).is_err());
     }
 
     #[test]

@@ -53,9 +53,14 @@ pub struct Doslet {
     agent_mouse_buttons: u8,
     host_modifiers: u8,
     agent_modifiers: u8,
+    startup_keys_epoch: Option<u64>,
+    startup_keys_index: usize,
     pub workspace: crate::ui::Workspace,
     pub configurator: crate::configurator::ConfiguratorState,
     storage: Option<crate::native_storage::NativeStorage>,
+    /// Background preparation of this game's AOT module.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasm-procedures"))]
+    aot_job: Option<crate::native_aot::Job>,
     gamepads: Option<crate::native_gamepad::NativeGamepads>,
     pad_axes: [i16; 2],
     pad_buttons: [bool; 2],
@@ -142,6 +147,10 @@ pub enum Message {
     FocusLost,
     CloseRequested(iced::window::Id),
     ExitRequested,
+    /// Leave a game started from the library once its saves are settled.
+    ReturnToLibrary,
+    /// The machine is paused for the library; the window shell drops it.
+    LibraryReady,
     RefreshMidi,
     AudioVolume(u8),
     MidiSelected(String),
@@ -170,9 +179,13 @@ impl Doslet {
             agent_mouse_buttons: 0,
             host_modifiers: 0,
             agent_modifiers: 0,
+            startup_keys_epoch: None,
+            startup_keys_index: 0,
             workspace: crate::ui::Workspace::default(),
             configurator: crate::configurator::ConfiguratorState::default(),
             storage: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "wasm-procedures"))]
+            aot_job: None,
             gamepads: None,
             pad_axes: [0; 2],
             pad_buttons: [false; 2],
@@ -265,6 +278,18 @@ impl Doslet {
         } else {
             None
         };
+        // Labelled tiers refuse every procedure call without tier proofs, so
+        // a learned profile keeps the plain interpreter instead.
+        if automatic_tiers.is_some()
+            && (app.launch.automatic_procedures || app.launch.prepare_procedures.is_some())
+        {
+            eprintln!(
+                "[INFO doslet] AOT: learned speed tiers take precedence; using the interpreter"
+            );
+            app.launch.wasm_procedures = None;
+            app.launch.automatic_procedures = false;
+            app.launch.prepare_procedures = None;
+        }
         app.launch.preload_local_media = cli.learn_speed_tiers
             || cli.load_state.is_some()
             || automatic_tiers.as_ref().is_some_and(|t| t.stats.learning);
@@ -279,6 +304,7 @@ impl Doslet {
         machine_spec.output.game_midi = app.midi_mode.as_str().into();
         machine_spec.output.host_midi = app.midi_output_mode.as_str().into();
         machine_spec.output.midi_output = cli.midi_output.clone().unwrap_or_else(|| "rust".into());
+        app.display_sizing.filter = machine_spec.output.video_filter.into();
         app.configurator.set_active(machine_spec);
         if cli.game.is_none() && cli.load_state.is_none() {
             app.session = Session::demo_configured(app.launch.hardware)?.into();
@@ -310,6 +336,10 @@ impl Doslet {
                     &app.launch,
                 )?);
                 app.name = path.file_name().unwrap().to_string_lossy().into_owned();
+                #[cfg(feature = "wasm-procedures")]
+                {
+                    app.aot_job = crate::native_aot::Job::start(&path, &app.launch);
+                }
                 app.source = Some(path);
                 session.start();
                 app.session = session.into();
@@ -1140,6 +1170,8 @@ impl Doslet {
                 self.save_core_profile();
                 return iced::exit();
             }
+            Message::ReturnToLibrary => return self.return_to_library(),
+            Message::LibraryReady => {}
             Message::Tick => self.tick(),
             Message::GamepadsReady => self.poll_gamepads(),
         }
@@ -1492,6 +1524,8 @@ impl Doslet {
                             candidate.spec.name.clone()
                         };
                         self.configurator.set_active(candidate.spec);
+                        self.display_sizing.filter =
+                            self.configurator.active.output.video_filter.into();
                         self.configurator.open = false;
                         self.workspace.panel = None;
                         self.configurator.message = Some("Machine applied and restarted.".into());
@@ -1704,6 +1738,35 @@ impl Doslet {
         }
         let _ = self.session.release_keys();
         self.clear_presentation();
+    }
+    /// Leaving drops the machine, so it needs Reset's guarantees: committed
+    /// saves and no silently discarded temporary changes.
+    fn return_to_library(&mut self) -> Task<Message> {
+        if let Some(storage) = &mut self.storage
+            && let Err(error) = storage.service(&mut self.session)
+        {
+            self.notice = Some(error);
+            return Task::none();
+        }
+        if self.session.storage_waiting() || self.session.pending_commit() {
+            self.notice = Some("Saving; return to the library after the commit finishes.".into());
+            return Task::none();
+        }
+        if self.session.dirty_overlay()
+            && !self.launch.persist
+            && !self.configurator.discard_changes
+        {
+            self.configurator.open = true;
+            self.configurator.message = Some(
+                "Export saves or select Discard unsaved temporary changes before returning to the library."
+                    .into(),
+            );
+            return Task::none();
+        }
+        self.session.pause();
+        self.presentation_revision = self.presentation_revision.wrapping_add(1);
+        self.save_core_profile();
+        Task::batch([self.release_mouse(), Task::done(Message::LibraryReady)])
     }
     pub(crate) fn save_core_profile(&self) {
         #[cfg(not(target_arch = "wasm32"))]
@@ -2051,6 +2114,36 @@ impl Doslet {
             && self.session.emulated_nanos() < target
             && can_continue()
         {
+            let epoch = self.session.epoch();
+            if self.startup_keys_epoch != Some(epoch) {
+                self.startup_keys_epoch = Some(epoch);
+                self.startup_keys_index = 0;
+            }
+            if self.session.waiting_for_key() {
+                while let Some(&ascii) = self
+                    .configurator
+                    .active
+                    .game
+                    .startup_keys
+                    .as_bytes()
+                    .get(self.startup_keys_index)
+                {
+                    let Some((scan, ascii)) = doslet_config::bios_key_for_ascii(ascii) else {
+                        self.notice = Some("Invalid configured startup character".into());
+                        self.session.pause();
+                        return;
+                    };
+                    match self.session.push_key(scan, ascii) {
+                        Ok(true) => self.startup_keys_index += 1,
+                        Ok(false) => break,
+                        Err(error) => {
+                            self.notice = Some(format!("Startup keyboard input failed: {error}"));
+                            self.session.pause();
+                            return;
+                        }
+                    }
+                }
+            }
             #[cfg(not(target_arch = "wasm32"))]
             if self
                 .audio
@@ -2658,7 +2751,19 @@ impl Doslet {
             }
         }
     }
+    /// A module prepared during this run applies from the next Reset.
+    #[cfg(feature = "wasm-procedures")]
+    fn poll_aot_job(&mut self) {
+        if let Some(path) = self.aot_job.as_ref().and_then(crate::native_aot::Job::poll) {
+            self.aot_job = None;
+            self.launch.prepare_procedures = None;
+            self.launch.wasm_procedures = Some(path);
+            self.launch.automatic_procedures = true;
+        }
+    }
     pub(crate) fn worker_tick(&mut self) -> Task<Message> {
+        #[cfg(feature = "wasm-procedures")]
+        self.poll_aot_job();
         let computer_effects = if let Some(mut computer) = self.computer.take() {
             let effects = computer.poll(self);
             let closing = computer.is_closing();
@@ -3538,6 +3643,36 @@ enabled = false
                 assert!(!app.hide_host_cursor());
             }
         }
+    }
+
+    #[test]
+    fn configured_startup_text_queues_bios_keys_on_native_tick() {
+        let mut app = Doslet::new();
+        app.configurator.active.game.startup_keys = "A?".into();
+        // Two blocking BIOS reads store their scan/ASCII pairs in the PSP.
+        app.session = Session::new(&[
+            0xb4, 0, 0xcd, 0x16, 0xa3, 0, 2, 0xb4, 0, 0xcd, 0x16, 0xa3, 2, 2, 0xeb, 0xfe,
+        ])
+        .unwrap()
+        .into();
+        app.session.start();
+        app.session.advance(100);
+        assert!(app.session.waiting_for_key());
+        let now = Instant::now();
+        app.anchor = Some((now - Duration::from_millis(5), app.session.emulated_nanos()));
+        app.tick_at(now);
+        assert_eq!(app.startup_keys_index, 2);
+        // The blocked BIOS read resumes on the next guest timer interrupt.
+        app.session.advance(1_000_000);
+        assert_eq!(
+            app.session.ram_view(0x10200..0x10204).unwrap(),
+            &[b'A', 0x1e, b'?', 0x35],
+            "index={} notice={:?} status={:?} steps={}",
+            app.startup_keys_index,
+            app.notice,
+            app.session.status(),
+            app.session.steps()
+        );
     }
 
     #[test]

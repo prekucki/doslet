@@ -1,10 +1,14 @@
-use crate::{BINDINGS, DISPATCH_PROBES, DISPATCH_SLOTS, IP, QUOTA, Translation};
+use crate::{
+    BINDINGS, DISPATCH_PROBES, DISPATCH_SLOTS, INTERPRETED, IP, QUOTA, TIER, Translation, WINDOW,
+    WINDOW_LEN,
+};
 use alloc::{borrow::Cow, vec::Vec};
 use doslet_x86::translation::{Operation as Op, Source};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, CustomSection, ElementSection, Elements, EntityType,
-    ExportKind, ExportSection, Function, FunctionSection, ImportSection, Instruction as W, MemArg,
-    MemorySection, MemoryType, Module, RefType, TableSection, TableType, TypeSection, ValType,
+    ExportKind, ExportSection, Function, FunctionSection, GlobalType, ImportSection,
+    Instruction as W, MemArg, MemoryType, Module, RefType, TableSection, TableType, TypeSection,
+    ValType,
 };
 
 fn ins(f: &mut Function, op: W<'_>) {
@@ -26,12 +30,16 @@ fn arg(offset: u32) -> MemArg {
         memory_index: 0,
     }
 }
+// Global 0 is the imported scratch base inside the host's memory.
+fn base(f: &mut Function) {
+    ins(f, W::GlobalGet(0));
+}
 fn load(f: &mut Function, offset: u32) {
-    c(f, 0);
+    base(f);
     ins(f, W::I32Load(arg(offset)));
 }
 fn store_local(f: &mut Function, offset: u32, local: u32) {
-    c(f, 0);
+    base(f);
     get(f, local);
     ins(f, W::I32Store(arg(offset)));
 }
@@ -284,6 +292,27 @@ pub fn module(t: &Translation) -> Vec<u8> {
     m.section(&types);
     let mut imports = ImportSection::new();
     imports.import("doslet", "poll", EntityType::Function(0));
+    // The runtime owns this memory; the module touches only its scratch.
+    imports.import(
+        "doslet",
+        "memory",
+        EntityType::Memory(MemoryType {
+            minimum: crate::STATE_BYTES.div_ceil(65536) as u64,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        }),
+    );
+    imports.import(
+        "doslet",
+        "base",
+        EntityType::Global(GlobalType {
+            val_type: ValType::I32,
+            mutable: false,
+            shared: false,
+        }),
+    );
     m.section(&imports);
     let n = t.blocks.len() as u32;
     let mut functions = FunctionSection::new();
@@ -301,17 +330,7 @@ pub fn module(t: &Translation) -> Vec<u8> {
         shared: false,
     });
     m.section(&tables);
-    let mut memories = MemorySection::new();
-    memories.memory(MemoryType {
-        minimum: 2,
-        maximum: Some(2),
-        memory64: false,
-        shared: false,
-        page_size_log2: None,
-    });
-    m.section(&memories);
     let mut exports = ExportSection::new();
-    exports.export("memory", ExportKind::Memory, 0);
     exports.export("run", ExportKind::Func, n + 2);
     m.section(&exports);
     let indices: Vec<u32> = (1..=n).collect();
@@ -327,9 +346,22 @@ pub fn module(t: &Translation) -> Vec<u8> {
         code.function(&block(b));
     }
     // resolve(): bounded hash lookup, rather than a scan of thousands of blocks.
-    // Locals: slot=0, probes=1, offset=2, packed entry=3.
-    let mut resolve = Function::new([(4, ValType::I32)]);
+    // An entry matches only inside the validated window, with the grant's tier
+    // and a length within the remaining quota. Packed entries hold index + 1,
+    // instruction count << 16 and tier << 24.
+    // Locals: slot=0, probes=1, offset=2, packed entry=3, ip=4.
+    let mut resolve = Function::new([(5, ValType::I32)]);
     load(&mut resolve, IP);
+    ins(&mut resolve, W::LocalTee(4));
+    load(&mut resolve, WINDOW);
+    ins(&mut resolve, W::I32Sub);
+    load(&mut resolve, WINDOW_LEN);
+    ins(&mut resolve, W::I32GeU);
+    ins(&mut resolve, W::If(BlockType::Empty));
+    c(&mut resolve, u32::MAX);
+    ins(&mut resolve, W::Return);
+    ins(&mut resolve, W::End);
+    get(&mut resolve, 4);
     c(&mut resolve, 0x9e37_79b1);
     ins(&mut resolve, W::I32Mul);
     c(&mut resolve, 19);
@@ -339,11 +371,11 @@ pub fn module(t: &Translation) -> Vec<u8> {
     get(&mut resolve, 0);
     c(&mut resolve, 8);
     ins(&mut resolve, W::I32Mul);
-    c(&mut resolve, BINDINGS);
+    base(&mut resolve);
     ins(&mut resolve, W::I32Add);
     set(&mut resolve, 2);
     get(&mut resolve, 2);
-    ins(&mut resolve, W::I32Load(arg(4)));
+    ins(&mut resolve, W::I32Load(arg(BINDINGS + 4)));
     ins(&mut resolve, W::LocalTee(3));
     ins(&mut resolve, W::I32Eqz);
     ins(&mut resolve, W::If(BlockType::Empty));
@@ -351,14 +383,22 @@ pub fn module(t: &Translation) -> Vec<u8> {
     ins(&mut resolve, W::Return);
     ins(&mut resolve, W::End);
     get(&mut resolve, 2);
-    ins(&mut resolve, W::I32Load(arg(0)));
-    load(&mut resolve, IP);
+    ins(&mut resolve, W::I32Load(arg(BINDINGS)));
+    get(&mut resolve, 4);
     ins(&mut resolve, W::I32Eq);
     get(&mut resolve, 3);
     c(&mut resolve, 16);
     ins(&mut resolve, W::I32ShrU);
+    c(&mut resolve, 0xff);
+    ins(&mut resolve, W::I32And);
     load(&mut resolve, QUOTA);
     ins(&mut resolve, W::I32LeU);
+    ins(&mut resolve, W::I32And);
+    get(&mut resolve, 3);
+    c(&mut resolve, 24);
+    ins(&mut resolve, W::I32ShrU);
+    load(&mut resolve, TIER);
+    ins(&mut resolve, W::I32Eq);
     ins(&mut resolve, W::I32And);
     ins(&mut resolve, W::If(BlockType::Empty));
     get(&mut resolve, 3);
@@ -390,6 +430,7 @@ pub fn module(t: &Translation) -> Vec<u8> {
     ins(&mut resolve, W::End);
     code.function(&resolve);
     // run(budget): outer loop crosses to the host; inner loop stays in this module.
+    // Every poll reports its interpreted steps; -1 asks for another poll.
     // Locals: remaining=1, completed=2, id=3, count=4.
     let mut run = Function::new([(4, ValType::I32)]);
     get(&mut run, 0);
@@ -401,6 +442,10 @@ pub fn module(t: &Translation) -> Vec<u8> {
     set(&mut run, 3);
     c(&mut run, 0);
     set(&mut run, 2);
+    get(&mut run, 1);
+    load(&mut run, INTERPRETED);
+    ins(&mut run, W::I32Sub);
+    set(&mut run, 1);
     get(&mut run, 3);
     c(&mut run, (-2_i32) as u32);
     ins(&mut run, W::I32Eq);
@@ -411,14 +456,9 @@ pub fn module(t: &Translation) -> Vec<u8> {
     ins(&mut run, W::Return);
     ins(&mut run, W::End);
     get(&mut run, 3);
-    c(&mut run, u32::MAX);
-    ins(&mut run, W::I32Eq);
+    c(&mut run, 0);
+    ins(&mut run, W::I32GeS);
     ins(&mut run, W::If(BlockType::Empty));
-    get(&mut run, 1);
-    c(&mut run, 1);
-    ins(&mut run, W::I32Sub);
-    set(&mut run, 1);
-    ins(&mut run, W::Else);
     ins(&mut run, W::Loop(BlockType::Empty));
     get(&mut run, 3);
     ins(

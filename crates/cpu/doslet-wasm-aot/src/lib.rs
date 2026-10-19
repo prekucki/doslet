@@ -4,8 +4,8 @@
 use doslet_x86_wasm::host::{Host, Runtime};
 use std::time::Instant;
 use wasmtime::{
-    Caller, Config, Engine, Inlining, Linker, Memory, Module, OptLevel, RegallocAlgorithm, Store,
-    Strategy, TypedFunc,
+    Caller, Config, Engine, Global, GlobalType, Inlining, Linker, Memory, MemoryType, Module,
+    Mutability, OptLevel, RegallocAlgorithm, Store, Strategy, TypedFunc, Val, ValType,
 };
 
 pub mod probe;
@@ -99,17 +99,36 @@ impl Artifact {
         if host.translation().wasm() != self.source {
             return Err("AOT artifact and host profile differ".into());
         }
-        let mut store = Store::new(&self.engine, State { host, error: None });
+        let mut store = Store::new(
+            &self.engine,
+            State {
+                host,
+                memory: None,
+                error: None,
+            },
+        );
+        // The native host owns this scratch memory; the module imports it at base 0.
+        let pages = doslet_x86_wasm::STATE_BYTES.div_ceil(65536) as u32;
+        let memory = Memory::new(&mut store, MemoryType::new(pages, Some(pages)))
+            .map_err(|e| e.to_string())?;
+        store.data_mut().memory = Some(memory);
+        let base = Global::new(
+            &mut store,
+            GlobalType::new(ValType::I32, Mutability::Const),
+            Val::I32(0),
+        )
+        .map_err(|e| e.to_string())?;
         let mut linker = Linker::new(&self.engine);
+        linker
+            .define(&store, "doslet", "memory", memory)
+            .and_then(|linker| linker.define(&store, "doslet", "base", base))
+            .map_err(|e| e.to_string())?;
         linker
             .func_wrap(
                 "doslet",
                 "poll",
                 |mut caller: Caller<'_, State<R>>, completed: u32, remaining: u32| -> i32 {
-                    let memory = caller
-                        .get_export("memory")
-                        .and_then(|e| e.into_memory())
-                        .expect("compiler memory export");
+                    let memory = caller.data().memory.expect("scratch memory");
                     let (bytes, state) = memory.data_and_store_mut(&mut caller);
                     match state.host.poll(completed, remaining, bytes) {
                         Ok(id) => id,
@@ -127,9 +146,6 @@ impl Artifact {
         let run = instance
             .get_typed_func::<u32, u32>(&mut store, "run")
             .map_err(|e| e.to_string())?;
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or("missing memory")?;
         Ok(Runner {
             store,
             run,
@@ -158,6 +174,7 @@ fn load_cached_artifact(engine: &Engine, serialized: &[u8]) -> Result<Module, St
 
 struct State<R: Runtime> {
     host: Host<R>,
+    memory: Option<Memory>,
     error: Option<doslet_x86_wasm::host::Error<R::Error>>,
 }
 pub struct Runner<R: Runtime + 'static> {

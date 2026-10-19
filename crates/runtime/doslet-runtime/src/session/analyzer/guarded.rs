@@ -43,6 +43,9 @@ pub(super) struct GuardProbe {
     pub interrupted_traces: u64,
 }
 impl GuardProbe {
+    pub(super) fn idle(&self) -> bool {
+        self.remaining == 0 && self.irq.is_none() && self.guards.iter().all(Option::is_none)
+    }
     pub(super) fn recurring_source(
         &self,
         head: u32,

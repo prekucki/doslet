@@ -84,6 +84,138 @@ Heroes image with a RAM overlay. After arrival-based learning, a menu run at
 seconds through learned waiting, with ongoing nonzero PCM output. This verifies
 activation in that menu, not puzzle/battle compatibility or audible playback.
 
+## Game web packages
+
+`doslet-web` is the user-facing Rust CLI; `doslet-web-build` remains Trunk's
+internal worker/audio build hook. Install the pinned Cargo, Trunk,
+wasm-bindgen and Binaryen tools from `mise.toml` before building a site.
+
+```sh
+cargo run -p doslet-web --release --locked -- build games/ROTT.toml -o target/rott-site
+cargo run -p doslet-web --release --locked -- serve games/ROTT.toml --port 8080
+```
+
+Both commands build the release frontend through Trunk. `serve` then starts
+a Rust HTTP server bound to loopback; it prints the localhost URL. Without
+`--output`, previews use a fresh directory under `target`; `build` defaults to
+`target/<profile-name>-web`. Existing output directories are never overwritten.
+Use `--web-dist web/dist` to reuse a previously built frontend and `--offline`
+to build without downloading tool dependencies. No Node tooling is involved.
+`games/ROTT.toml` sets `[game] startup_keys = "15"`; both native and browser
+frontends queue that text at the first BIOS keyboard wait. The optional
+`--startup-keys` build argument overrides this profile value for one web
+package.
+
+The current packager accepts one C: directory or ZIP mount, resolves paths
+beside the TOML, and validates the selected EXE/COM with the browser loader.
+Without an explicit mount it uses the executable's directory as C:.
+It generates a portable profile and launch manifest, and converts native save
+store bindings to IndexedDB for new browser writes. At build time, an existing
+native C: save overlay is validated against the original game files and merged
+into the single `bundle/game.zip`; no native database or separate save seed is
+shipped. Pass `--no-saves` to package only the original files. An `info.cover`
+image becomes `bundle/cover.<ext>` and the start page's artwork and blurred
+backdrop; other `[info]` fields are listed under the title. Empty directories
+created only in the native overlay cannot yet be represented by the ZIP loader,
+so the packager rejects that case instead of silently dropping them.
+Additional drives, ISO media and native memory-patch manifests are rejected.
+Directory media must contain at most 4,096 files, 256 MiB expanded and 64 MiB
+per file; the resulting ZIP must fit the browser's 64 MiB limit. Symlinks and
+special files inside a game directory are rejected. Source media stay unchanged.
+
+`--wasm-procedures FILE` packages the same embedded `procedure_memory` bundle
+used by the native frontend. The packager preserves its bytes, checks the
+executable identity, module checksum and memory ABI, and emits
+`aot.kind = "procedure-memory"` in the launch manifest. The input must be the
+version-2 `procedures.wasm` produced by the existing
+[`prepare_memory_procedures` generator](compatibility/wasm-core.md#direct-memory-procedures-with-internal-branches).
+The browser uses its own machine memory and still verifies live instruction
+sources, CPU context and memory capabilities before each admitted call.
+Bound addresses must match the browser loader: ROTT loads at different bases
+with and without a DPMI host. Modules record the DPMI mode of their captured
+layout; the packager accepts `direct`, the browser's mode, and older modules
+without a recorded mode. Packaging a native module alone does not establish
+that its procedures run in the browser or improve performance.
+
+Without `--wasm-procedures` or `--aot-profile`, `--aot auto` and `--aot required`
+first look for the native cache's
+`aot/<executable-sha256>/dpmi-direct/procedures.wasm`, the copy bound under the
+browser's DPMI Direct mode.
+An invalid discovered bundle is reported as an error. `--aot-profile` explicitly
+selects the register-code backend; `--aot off` disables both backends and cannot
+be combined with either explicit AOT input.
+
+When no procedure bundle is selected, `--aot auto` analyzes reachable original
+LE instructions and emits a guarded register-code module when supported entries
+exist and average at least four instructions per block. Shorter pieces cost
+more per grant than they run, so the build reports their average and keeps the
+interpreter; `--aot required` or `--aot-profile` packages them anyway. It declares each LE code
+object at its preferred base; the runtime verifies one live load delta per object,
+since DOS4GW places ROTT at different addresses with and without a DPMI host. Relocated instructions and
+unsupported code stay in the interpreter. `--aot required` fails if there are
+no entries; `--aot off` disables preparation. `--aot-profile FILE` accepts DSJ1
+or speed-tier instruction observations as an alternative source. An explicit
+executable identity must match the selected EXE; runtime source-byte, CPU-context
+and device-budget checks still apply. AOT input does not install speed-tier
+labels or authorize skipping instructions. The browser loads the generated
+module, checks its profile and asset hashes, and retains AOT across Reset.
+The runtime reads its profile directly from the module's `doslet.profile`
+custom section; new packages do not duplicate it as `aot-profile.bin`. Older
+manifests with an external profile remain readable and are checked against the
+embedded profile before installation.
+Register-code AOT keeps the configured pacing (HOT/COLD/GREY tiers or adaptive
+CPU) and idle policies. Grants yield to idle-loop proofs, known idle heads, analyzer windows and
+synchronization bursts, so the same wait loops are detected and skipped with AOT.
+
+To enable actual HOT/COLD/GREY pacing, use `--speed-tiers FILE.json` with an
+exact-executable profile (`identity = "exe-sha256:..."`). The packager validates
+and includes it, and the browser starts in the tiered CPU mode. The CPU menu then
+exposes the three rates and preserves the mode across Reset. Example:
+
+```sh
+cargo run -p doslet-web --release --locked -- serve games/ROTT.toml \
+  --speed-tiers "$HOME/.cache/doslet/speed-tiers/2deedf54c45178792483114c017223407e3044abcc0863526aa477654a78569a.json" \
+  --aot required
+```
+
+With `--speed-tiers`, AOT preparation uses that profile's observed code unless
+`--aot-profile` supplies another input. `--aot off` keeps tier pacing with the
+ordinary interpreter. A tiered AOT grant binds only blocks whose instructions
+all have the same live, byte-guarded tier; a tier transition returns to the
+runtime. It charges completed instruction counts to that tier before advancing
+devices through the existing scheduler. The slowest configured tier bounds
+grants before hardware events, including for HOT/MAX. Mixed blocks and refused
+grants keep the interpreter fallback. IRQ labels retain their existing static
+meaning; AOT does not infer a label from the caller or current interrupt depth.
+
+The register-code backend currently translates flat protected-mode 32-bit
+register code, with interpreter fallback for real mode, memory instructions and other forms.
+Its coverage and callback overhead depend on the game. Generated entry counts
+are not evidence of a browser speedup; compare the production browser bundle
+with `--aot off` before claiming a gain. On a ROTT gameplay state under native
+Wasmtime, three guest seconds took 2–8% longer than the interpreter: this
+register-only backend translated 0.03–0.3% of steps. Its static ROTT blocks
+average 2.5 instructions, because every memory access ends a block, so
+`--aot auto` leaves it out. Entries that do not repay
+their batch stop become cold, which bounds that overhead.
+
+For a bundled game, inspect `window.dosletBundleBridge.state.aot` in the browser
+console. `active` and `installed` confirm the worker has installed the module;
+increasing `translatedSteps` proves execution. `translatedTiers` counts translated
+HOT/COLD/GREY/IRQ instructions. `zeroBudget`, `rejectedContext`
+and `missingCode` count decisions to use the interpreter because the runtime
+gave no translated grant, the CPU context was unsuitable, or no guarded code
+matched. `regions` lists each relocatable span with its verified live `delta`
+(null until found); `interpreterBatches`, `pageValidations`, `rebaseAttempts`
+and `coldEntries` show fallback batching, code-page checks, rebase work and
+entries no longer stopping batches. These are cumulative counts; the adjacent `code32`, `protectedMode`,
+`paging`, `executionLabels`, `csBase` and `csLimit` describe the latest CPU state.
+
+Use `output.midi_output = "rust"` for ROM-free portable audio. MT-32 profiles
+require a configured ROM directory or `--rom-dir DIRECTORY`; only that CONTROL/PCM pair
+is included. The resulting site includes local game media and any supplied
+ROMs. The output is a static directory; serve it on localhost or over HTTPS.
+
 ## Comparison baseline
 
 The annotated tag `baseline/pre-adaptive-cpu` points to commit
@@ -631,6 +763,32 @@ cargo test -p doslet --locked large_hq2x_frames_remain_visible_during_gpu_upload
 It renders nine 640×480 synthetic frames enlarged by HQ2x to 1280×960,
 checking image pixels before and after asynchronous texture uploads. It requires
 no window or game data and does not validate live gameplay or display timing.
+
+Validate the desktop xBRZ shader with an available wgpu adapter:
+
+```sh
+cargo test -p doslet --locked gpu_xbrz -- --ignored --nocapture
+```
+
+This offscreen rendering test checks edge smoothing, 1:1 pixels, source borders,
+sRGB output, fractional scaling, frame replacement and video-size changes. It
+prints the adapter so software Vulkan is distinguishable from hardware GPU
+execution. It does not verify interactive window presentation or game performance.
+
+After building `web/dist` with Rust Trunk, check the production iced filter
+selector in an isolated Firefox profile (Python standard library, no Node):
+
+```sh
+python3 tests/browser_xbrz.py
+python3 tests/browser_xbrz.py --software
+```
+
+The first test forces the WebGL path, selects xBRZ through the UI, verifies that
+its shader compiles and draws, and switches back to Nearest before resizing.
+The second disables GPU rendering and checks the visible fallback notice and
+unchanged guest pixels. Screenshots and Firefox logs are written under `target/`.
+This is a synthetic display test, not a game-performance benchmark or WebGPU
+browser acceptance test.
 
 For the local Heroes build, this ignored test compares 40 guest seconds at
 50 MHz with background JIT and with the cached interpreter. Both retain Rust GM

@@ -554,6 +554,7 @@ mod tests {
             config_sequence: 0,
             cpu_sequence: 0,
             tier_meter: crate::speed_tier_meter::Meter::default(),
+            from_library: false,
         };
         let _ = app.update(Message::Config(crate::configurator::Edit::Name(
             "New name".into(),
@@ -880,6 +881,8 @@ pub struct Doslet {
     config_sequence: u64,
     cpu_sequence: u64,
     pub(crate) tier_meter: crate::speed_tier_meter::Meter,
+    /// Started from the library, which the toolbar offers to return to.
+    pub from_library: bool,
 }
 impl std::ops::Deref for Doslet {
     type Target = Snapshot;
@@ -889,9 +892,22 @@ impl std::ops::Deref for Doslet {
 }
 impl Doslet {
     pub fn from_cli(cli: crate::cli::Cli) -> Result<Box<Self>, Box<dyn std::error::Error>> {
-        let (worker, mut state) = Worker::spawn(cli)?;
+        let (worker, state) = Worker::spawn(cli)?;
+        Ok(Self::from_worker(worker, state))
+    }
+    /// A frontend for an engine built by `boot` on its emulation thread.
+    #[cfg(test)]
+    pub(crate) fn with_engine(
+        boot: impl FnOnce() -> Result<Box<crate::app::Doslet>, String> + Send + 'static,
+    ) -> Box<Self> {
+        let (worker, state) = Worker::spawn_with(boot).unwrap();
+        Self::from_worker(worker, state)
+    }
+    fn from_worker(worker: Worker, mut state: Snapshot) -> Box<Self> {
         let configurator = state.configurator.take().unwrap();
-        Ok(Box::new(Self {
+        let mut display_sizing = DisplaySizing::default();
+        display_sizing.filter = configurator.active.output.video_filter.into();
+        Box::new(Self {
             disk_activity: crate::disk_activity::Activity::new(
                 state.disk_reads.0,
                 state.disk_reads.1,
@@ -899,11 +915,12 @@ impl Doslet {
             worker,
             state,
             configurator,
-            display_sizing: DisplaySizing::default(),
+            display_sizing,
             config_sequence: 0,
             cpu_sequence: 0,
             tier_meter: crate::speed_tier_meter::Meter::default(),
-        }))
+            from_library: false,
+        })
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
         if let Message::DisplaySizing(message) = message {
@@ -923,6 +940,7 @@ impl Doslet {
                 if let Some(mut configurator) = packet.snapshot.configurator.take()
                     && packet.sequence >= self.config_sequence
                 {
+                    let previous_filter = self.configurator.active.output.video_filter;
                     // Preserve selection/caret across snapshots with unchanged text.
                     if configurator.profile_text == self.configurator.profile_text {
                         std::mem::swap(
@@ -931,6 +949,10 @@ impl Doslet {
                         );
                     }
                     self.configurator = configurator;
+                    if self.configurator.active.output.video_filter != previous_filter {
+                        self.display_sizing.filter =
+                            self.configurator.active.output.video_filter.into();
+                    }
                 }
                 self.state = packet.snapshot;
                 self.disk_activity.observe(

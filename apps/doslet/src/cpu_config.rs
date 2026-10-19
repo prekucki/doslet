@@ -18,12 +18,15 @@ impl std::fmt::Display for Mode {
 pub enum Core {
     Interpreter,
     Jit,
+    /// Installed procedure module; the interpreter runs everything else.
+    Aot,
 }
 impl std::fmt::Display for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Interpreter => "Interpreter",
             Self::Jit => "JIT · Cranelift",
+            Self::Aot => "AOT · Wasmtime",
         })
     }
 }

@@ -34,6 +34,13 @@ pub struct LaunchSettings {
     #[allow(dead_code, reason = "headless runners select profiles explicitly")]
     pub core_profile_cache: Option<PathBuf>,
     pub wasm_procedures: Option<PathBuf>,
+    /// The module was found in the cache rather than requested; speed-tier
+    /// labels then take precedence instead of rejecting the launch.
+    #[allow(dead_code, reason = "headless runners select modules explicitly")]
+    pub automatic_procedures: bool,
+    /// Cache path of a module to prepare in the background for this program.
+    #[allow(dead_code, reason = "only the desktop prepares modules")]
+    pub prepare_procedures: Option<PathBuf>,
     pub interpret_procedures: bool,
     /// Native code compiled from procedure modules; `None` compiles every launch.
     #[allow(dead_code, reason = "read only with the wasm-procedures feature")]
@@ -63,9 +70,22 @@ impl Default for LaunchSettings {
             core_profile: None,
             core_profile_cache: None,
             wasm_procedures: None,
+            automatic_procedures: false,
+            prepare_procedures: None,
             interpret_procedures: false,
             compiled_cache: None,
         }
+    }
+}
+
+/// The DPMI mode a procedure module is bound to, as named in its metadata.
+#[allow(dead_code, reason = "read only with the wasm-procedures feature")]
+pub fn dpmi_layout(mode: Option<doslet_runtime::session::dpmi::Mode>) -> &'static str {
+    use doslet_runtime::session::dpmi::Mode;
+    match mode {
+        None => "off",
+        Some(Mode::Reflect) => "reflect",
+        Some(Mode::Direct) => "direct",
     }
 }
 
@@ -169,14 +189,35 @@ pub fn install_wasm_procedures(
     }
     #[cfg(not(feature = "wasm-procedures"))]
     let _ = session;
+    // The cached copy was chosen for the configured DPMI mode. A restored
+    // state without that host places code elsewhere; keep the interpreter.
+    if settings.automatic_procedures && session.dpmi_mode() != settings.dpmi {
+        eprintln!(
+            "[INFO doslet] AOT: cached procedures need DPMI {}; this session uses DPMI {}",
+            dpmi_layout(settings.dpmi),
+            dpmi_layout(session.dpmi_mode())
+        );
+        return Ok(());
+    }
     if let Some(path) = &settings.wasm_procedures {
+        // Validation precedes any session change, so a rejected cached module
+        // leaves the ordinary interpreter; an explicit one stops the launch.
         #[cfg(feature = "wasm-procedures")]
-        wasm_procedures::install(
+        if let Err(error) = wasm_procedures::install(
             session,
             path,
+            dpmi_layout(session.dpmi_mode()),
             settings.interpret_procedures,
             settings.compiled_cache.as_deref(),
-        )?;
+        ) {
+            if !settings.automatic_procedures {
+                return Err(error);
+            }
+            eprintln!(
+                "[WARN doslet] AOT: ignoring cached {}: {error}",
+                path.display()
+            );
+        }
         #[cfg(not(feature = "wasm-procedures"))]
         return Err(format!(
             "{} requires the wasm-procedures Cargo feature",

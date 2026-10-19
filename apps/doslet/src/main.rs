@@ -48,9 +48,13 @@ mod browser_input;
 mod cli;
 mod configurator;
 mod keyboard;
+#[cfg(not(target_arch = "wasm32"))]
+mod library;
 #[path = "../../common/machine_profile.rs"]
 mod machine_profile;
 mod midi_activity;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasm-procedures"))]
+mod native_aot;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_audio;
 #[cfg(not(target_arch = "wasm32"))]
@@ -66,13 +70,23 @@ mod native_roms;
 #[path = "../../common/native_storage.rs"]
 mod native_storage;
 #[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/native_store_format.rs"]
+#[allow(dead_code, reason = "native tools read committed snapshots")]
+mod native_store_format;
+#[cfg(not(target_arch = "wasm32"))]
 mod native_synth;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_zip;
 mod presentation;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasm-procedures"))]
+#[path = "../../common/procedure_cache.rs"]
+mod procedure_cache;
 #[cfg(not(target_arch = "wasm32"))]
 mod profile;
+#[cfg(not(target_arch = "wasm32"))]
+mod shell;
 mod ui;
+mod xbrz;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -87,6 +101,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{name}");
         }
         return Ok(());
+    }
+    // Without a game, browse launch profiles; Play starts one in this window.
+    if cli.opens_library() {
+        let library = library::Library::discover();
+        if !library.is_empty() {
+            let forwarded = std::env::args_os().skip(1).collect();
+            shell::run(shell::Shell::new(library, forwarded))?;
+            return Ok(());
+        }
     }
     let app = desktop::Doslet::from_cli(cli)?;
     // Transfer the presentation proxy once; the worker retains machine ownership.

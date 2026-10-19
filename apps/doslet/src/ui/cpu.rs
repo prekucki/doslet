@@ -56,8 +56,11 @@ pub(super) fn dialog(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     } else {
         &[Mode::Fixed, Mode::Adaptive][..]
     };
-    let cores = if JIT_AVAILABLE {
-        &[Core::Jit, Core::Interpreter][..]
+    // Installed procedures stay for the session and keep the JIT idle.
+    let cores = if app.cpu_settings.core == Core::Aot {
+        &[Core::Aot][..]
+    } else if JIT_AVAILABLE {
+        &[Core::Interpreter, Core::Jit][..]
     } else {
         &[Core::Interpreter][..]
     };

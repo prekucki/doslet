@@ -17,6 +17,26 @@ mounted file ownership during setup. `Session::configure_launch` accepts DOS
 command-tail and working-directory byte slices before execution; the CPU and
 chip graph does not depend on TOML. The desktop retains launch settings for Reset.
 
+The Rust `doslet-web` application packages a TOML launch profile and local media
+as a static website. Its `serve` subcommand builds before starting a localhost
+preview. Optional offline register-code AOT uses the existing CPU WASM compiler;
+the browser machine Worker retains one Session owner, validates live code and
+device grants, and calls the interpreter for unsupported work. Generated modules
+import the runtime's memory but touch only a fixed register/dispatch scratch;
+polls copy nothing. The runtime verifies each LE object's live load delta.
+An embedded `doslet.procedures` module can instead use the same bounded
+memory-procedure compiler and metadata as native AOT. The browser Worker imports
+its own linear memory into that module, owns RAM, VRAM and code generations in
+stable allocations there, and passes only a small call frame at procedure
+boundaries. Native and browser dispatch share source-byte guards, work and IRQ
+admission, and interpreter fallback. Procedure bundles carry post-relocation
+absolute addresses, so preparation must use the browser's actual loader layout.
+Tier-aware register grants use the existing instruction labels and scheduler:
+every bound block must have one live tier, transitions end the grant, and the
+runtime charges that tier's counters before advancing devices. Other foreign
+engines retain their existing refusal of labels unless they explicitly provide
+live classification and matching tier accounting.
+
 `doslet-storage` defines bounded positional reads, source identities, request
 epochs and atomic commit messages. `doslet-iso9660` parses either an owned
 immutable image or a cached positional provider. Its DOS file and MSCDEX paths
@@ -178,7 +198,8 @@ graph TD
 
 ## Ownership and borrowing
 
-The native experimental `wasm-procedures` feature gives PC RAM one concrete
+The native `wasm-procedures` feature, enabled by default in the desktop app,
+gives PC RAM one concrete
 backing selector. Its ordinary variant owns boxed RAM and page generations;
 its WASM variant owns one fixed Wasmtime linear memory containing RAM,
 generations and physical VRAM. VGA retains its device controls and borrows the
@@ -971,12 +992,14 @@ The standalone `doslet-wasm-game-probe` application also compiles the complete
 interpreter/runtime to WASM for comparisons under that engine. Its private unsafe
 FFI boundary transfers owned setup buffers and opaque owner handles to a trusted
 synchronous diagnostic driver. One probe owns each Session; the shared Session
-adapter and emulation libraries retain safe interfaces. A native trampoline
-bridges fixed scratch state between runtime and translated WASM memories.
+adapter and emulation libraries retain safe interfaces. The translated module
+imports the probe's memory and scratch base, as in the browser worker.
 See [WASM core](compatibility/wasm-core.md).
 It does not replace the execution or adaptive scheduling strategies below.
 
-The native frontends enable `dynamic-core` by default on x86-64 and AArch64.
+The headless frontend enables `dynamic-core` by default on x86-64 and AArch64.
+The desktop app makes it opt-in (`--features dynamic-core`, then `--dynamic-core`)
+and enables `wasm-procedures` by default instead.
 `doslet-x86` remains a `no_std` CPU library with static bus dispatch. Its optional
 `doslet-x86-jit` dependency is a host compiler adapter using `std` and Cranelift;
 it is excluded from WASM and from builds without the feature. The adapter has
@@ -1184,6 +1207,18 @@ number prevents rebuilding an unchanged frame. The initial iced image handle
 requires owned pixels, so presentation allocates an RGBA image and moves that
 buffer into iced. Handle clones share the underlying image; they do not clone
 the emulated machine.
+
+Desktop and browser xBRZ use an iced shader primitive with a WGSL port of
+[libretro's xBRZ freescale shader](https://github.com/libretro/slang-shaders/blob/master/edge-smoothing/xbrz/shaders/xbrz-freescale.slang).
+Its GPU texture stays at guest resolution, is uploaded only when the presentation
+handle changes, and is reused until the video dimensions change. Corner detection
+and blending run in the fragment shader at the physical viewport size. The
+shader clamps source-edge reads and handles the target's sRGB encoding. The
+shader retains upstream Hyllian/Zenju attribution and license notices (MIT and
+GPLv3). Browser builds use the same shader through wgpu's WebGPU/WebGL backend.
+When iced falls back to Canvas2D, selecting xBRZ reports that GPU rendering is
+unavailable and retains the current filter. The check uses iced's existing canvas
+context rather than a separate GPU capability probe.
 
 A future shader widget can own reusable GPU textures and accept indexed pixels
 plus a palette, reducing CPU conversion and repeated host allocations. GPU upload

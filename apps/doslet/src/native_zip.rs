@@ -66,6 +66,28 @@ pub fn load_game_with_settings(
     Ok(session)
 }
 
+/// The selected program's bytes, from its ZIP or from the host file.
+#[cfg_attr(not(feature = "wasm-procedures"), allow(dead_code))]
+pub fn program_bytes(path: &Path, settings: &LaunchSettings) -> Result<Vec<u8>, Box<dyn Error>> {
+    if let Some((spec, mount)) = settings
+        .machine_spec
+        .as_ref()
+        .and_then(|s| mount(s).map(|m| (s, m)))
+    {
+        let archive = read(Path::new(spec.binding(&mount.source)))?;
+        let program = select(&archive, path.to_str())?;
+        return Ok(archive.program_bytes(&program)?);
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(crate::archive::MAX_ZIP_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > crate::archive::MAX_ZIP_BYTES {
+        return Err(format!("{} exceeds the program size limit", path.display()).into());
+    }
+    Ok(bytes)
+}
+
 pub fn bind_game(
     controller: &mut crate::native_speed_tiers::Controller,
     path: &Path,
@@ -252,7 +274,15 @@ mod tests {
             .resolve()
             .unwrap();
         assert_eq!(cli.game.as_deref(), Some(Path::new("PLAY.COM")));
-        assert!(Cli::try_parse_from(["doslet", "--program", "PLAY.COM"]).is_err());
+        // --program also selects from a ZIP profile, so only resolution can reject it.
+        assert!(
+            Cli::parse_from(["doslet", "--program", "PLAY.COM"])
+                .resolve()
+                .is_err_and(|e| e.to_string().contains("inside a ZIP"))
+        );
+        assert!(
+            Cli::try_parse_from(["doslet", "--game", "GAME.EXE", "--program", "PLAY.COM"]).is_err()
+        );
         assert!(
             Cli::try_parse_from(["doslet", "--zip", "game.zip", "--game", "PLAY.COM"]).is_err()
         );

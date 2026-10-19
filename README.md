@@ -50,11 +50,14 @@ The browser version needs no installation and no server.
   VGA, SB16 DSP and mixer, MPU-401 and gameport are separate `no_std` libraries,
   each with its own tests. The CPU depends only on a bus contract, not on a PC,
   so the parts can be reused in other projects.
-- **Fast where it counts.** A decode cache speeds up the interpreter. On x86-64
-  and AArch64, a [Cranelift](https://cranelift.dev) JIT compiles frequently
-  executed protected-mode code. Differential tests check both against a
-  reference interpreter. Loops that only wait for the VGA retrace are skipped
-  ahead instead of being executed step by step.
+- **Fast where it counts.** A decode cache speeds up the interpreter. A game
+  procedure module generated offline runs whole procedures as WebAssembly
+  compiled by Wasmtime; the desktop installs it automatically for the matching
+  program and DPMI mode (ROTT: 1.23× in a measured window). An optional
+  [Cranelift](https://cranelift.dev) JIT remains behind a Cargo feature.
+  Differential tests check them against a reference interpreter. Loops that
+  only wait for the VGA retrace are skipped ahead instead of being executed
+  step by step.
 - **Flexible MIDI.** Play music through the built-in Rust synthesizer, Apple's
   system General MIDI synth on macOS, a MIDI
   port on your computer (TiMidity, Munt or a hardware synth), Web MIDI in the
@@ -104,8 +107,10 @@ sudo apt install build-essential pkg-config libasound2-dev libudev-dev
 ### On the desktop
 
 ```sh
-# Open the workspace, then press the play icon to start the built-in demo
+# Browse the launch profiles in ./games (covers, details, Play)
 cargo run -p doslet --release --locked
+# Without profiles, or with --demo: the workspace and its built-in demo
+cargo run -p doslet --release --locked -- --demo
 
 # Start your own game directly
 cargo run -p doslet --release --locked -- --game path/to/GAME.EXE
@@ -125,6 +130,18 @@ mise run web
 Open <http://127.0.0.1:8080>, choose **Open… → Choose ZIP…**, select the
 game's EXE and press **Start game**. `mise run web-build` builds a static
 bundle in `web/dist`. It needs no backend.
+
+Package a game from its TOML profile, or build and serve a quick localhost preview:
+
+```sh
+cargo run -p doslet-web --release --locked -- build games/ROTT.toml -o target/rott-site
+cargo run -p doslet-web --release --locked -- serve games/ROTT.toml --port 8080
+```
+
+The Rust CLI shows build progress and prepares experimental guarded AOT WASM
+for supported 32-bit register code. Other code keeps the interpreter. `serve`
+builds first; `--web-dist web/dist` explicitly reuses an existing frontend for
+faster packaging. See [web packaging](docs/development.md#game-web-packages).
 
 ### Without a window
 

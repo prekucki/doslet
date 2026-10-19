@@ -107,15 +107,33 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         },
         true,
     );
-    let identity = row![
-        text("doslet").size(20),
-        container(rule::vertical(1)).height(18),
-        text(shorten(&app.name, if narrow { 12 } else { 38 }))
-            .size(13)
-            .color(MUTED),
-    ]
-    .spacing(if narrow { 8 } else { 16 })
-    .align_y(iced::Center);
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut identity = row![]
+        .spacing(if narrow { 8 } else { 16 })
+        .align_y(iced::Center);
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.from_library {
+        identity = identity
+            .push(
+                button(
+                    row![text("‹").size(18), text("Library").size(13)]
+                        .spacing(6)
+                        .align_y(iced::Center),
+                )
+                .padding([4, 10])
+                .style(ghost)
+                .on_press(Message::ReturnToLibrary),
+            )
+            .push(container(rule::vertical(1)).height(18));
+    }
+    let identity = identity
+        .push(text("doslet").size(20))
+        .push(container(rule::vertical(1)).height(18))
+        .push(
+            text(shorten(&app.name, if narrow { 12 } else { 38 }))
+                .size(13)
+                .color(MUTED),
+        );
     let mut actions = row![run].spacing(4).align_y(iced::Center);
     if can_run {
         actions = actions.push(icon_button(Icon::Restart, "Restart", Message::Reset, false));
@@ -456,7 +474,7 @@ fn display_panel(app: &Doslet) -> Element<'_, Message> {
         field(
             "Filter",
             pick_list(
-                &DisplayFilter::ALL[..],
+                DisplayFilter::ALL,
                 Some(app.display_sizing.filter),
                 |filter| Message::DisplaySizing(SizingMessage::Filter(filter))
             )
@@ -933,6 +951,14 @@ fn viewport(app: &Doslet) -> Element<'_, Message> {
                 .width(width)
                 .height(height)
                 .into();
+            let pixels = if frame.filter == crate::presentation::DisplayFilter::Xbrz {
+                iced::widget::shader(crate::xbrz::Frame(handle.clone()))
+                    .width(width)
+                    .height(height)
+                    .into()
+            } else {
+                pixels
+            };
             let content = container(
                 iced::widget::mouse_area(pixels)
                     .interaction(cursor)

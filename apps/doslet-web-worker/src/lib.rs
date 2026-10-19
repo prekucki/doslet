@@ -10,10 +10,13 @@ mod machine_profile;
 use doslet_config::{MachineSpec, SourceKind, WritePolicy};
 use doslet_midi_routing::{Mode, Routing, SNAPSHOT_CAPACITY};
 use doslet_runtime::{Session, SessionStatus};
+mod aot;
+#[path = "../../common/procedure_manifest.rs"]
+mod procedure_manifest;
+use aot::BrowserSession;
 use doslet_storage::{
     CachedSource, HostCompletion, HostRequest, RequestTag, SourceId, SourceIdentity, StorageError,
 };
-use doslet_x86::ExecutionLabel;
 use doslet_x86::Gpr16;
 use std::sync::Arc;
 #[cfg(target_arch = "wasm32")]
@@ -21,7 +24,7 @@ use wasm_bindgen::prelude::*;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct WorkerEngine {
-    session: Session,
+    session: BrowserSession,
     archive: Option<archive::GameArchive>,
     active: Option<(archive::GameArchive, String)>,
     active_spec: MachineSpec,
@@ -47,79 +50,13 @@ pub struct WorkerEngine {
     pcm_wire: [f64; 128 * 4],
     routing: Routing,
     replay: Box<[u8]>,
+    /// Generated AOT modules import this fixed scratch as their base.
+    aot_scratch: Box<[u8]>,
 }
 
-#[derive(Clone)]
-struct TierProfile {
-    labels: Vec<ExecutionLabel>,
-    rates: [Option<u16>; 3],
-}
-
-fn parse_tier_profile(input: &str) -> Result<TierProfile, String> {
-    let value: serde_json::Value = serde_json::from_str(input).map_err(|e| e.to_string())?;
-    if value["unknown"] != "grey" || value["irq_policy"] != "static-grey" {
-        return Err("Speed-tier profile requires unknown=grey and irq_policy=static-grey".into());
-    }
-    let rates = value["rates"]
-        .as_array()
-        .ok_or("Missing speed-tier rates")?;
-    if rates.len() != 3 {
-        return Err("Expected HOT, COLD and GREY rates".into());
-    }
-    let rate = |value: &serde_json::Value| -> Result<Option<u16>, String> {
-        if value.is_null() {
-            return Ok(None);
-        }
-        let number = value.as_u64().ok_or("Invalid speed-tier rate")?;
-        if !(1..=1000).contains(&number) {
-            return Err("Speed-tier rates must be 1..1000 MHz".into());
-        }
-        Ok(Some(number as u16))
-    };
-    let rates = [rate(&rates[0])?, rate(&rates[1])?, rate(&rates[2])?];
-    if rates[1].is_none() || rates[2].is_none() {
-        return Err("COLD and GREY rates are required".into());
-    }
-    let nodes = value["nodes"]
-        .as_array()
-        .ok_or("Missing speed-tier labels")?;
-    if nodes.len() > 100_000 {
-        return Err("Too many speed-tier labels".into());
-    }
-    let mut labels = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let address = u32::try_from(node["pc"].as_u64().ok_or("Invalid label address")?)
-            .map_err(|_| "Invalid label address")?;
-        let code32 = match node["bits"].as_u64() {
-            Some(16) => false,
-            Some(32) => true,
-            _ => return Err("Invalid label bitness".into()),
-        };
-        let bytes = node["bytes"].as_array().ok_or("Missing label bytes")?;
-        if bytes.len() != 15 {
-            return Err("A label must guard 15 instruction bytes".into());
-        }
-        let mut guard = [0; 15];
-        for (out, byte) in guard.iter_mut().zip(bytes) {
-            *out = u8::try_from(byte.as_u64().ok_or("Invalid label byte")?)
-                .map_err(|_| "Invalid label byte")?;
-        }
-        let tier = match node["tier"].as_str() {
-            Some("fast") => 0,
-            Some("slow") => 1,
-            Some("grey") => 2,
-            Some("irq") => 3,
-            _ => return Err("Invalid speed tier".into()),
-        };
-        labels.push(ExecutionLabel {
-            address,
-            code32,
-            bytes: guard,
-            tier,
-        });
-    }
-    Ok(TierProfile { labels, rates })
-}
+#[path = "../../common/web_speed_tiers.rs"]
+mod web_speed_tiers;
+use web_speed_tiers::{TierProfile, parse_tier_profile};
 impl Default for WorkerEngine {
     fn default() -> Self {
         Self::new()
@@ -166,12 +103,19 @@ impl WorkerEngine {
     pub fn effective_cpu_mhz(&self) -> u16 {
         self.session.hardware_config().cpu_mhz
     }
-    /// Browser pacing may lower the live rate while preserving the user's ceiling.
+    /// Browser pacing caps adaptive throughput at host capacity, preserving the
+    /// user's ceiling. Zero, or the ceiling itself, removes the cap.
     pub fn set_host_cpu_mhz(&mut self, mhz: u16) -> Result<(), String> {
-        if !self.adaptive_cpu || mhz == 0 || mhz > self.active_spec.hardware.cpu_mhz {
+        if !self.adaptive_cpu || mhz > self.active_spec.hardware.cpu_mhz {
             return Err("Host CPU rate must be within the adaptive ceiling".into());
         }
-        self.session.set_cpu_mhz(mhz).map_err(|e| e.to_string())
+        self.session
+            .set_host_cpu_limit(mhz)
+            .map_err(|e| e.to_string())
+    }
+    /// Current host capacity cap, or zero.
+    pub fn host_cpu_limit(&self) -> u16 {
+        self.session.host_cpu_limit()
     }
     pub fn cpu_mode(&self) -> String {
         if self.tiers_active {
@@ -221,6 +165,7 @@ impl WorkerEngine {
         ];
         self.session.set_adaptive_cpu(false);
         self.session.set_adaptive_idle(false);
+        self.session.set_synchronization_analysis(false);
         self.session
             .set_execution_tiers(Some(profile.labels.clone()), rates)
             .map_err(str::to_owned)?;
@@ -242,6 +187,7 @@ impl WorkerEngine {
         let candidate = self.candidate.as_mut().ok_or("No prepared machine")?;
         candidate.set_adaptive_cpu(false);
         candidate.set_adaptive_idle(false);
+        candidate.set_synchronization_analysis(false);
         candidate
             .set_execution_tiers(Some(profile.labels.clone()), profile.rates)
             .map_err(str::to_owned)?;
@@ -285,7 +231,7 @@ impl WorkerEngine {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
         Self {
-            session: Session::demo(),
+            session: Session::demo().into(),
             archive: None,
             active: None,
             active_spec: MachineSpec::default(),
@@ -311,6 +257,7 @@ impl WorkerEngine {
             pcm_wire: [0.0; 128 * 4],
             routing: Routing::new(Mode::Gm),
             replay: vec![0; SNAPSHOT_CAPACITY].into_boxed_slice(),
+            aot_scratch: vec![0; doslet_x86_wasm::STATE_BYTES].into_boxed_slice(),
         }
     }
     pub fn import_zip(&mut self, bytes: Vec<u8>) -> Result<String, String> {
@@ -331,7 +278,7 @@ impl WorkerEngine {
         self.tiers_active = false;
         self.bundle_runtime = false;
         self.machine_epoch += 1;
-        self.session = session;
+        self.session = session.into();
         self.routing = Routing::new(self.routing.mode());
         self.revision = None;
         Ok(())
@@ -426,7 +373,7 @@ impl WorkerEngine {
             .take()
             .ok_or("No prepared configuration")?;
         candidate.start();
-        self.session = candidate;
+        self.session = candidate.into();
         self.active = self.candidate_archive.take();
         self.active_spec = spec;
         self.bundle_runtime = self.candidate_bundle_runtime;
@@ -592,7 +539,8 @@ impl WorkerEngine {
             session
         } else {
             Session::demo()
-        };
+        }
+        .into();
         self.routing = Routing::new(self.routing.mode());
         self.machine_epoch += 1;
         self.revision = None;
@@ -609,6 +557,93 @@ impl WorkerEngine {
     }
     pub fn advance(&mut self, budget: u32) -> u32 {
         self.session.advance(budget.min(10000))
+    }
+    /// Install only compiler-produced ABI-v1 metadata between execution batches.
+    pub fn validate_aot(&self, profile: &[u8]) -> Result<(), String> {
+        doslet_x86_wasm::Translation::from_bytes(profile)
+            .map(|_| ())
+            .map_err(str::to_owned)
+    }
+    /// Configured pacing and idle policies stay active; grants yield to them
+    /// whenever they observe execution.
+    pub fn install_aot(&mut self, profile: &[u8]) -> Result<(), String> {
+        self.session.install(profile)
+    }
+    pub fn aot_begin(&mut self) {
+        self.session.begin();
+    }
+    pub fn aot_abi_ptr(&self) -> *const u8 {
+        self.aot_scratch.as_ptr()
+    }
+    pub fn aot_abi_len(&self) -> usize {
+        doslet_x86_wasm::STATE_BYTES
+    }
+    pub fn aot_poll(&mut self, completed: u32, remaining: u32) -> Result<i32, String> {
+        self.session
+            .poll(completed, remaining, &mut self.aot_scratch)
+    }
+    pub fn aot_translated_steps(&self) -> u64 {
+        self.session.translated()
+            + self
+                .session
+                .wasm_procedure_stats()
+                .map_or(0, |stats| stats.translated_instructions)
+    }
+    pub fn aot_diagnostics(&self) -> String {
+        self.session.diagnostics()
+    }
+    /// Validate the same bounded declarations used by the native loader.
+    pub fn validate_procedure_aot(&self, metadata: &[u8]) -> Result<(), String> {
+        procedure_manifest::parse(metadata)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    /// The generated exports import this worker's memory. This callback only
+    /// selects an already compiled export; it must never reenter WorkerEngine.
+    #[cfg(target_arch = "wasm32")]
+    pub fn install_procedure_aot(
+        &mut self,
+        metadata: &[u8],
+        callback: js_sys::Function,
+    ) -> Result<(), String> {
+        let bindings = procedure_manifest::parse(metadata).map_err(|error| error.to_string())?;
+        let call = Box::new(move |index: u32, pointer: u32| {
+            let result = callback
+                .call2(
+                    &JsValue::UNDEFINED,
+                    &JsValue::from(index),
+                    &JsValue::from(pointer),
+                )
+                .map_err(|error| format!("Browser procedure execution: {error:?}"))?;
+            result
+                .as_f64()
+                .filter(|n| {
+                    n.is_finite() && *n >= 0.0 && *n <= f64::from(u32::MAX) && n.fract() == 0.0
+                })
+                .map(|n| n as u32)
+                .ok_or_else(|| "Browser procedure returned a non-u32 status".to_owned())
+        });
+        self.session.install_browser_wasm_procedures(call, bindings)
+    }
+    pub fn procedure_aot_diagnostics(&self) -> String {
+        let stats = self.session.wasm_procedure_stats();
+        serde_json::json!({
+            "installed": stats.is_some(),
+            "entries": self.session.wasm_procedure_entry_count(),
+            "copyTierEntries": self.session.wasm_procedure_copy_tier_entries().collect::<Vec<_>>(),
+            "calls": stats.map_or(0, |s| s.calls),
+            "translatedSteps": stats.map_or(0, |s| s.translated_instructions),
+            "kernelCalls": stats.map_or(0, |s| s.kernel_calls),
+            "kernelInstructions": stats.map_or(0, |s| s.kernel_instructions),
+            "sideExits": stats.map_or(0, |s| s.side_exits),
+            "sourceRefusals": stats.map_or(0, |s| s.source_refusals),
+            "budgetRefusals": stats.map_or(0, |s| s.budget_refusals),
+            "kernelIrqRefusals": stats.map_or(0, |s| s.kernel_irq_refusals),
+            "tierRefusals": stats.map_or(0, |s| s.tier_refusals),
+            "translatedTiers": stats.map_or([0;4], |s| s.translated_tiers),
+            "lastError": self.session.wasm_procedure_last_error(),
+        })
+        .to_string()
     }
     pub fn timeslice_yielded(&self) -> bool {
         self.session.timeslice_yielded()
@@ -630,6 +665,14 @@ impl WorkerEngine {
         } else {
             Ok(true)
         }
+    }
+    /// Queue one configured ASCII character as a BIOS scan/ASCII pair.
+    pub fn startup_key(&mut self, ascii: u8) -> Result<bool, String> {
+        let (scan, ascii) = doslet_config::bios_key_for_ascii(ascii)
+            .ok_or("Unsupported startup keyboard character")?;
+        self.session
+            .push_key(scan, ascii)
+            .map_err(|e| e.to_string())
     }
     pub fn waiting_for_key(&self) -> bool {
         self.session.waiting_for_key()
@@ -789,12 +832,11 @@ impl WorkerEngine {
     }
     pub fn midi_channels(&self) -> Vec<u8> {
         let mut bytes = vec![0; 16 * doslet_midi_routing::Channel::BYTES];
-        for (channel, out) in self
-            .routing
-            .channels(self.output_mode)
-            .into_iter()
-            .zip(bytes.chunks_exact_mut(doslet_midi_routing::Channel::BYTES))
-        {
+        for (channel, out) in self.routing.channels(self.output_mode).into_iter().zip(
+            bytes
+                .as_chunks_mut::<{ doslet_midi_routing::Channel::BYTES }>()
+                .0,
+        ) {
             channel.write(out);
         }
         bytes
@@ -979,9 +1021,116 @@ mod tests {
     include!("../../../tests/fixtures/midi.rs");
     use super::*;
     #[test]
+    #[ignore = "requires the local prepared ROTT browser module and learned instruction labels"]
+    fn local_browser_rott_copy_has_a_canonical_cfg_and_exact_mixed_label_counts() {
+        use doslet_runtime::wasm_procedures::bundle;
+        let module_path = std::env::var_os("DOSLET_PROCEDURE_BUNDLE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/rott-browser-procedures/procedures.wasm")
+            });
+        let profile_path = std::env::var_os("DOSLET_PROCEDURE_TIERS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("XDG_CACHE_HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(
+                            std::env::var_os("HOME").expect("HOME or DOSLET_PROCEDURE_TIERS"),
+                        )
+                        .join(".cache")
+                    })
+                    .join(
+                        "doslet/speed-tiers/profiles/RiseoftheTriad-speed-tiers.json.learned.json",
+                    )
+            });
+        let module = std::fs::read(module_path).unwrap();
+        let metadata = bundle::read(&module).unwrap().unwrap().metadata;
+        let mut bindings = procedure_manifest::parse(metadata).unwrap();
+        let profile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(profile_path).unwrap()).unwrap();
+        let nodes: std::collections::BTreeMap<_, _> = profile["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|node| node["bits"] == 32)
+            .map(|node| (node["pc"].as_u64().unwrap() as u32, node))
+            .collect();
+        let binding = bindings
+            .iter_mut()
+            .find(|binding| binding.kernel.is_some())
+            .unwrap();
+        let entry = binding.entry_ip;
+        let kernel = binding.kernel.unwrap();
+        binding.code.sort_unstable_by_key(|part| part.linear);
+        let mut sites = Vec::new();
+        for part in &binding.code {
+            let mut cursor = 0;
+            while cursor < part.expected.len() {
+                let length = usize::from(
+                    doslet_x86::translation::instruction_length(&part.expected[cursor..], true)
+                        .unwrap(),
+                );
+                let address = part.linear + cursor as u32;
+                let expected = &part.expected[cursor..cursor + length];
+                let tier = nodes
+                    .get(&address)
+                    .filter(|node| {
+                        node["bytes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .take(length)
+                            .map(|n| n.as_u64().unwrap() as u8)
+                            .eq(expected.iter().copied())
+                    })
+                    .map_or(2, |node| match node["tier"].as_str().unwrap() {
+                        "fast" => 0,
+                        "slow" => 1,
+                        "irq" => 3,
+                        _ => 2,
+                    });
+                sites.push(tier);
+                cursor += length;
+            }
+        }
+        assert_eq!(kernel.canonical_sites(), Some(sites.len()));
+        let count = 201;
+        let mut counts = [0u64; 4];
+        for (site, tier) in sites.into_iter().enumerate() {
+            counts[tier] += u64::from(kernel.canonical_repetitions(count, site).unwrap());
+        }
+        assert_eq!(
+            counts.iter().sum::<u64>(),
+            u64::from(kernel.actual_work(count).unwrap())
+        );
+        assert!(
+            counts[0] > 0 && counts[2] > 0,
+            "learned renderer should retain both FAST and GREY work"
+        );
+        let mut engine = WorkerEngine::new();
+        engine
+            .session
+            .install_wasm_procedures(&module, bindings)
+            .unwrap();
+        let diagnostics: serde_json::Value =
+            serde_json::from_str(&engine.procedure_aot_diagnostics()).unwrap();
+        assert!(
+            diagnostics["copyTierEntries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_u64() == Some(u64::from(entry)))
+        );
+        println!(
+            "local browser copy entry={entry:#x}, canonical CFG proved, ECX={count}, original instruction tier counts={counts:?}"
+        );
+    }
+    #[test]
     fn blaster_audio_change_requires_restart_and_preserves_worker_state() {
         let mut engine = WorkerEngine::new();
-        engine.session = Session::new(&[0xeb, 0xfe]).unwrap();
+        engine.session = Session::new(&[0xeb, 0xfe]).unwrap().into();
         engine.start();
         engine.advance(100);
         let before = (
@@ -1013,7 +1162,7 @@ mod tests {
     #[test]
     fn keyboard_mode_changes_live_and_is_retained_by_reset() {
         let mut engine = WorkerEngine::new();
-        engine.session = Session::new(&[0x40, 0xeb, 0xfd]).unwrap();
+        engine.session = Session::new(&[0x40, 0xeb, 0xfd]).unwrap().into();
         engine.start();
         engine.advance(100);
         let before = (
@@ -1052,7 +1201,9 @@ mod tests {
     #[test]
     fn mouse_capture_mode_selects_host_motion_without_restarting_the_worker() {
         let mut engine = WorkerEngine::new();
-        engine.session = Session::new(&[0xb8, 0x0b, 0, 0xcd, 0x33, 0xEB, 0xFE]).unwrap();
+        engine.session = Session::new(&[0xb8, 0x0b, 0, 0xcd, 0x33, 0xEB, 0xFE])
+            .unwrap()
+            .into();
         engine.start();
         engine.advance(16);
         assert!(engine.pointer_relative_in_use());
@@ -1087,7 +1238,7 @@ mod tests {
     #[test]
     fn live_cpu_speed_preserves_execution_and_the_reset_recipe() {
         let mut engine = WorkerEngine::new();
-        engine.session = Session::new(&[0x40, 0xeb, 0xfd]).unwrap();
+        engine.session = Session::new(&[0x40, 0xeb, 0xfd]).unwrap().into();
         engine.start();
         engine.advance(100);
         engine.pause();
@@ -1120,7 +1271,16 @@ mod tests {
         engine.set_host_cpu_mhz(33).unwrap();
         assert_eq!(engine.cpu_mhz(), 133);
         assert_eq!(engine.effective_cpu_mhz(), 33);
+        // The host cap never replaces the adaptive ceiling, and it can recover.
+        assert_eq!(engine.host_cpu_limit(), 33);
+        assert_eq!(
+            engine.session.synchronization_analysis().configured_mhz,
+            133
+        );
         assert!(engine.set_host_cpu_mhz(134).is_err());
+        engine.set_host_cpu_mhz(0).unwrap();
+        assert_eq!(engine.host_cpu_limit(), 0);
+        engine.set_host_cpu_mhz(33).unwrap();
         engine.prepare_reset().unwrap();
         assert!(engine.candidate_adaptive_cpu);
         assert!(
@@ -1167,7 +1327,7 @@ mod tests {
     fn guest_pcm_metadata_comes_from_guest_dsp_commands() {
         let mut engine = WorkerEngine::new();
         assert_eq!(engine.guest_pcm_bits(), 0);
-        engine.session = Session::new(&sb16_pcm_program()).unwrap();
+        engine.session = Session::new(&sb16_pcm_program()).unwrap().into();
         engine.start();
         engine.advance(10000);
         assert_eq!(engine.guest_pcm_rate(), 16000);
@@ -1178,7 +1338,7 @@ mod tests {
     #[test]
     fn worker_transports_guest_opl3_audio_in_pcm_packets() {
         let mut engine = WorkerEngine::new();
-        engine.session = Session::new(&opl3_tone_program()).unwrap();
+        engine.session = Session::new(&opl3_tone_program()).unwrap().into();
         engine.start();
         let mut nonzero = 0;
         for _ in 0..50 {
@@ -1195,8 +1355,9 @@ mod tests {
     #[test]
     fn worker_exposes_guest_yield_before_the_next_batch() {
         let mut engine = WorkerEngine::new();
-        engine.session =
-            Session::new(&[0xB8, 0x80, 0x16, 0xCD, 0x2F, 0xB8, 0, 0x4C, 0xCD, 0x21]).unwrap();
+        engine.session = Session::new(&[0xB8, 0x80, 0x16, 0xCD, 0x2F, 0xB8, 0, 0x4C, 0xCD, 0x21])
+            .unwrap()
+            .into();
         engine.start();
         assert!(engine.advance(1000) < 1000);
         assert!(engine.timeslice_yielded());
@@ -1228,7 +1389,7 @@ mod tests {
             append_midi_byte(&mut program, byte);
         }
         program.extend_from_slice(&[0xEB, 0xFE]);
-        engine.session = Session::new(&program).unwrap();
+        engine.session = Session::new(&program).unwrap().into();
         engine.start();
         for _ in 0..4 {
             engine.advance(10000);

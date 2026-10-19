@@ -121,12 +121,74 @@ pub struct DirectoryTree {
     overlay: Option<overlay::Overlay>,
     new_file_limit: usize,
 }
+/// Read-only view of a file after applying the sparse writable upper layer.
+/// Intended for host-side export; reading does not mutate DOS file handles.
+pub struct VisibleFile<'a> {
+    tree: &'a DirectoryTree,
+    index: usize,
+}
+impl VisibleFile<'_> {
+    pub fn name(&self) -> &[u8] {
+        self.tree.files[self.index].name.as_bytes()
+    }
+    pub fn len(&self) -> u32 {
+        let original = self.tree.files[self.index].bytes.len() as u32;
+        self.tree
+            .overlay
+            .as_ref()
+            .map_or(original, |upper| upper.length(self.index, original))
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn read_into(&self, position: u32, output: &mut [u8]) {
+        let original = &self.tree.files[self.index].bytes;
+        let count = output
+            .len()
+            .min(self.len().saturating_sub(position) as usize);
+        let (within, beyond) = output.split_at_mut(count);
+        beyond.fill(0);
+        if let Some(upper) = &self.tree.overlay {
+            upper.read_into(self.index, position, original, within);
+        } else {
+            within.fill(0);
+            let count = within
+                .len()
+                .min(original.len().saturating_sub(position as usize));
+            if count != 0 {
+                within[..count]
+                    .copy_from_slice(&original[position as usize..position as usize + count]);
+            }
+        }
+    }
+}
 impl Default for DirectoryTree {
     fn default() -> Self {
         Self::new()
     }
 }
 impl DirectoryTree {
+    /// Files visible to DOS, including created and renamed files and their
+    /// effective contents. Deleted files and directory records are omitted.
+    pub fn visible_files(&self) -> impl Iterator<Item = VisibleFile<'_>> {
+        self.files.iter().enumerate().filter_map(|(index, file)| {
+            (!file.deleted && !file.directory).then_some(VisibleFile { tree: self, index })
+        })
+    }
+    /// ZIP mounting infers directories from file paths, so an empty guest
+    /// directory cannot currently be represented in a flattened archive.
+    pub fn has_empty_directories(&self) -> bool {
+        self.files.iter().any(|directory| {
+            !directory.deleted
+                && directory.directory
+                && !self.files.iter().any(|file| {
+                    !file.deleted
+                        && !file.directory
+                        && file.name.as_bytes().starts_with(directory.name.as_bytes())
+                        && file.name.as_bytes().get(directory.name.len) == Some(&b'\\')
+                })
+        })
+    }
     /// Mounted input plus the bounded writable overlay, in 512-byte clusters.
     /// Free space describes the emulated write budget, not the host filesystem.
     pub fn disk_space(&self) -> (u64, u64) {

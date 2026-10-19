@@ -307,9 +307,26 @@ cargo build -p doslet --features wasm-procedures --release --locked --offline
 sh tools/run-rott-aot.sh
 ```
 
+These historical bindings were captured without a DPMI host (object 1 at
+0x18e000), so `tools/run-rott-aot.sh` launches with `--experimental-dpmi off`.
+`capture_procedure_layout` now enables DPMI Direct by default, as the desktop
+does, where object 1 starts at 0x1e4000; pass `--dpmi off` or `--dpmi reflect`
+for other launches. The capture records the mode in `bindings.json`; the
+generator copies it into the module metadata, and loaders reject a module
+recorded for another mode. Bindings without the field are treated as `off`.
+States cannot yet hold the DPMI host, so such captures write no `start.state`.
+
 Without `OUTPUT_DIR`, the generator writes `procedures.wasm` to the user cache
-under the executable's SHA-256, and `--wasm-procedures` without a path selects
-that module for the launched executable. The desktop stores the module's native
+under `aot/<executable-sha256>/dpmi-<mode>/`. The desktop installs that copy
+for the launched program and DPMI mode automatically; `--no-aot` disables this,
+and `--wasm-procedures` without a path requires it. When the copy is missing,
+the desktop prepares it in the background with the same capture and the
+`--computation-kernels --kernel-interrupts before-irq` recipe, shared with both
+examples through `apps/common/procedure_cache.rs`. For ROTT the result equals
+the offline module byte for byte and took 0.52 s in a release build. Under DPMI Direct from boot,
+the regenerated 202-entry ROTT module ran steps 60–100 million in 287 ms against
+353 ms interpreted (1.23×). AOT executed 15% of those instructions in 8,992
+calls, and both runs ended at the same PC and guest time. The desktop stores the module's native
 compilation in the user cache, so later launches load it instead of compiling;
 see [host directories](../configuration.md#host-directories).
 
@@ -1630,45 +1647,72 @@ CALL/RET, REP, x87 and changes to segments or control state use the interpreter.
 An unsupported instruction can return to translated execution afterward.
 
 Compilation does not discover every code path or apply executable relocations.
-Profiles identify observed loaded code. Exact current instruction bytes must
-match before a binding is enabled. Address hints can bind known successors;
-matching current bytes can also bind an entry at another address. An entire
-relocated graph is not automatically rebased. Changed code falls back safely.
+Profiles identify observed loaded code. Blocks start at leaders: instructions
+not reached by fallthrough from another supported instruction of the same tier,
+plus local branch targets. Exact current instruction bytes must match before a
+binding is enabled, and changed code falls back safely.
+
+Addresses in a profile come from one layout. DOS4GW places ROTT's code object at
+0x18e000 without a DPMI host and at 0x1e4000 under the built-in direct DPMI
+host; the LE preferred base 0x10000 is used in neither. Static profiles declare
+each code object as `relocatable: [{base, size}]` at its preferred base;
+observed profiles without declarations form one implicit span over their hints.
+The host resolves one live delta per span from code executing in it: it searches
+the span's longest block around EIP and accepts a delta when at least half of
+its 64 longest blocks match live bytes. Page-aligned deltas win over unaligned
+copies of the image, such as a file buffer. Failed attempts back off. A delta
+only chooses where blocks are looked for; bytes still guard every binding.
 
 ## Host contract and module ABI
 
 `host::Runtime` keeps ownership of the CPU, RAM, devices, clocks and services.
-The generated module owns two fixed 64-KiB WASM pages containing only scratch
-register state and a bounded dispatch table. No guest RAM or VRAM is copied.
+The generated module imports the runtime's memory and the fixed address of a
+65,600-byte scratch area holding register state and a bounded dispatch table.
+It touches nothing else in that memory, and polls copy nothing.
 
 `Host::poll(completed, remaining, memory)` first commits completed translated CPU
 state, then calls `Runtime::account_translated`. It checks the next execution
-context and exact code bytes, and asks `translated_budget` for a grant capped at
-4096 steps. A machine/session adapter must end that grant before an eligible
-interrupt, hardware deadline, service interception, debugger boundary or external
+context and asks `translated_budget` for a grant capped at 4096 steps. A
+machine/session adapter must end that grant before an eligible interrupt,
+hardware deadline, service interception, debugger boundary or external
 code/mapping change. It must execute all of those effects through its normal
-runtime path. Returning zero keeps execution on the interpreter.
+runtime path. Returning zero keeps execution on the interpreter. The PC session
+also returns zero while a policy single-steps or acts at the current boundary:
+an idle-loop proof, a known idle head or proven pass, an analyzer window or probe,
+a synchronization burst or a parked menu. Between those, a grant is equivalent to
+an ordinary batch, so the same wait loops are detected and skipped with AOT.
 
-Inside a grant, translated code only changes registers, arithmetic flags and EIP.
-The module uses a bounded hash lookup and indirect calls to move between validated
-blocks without leaving WASM. A whole block must fit the remaining grant. Missing
-targets and exhausted grants return to `poll`; the callback commits progress and
-either grants more work or performs one ordinary interpreter/runtime step.
-Code writes performed by the interpreter are checked before another grant.
-Dispatch lookup collisions that exhaust the 16-probe limit use fallback.
+The dispatch table persists between polls. Each entry records its block, length
+and live tier. The host tracks write generations per 4-KiB code page; before a
+grant it revalidates only changed pages on EIP's page and its two neighbours, and
+the module chains only into entries in that window. Self-modifying code therefore
+costs one page check, not a table rebuild. Inside a grant, translated code only
+changes registers, arithmetic flags and EIP. A whole block must fit the remaining
+grant, and chained entries must have the grant's tier. Missing targets and
+exhausted grants return to `poll`. Dispatch collisions that exhaust the
+16-probe limit use fallback.
 
-The module exports `memory` and `run(budget: u32) -> u32`, and imports only
-`doslet.poll(completed: u32, remaining: u32) -> i32`. Callback results are a
-nonnegative initial block index, `-1` after one successful interpreted step, or
-`-2` to stop. A final poll commits state even when the run budget reaches zero.
-Only compiler-produced modules and their matching host metadata are supported.
+Fallback is batched. Block entries are registered as prepared CPU entries, and
+`Runtime::interpret(budget)` runs ordinary batches until execution arrives at one.
+An entry stops batches only while its grants pay for the stop. After 32 attempts,
+an entry yielding fewer than 32 translated steps per attempt becomes cold; refused
+grants count as zero. Cold entries are retried after 2^28 guest steps.
+
+The module exports `run(budget: u32) -> u32`. It imports `doslet.memory`,
+the immutable `doslet.base: i32` scratch address and
+`doslet.poll(completed: u32, remaining: u32) -> i32`. Before returning, every
+poll stores its interpreted steps at byte 44. Results are a nonnegative initial
+block index, `-1` for another poll, or `-2` to stop. A final poll commits state
+even when the run budget reaches zero. Only compiler-produced modules and their
+matching host metadata are supported; the `doslet.abi` section is version 2.
 
 The first eight scratch words contain EAX, ECX, EDX, EBX, ESP, EBP, ESI and EDI;
-EFLAGS is at byte 32, EIP at 36 and the grant remainder at 40. The dispatch table
-starts at 64. Scratch occupies 65,600 bytes. The browser bridge in
-`web/browser/wasm-core.js` copies this fixed scratch area between the generated
-module and the Rust host at callback boundaries; it does not copy guest buffers.
-It also validates ABI version 1 and rejects execution after a trap.
+EFLAGS is at byte 32, EIP at 36, the grant remainder at 40, interpreted steps at
+44, the grant tier at 48 (0xff without labels) and the validated window start and
+length at 52 and 56. The dispatch table starts at 64. The browser worker keeps one
+scratch allocation for its lifetime, so the base survives machine replacement.
+`web/browser/wasm-core.js` validates ABI version 2 and rejects execution after a
+trap. Bundles generated for ABI version 1 must be rebuilt.
 
 `host::CpuRuntime` is a CPU/bus test adapter. It supplies no PC device clocks,
 IRQ delivery or DOS service interception. Do not use it as a game session adapter.
@@ -1851,10 +1895,9 @@ restoration, audio draining/hashing and final state serialization are outside th
 execution timer. The driver writes measurements and compiler timings to
 `report.json`; the native oracle timing is a single validation run, not a median.
 
-The two-module variant uses a native reentrant poll trampoline and a preallocated
-scratch buffer. It makes four copies of the 65,600-byte scratch area per callback;
-guest RAM/VRAM remain entirely owned by the runtime WASM instance. This transport
-is part of the measured backend and differs from the browser bridge's two copies.
+The two-module variant uses a native reentrant poll trampoline. The generated
+module imports the probe's memory and scratch base, as in the browser, so
+callbacks copy no scratch; guest RAM/VRAM remain owned by the runtime instance.
 These results measure Wasmtime, not a browser engine. The probe's narrow unsafe
 FFI boundary transfers owned input buffers and opaque owner handles only between
 this diagnostic module and its trusted synchronous driver. Emulation libraries

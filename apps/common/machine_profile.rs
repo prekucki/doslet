@@ -89,6 +89,107 @@ pub fn patch_paths(game: &dyn TableLike) -> Result<Vec<String>, String> {
         })
         .collect()
 }
+fn startup_keys(game: &dyn TableLike) -> Result<String, String> {
+    let Some(item) = game.get("startup_keys") else {
+        return Ok(String::new());
+    };
+    let text = if let Some(value) = item.as_str() {
+        value.to_owned()
+    } else if let Some(values) = item.as_array() {
+        let mut text = String::new();
+        for value in values.iter() {
+            if let Some(character) = value.as_str().filter(|value| value.len() == 1) {
+                text.push_str(character);
+            } else if let Some(digit) = value.as_integer().filter(|digit| (0..=9).contains(digit)) {
+                text.push(char::from(b'0' + digit as u8));
+            } else {
+                return Err("game.startup_keys array entries must be single ASCII characters or digits 0 through 9".into());
+            }
+        }
+        text
+    } else {
+        return Err("game.startup_keys must be a string or an array of characters".into());
+    };
+    if text.len() > 15 {
+        return Err("game.startup_keys supports at most 15 characters".into());
+    }
+    if !text
+        .bytes()
+        .all(|byte| doslet_config::bios_key_for_ascii(byte).is_some())
+    {
+        return Err(
+            "game.startup_keys supports printable ASCII and Enter, Tab, Backspace or Escape".into(),
+        );
+    }
+    Ok(text)
+}
+
+/// A nonempty, bounded label, or a list of them.
+fn labels(t: &dyn TableLike, k: &str) -> Result<Vec<String>, String> {
+    let error = || format!("info.{k} must be a nonempty string or at most 16 of them");
+    let Some(item) = t.get(k) else {
+        return Ok(Vec::new());
+    };
+    let values: Vec<_> = match item.as_array() {
+        Some(array) => array.iter().map(|v| v.as_str()).collect(),
+        None => vec![item.as_str()],
+    };
+    if values.is_empty() || values.len() > 16 {
+        return Err(error());
+    }
+    values
+        .into_iter()
+        .map(|v| {
+            v.filter(|s| !s.trim().is_empty() && s.chars().count() <= 200)
+                .map(str::to_owned)
+                .ok_or_else(error)
+        })
+        .collect()
+}
+fn game_info(t: &dyn TableLike) -> Result<GameInfo, String> {
+    fields(
+        t,
+        &[
+            "cover",
+            "released",
+            "publishers",
+            "developers",
+            "genres",
+            "gameplay",
+            "description",
+        ],
+        "info.",
+    )?;
+    let cover = string(t, "cover")?;
+    if cover.as_ref().is_some_and(String::is_empty) {
+        return Err("info.cover must be a nonempty path".into());
+    }
+    let released = t
+        .get("released")
+        .map(|v| {
+            v.as_integer()
+                .filter(|year| (1970..=2100).contains(year))
+                .map(|year| year as u16)
+                .ok_or("info.released must be a year from 1970 to 2100")
+        })
+        .transpose()?;
+    let description = string(t, "description")?;
+    if description
+        .as_ref()
+        .is_some_and(|text| text.trim().is_empty() || text.chars().count() > 4000)
+    {
+        return Err("info.description must be nonempty text of at most 4000 characters".into());
+    }
+    Ok(GameInfo {
+        cover,
+        released,
+        publishers: labels(t, "publishers")?,
+        developers: labels(t, "developers")?,
+        genres: labels(t, "genres")?,
+        gameplay: labels(t, "gameplay")?,
+        description,
+    })
+}
 
 pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
     let doc = text.parse::<DocumentMut>().map_err(|e| e.to_string())?;
@@ -99,7 +200,8 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
     fields(
         t,
         &[
-            "version", "name", "machine", "sound", "input", "output", "game", "drives", "bindings",
+            "version", "name", "machine", "sound", "input", "output", "game", "info", "drives",
+            "bindings",
         ],
         "",
     )?;
@@ -235,6 +337,7 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
             o,
             &[
                 "audio",
+                "video_filter",
                 "game_midi",
                 "host_midi",
                 "midi_output",
@@ -244,6 +347,9 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
         )?;
         if let Some(v) = boolean(o, "audio")? {
             spec.output.audio = v;
+        }
+        if let Some(v) = string(o, "video_filter")? {
+            spec.output.video_filter = v.parse::<VideoFilter>()?;
         }
         if let Some(v) = string(o, "game_midi")? {
             spec.output.game_midi = v;
@@ -256,14 +362,24 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
         }
         spec.output.rom_binding = string(o, "rom_binding")?;
     }
+    if let Some(info) = section(t, "info")? {
+        spec.info = game_info(info)?;
+    }
     if let Some(g) = section(t, "game")? {
         fields(
             g,
-            &["executable", "arguments", "working_directory", "patches"],
+            &[
+                "executable",
+                "arguments",
+                "working_directory",
+                "patches",
+                "startup_keys",
+            ],
             "game.",
         )?;
         spec.game.executable = string(g, "executable")?.unwrap_or_default();
         spec.game.patches = patch_paths(g)?;
+        spec.game.startup_keys = startup_keys(g)?;
         if let Some(v) = string(g, "working_directory")? {
             spec.game.working_directory = v;
         }
@@ -529,6 +645,7 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
         d["input"][k] = value(i64::from(v));
     }
     d["output"]["audio"] = value(spec.output.audio);
+    d["output"]["video_filter"] = value(spec.output.video_filter.as_str());
     d["output"]["game_midi"] = value(&spec.output.game_midi);
     d["output"]["host_midi"] = value(&spec.output.host_midi);
     d["output"]["midi_output"] = value(&spec.output.midi_output);
@@ -548,6 +665,29 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
             paths.push(path.as_str());
         }
         d["game"]["patches"] = value(paths);
+    }
+    if !spec.game.startup_keys.is_empty() {
+        d["game"]["startup_keys"] = value(&spec.game.startup_keys);
+    }
+    let info = &spec.info;
+    if let Some(cover) = &info.cover {
+        d["info"]["cover"] = value(cover);
+    }
+    if let Some(year) = info.released {
+        d["info"]["released"] = value(i64::from(year));
+    }
+    for (key, list) in [
+        ("publishers", &info.publishers),
+        ("developers", &info.developers),
+        ("genres", &info.genres),
+        ("gameplay", &info.gameplay),
+    ] {
+        if !list.is_empty() {
+            d["info"][key] = value(list.iter().map(String::as_str).collect::<Array>());
+        }
+    }
+    if let Some(description) = &info.description {
+        d["info"]["description"] = value(description);
     }
     let mut drives = ArrayOfTables::new();
     for mount in &spec.mounts {
@@ -598,6 +738,64 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn video_filter_round_trips_and_rejects_unknown_values() {
+        for filter in [
+            VideoFilter::Nearest,
+            VideoFilter::SharpBilinear,
+            VideoFilter::Hq2x,
+        ] {
+            let profile = format!("version=2\n[output]\nvideo_filter='{}'\n", filter.as_str());
+            let spec = parse_machine_profile(&profile).unwrap();
+            assert_eq!(spec.output.video_filter, filter);
+            assert_eq!(
+                parse_machine_profile(&export_machine_profile(&spec))
+                    .unwrap()
+                    .output
+                    .video_filter,
+                filter
+            );
+        }
+        assert_eq!(
+            parse_machine_profile("version=2")
+                .unwrap()
+                .output
+                .video_filter,
+            VideoFilter::Nearest
+        );
+        for value in ["'bilinear'", "42"] {
+            assert!(
+                parse_machine_profile(&format!("version=2\n[output]\nvideo_filter={value}"))
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn startup_text_accepts_printable_ascii_and_legacy_digit_arrays() {
+        for (value, expected) in [
+            ("\"15\"", "15"),
+            ("[1, 5]", "15"),
+            ("[\"A\", \"?\"]", "A?"),
+            ("\"A?\\n\"", "A?\n"),
+        ] {
+            let profile = format!("version=2\n[game]\nstartup_keys={value}\n");
+            let spec = parse_machine_profile(&profile).unwrap();
+            assert_eq!(spec.game.startup_keys, expected);
+            assert_eq!(
+                parse_machine_profile(&export_machine_profile(&spec))
+                    .unwrap()
+                    .game
+                    .startup_keys,
+                expected
+            );
+        }
+        for value in ["\"zażółć\"", "\"\\u0000\"", "[10]", "[\"AB\"]"] {
+            assert!(
+                parse_machine_profile(&format!("version=2\n[game]\nstartup_keys={value}\n"))
+                    .is_err()
+            );
+        }
+    }
+    #[test]
     fn documented_profile_is_accepted() {
         let guide = include_str!("../../docs/configuration.md");
         let profile = guide
@@ -640,6 +838,15 @@ mod tests {
         s.input.deadzone_percent = 20;
         s.input.mouse_mode = MouseMode::NoCapture;
         s.input.hide_cursor = true;
+        s.info = GameInfo {
+            cover: Some("art/cover.jpg".into()),
+            released: Some(1994),
+            publishers: vec!["Apogee Software, Ltd.".into()],
+            developers: vec!["Apogee Software, Ltd.".into()],
+            genres: vec!["Action".into()],
+            gameplay: vec!["Shooter".into(), "Arcade".into()],
+            description: Some("First paragraph.\n\nSecond \"quoted\" one.".into()),
+        };
         assert_eq!(
             parse_machine_profile(&export_machine_profile(&s)).unwrap(),
             s
@@ -704,11 +911,32 @@ mod tests {
         }
     }
     #[test]
+    fn info_lists_accept_one_label_or_an_array() {
+        let spec = parse_machine_profile(
+            "version=2\n[info]\nreleased=1994\ngenres='Action'\npublishers=['A','B']",
+        )
+        .unwrap();
+        assert_eq!(spec.info.released, Some(1994));
+        assert_eq!(spec.info.genres, ["Action"]);
+        assert_eq!(spec.info.publishers, ["A", "B"]);
+        assert!(spec.info.cover.is_none() && spec.info.gameplay.is_empty());
+    }
+    #[test]
     fn reject_unknown_and_unsupported() {
         for text in [
             "version=2\n[machine]\ncpu='pentium'",
             "version=2\n[input]\nkeyboard='usb'",
             "version=2\n[[bindings]]\nid='saves'\nkind='sqlite'\nlocation='saves'",
+            "version=2\n[game]\ncover='a.jpg'",
+            "version=2\n[info]\ncover=''",
+            "version=2\n[info]\ncover=['a.jpg']",
+            "version=2\n[info]\nreleased=1800",
+            "version=2\n[info]\nreleased='1994'",
+            "version=2\n[info]\ngenres=[]",
+            "version=2\n[info]\ngenres=['']",
+            "version=2\n[info]\ngenre='Action'",
+            "version=2\n[info]\ndescription='  '",
+            "version=2\n[info]\ndescription=['text']",
         ] {
             assert!(parse_machine_profile(text).is_err());
         }

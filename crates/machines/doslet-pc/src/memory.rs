@@ -1,6 +1,6 @@
 use core::ops::Range;
 use doslet_bus::{BusError, CodeCheck, CodeOwnerId};
-#[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+#[cfg(feature = "wasm-procedures")]
 pub(crate) mod batch;
 mod journal;
 pub(crate) mod storage;
@@ -69,7 +69,7 @@ impl Default for Ram {
 impl Ram {
     /// Resolve the foreign owner's slices once for an ordinary decoded batch.
     /// Logging paths retain the full PC bus so every write remains observable.
-    #[cfg(all(test, feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(all(test, feature = "wasm-procedures"))]
     pub(crate) fn interpreter_batch_bus(&mut self) -> Option<batch::BorrowedRamBus<'_>> {
         if !matches!(self.storage, storage::Storage::Wasm(_)) || !self.direct_execution_ready() {
             return None;
@@ -83,7 +83,7 @@ impl Ram {
     }
 
     /// VGA controls and its physical backing stay borrowed for the same slice.
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn interpreter_batch_bus_with_video<'a>(
         &'a mut self,
         vga: &'a mut doslet_vga::Vga,
@@ -101,7 +101,7 @@ impl Ram {
         ))
     }
 
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn complete_interpreter_batch(&mut self, effects: batch::Effects) {
         self.complete_direct_writes(effects.page_writes);
         if effects.code_exhausted {
@@ -110,14 +110,14 @@ impl Ram {
         }
     }
 
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn direct_execution_ready(&self) -> bool {
         self.code_space != 0 && self.log.is_none() && !self.journal.recording()
     }
 
     /// Setup-only backing migration. Preserve RAM accounting and replace its
     /// code identity so no decoded/native proof can retain the old owner.
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn replace_storage(&mut self, storage: storage::Storage) {
         let mapping = self.code_space & u64::from(u32::MAX);
         self.storage = storage;

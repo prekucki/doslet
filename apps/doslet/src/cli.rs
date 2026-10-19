@@ -43,12 +43,15 @@ impl DpmiMode {
 #[derive(Debug, Default, Parser)]
 #[command(
     version,
-    after_help = "Without a game source, opens the built-in color-bar demo.\nGame support is experimental. Use --game EXE, --zip ZIP [--program EXE], or --config TOML."
+    after_help = "Without a game source, opens the game library from ./games and saved profiles, or the color-bar demo when there are none.\nGame support is experimental. Use --game EXE, --zip ZIP [--program EXE], or --config TOML [--program EXE] for a ZIP profile."
 )]
 pub struct Cli {
     /// Load a TOML launch profile; explicit CLI options override profile values
     #[arg(long, value_name = "TOML")]
     pub config: Option<PathBuf>,
+    /// Open the built-in color-bar demo instead of the game library
+    #[arg(long, conflicts_with_all = ["config", "game", "zip", "load_state"])]
+    pub demo: bool,
     /// Nominal CPU clock in MHz (1..=1000, default 33); not cycle-accurate
     #[arg(long, value_name = "MHZ")]
     pub cpu_mhz: Option<u16>,
@@ -70,8 +73,9 @@ pub struct Cli {
     /// ZIP game installation mounted in memory as C:
     #[arg(long, value_name = "ZIP", conflicts_with = "game")]
     pub zip: Option<PathBuf>,
-    /// EXE or COM path inside the ZIP; optional when it contains one program
-    #[arg(long, value_name = "EXE", requires = "zip")]
+    /// EXE or COM path inside the ZIP (from --zip or a ZIP profile); optional
+    /// with --zip when it contains one program
+    #[arg(long, value_name = "EXE", conflicts_with = "game")]
     pub program: Option<String>,
     /// C: writes: ro denies, overlay keeps in memory (default), rw persists closed files
     #[arg(long, value_enum)]
@@ -134,8 +138,11 @@ pub struct Cli {
     #[arg(long, value_name = "STATE", conflicts_with_all = ["cpu_mhz", "memory_mib", "no_x87", "no_sb16", "no_mpu401", "drive_mode"])]
     pub load_state: Option<PathBuf>,
 
-    /// Use the interpreter instead of the native dynamic core
+    /// Use the experimental Cranelift JIT; slower than the interpreter on ROTT
     #[arg(long)]
+    pub dynamic_core: bool,
+    /// Accepted for older launch commands; the interpreter is now the default
+    #[arg(long, hide = true, conflicts_with = "dynamic_core")]
     pub no_dynamic_core: bool,
     /// DPMI host mode; direct avoids eligible BIOS/DOS switches, off uses the guest extender
     #[arg(long, value_enum, default_value = "direct")]
@@ -155,9 +162,12 @@ pub struct Cli {
     /// Neither load nor save a dynamic-core profile
     #[arg(long, conflicts_with = "core_profile")]
     pub no_core_profile: bool,
-    /// Use AOT procedures with embedded metadata (.wasm; legacy .json also accepted); without a path, the module cached for this executable
+    /// Use AOT procedures with embedded metadata (.wasm; legacy .json also accepted); without a path, the module cached for this executable and DPMI mode
     #[arg(long, value_name = "WASM_OR_JSON", requires = "no_speed_tiers", num_args = 0..=1, default_missing_value = "")]
     pub wasm_procedures: Option<PathBuf>,
+    /// Do not install the AOT procedures cached for this executable and DPMI mode
+    #[arg(long, conflicts_with = "wasm_procedures")]
+    pub no_aot: bool,
     /// Interpret marked procedures with the bundle's IRQ boundary policy
     #[arg(long, requires = "wasm_procedures")]
     pub interpret_procedures: bool,
@@ -188,9 +198,40 @@ pub struct Cli {
     pub profile_name: Option<String>,
 }
 
+impl Cli {
+    /// No game source or debugging endpoint: show the game library instead.
+    pub fn opens_library(&self) -> bool {
+        self.config.is_none()
+            && self.game.is_none()
+            && self.zip.is_none()
+            && self.program.is_none()
+            && self.load_state.is_none()
+            && self.gdb.is_none()
+            && self.mcp.is_none()
+            && !self.demo
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_opens_only_without_a_game_or_debugger() {
+        let parse = |args: &[&str]| Cli::try_parse_from([&["doslet"], args].concat()).unwrap();
+        assert!(parse(&[]).opens_library());
+        assert!(parse(&["--no-audio", "--experimental-dpmi", "off"]).opens_library());
+        for args in [
+            &["--demo"][..],
+            &["--config", "games/ROTT.toml"],
+            &["--game", "GAME.EXE"],
+            &["--zip", "GAME.ZIP"],
+            &["--mcp", "127.0.0.1:9000"],
+        ] {
+            assert!(!parse(args).opens_library(), "{args:?}");
+        }
+        assert!(Cli::try_parse_from(["doslet", "--demo", "--config", "a.toml"]).is_err());
+    }
 
     #[test]
     fn wasm_procedure_launch_requires_explicit_tier_policy() {
@@ -318,14 +359,19 @@ mod tests {
             cli.launch.core_profile,
             Some(PathBuf::from("target/game.core-profile"))
         );
-        assert!(
-            !Cli::try_parse_from(["doslet"])
-                .unwrap()
-                .resolve()
-                .unwrap()
-                .launch
-                .no_dynamic_core
-        );
+        // The JIT is slower than the interpreter on measured ROTT gameplay.
+        let default = Cli::try_parse_from(["doslet"]).unwrap().resolve().unwrap();
+        assert!(default.launch.no_dynamic_core);
+        let jit = Cli::try_parse_from(["doslet", "--dynamic-core"])
+            .unwrap()
+            .resolve();
+        if crate::cpu_config::JIT_AVAILABLE {
+            assert!(!jit.unwrap().launch.no_dynamic_core);
+        } else {
+            assert!(jit.is_err_and(|e| e.to_string().contains("--features dynamic-core")));
+        }
+        assert!(Cli::try_parse_from(["doslet", "--dynamic-core", "--no-dynamic-core"]).is_err());
+        assert!(Cli::try_parse_from(["doslet", "--no-aot", "--wasm-procedures"]).is_err());
     }
 
     #[test]

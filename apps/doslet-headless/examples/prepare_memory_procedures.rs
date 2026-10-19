@@ -3,21 +3,17 @@
 #[path = "../../common/host_dirs.rs"]
 mod host_dirs;
 #[allow(dead_code)]
+#[path = "../../common/procedure_cache.rs"]
+mod procedure_cache;
+#[allow(dead_code)]
 #[path = "../../common/procedure_input.rs"]
 mod procedure_input;
 use doslet_aot::{
-    ImageLimits, SymbolicImage,
+    SymbolicImage,
     binding::{BindingLimits, DosFlatBindingPlan},
-    cfg::{CfgLimits, StaticCfg},
     profile::{BoundGuidance, GuidanceLimits, Profile, ProfileLimits},
-    wasm::memory_procedures::{MemoryProcedureLimits, PreparedMemoryProcedures},
 };
-use doslet_executable::{LeImage, LeLimits};
-use doslet_static_game_probe::prepare::bindings_from_json;
-use doslet_x86_wasm::static_program::procedure_memory::{
-    ProcedureCompileOptions, ProcedureGraphProgram, ProcedureTerminatorKind, bundle,
-};
-use serde_json::json;
+use doslet_static_game_probe::prepare::{bindings_dpmi, bindings_from_json};
 use sha2::{Digest, Sha256};
 use std::{
     error::Error,
@@ -102,237 +98,92 @@ fn main() -> Result<()> {
     }
     let config = Path::new(&args[0]);
     let procedure_input::Input { exe, .. } = procedure_input::load(config)?;
-    let declarations = bindings_from_json(&exe, &read(Path::new(&args[1]), 64 * 1024)?)?;
-    let le = LeImage::discover(&exe, LeLimits::default())?;
-    let image = SymbolicImage::from_le(&le, ImageLimits::default())?;
-    let binding = DosFlatBindingPlan::new(&image, &declarations, BindingLimits::default())?;
-    let graph = StaticCfg::analyze_bound(&binding, &[], CfgLimits::default())?;
-    let prepare = if computation_kernels {
-        PreparedMemoryProcedures::from_bound_graph_with_computations
-    } else {
-        PreparedMemoryProcedures::from_bound_graph
-    };
-    let prepared = prepare(
-        &graph,
-        &binding,
-        MemoryProcedureLimits {
-            max_work_per_call,
-            ..MemoryProcedureLimits::default()
-        },
-    )?;
-    let verified_hot = if let (Some(path), Some(layout)) = (profile_path, profile_bindings) {
-        let profile = Profile::parse(&read(path, 64 * 1024 * 1024)?, ProfileLimits::default())?;
-        let declarations = bindings_from_json(&exe, &read(layout, 64 * 1024)?)?;
-        let historical = DosFlatBindingPlan::new(&image, &declarations, BindingLimits::default())?;
-        let guidance = BoundGuidance::bind(
-            &profile,
-            &graph,
-            &historical,
-            None,
-            GuidanceLimits::default(),
-        )?;
-        println!("HOT source verification: {:?}", guidance.report());
-        Some(
-            guidance
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.verified_hot())
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        None
-    };
-    let compile = |program: &ProcedureGraphProgram| {
-        let options = ProcedureCompileOptions::default();
-        match max_work_per_call {
-            Some(limit) if computation_kernels => {
-                program.compile_with_computation_kernels(&options, limit)
-            }
-            Some(limit) if copy_kernels => program.compile_with_copy_kernels(&options, limit),
-            Some(limit) => program.compile_with_work_limit(&options, limit),
-            None => program.compile(&options),
-        }
-    };
-    let mut selected = Vec::new();
-    let mut selected_indices = Vec::new();
-    let mut unsupported = 0usize;
-    for (index, function) in prepared.program().functions.iter().enumerate() {
-        if let Some(hot) = &verified_hot {
-            let mut hot_nodes = 0usize;
-            let mut relevant_nodes = 0usize;
-            for address in prepared.sources(index).ok_or("missing procedure sources")? {
-                let at = graph
-                    .nodes()
-                    .binary_search_by_key(address, |node| node.address)
-                    .map_err(|_| "missing procedure node")?;
-                if graph.nodes()[at].byte_len == 1
-                    && image
-                        .object(address.object_number)
-                        .and_then(|object| object.bytes().get(address.offset as usize))
-                        .copied()
-                        == Some(0x90)
-                {
-                    continue;
-                }
-                relevant_nodes += 1;
-                hot_nodes += usize::from(hot[at]);
-            }
-            // Selection is optimization guidance only. It never assigns the
-            // caller's tier to the other instructions or relaxes code proofs.
-            if hot_nodes == 0 || hot_nodes * 2 < relevant_nodes {
-                continue;
-            }
-        }
-        let program = ProcedureGraphProgram {
-            functions: vec![function.clone()],
+    let live_bindings = read(Path::new(&args[1]), 64 * 1024)?;
+    let declarations = bindings_from_json(&exe, &live_bindings)?;
+    // Bound code is valid only for the DPMI mode that placed it.
+    let dpmi = bindings_dpmi(&live_bindings)?;
+    // HOT guidance only narrows the selection; it never relaxes code proofs.
+    let mut verified_hot: Option<Vec<bool>> = None;
+    let mut keep = |graph: &doslet_aot::cfg::StaticCfg<'_>,
+                    image: &SymbolicImage,
+                    sources: &[doslet_aot::ObjectAddress]|
+     -> Result<bool> {
+        let (Some(path), Some(layout)) = (profile_path, profile_bindings) else {
+            return Ok(true);
         };
-        match compile(&program) {
-            Ok(compiled)
-                if kernels_only
-                    && compiled.semantic_kernel(function.id).is_none()
-                    && compiled.rle_kernel(function.id).is_none()
-                    && compiled.finite_maximum_work(function.id).is_none() =>
+        if verified_hot.is_none() {
+            let profile = Profile::parse(&read(path, 64 * 1024 * 1024)?, ProfileLimits::default())?;
+            let declarations = bindings_from_json(&exe, &read(layout, 64 * 1024)?)?;
+            let historical =
+                DosFlatBindingPlan::new(image, &declarations, BindingLimits::default())?;
+            let guidance = BoundGuidance::bind(
+                &profile,
+                graph,
+                &historical,
+                None,
+                GuidanceLimits::default(),
+            )?;
+            println!("HOT source verification: {:?}", guidance.report());
+            verified_hot = Some(
+                guidance
+                    .instructions()
+                    .iter()
+                    .map(|instruction| instruction.verified_hot())
+                    .collect(),
+            );
+        }
+        let hot = verified_hot.as_ref().expect("HOT labels");
+        let mut hot_nodes = 0usize;
+        let mut relevant_nodes = 0usize;
+        for address in sources {
+            let at = graph
+                .nodes()
+                .binary_search_by_key(address, |node| node.address)
+                .map_err(|_| "missing procedure node")?;
+            if graph.nodes()[at].byte_len == 1
+                && image
+                    .object(address.object_number)
+                    .and_then(|object| object.bytes().get(address.offset as usize))
+                    .copied()
+                    == Some(0x90)
             {
                 continue;
             }
-            Ok(_) => {}
-            Err(error) => {
-                unsupported += 1;
-                println!(
-                    "Declined object{}+{:#x}: {error}",
-                    prepared.entries()[index].object_number,
-                    prepared.entries()[index].offset
-                );
-                continue;
-            }
+            relevant_nodes += 1;
+            hot_nodes += usize::from(hot[at]);
         }
-        selected.push(function.clone());
-        selected_indices.push(index);
-    }
-    if selected.is_empty() {
-        return Err("no eligible computational procedures selected".into());
-    }
-    let program = ProcedureGraphProgram {
-        functions: selected,
+        // Selection is optimization guidance only. It never assigns the
+        // caller's tier to the other instructions or relaxes code proofs.
+        Ok(hot_nodes != 0 && hot_nodes * 2 >= relevant_nodes)
     };
-    let compiled = compile(&program)?;
-    println!(
-        "Selected {} of {} procedure/region entries; unsupported graph shapes={unsupported}; ordinary_work_limit={max_work_per_call:?}",
-        program.functions.len(),
-        prepared.entries().len()
-    );
-    let mut functions = Vec::new();
-    for (&index, function) in selected_indices.iter().zip(&program.functions) {
-        let mut sources = Vec::new();
-        for address in prepared.sources(index).ok_or("missing procedure sources")? {
-            let node = &graph.nodes()[graph
-                .nodes()
-                .binary_search_by_key(address, |node| node.address)
-                .map_err(|_| "missing source node")?];
-            let object = image
-                .object(address.object_number)
-                .ok_or("missing object")?;
-            let start = address.offset as usize;
-            let mut bytes = object
-                .bytes()
-                .get(start..start + node.byte_len as usize)
-                .ok_or("source out of bounds")?
-                .to_vec();
-            let patches = binding
-                .object_patches(address.object_number)
-                .ok_or("missing patches")?;
-            let first = patches.partition_point(|patch| {
-                u64::from(patch.source.offset) + patch.bytes().len() as u64
-                    <= u64::from(address.offset)
-            });
-            for patch in &patches[first..] {
-                if patch.source.offset >= address.offset + u32::from(node.byte_len) {
-                    break;
-                }
-                for (offset, &byte) in patch.bytes().iter().enumerate() {
-                    let at = patch.source.offset as usize + offset;
-                    if at >= start && at - start < bytes.len() {
-                        bytes[at - start] = byte;
-                    }
-                }
-            }
-            let linear = binding
-                .object_binding(address.object_number)
-                .and_then(|o| o.linear_base.checked_add(address.offset))
-                .ok_or("linear source overflow")?;
-            sources.push(json!({"linear":linear,"bytes":bytes}));
-        }
-        let kernel = compiled
-            .semantic_kernel(function.id)
-            .map(|kernel| {
-                println!(
-                    "Semantic strided-copy kernel: entry={:#x}, stride={}",
-                    function.entry.offset, kernel.stride
-                );
-                json!({"kind":"paired-strided-copy", "stride":kernel.stride,
-                "maximum_work":kernel.max_work_per_call, "prefix_nops":kernel.prefix_nops,
-                "tail_nops":kernel.tail_nops})
-            })
-            .or_else(|| {
-                compiled.rle_kernel(function.id).map(|kernel| {
-                    println!("Semantic RLE kernel: entry={:#x}", function.entry.offset);
-                    json!({"kind":"rle-decode", "maximum_work":kernel.maximum_work()})
-                })
-            });
-        let finite = compiled.finite_maximum_work(function.id).map(|work| {
-            let mut exits = Vec::new();
-            let mut returns = Vec::new();
-            for block in &function.blocks {
-                match block.terminator.kind {
-                    ProcedureTerminatorKind::Exit => exits.push(block.terminator.address.offset),
-                    ProcedureTerminatorKind::Return { .. } => {
-                        returns.push(block.terminator.address.offset)
-                    }
-                    _ => {}
-                }
-            }
-            println!(
-                "Finite computational CFG: entry={:#x}, maximum_work={work}, exits={}, returns={}",
-                function.entry.offset,
-                exits.len(),
-                returns.len()
-            );
-            let guards: Vec<_> = compiled
-                .finite_loop_guards(function.id)
-                .expect("finite computation guard metadata")
-                .iter()
-                .map(|guard| {
-                    json!({"entry":guard.entry.offset,
-                    "counter":guard.counter.index(),"decrement":guard.decrement,
-                    "maximum_trips":guard.maximum_trips})
-                })
-                .collect();
-            json!({"exits":exits,"returns":returns,"guards":guards})
-        });
-        functions.push(json!({"id":function.id.0,"entry":function.entry.offset,
-            "maximum_work":compiled.maximum_work(function.id).ok_or("missing work")?,"semantic_kernel":kernel,
-            "finite_computation":finite,
-            "kernel_interrupts":kernel_interrupts.unwrap_or("defer"),"sources":sources}));
-    }
+    let recipe = procedure_cache::Recipe {
+        max_work_per_call,
+        copy_kernels,
+        computation_kernels,
+        kernels_only,
+        kernel_interrupts,
+        hot_profile: profile_path.is_some(),
+    };
+    let module =
+        procedure_cache::build(&exe, &declarations, dpmi, &recipe, &mut keep, &mut |line| {
+            println!("{line}")
+        })?;
     let output = match explicit_output {
         Some(path) => PathBuf::from(path),
-        // The desktop finds this module with `--wasm-procedures` and no path.
+        // The desktop finds this module for its DPMI mode without options.
         None => host_dirs::HostDirs::detect()?
-            .aot_modules()
-            .join(format!("{:x}", Sha256::digest(&exe))),
+            .aot_module(&format!("{:x}", Sha256::digest(&exe)), dpmi)
+            .parent()
+            .ok_or("invalid AOT cache path")?
+            .to_path_buf(),
     };
     let output = output.as_path();
     fs::create_dir_all(output)?;
-    let manifest = json!({"version":2,"memory_abi_version":doslet_x86_wasm::static_program::memory::VERSION,"code_sha256":format!("{:x}",Sha256::digest(compiled.wasm())),
-        "exe_sha256":format!("{:x}",Sha256::digest(&exe)),"maximum_work_per_call":max_work_per_call,"hot_profile_selected":verified_hot.is_some(),"copy_kernels":copy_kernels,"computation_kernels":computation_kernels,"kernels_only":kernels_only,"functions":functions});
-    let metadata = serde_json::to_vec(&manifest)?;
-    let module = bundle::append(compiled.wasm(), &metadata)?;
-    fs::write(output.join("procedures.wasm"), &module)?;
+    fs::write(output.join("procedures.wasm"), &module.bytes)?;
     println!(
-        "Prepared {} original-EXE procedure/region entries in one {}-byte WASM module ({} bytes of embedded metadata): {}",
-        functions.len(),
-        module.len(),
-        metadata.len(),
+        "Prepared {} original-EXE procedure/region entries for DPMI {dpmi} in one {}-byte WASM module: {}",
+        module.entries,
+        module.bytes.len(),
         output.join("procedures.wasm").display()
     );
     Ok(())

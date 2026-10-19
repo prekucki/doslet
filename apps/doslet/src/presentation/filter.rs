@@ -9,15 +9,27 @@ pub enum DisplayFilter {
     Nearest,
     SharpBilinear,
     Hq2x,
+    Xbrz,
 }
 
 impl DisplayFilter {
-    pub const ALL: [Self; 3] = [Self::Nearest, Self::SharpBilinear, Self::Hq2x];
+    pub const ALL: &[Self] = &[Self::Nearest, Self::SharpBilinear, Self::Hq2x, Self::Xbrz];
 
     pub fn sampling(self) -> FilterMethod {
         match self {
             Self::Nearest => FilterMethod::Nearest,
+            Self::Xbrz => FilterMethod::Nearest,
             Self::SharpBilinear | Self::Hq2x => FilterMethod::Linear,
+        }
+    }
+}
+
+impl From<doslet_config::VideoFilter> for DisplayFilter {
+    fn from(value: doslet_config::VideoFilter) -> Self {
+        match value {
+            doslet_config::VideoFilter::Nearest => Self::Nearest,
+            doslet_config::VideoFilter::SharpBilinear => Self::SharpBilinear,
+            doslet_config::VideoFilter::Hq2x => Self::Hq2x,
         }
     }
 }
@@ -28,6 +40,7 @@ impl std::fmt::Display for DisplayFilter {
             Self::Nearest => "Nearest",
             Self::SharpBilinear => "Sharp Bilinear",
             Self::Hq2x => "HQ2x",
+            Self::Xbrz => "xBRZ (GPU)",
         })
     }
 }
@@ -66,7 +79,7 @@ impl FilterCache {
             self.image = None;
             return;
         };
-        if filter == DisplayFilter::Nearest {
+        if !matches!(filter, DisplayFilter::SharpBilinear | DisplayFilter::Hq2x) {
             self.source = None;
             self.image = None;
             return;
@@ -83,7 +96,7 @@ impl FilterCache {
                 ]
             }
             DisplayFilter::Hq2x => [2, 2],
-            DisplayFilter::Nearest => unreachable!(),
+            _ => unreachable!(),
         };
         if self
             .source
@@ -119,7 +132,7 @@ impl FilterCache {
                 }
                 Handle::from_rgba(width * 2, height * 2, rgba)
             }
-            DisplayFilter::Nearest => unreachable!(),
+            _ => unreachable!(),
         });
         // Cloning a Handle shares its immutable bytes, not the pixel buffer.
         self.source = Some(source.clone());
@@ -186,6 +199,23 @@ mod tests {
         for row in pixels.as_chunks::<16>().0 {
             assert_eq!(row.as_slice(), [red, red, blue, blue].concat());
         }
+    }
+
+    #[test]
+    fn switching_to_xbrz_discards_cpu_enlargement() {
+        let source = Handle::from_rgba(2, 2, vec![255; 16]);
+        let mut cache = FilterCache::default();
+        cache.refresh(Some(&source), DisplayFilter::Hq2x, None);
+        assert_eq!(rgba(cache.image().unwrap()).0, 4);
+        cache.refresh(
+            Some(&source),
+            DisplayFilter::Xbrz,
+            Some(Size::new(100.0, 100.0)),
+        );
+        // The viewport must receive the original guest-sized image for its shader.
+        assert!(cache.image().is_none());
+        cache.refresh(Some(&source), DisplayFilter::Hq2x, None);
+        assert_eq!(rgba(cache.image().unwrap()).0, 4);
     }
 
     #[test]

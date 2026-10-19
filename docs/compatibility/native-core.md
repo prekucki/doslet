@@ -8,8 +8,10 @@ The 300-million-step uncached-reference comparison also passed. These are
 Linux x86-64 headless startup results, not interactive FPS or another target's
 performance. Earlier implementation measurements are retained below.
 
-The native feature remains enabled by default; `--no-dynamic-core` retains the
-cached interpreter with ordinary scheduling. Scope and fallback are described in the
+The desktop app no longer enables this feature by default. On a ROTT gameplay
+state the JIT took about 360 ms plus 600 ms of compilation for 20 million steps
+that the interpreter ran in 205 ms. Build with `--features dynamic-core` and pass
+`--dynamic-core` to measure it; the headless frontend still enables it by default. Scope and fallback are described in the
 [architecture](../architecture.md#native-dynamic-core).
 
 Measurements below use the native x86-64 target before integration with the

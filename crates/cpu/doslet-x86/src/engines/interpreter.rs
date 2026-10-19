@@ -436,8 +436,34 @@ impl Cpu {
         }
     }
     pub fn execution_tier_at<B: MemoryBus>(&self, bus: &B, address: u32) -> u8 {
-        self.decode_cache.profile.as_ref().map_or(2, |p| {
+        self.decode_cache.profile.as_ref().map_or(2, |profile| {
             bus.code_bytes(address, 15).map_or(2, |bytes| {
+                // Prepared batches classify the decoded prefix. Keep scalar
+                // register execution and foreign register engines consistent
+                // when bytes after an otherwise unchanged instruction change.
+                let length = self
+                    .registers
+                    .code32()
+                    .then(|| cache::translation::decode(bytes))
+                    .flatten()
+                    .map_or(bytes.len(), |i| usize::from(i.length));
+                profile.classify(address, self.registers.code32(), &bytes[..length])
+            })
+        })
+    }
+    /// Match the actual decoded instruction prefix, as the prepared interpreter
+    /// does. The caller supplies a validated instruction length, never a hint.
+    pub fn execution_tier_for_instruction_at<B: MemoryBus>(
+        &self,
+        bus: &B,
+        address: u32,
+        length: u8,
+    ) -> u8 {
+        if !(1..=15).contains(&length) {
+            return 2;
+        }
+        self.decode_cache.profile.as_ref().map_or(2, |p| {
+            bus.code_bytes(address, length).map_or(2, |bytes| {
                 p.classify(address, self.registers.code32(), bytes)
             })
         })

@@ -19,6 +19,8 @@ mod finite_tests;
 mod kernel_tests;
 #[path = "rle_tests.rs"]
 mod rle_tests;
+#[path = "tier_tests.rs"]
+mod tier_tests;
 
 const ENTRY: u32 = 0x8000;
 const DATA: u32 = 0x2000;

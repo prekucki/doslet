@@ -674,6 +674,18 @@ impl Doslet {
                 }
             }
             Message::DisplaySizing(message) => {
+                if matches!(
+                    message,
+                    SizingMessage::Filter(crate::presentation::DisplayFilter::Xbrz)
+                ) && !crate::browser_diagnostics::gpu_canvas_active()
+                {
+                    log::warn!("xBRZ unavailable: the active renderer is Canvas2D");
+                    self.notice = Some(
+                        "xBRZ requires GPU rendering. Enable browser hardware acceleration and reload the page."
+                            .into(),
+                    );
+                    return Task::none();
+                }
                 return self
                     .display_sizing
                     .update(message, &self.display)
@@ -948,8 +960,10 @@ impl Doslet {
         let event = field(&packet, "event");
         match field(&event, "kind").as_string().as_deref() {
             Some("bundle-display") => {
-                if field(&event, "filter").as_string().as_deref() == Some("hq2x") {
-                    self.display_sizing.filter = crate::presentation::DisplayFilter::Hq2x;
+                if let Some(filter) = field(&event, "filter").as_string()
+                    && let Ok(filter) = filter.parse::<doslet_config::VideoFilter>()
+                {
+                    self.display_sizing.filter = filter.into();
                 }
             }
             Some("storage-policy") => {
@@ -1006,6 +1020,7 @@ impl Doslet {
                 self.session.graphics = None;
                 self.configurator
                     .set_active(self.configurator.draft.clone());
+                self.display_sizing.filter = self.configurator.active.output.video_filter.into();
                 self.configurator.message = Some("Machine applied and restarted.".into());
             }
             Some("machine-failed") => {

@@ -6,9 +6,23 @@
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 use doslet_bus::{CodeCheck, MemoryBus};
+#[cfg(not(target_arch = "wasm32"))]
 pub use doslet_wasm_aot::CompiledCache;
-use doslet_wasm_aot::procedure_memory::rle::{RleAdmission, RleMemory, prepare_rle};
-use doslet_wasm_aot::procedure_memory::{Exit, SharedProcedureMemory};
+#[cfg(not(target_arch = "wasm32"))]
+use doslet_wasm_aot::procedure_memory::Exit;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use doslet_wasm_aot::procedure_memory::SharedProcedureMemory;
+use doslet_x86_wasm::static_program::procedure_memory::rle::{
+    RleAdmission, RleMemory, prepare_rle,
+};
+#[cfg(target_arch = "wasm32")]
+mod browser;
+#[cfg(target_arch = "wasm32")]
+pub use browser::BrowserCall;
+#[cfg(target_arch = "wasm32")]
+use browser::Exit;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use browser::SharedProcedureMemory;
 use doslet_x86::procedure_calls::{
     FrozenCode, MAX_PROCEDURE_INSTRUCTIONS, ProcedureContext, ProcedureRegisters,
     memory::{
@@ -100,6 +114,9 @@ pub struct Stats {
     pub source_refusals: u64,
     pub budget_refusals: u64,
     pub kernel_irq_refusals: u64,
+    /// A procedure cannot prove one live label for all its source instructions.
+    pub tier_refusals: u64,
+    pub translated_tiers: [u64; 4],
     /// Effects reported by generated WASM; interpreter bus effects are already
     /// accounted by the ordinary PC bus and are not added here again.
     pub device_reads: u64,
@@ -140,6 +157,35 @@ struct PreparedBinding {
     guards: Vec<SourceGuard>,
     checked: bool,
     matches: bool,
+    /// Decoded original instruction boundaries, prepared once from frozen code.
+    /// Unsupported or oversized proofs retain the ordinary interpreter path.
+    instructions: Option<Vec<SourceInstruction>>,
+    canonical_copy: bool,
+}
+
+struct SourceInstruction {
+    address: u32,
+    length: u8,
+    flow: doslet_x86::translation::NearFlow,
+}
+
+#[derive(Clone, Copy)]
+enum TierProof {
+    Uniform(u8),
+    Complete([u64; 4]),
+}
+
+impl TierProof {
+    fn counts(&self, maximum: u32) -> [u64; 4] {
+        match self {
+            Self::Uniform(tier) => {
+                let mut counts = [0; 4];
+                counts[usize::from(*tier)] = u64::from(maximum);
+                counts
+            }
+            Self::Complete(counts) => *counts,
+        }
+    }
 }
 
 /// Segment capabilities depend on selectors, hidden caches and PE mode, never
@@ -187,6 +233,39 @@ impl CallWindows {
 }
 
 impl PreparedBinding {
+    fn uniform_tier(&self, cpu: &Cpu, bus: &PcBus) -> Option<u8> {
+        let instructions = self.instructions.as_ref()?;
+        let mut common = None;
+        for instruction in instructions {
+            let tier =
+                cpu.execution_tier_for_instruction_at(bus, instruction.address, instruction.length);
+            if common.is_some_and(|previous| previous != tier) {
+                return None;
+            }
+            common = Some(tier);
+        }
+        common
+    }
+
+    fn tier_proof(&self, cpu: &Cpu, bus: &PcBus) -> Option<TierProof> {
+        if let Some(tier) = self.uniform_tier(cpu, bus) {
+            return Some(TierProof::Uniform(tier));
+        }
+        if !self.canonical_copy {
+            return None;
+        }
+        let kernel = self.binding.kernel?;
+        let count = cpu.registers.get32(Gpr32::Ecx);
+        let expected = kernel.actual_work(count)?;
+        let mut counts = [0u64; 4];
+        for (site, instruction) in self.instructions.as_ref()?.iter().enumerate() {
+            let tier =
+                cpu.execution_tier_for_instruction_at(bus, instruction.address, instruction.length);
+            counts[usize::from(tier)] += u64::from(kernel.canonical_repetitions(count, site)?);
+        }
+        (counts.iter().sum::<u64>() == u64::from(expected)).then_some(TierProof::Complete(counts))
+    }
+
     fn source_matches(&mut self, bus: &PcBus) -> bool {
         if self.checked
             && self.guards.iter().all(|guard| {
@@ -217,8 +296,86 @@ pub(crate) struct Plan {
     stats: Stats,
     failure: Option<ExecutionError>,
     last_error: Option<String>,
+    tier_accounting: bool,
     #[cfg(feature = "wasm-procedure-diagnostics")]
     diagnostic_mode: DiagnosticMode,
+}
+
+fn source_instructions(binding: &Binding) -> Option<Vec<SourceInstruction>> {
+    let mut instructions = Vec::new();
+    for part in &binding.code {
+        let mut cursor = 0usize;
+        while cursor < part.expected.len() {
+            if instructions.len() >= MAX_SOURCE_PARTS {
+                return None;
+            }
+            let length =
+                doslet_x86::translation::instruction_length(&part.expected[cursor..], true)?;
+            if length == 0 || cursor + usize::from(length) > part.expected.len() {
+                return None;
+            }
+            instructions.try_reserve(1).ok()?;
+            instructions.push(SourceInstruction {
+                address: part.linear.checked_add(cursor as u32)?,
+                length,
+                flow: doslet_x86::translation::near_flow(&part.expected[cursor..], true)?,
+            });
+            cursor += usize::from(length);
+        }
+    }
+    Some(instructions)
+}
+
+fn canonical_copy_sources(
+    kernel: CopyKernel,
+    entry: u32,
+    instructions: &[SourceInstruction],
+) -> bool {
+    // The trusted kernel declaration proves the semantic idiom. Independently
+    // prove that sorted source sites follow its exact CFG before assigning the
+    // contract's roles: three entry sites, prefix padding, seven loop sites,
+    // AND/JZ, tail padding, byte load/store and RET. Reordered blocks decline.
+    use doslet_x86::translation::NearFlow;
+    if kernel.canonical_sites() != Some(instructions.len())
+        || instructions
+            .first()
+            .is_none_or(|site| site.address != entry)
+        || instructions.windows(2).any(|sites| {
+            sites[0].address.checked_add(u32::from(sites[0].length)) != Some(sites[1].address)
+        })
+    {
+        return false;
+    }
+    let prefix = kernel.prefix_nops as usize;
+    let tail = kernel.tail_nops as usize;
+    let initial = 2;
+    let backedge = 9 + prefix;
+    let final_branch = 11 + prefix;
+    let tail_load = 12 + prefix + tail;
+    let ret = instructions.len() - 1;
+    for (site, instruction) in instructions.iter().enumerate() {
+        let branch = if site == initial {
+            Some((4, tail_load))
+        } else if site == backedge {
+            Some((5, 3 + prefix))
+        } else if site == final_branch {
+            Some((4, ret))
+        } else {
+            None
+        };
+        let valid = if let Some((expected, target)) = branch {
+            matches!(instruction.flow, NearFlow::Branch { condition: Some(condition), displacement }
+                if condition == expected && instruction.address.wrapping_add(u32::from(instruction.length)).wrapping_add_signed(displacement) == instructions[target].address)
+        } else if site == ret {
+            instruction.flow == (NearFlow::Return { pop: 0, width: 4 })
+        } else {
+            instruction.flow == NearFlow::Next
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) struct PreparedRleCall {
@@ -350,26 +507,47 @@ enum Backend {
     Interpreter,
 }
 
+enum Module<'a> {
+    #[cfg(not(target_arch = "wasm32"))]
+    Native(&'a [u8], Option<&'a mut dyn CompiledCache>),
+    #[cfg(target_arch = "wasm32")]
+    Browser(BrowserCall),
+    Interpreter(core::marker::PhantomData<&'a ()>),
+}
+
 impl PcMachine {
     /// Compile and install one prepared module, then migrate RAM, VRAM and page
     /// generations once. Subsequent interpreter, device and WASM accesses
     /// borrow the same bytes. Validation failure leaves the machine unchanged.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn install_wasm_procedures(
         &mut self,
         wasm: &[u8],
         bindings: Vec<Binding>,
     ) -> Result<(), String> {
-        self.install_procedures(Some(wasm), bindings, None)
+        self.install_procedures(Module::Native(wasm, None), bindings)
     }
 
     /// As `install_wasm_procedures`, reusing compatible native code from the host.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn install_wasm_procedures_cached(
         &mut self,
         wasm: &[u8],
         bindings: Vec<Binding>,
         cache: &mut dyn CompiledCache,
     ) -> Result<(), String> {
-        self.install_procedures(Some(wasm), bindings, Some(cache))
+        self.install_procedures(Module::Native(wasm, Some(cache)), bindings)
+    }
+
+    /// Install exports from a module importing this worker's linear memory.
+    /// The callback table is sorted by function ID and fixed before execution.
+    #[cfg(target_arch = "wasm32")]
+    pub fn install_browser_wasm_procedures(
+        &mut self,
+        callback: BrowserCall,
+        bindings: Vec<Binding>,
+    ) -> Result<(), String> {
+        self.install_procedures(Module::Browser(callback), bindings)
     }
 
     /// Interpret admitted finite semantic procedures through RET before IRQ
@@ -379,15 +557,15 @@ impl PcMachine {
         &mut self,
         bindings: Vec<Binding>,
     ) -> Result<(), String> {
-        self.install_procedures(None, bindings, None)
+        self.install_procedures(Module::Interpreter(core::marker::PhantomData), bindings)
     }
 
     fn install_procedures(
         &mut self,
-        wasm: Option<&[u8]>,
+        module: Module<'_>,
         mut bindings: Vec<Binding>,
-        cache: Option<&mut dyn CompiledCache>,
     ) -> Result<(), String> {
+        let wasm = !matches!(&module, Module::Interpreter(_));
         if self.wasm_procedures.is_some() {
             return Err("WASM procedures already installed".into());
         }
@@ -412,7 +590,7 @@ impl PcMachine {
         let mut source_parts = 0usize;
         let mut source_bytes = 0usize;
         for binding in &mut bindings {
-            if wasm.is_none()
+            if !wasm
                 && binding.kernel.is_none()
                 && binding.rle_kernel.is_none()
                 && binding.finite_computation.is_none()
@@ -514,9 +692,22 @@ impl PcMachine {
                 }
             }
         }
-        let mut owner = wasm
-            .map(|wasm| SharedProcedureMemory::with_cache(wasm, &ids, self.bus.ram_size(), cache))
-            .transpose()?;
+        let mut owner = match module {
+            #[cfg(not(target_arch = "wasm32"))]
+            Module::Native(bytes, cache) => Some(SharedProcedureMemory::with_cache(
+                bytes,
+                &ids,
+                self.bus.ram_size(),
+                cache,
+            )?),
+            #[cfg(target_arch = "wasm32")]
+            Module::Browser(callback) => Some(SharedProcedureMemory::new(
+                &ids,
+                self.bus.ram_size(),
+                callback,
+            )?),
+            Module::Interpreter(_) => None,
+        };
         let mut prepared = Vec::new();
         let mut source_pages = alloc::vec![0u8; self.bus.ram_size().div_ceil(PAGE_BYTES)];
         let mut entry_ips = Vec::new();
@@ -527,6 +718,14 @@ impl PcMachine {
             .try_reserve_exact(bindings.len())
             .map_err(|_| "WASM entry allocation")?;
         for binding in bindings {
+            let instructions = source_instructions(&binding);
+            let canonical_copy =
+                binding
+                    .kernel
+                    .zip(instructions.as_ref())
+                    .is_some_and(|(kernel, sources)| {
+                        canonical_copy_sources(kernel, binding.entry_ip, sources)
+                    });
             let function_index = ids
                 .binary_search(&binding.function_id)
                 .expect("validated procedure ID") as u32;
@@ -567,6 +766,8 @@ impl PcMachine {
                 guards,
                 checked: false,
                 matches: false,
+                instructions,
+                canonical_copy,
             });
         }
         // Publish hints only after every fallible preparation step. They never
@@ -587,7 +788,7 @@ impl PcMachine {
         }
         self.cpu.set_dynamic_core(false);
         self.wasm_procedures = Some(Plan {
-            backend: if wasm.is_some() {
+            backend: if wasm {
                 Backend::Wasm
             } else {
                 Backend::Interpreter
@@ -597,6 +798,9 @@ impl PcMachine {
             stats: Stats::default(),
             failure: None,
             last_error: None,
+            // Native callers retain their existing refusal unless they opt in.
+            // Browser procedures use this conservative byte-validated policy.
+            tier_accounting: cfg!(target_arch = "wasm32"),
             #[cfg(feature = "wasm-procedure-diagnostics")]
             diagnostic_mode: DiagnosticMode::Normal,
         });
@@ -605,6 +809,33 @@ impl PcMachine {
 
     pub fn wasm_procedure_stats(&self) -> Option<Stats> {
         self.wasm_procedures.as_ref().map(|plan| plan.stats)
+    }
+
+    pub fn wasm_procedure_entry_count(&self) -> usize {
+        self.wasm_procedures
+            .as_ref()
+            .map_or(0, |plan| plan.bindings.len())
+    }
+
+    pub fn wasm_procedure_copy_tier_entries(&self) -> impl Iterator<Item = u32> + '_ {
+        self.wasm_procedures
+            .iter()
+            .flat_map(|plan| plan.bindings.iter())
+            .filter(|binding| binding.canonical_copy)
+            .map(|binding| binding.binding.entry_ip)
+    }
+
+    /// Allow byte-validated uniform procedures and proved per-site copy counts.
+    /// This is enabled by the browser adapter; native behavior stays opt-in.
+    pub fn set_wasm_procedure_tier_accounting(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        self.wasm_procedures
+            .as_mut()
+            .ok_or("WASM procedures are not installed")?
+            .tier_accounting = enabled;
+        Ok(())
     }
 
     pub fn wasm_procedure_last_error(&self) -> Option<&str> {
@@ -691,12 +922,28 @@ impl PcMachine {
             || !self.bus.a20_enabled()
             || !self.bus.ram.direct_execution_ready()
             || (self.cpu.accepts_maskable_interrupt() && self.bus.pic.has_interrupt())
-            || self.cpu.execution_labels_enabled()
         {
             return Ok(None);
         }
         let Some(context) = ProcedureContext::capture(&self.cpu) else {
             return Ok(None);
+        };
+        let tier = if self.cpu.execution_labels_enabled() {
+            let tier = plan
+                .tier_accounting
+                .then(|| binding.tier_proof(&self.cpu, &self.bus))
+                .flatten();
+            let Some(tier) = tier else {
+                self.wasm_procedures
+                    .as_mut()
+                    .expect("prepared plan")
+                    .stats
+                    .tier_refusals += 1;
+                return Ok(None);
+            };
+            Some(tier)
+        } else {
+            None
         };
         self.bus.wasm_rle_call = None;
         let atomic = binding.binding.kernel.is_some()
@@ -731,7 +978,11 @@ impl PcMachine {
         let irq_refused = maximum_instructions <= grant
             && atomic
             && binding.binding.kernel_interrupts == KernelInterrupts::BeforeNextIrq
-            && !self.procedure_fits_before_irq(maximum_instructions);
+            && !self.procedure_fits_before_irq_with_counts(
+                maximum_instructions,
+                tier.as_ref()
+                    .map(|proof| proof.counts(maximum_instructions)),
+            );
         let plan = self.wasm_procedures.as_mut().expect("prepared plan");
         let binding = &mut plan.bindings[index];
         if maximum_instructions > grant {
@@ -772,8 +1023,25 @@ impl PcMachine {
                 maximum_instructions,
             )
         } else {
-            self.cpu
-                .try_call_memory_procedure(&mut self.bus, &registry, grant)
+            match tier {
+                Some(TierProof::Uniform(tier)) => self.cpu.try_call_memory_procedure_in_tier(
+                    &mut self.bus,
+                    &registry,
+                    grant,
+                    tier,
+                ),
+                Some(TierProof::Complete(counts)) => {
+                    self.cpu.try_call_memory_procedure_with_tier_counts(
+                        &mut self.bus,
+                        &registry,
+                        grant,
+                        counts,
+                    )
+                }
+                None => self
+                    .cpu
+                    .try_call_memory_procedure(&mut self.bus, &registry, grant),
+            }
         } {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -804,6 +1072,16 @@ impl PcMachine {
             plan.stats.interpreted_instructions += u64::from(instructions);
         } else {
             plan.stats.translated_instructions += u64::from(instructions);
+            if let Some(proof) = tier.filter(|_| instructions != 0) {
+                for (total, count) in plan
+                    .stats
+                    .translated_tiers
+                    .iter_mut()
+                    .zip(proof.counts(instructions))
+                {
+                    *total += count;
+                }
+            }
             plan.stats.device_reads += self.bus.wasm_device_effects.device_reads;
             plan.stats.device_writes += self.bus.wasm_device_effects.device_writes;
             plan.stats.device_changes += self.bus.wasm_device_effects.device_changes;

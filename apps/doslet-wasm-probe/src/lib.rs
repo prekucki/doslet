@@ -97,8 +97,12 @@ impl CpuProbe {
         let rt = self.host.runtime_mut();
         let mut completed = 0;
         while completed < budget && !rt.cpu.is_halted() {
-            rt.interpret().map_err(|e| e.to_string())?;
-            completed += 1;
+            // The reference advances one instruction per call.
+            let steps = rt.interpret(1).map_err(|e| e.to_string())?;
+            if steps == 0 {
+                break;
+            }
+            completed += steps;
         }
         Ok(completed)
     }

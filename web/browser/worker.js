@@ -1,8 +1,23 @@
 import init, { WorkerEngine } from './doslet_web_worker.js';
 import {HostIo} from './io.js';
+import {instantiateWasmCore, instantiateWasmProcedures} from './wasm-core.js';
 
 const wasm = await init();
 const engine = new WorkerEngine();
+let aot = null, aotAssets = null;
+async function prepareAot(assets) {
+    if (!assets) return null;
+    if (assets.kind === 'procedure-memory')
+        return instantiateWasmProcedures(new Uint8Array(assets.module), wasm.memory,
+            metadata => engine.validate_procedure_aot(metadata));
+    const profile = assets.profile ? new Uint8Array(assets.profile) : null;
+    return instantiateWasmCore(new Uint8Array(assets.module), {
+        abi_ptr: () => engine.aot_abi_ptr(),
+        abi_len: () => engine.aot_abi_len(),
+        poll: (completed, remaining) => engine.aot_poll(completed, remaining),
+        validate_profile: profile => engine.validate_aot(profile),
+    }, wasm.memory, profile);
+}
 const io = new HostIo(engine, error => self.postMessage({kind:'storage-error',error}));
 let transitioning = false, wasWaiting = false;
 let startupKeys = '', startupIndex = 0;
@@ -20,8 +35,8 @@ let port = null, audioPort = null, audioRunning = false, epoch = 0, played = 0;
 let clockMode = 'worklet', nextPoll = 0;
 let ended = false;
 let anchor = null, nextVideo = 0, failed = false;
-let hostSpeed = {at: performance.now(), guest: engine.nanos()};
-function resetHostSpeed() { hostSpeed = {at: performance.now(), guest: engine.nanos()}; }
+let hostSpeed = {at: performance.now(), guest: engine.nanos(), busy: 0, calm: 0};
+function resetHostSpeed() { hostSpeed = {at: performance.now(), guest: engine.nanos(), busy: 0, calm: 0}; }
 let snapshotPending = null;
 // Transferable host presentation buffers. Guest RAM and VRAM never cross realms.
 let midiPool = Array.from({length: 32}, () => new ArrayBuffer(16384));
@@ -89,7 +104,7 @@ function present(force = false) {
     const now = performance.now();
     if (!force && now < nextVideo) return;
     nextVideo = now + 16;
-    const state = {kind: 'state', epoch, status: engine.status(), steps: engine.steps(), cpuMhz: engine.cpu_mhz(), effectiveCpuMhz: engine.effective_cpu_mhz(), cpuMode: engine.cpu_mode(), tierRates: Array.from(engine.tier_rates()), tierCounts: Array.from(engine.tier_counts(), Number), keyboardMode: engine.keyboard_mode(),
+    const state = {kind: 'state', epoch, status: engine.status(), steps: engine.steps(), cpuMhz: engine.cpu_mhz(), effectiveCpuMhz: engine.effective_cpu_mhz(), hostCpuLimit: engine.host_cpu_limit(), cpuMode: engine.cpu_mode(), tierRates: Array.from(engine.tier_rates()), tierCounts: Array.from(engine.tier_counts(), Number), keyboardMode: engine.keyboard_mode(),
         nanos: engine.nanos(), idleNanos: engine.idle_nanos(), waitingForIo:engine.waiting_for_io(), dirty:engine.dirty_overlay(), pendingCommit:engine.pending_commit(), cs: engine.cs(), ip: engine.ip(), ax: engine.ax(),
         cx: engine.cx(), di: engine.di(), fault: engine.fault(), midiMode: engine.midi_mode(),
         midiUpgraded: engine.midi_upgraded(), midiSysex: engine.midi_sysex(),
@@ -97,6 +112,9 @@ function present(force = false) {
         guestPcmChannels: engine.guest_pcm_channels(),
         midiBytes: engine.midi_bytes(), midiNotes: engine.midi_notes(), midiChannels: engine.midi_channels(), diskReadBytes: engine.disk_read_bytes(),
         pointerInUse: engine.pointer_in_use(), pointerRelative: engine.pointer_relative_in_use(), memory: JSON.parse(engine.memory_usage()), videoMode: engine.video_mode_label(),
+        aotTranslatedSteps: Number(engine.aot_translated_steps()),
+        aot: {active: !!aot, ...JSON.parse(aot?.kind === 'procedure-memory' ?
+            engine.procedure_aot_diagnostics() : engine.aot_diagnostics())},
         midiUnmapped: engine.midi_unmapped(), midiDisplay: engine.midi_display()};
     self.postMessage(state);
     if (!videoPool.length) return;
@@ -243,8 +261,21 @@ async function hostCommand(data) {
         if(data.kind==='apply-machine' && data.tierProfile)
             engine.prepare_candidate_tiers(data.tierProfile);
         if(data.kind==='apply-machine') preparedOutput=await prepareOutput(metadata.output);
+        const nextAssets = reset ? aotAssets : (data.aot || null);
+        const nextAot = await prepareAot(nextAssets);
         await io.install(prepared);
         prepared=null;
+        aot = null; aotAssets = null;
+        if (nextAot) {
+            if (nextAot.kind === 'procedure-memory') {
+                engine.install_procedure_aot(nextAot.metadata, nextAot.call);
+                aot = {kind: nextAot.kind, run: budget => engine.advance(budget)};
+            } else {
+                engine.install_aot(nextAot.profile);
+                aot = nextAot;
+            }
+            aotAssets = nextAssets;
+        }
         if(data.kind==='apply-machine' && data.seedBuffer && io.namespace && engine.dirty_overlay()) {
             engine.pause();engine.request_save_commit();await io.settled();
             if(engine.pending_commit() || engine.dirty_overlay()) throw new Error('Bundled saves could not be committed');
@@ -281,9 +312,13 @@ function tick() {
         let behind = false;
         if (engine.status() === 1 && !failed && !snapshotPending && !transitioning && !waiting) {
             if (startupIndex < startupKeys.length && engine.waiting_for_key()) {
-                const ascii = startupKeys.charCodeAt(startupIndex);
-                if (!engine.key_event(0, ascii, 0, true)) throw new Error('Startup selection key queue is full');
-                startupIndex++;
+                // Queue the whole sequence while the first BIOS read is blocked.
+                // Later prompts may poll the buffer without blocking again.
+                while (startupIndex < startupKeys.length) {
+                    const ascii = startupKeys.charCodeAt(startupIndex);
+                    if (!engine.startup_key(ascii)) break;
+                    startupIndex++;
+                }
             }
             const now = performance.now();
             if (!anchor) anchor = {host: now, guest: engine.nanos()};
@@ -294,12 +329,15 @@ function tick() {
             // step limit. Presentation frequency never advances guest devices.
             while (engine.nanos() < target && budget > 0 && engine.status() === 1 && performance.now() - now < 8) {
                 if (audioRunning && midiPool.length < 12) break;
-                const completed = engine.advance(Math.min(budget, 10000));
+                const chunk = Math.min(budget, 10000);
+                if (aot) engine.aot_begin();
+                const completed = aot ? aot.run(chunk) : engine.advance(chunk);
                 budget -= completed; drain();
                 io.pump();
                 if(engine.waiting_for_io()) {anchor=null;break;}
                 if (!completed || engine.timeslice_yielded()) break;
             }
+            hostSpeed.busy += performance.now() - now;
             if (audioRunning && port) audioMessage({kind: 'commit', epoch, nanos: engine.nanos()});
             if (engine.status() !== 1 && !ended && port && audioRunning) {
                 audioMessage({kind: 'end', epoch}); ended = true;
@@ -309,15 +347,26 @@ function tick() {
                 audioMessage({kind: 'poll', epoch}); nextPoll = now + 20;
             }
             behind = engine.nanos() < target && !engine.waiting_for_io();
+            // Adaptive mode caps the rate at host capacity, separately from the
+            // user's ceiling. The cap recovers gradually after sustained headroom,
+            // so a loading spike does not keep the game slow afterwards.
             if (engine.cpu_mode() === 'adaptive' && now - hostSpeed.at >= 250) {
                 const guestElapsed = engine.nanos() - hostSpeed.guest;
                 const hostElapsed = (now - hostSpeed.at) * 1_000_000;
+                const ceiling = engine.cpu_mhz(), limit = engine.host_cpu_limit() || ceiling;
+                let calm = 0;
                 if (behind && guestElapsed < hostElapsed * 0.9) {
                     const current = engine.effective_cpu_mhz();
                     const next = Math.max(1, Math.floor(current * guestElapsed / hostElapsed * 0.85));
-                    if (next < current) engine.set_host_cpu_mhz(next);
+                    if (next < limit) engine.set_host_cpu_mhz(next);
+                } else if (!behind && hostSpeed.busy < (now - hostSpeed.at) * 0.5 && limit < ceiling) {
+                    calm = hostSpeed.calm + 1;
+                    if (calm >= 4) {
+                        engine.set_host_cpu_mhz(Math.min(ceiling, Math.ceil(limit * 1.1) + 1));
+                        calm = 0;
+                    }
                 }
-                hostSpeed = {at: now, guest: engine.nanos()};
+                hostSpeed = {at: now, guest: engine.nanos(), busy: 0, calm};
             }
         }
         present();

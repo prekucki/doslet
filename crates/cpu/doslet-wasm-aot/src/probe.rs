@@ -1,8 +1,9 @@
 //! Native harness for the trusted standalone game probe ABI.
 //! Both interpreter/runtime and translated guest blocks run inside Wasmtime.
 use super::Artifact;
-use doslet_x86_wasm::STATE_BYTES;
-use wasmtime::{Caller, Linker, Memory, Store, TypedFunc};
+use wasmtime::{
+    Caller, Global, GlobalType, Linker, Memory, Mutability, Store, TypedFunc, Val, ValType,
+};
 
 pub struct GameArtifacts {
     pub probe: Artifact,
@@ -18,11 +19,8 @@ impl GameArtifacts {
         let mut store = Store::new(
             &self.probe.engine,
             Bridge {
-                memory: None,
                 poll: None,
                 handle: 0,
-                scratch: 0,
-                buffer: vec![0; STATE_BYTES].into_boxed_slice(),
             },
         );
         let mut linker = Linker::new(&self.probe.engine);
@@ -34,34 +32,10 @@ impl GameArtifacts {
                  completed: u32,
                  remaining: u32|
                  -> wasmtime::Result<i32> {
-                    let module_memory = caller
-                        .get_export("memory")
-                        .and_then(|e| e.into_memory())
-                        .expect("translated memory");
-                    let probe_memory = caller.data().memory.expect("probe memory");
-                    let offset = caller.data().scratch as usize;
-                    {
-                        let (bytes, state) = module_memory.data_and_store_mut(&mut caller);
-                        state.buffer.copy_from_slice(&bytes[..STATE_BYTES]);
-                    }
-                    {
-                        let (bytes, state) = probe_memory.data_and_store_mut(&mut caller);
-                        bytes[offset..offset + STATE_BYTES].copy_from_slice(&state.buffer);
-                    }
+                    // The generated module shares the probe's memory and scratch.
                     let poll = caller.data().poll.clone().expect("probe poll");
                     let handle = caller.data().handle;
-                    let result = poll.call(&mut caller, (handle, completed, remaining))?;
-                    {
-                        let (bytes, state) = probe_memory.data_and_store_mut(&mut caller);
-                        state
-                            .buffer
-                            .copy_from_slice(&bytes[offset..offset + STATE_BYTES]);
-                    }
-                    {
-                        let (bytes, state) = module_memory.data_and_store_mut(&mut caller);
-                        bytes[..STATE_BYTES].copy_from_slice(&state.buffer);
-                    }
-                    Ok(result)
+                    poll.call(&mut caller, (handle, completed, remaining))
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -97,10 +71,18 @@ impl GameArtifacts {
         let poll = instance
             .get_typed_func::<(u32, u32, u32), i32>(&mut store, "probe_poll")
             .map_err(|e| e.to_string())?;
-        store.data_mut().memory = Some(memory);
         store.data_mut().poll = Some(poll);
         store.data_mut().handle = handle;
-        store.data_mut().scratch = scratch;
+        let base = Global::new(
+            &mut store,
+            GlobalType::new(ValType::I32, Mutability::Const),
+            Val::I32(scratch as i32),
+        )
+        .map_err(|e| e.to_string())?;
+        linker
+            .define(&store, "doslet", "memory", memory)
+            .and_then(|linker| linker.define(&store, "doslet", "base", base))
+            .map_err(|e| e.to_string())?;
         let run_reference = instance
             .get_typed_func(&mut store, "probe_run")
             .map_err(|e| e.to_string())?;
@@ -143,11 +125,8 @@ impl GameArtifacts {
     }
 }
 struct Bridge {
-    memory: Option<Memory>,
     poll: Option<TypedFunc<(u32, u32, u32), i32>>,
     handle: u32,
-    scratch: u32,
-    buffer: Box<[u8]>,
 }
 pub struct GameRunner {
     store: Store<Bridge>,

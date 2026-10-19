@@ -15,6 +15,10 @@ The display fills the workspace. The toolbar has play/pause and restart icons;
 hover over an icon to see its action. **Info** opens diagnostics and provides
 access to **Audio…** and **Settings…**. The monitor icon opens **Display**, with
 **Pixel perfect / Fit** scaling and **Nearest / Sharp Bilinear / HQ2x** filtering.
+Set `video_filter = "sharp-bilinear"` under `[output]` in a native or browser
+game profile. Supported values are `nearest`, `sharp-bilinear`, and `hq2x`;
+omitting the field selects `nearest`. The display menu can change the filter
+while the game is running.
 The CPU indicator shows the target speed and recent activity; hover for its
 breakdown or click for diagnostics. The video indicator reports register-derived
 guest geometry and depth, such as `320×240×8 VGA`, using the current scanout
@@ -216,7 +220,7 @@ Linux and BSD these follow the XDG Base Directory specification; relative
 | Save export/import file | `$XDG_DATA_HOME/doslet/exports` | `~/Library/Application Support/doslet/exports` | `%LOCALAPPDATA%\doslet\exports` |
 | Speed-tier labels and their **Save as** files | `$XDG_CACHE_HOME/doslet/speed-tiers` (`~/.cache/doslet/speed-tiers`) | `~/Library/Caches/doslet/speed-tiers` | `%LOCALAPPDATA%\doslet\cache\speed-tiers` |
 | Dynamic-core profiles, one per executable | `$XDG_CACHE_HOME/doslet/core-profiles` | `~/Library/Caches/doslet/core-profiles` | `%LOCALAPPDATA%\doslet\cache\core-profiles` |
-| Generated AOT procedure modules | `$XDG_CACHE_HOME/doslet/aot/<exe-sha256>` | `~/Library/Caches/doslet/aot/<exe-sha256>` | `%LOCALAPPDATA%\doslet\cache\aot\<exe-sha256>` |
+| Generated AOT procedure modules, one per DPMI mode | `$XDG_CACHE_HOME/doslet/aot/<exe-sha256>/dpmi-<mode>` | `~/Library/Caches/doslet/aot/<exe-sha256>/dpmi-<mode>` | `%LOCALAPPDATA%\doslet\cache\aot\<exe-sha256>\dpmi-<mode>` |
 | Native code compiled from those modules | `$XDG_CACHE_HOME/doslet/aot-compiled` | `~/Library/Caches/doslet/aot-compiled` | `%LOCALAPPDATA%\doslet\cache\aot-compiled` |
 
 These are defaults; edited paths, profile bindings and explicit CLI paths such
@@ -230,7 +234,11 @@ the cache. The browser stores saves in IndexedDB instead.
 Native game launches load and save a dynamic-core profile named by the SHA-256
 of the executable; `--no-core-profile` disables this and `--core-profile FILE`
 selects one file for every game. ZIP launches and the demo use no profile unless
-one is given explicitly. Compiled AOT files hold host machine code for this
+one is given explicitly; they apply only to builds with the optional JIT.
+`<mode>` is `off`, `reflect` or `direct`, matching `--experimental-dpmi`,
+because DOS4GW loads code at other addresses with a DPMI host. The desktop
+installs the module for the launched program and mode automatically unless
+`--no-aot` is given. Compiled AOT files hold host machine code for this
 Wasmtime version, configuration and CPU. Each records a SHA-256 of its contents;
 a mismatch, or code Wasmtime rejects, is compiled again. Only one compilation per
 module is kept.
@@ -281,6 +289,7 @@ button_2 = 1
 
 [output]
 audio = true
+video_filter = "sharp-bilinear"
 game_midi = "gm"
 host_midi = "gm"
 midi_output = "rust"
@@ -289,6 +298,18 @@ midi_output = "rust"
 executable = "installation/GAME.EXE"
 arguments = []
 working_directory = 'C:\'
+
+[info]
+cover = "cover.jpg"
+released = 1994
+publishers = ["Apogee Software, Ltd."]
+developers = ["Apogee Software, Ltd."]
+genres = ["Action"]
+gameplay = ["Shooter"]
+description = """
+One or more paragraphs about the game.
+
+A blank line starts a new paragraph."""
 
 [[drives]]
 letter = "C"
@@ -313,6 +334,23 @@ Set the executable and bindings to your own files, then launch with:
 ```sh
 cargo run -p doslet --release --locked -- --config machine.toml
 ```
+
+To queue startup input in both the native app and a web package, add
+`startup_keys = "15"` under `[game]`. Characters are written in order to the
+BIOS keyboard buffer when the game first waits for a key, and queued again
+after a restart. Up to 15 printable ASCII characters are supported; `\n`,
+`\t`, `\b` and Escape can also be expressed with TOML string escapes.
+For example, `startup_keys = "A?\n"` sends `A`, `?`, then Enter.
+
+The optional `[info]` table describes the game for launchers; emulation ignores
+it. `cover` names a JPEG, PNG or WebP image (at most 16 MiB) relative to the
+profile. `released` is a year from 1970 to 2100. `publishers`, `developers`,
+`genres` and `gameplay` each take one label or up to 16 nonempty labels of at
+most 200 characters. `description` is plain text of at most 4,000 characters;
+blank lines separate paragraphs. The desktop [game library](usage.md#game-library)
+shows all of these on its cards and game pages. `doslet-web` copies the cover
+unchanged into the bundle and shows it with these details and the description
+on the generated start page, whose first paragraph also becomes the page summary.
 
 The `saves` location is relative to the profile and holds `overlay.redb`. Omit
 the `game-saves` binding to keep that store in the per-user save directory

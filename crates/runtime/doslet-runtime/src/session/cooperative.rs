@@ -460,6 +460,10 @@ impl Session {
     pub fn menu_idle_stats(&self) -> MenuIdleStats {
         self.menu_idle.stats
     }
+    /// Parking holds the CPU at a head; work there must wake it normally.
+    pub(super) fn menu_idle_parked(&self) -> bool {
+        self.menu_idle.parked.is_some()
+    }
     pub fn menu_idle_enabled(&self) -> bool {
         self.menu_idle.adaptive
             || self.menu_idle.site.is_some()

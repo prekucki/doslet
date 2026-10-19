@@ -210,6 +210,21 @@ impl Session {
         self.idle.enabled = enabled;
     }
 
+    /// A foreign engine must leave this boundary to ordinary execution: a proof
+    /// observes every step, and a known head or proven state is where the
+    /// next proof starts or proven passes are skipped.
+    pub(super) fn idle_needs_boundary(&self) -> bool {
+        let r = &self.machine.cpu.registers;
+        self.idle.enabled
+            && (self.idle.proof.is_some()
+                || self.idle.head == Some((r.cs, r.ip))
+                || self
+                    .idle
+                    .proven
+                    .as_ref()
+                    .is_some_and(|proven| self.machine.cpu.matches(&proven.cpu)))
+    }
+
     pub fn idle_loop_stats(&self) -> IdleLoopStats {
         self.idle.stats
     }

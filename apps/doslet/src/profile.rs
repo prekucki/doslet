@@ -444,7 +444,8 @@ impl Cli {
         self.launch.adaptive_idle = self.adaptive_idle;
         self.launch.analyze_synchronization = self.analyze_synchronization || self.adaptive_cpu;
         self.launch.adaptive_cpu = self.adaptive_cpu;
-        self.launch.no_dynamic_core = self.no_dynamic_core;
+        // The interpreter is the default; the JIT was slower on ROTT gameplay.
+        self.launch.no_dynamic_core = !self.dynamic_core;
         self.launch.dpmi = self
             .experimental_dpmi
             .unwrap_or(crate::cli::DpmiMode::Direct)
@@ -459,28 +460,20 @@ impl Cli {
             select_core_profile(&mut self.launch, exe);
         }
         self.launch.compiled_cache = dirs.as_ref().map(crate::host_dirs::HostDirs::aot_compiled);
-        self.launch.wasm_procedures = match &self.wasm_procedures {
-            // Without a path, use the module generated for this executable.
-            Some(path) if path.as_os_str().is_empty() => {
-                let exe = self
-                    .game
-                    .as_deref()
-                    .ok_or("--wasm-procedures without a path requires a native executable")?;
-                let dirs = dirs
-                    .as_ref()
-                    .ok_or("no user cache directory for AOT modules")?;
-                Some(
-                    dirs.aot_modules()
-                        .join(crate::native_speed_tiers::executable_sha256(exe)?)
-                        .join("procedures.wasm"),
-                )
-            }
-            path => path.clone(),
-        };
+        // Without a path, the module is resolved with the selected program below.
+        self.launch.wasm_procedures = self
+            .wasm_procedures
+            .clone()
+            .filter(|path| !path.as_os_str().is_empty());
         self.launch.interpret_procedures = self.interpret_procedures;
         #[cfg(not(feature = "wasm-procedures"))]
         if self.wasm_procedures.is_some() {
             return Err("--wasm-procedures requires cargo --features wasm-procedures".into());
+        }
+        if self.dynamic_core && !crate::cpu_config::JIT_AVAILABLE {
+            return Err(
+                "--dynamic-core requires cargo --features dynamic-core on x86-64 or AArch64".into(),
+            );
         }
         if let Some(mode) = self.drive_mode {
             self.launch.writable = mode != DriveMode::Ro;
@@ -643,14 +636,127 @@ impl Cli {
                 return Err("ZIP sources cannot use rw; use overlay, ro, or a separate persistent save store".into());
             }
             let archive = crate::native_zip::read(Path::new(spec.binding(&mount.source)))?;
-            spec.game.executable =
-                crate::native_zip::select(&archive, Some(&spec.game.executable))?;
+            // --program picks another program from the same ZIP and save store.
+            let wanted = self.program.as_deref().unwrap_or(&spec.game.executable);
+            spec.game.executable = crate::native_zip::select(&archive, Some(wanted))?;
             self.game = Some(PathBuf::from(&spec.game.executable));
+            if self.wants_procedures() {
+                let bytes = archive.program_bytes(&spec.game.executable)?;
+                self.select_procedures(&spec.game.executable, Some(&bytes))?;
+            }
+        } else if self.program.is_some() {
+            return Err("--program selects an EXE inside a ZIP; use --zip or a ZIP profile".into());
+        } else if self.wants_procedures() {
+            let program = self.game.clone().filter(|game| game.is_file());
+            let bytes = program.as_deref().map(read_program).transpose()?;
+            let name = program
+                .as_deref()
+                .and_then(Path::file_name)
+                .map_or(String::new(), |name| name.to_string_lossy().into_owned());
+            self.select_procedures(&name, bytes.as_deref())?;
         }
         spec.resolve().map_err(|e| e.to_string())?;
         self.launch.machine_spec = Some(spec);
         Ok(self)
     }
+    /// An explicit cache request, or the default lookup for this executable.
+    /// Speed-tier labels refuse procedures, so learning or a selected profile
+    /// keeps the interpreter.
+    fn wants_procedures(&self) -> bool {
+        self.wasm_procedures
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+            || (cfg!(feature = "wasm-procedures")
+                && self.wasm_procedures.is_none()
+                && !self.no_aot
+                && !self.interpret_procedures
+                && self.speed_tier_profile.is_none()
+                && !self.learn_speed_tiers)
+    }
+    /// Procedure modules bind live addresses. DOS4GW loads code elsewhere
+    /// with a DPMI host, so each mode has its own cached copy.
+    fn select_procedures(
+        &mut self,
+        program: &str,
+        exe: Option<&[u8]>,
+    ) -> Result<(), Box<dyn Error>> {
+        use sha2::{Digest, Sha256};
+        let dpmi = crate::native_input::dpmi_layout(self.launch.dpmi);
+        let cached = |identity: &str| {
+            crate::host_dirs::HostDirs::detect()
+                .map(|dirs| dirs.aot_module(identity, dpmi))
+                .map_err(|error| format!("no user cache directory for AOT modules: {error}"))
+        };
+        let identity = exe.map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+        if self.wasm_procedures.is_some() {
+            let identity =
+                identity.ok_or("--wasm-procedures without a path requires a game executable")?;
+            self.launch.wasm_procedures = Some(cached(&identity)?);
+            return Ok(());
+        }
+        let (Some(exe), Some(identity)) = (exe, identity) else {
+            return Ok(());
+        };
+        // The procedure generator translates 32-bit LE code (DOS4GW and
+        // similar extenders); real-mode MZ programs stay interpreted.
+        let limits = doslet_executable::LeLimits::default();
+        if doslet_executable::LeImage::discover(exe, limits).is_err() {
+            eprintln!(
+                "[INFO doslet] AOT: {program} is not a 32-bit LE program; using the interpreter"
+            );
+            return Ok(());
+        }
+        match cached(&identity) {
+            Ok(path) if path.is_file() => {
+                eprintln!(
+                    "[INFO doslet] AOT: using the cached DPMI {dpmi} procedures {}",
+                    path.display()
+                );
+                self.launch.wasm_procedures = Some(path);
+                self.launch.automatic_procedures = true;
+            }
+            Ok(path) => self.prepare_procedures(program, dpmi, path),
+            Err(error) => eprintln!("[INFO doslet] AOT: {error}; using the interpreter"),
+        }
+        Ok(())
+    }
+    /// The first launch prepares the module in the background for later ones.
+    fn prepare_procedures(&mut self, program: &str, dpmi: &str, path: PathBuf) {
+        #[cfg(feature = "wasm-procedures")]
+        {
+            let marker = crate::native_aot::failure_marker(&path);
+            if let Ok(reason) = std::fs::read_to_string(&marker) {
+                eprintln!(
+                    "[INFO doslet] AOT: an earlier preparation for {program} failed ({}); delete {} to retry; using the interpreter",
+                    reason.trim(),
+                    marker.display()
+                );
+                return;
+            }
+            eprintln!(
+                "[INFO doslet] AOT: preparing DPMI {dpmi} procedures for {program} in the background; using the interpreter until then"
+            );
+            self.launch.prepare_procedures = Some(path);
+        }
+        #[cfg(not(feature = "wasm-procedures"))]
+        eprintln!(
+            "[INFO doslet] AOT: no DPMI {dpmi} procedures cached for {program} ({}); using the interpreter",
+            path.display()
+        );
+    }
+}
+
+/// The selected program, bounded like ZIP members.
+fn read_program(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(crate::archive::MAX_ZIP_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > crate::archive::MAX_ZIP_BYTES {
+        return Err(format!("{} exceeds the program size limit", path.display()).into());
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -781,6 +887,47 @@ pub(crate) mod tests {
         assert_eq!(
             cli.launch.machine_spec.unwrap().mounts[0].policy,
             doslet_config::WritePolicy::Temporary
+        );
+    }
+
+    #[test]
+    fn program_selects_another_exe_from_a_zip_profile_and_keeps_its_saves() {
+        use std::io::Write;
+        let fixture = Fixture::new(
+            "version=2\n[game]\nexecutable='GAME.EXE'\n[[drives]]\nletter='C'\nkind='zip'\nsource='../GAME.ZIP'\npolicy='persistent'\nstore='../saves'\n",
+        );
+        let mut zip =
+            zip::ZipWriter::new(std::fs::File::create(fixture.root.join("GAME.ZIP")).unwrap());
+        for name in ["GAME.EXE", "SETUP.EXE"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&relocated_mz()).unwrap();
+        }
+        zip.finish().unwrap();
+        let spec = |extra: &[&str]| {
+            let mut arguments = vec!["--no-audio"];
+            arguments.extend_from_slice(extra);
+            fixture
+                .cli(&arguments)
+                .resolve()
+                .unwrap()
+                .launch
+                .machine_spec
+                .unwrap()
+        };
+        let game = spec(&[]);
+        let setup = spec(&["--program", "setup.exe"]);
+        assert_eq!(game.game.executable, "GAME.EXE");
+        assert_eq!(setup.game.executable, "SETUP.EXE");
+        assert_eq!(setup.mounts, game.mounts);
+        let directory = Fixture::new("version=2\n[game]\nexecutable='../TINY.EXE'\n");
+        assert!(
+            directory
+                .cli(&["--program", "OTHER.EXE", "--no-audio"])
+                .resolve()
+                .unwrap_err()
+                .to_string()
+                .contains("--program selects")
         );
     }
 

@@ -291,6 +291,147 @@ fn whole_kernel_does_not_allocate_from_first_entry() {
     assert_eq!(measured.bytes_total, 0);
 }
 
+#[test]
+fn uniform_tier_semantic_copy_matches_original_labels_work_and_weighted_time() {
+    for rates in [[Some(133), Some(8), Some(33)], [None, Some(8), Some(133)]] {
+        for tier in 0..4 {
+            for count in [1, 3, 200] {
+                let (mut fast, mut reference) = setup(count);
+                for machine in [&mut fast, &mut reference] {
+                    super::tier_tests::set_tiers(machine, COPY, tier, rates);
+                }
+                fast.set_wasm_procedure_tier_accounting(true).unwrap();
+                let cost = fast.wasm_procedures.as_ref().unwrap().bindings[0]
+                    .binding
+                    .kernel
+                    .unwrap()
+                    .actual_work(count)
+                    .unwrap();
+                assert_eq!(fast.step_with_idle_budget(1).unwrap().1, cost);
+                reference_steps(&mut reference, cost);
+                super::tier_tests::same_tiered_state(&mut fast, &mut reference);
+                let mut counts = [0; 4];
+                counts[usize::from(tier)] = u64::from(cost);
+                assert_eq!(fast.cpu.execution_counts(), counts);
+                assert_eq!(fast.wasm_procedure_stats().unwrap().kernel_calls, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn tiered_before_irq_admission_uses_the_selected_weight_and_fraction() {
+    for (tier, admitted) in [(0, true), (1, false)] {
+        let (mut fast, _) = setup(200);
+        super::tier_tests::set_tiers(&mut fast, COPY, tier, [None, Some(8), Some(133)]);
+        fast.set_wasm_procedure_tier_accounting(true).unwrap();
+        fast.cpu.flags |= flags::INTERRUPT;
+        fast.bus.pit.write_control(0x34).unwrap();
+        fast.bus.pit.write_counter(0, 8).unwrap();
+        fast.bus.pit.write_counter(0, 0).unwrap();
+        fast.wasm_procedures.as_mut().unwrap().bindings[0]
+            .binding
+            .kernel_interrupts = KernelInterrupts::BeforeNextIrq;
+        assert_eq!(fast.try_wasm_procedure(1).unwrap().is_some(), admitted);
+        assert_eq!(
+            fast.wasm_procedure_stats().unwrap().kernel_irq_refusals,
+            u64::from(!admitted)
+        );
+        if !admitted {
+            assert_eq!(fast.cpu.execution_counts(), [0; 4]);
+            assert_eq!(fast.cpu.registers.ip, ENTRY);
+        }
+    }
+}
+
+#[test]
+fn mixed_copy_labels_match_exact_original_sites_and_time_for_every_path() {
+    for cache in [false, true] {
+        for rates in [[Some(133), Some(8), Some(33)], [None, Some(8), Some(133)]] {
+            for count in [1, 2, 3, 199, 200] {
+                let (mut fast, mut reference) = setup(count);
+                assert!(fast.wasm_procedures.as_ref().unwrap().bindings[0].canonical_copy);
+                for machine in [&mut fast, &mut reference] {
+                    machine.cpu.set_decode_cache(cache);
+                    let labels = super::tier_tests::labels(machine, COPY, |site| (site % 4) as u8);
+                    machine.set_execution_tiers(Some(labels), rates).unwrap();
+                }
+                fast.set_wasm_procedure_tier_accounting(true).unwrap();
+                let proof = fast.wasm_procedures.as_ref().unwrap().bindings[0]
+                    .tier_proof(&fast.cpu, &fast.bus);
+                assert!(matches!(proof, Some(TierProof::Complete(_))));
+                let cost = fast.wasm_procedures.as_ref().unwrap().bindings[0]
+                    .binding
+                    .kernel
+                    .unwrap()
+                    .actual_work(count)
+                    .unwrap();
+                assert_eq!(fast.step_with_idle_budget(1).unwrap().1, cost);
+                reference_steps(&mut reference, cost);
+                super::tier_tests::same_tiered_state(&mut fast, &mut reference);
+                assert_eq!(fast.wasm_procedure_stats().unwrap().kernel_calls, 1);
+                assert!(
+                    fast.cpu
+                        .execution_counts()
+                        .iter()
+                        .filter(|&&n| n != 0)
+                        .count()
+                        > 1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_copy_preflight_refusal_does_not_charge_the_unexecuted_tier_proof() {
+    let (mut fast, _) = setup(200);
+    let labels = super::tier_tests::labels(&fast, COPY, |site| (site % 4) as u8);
+    fast.set_execution_tiers(Some(labels), [Some(133), Some(8), Some(33)])
+        .unwrap();
+    fast.set_wasm_procedure_tier_accounting(true).unwrap();
+    // Semantic copy supports planar VGA only; ordinary RAM forces a zero prefix.
+    fast.cpu.registers.set32(Gpr32::Edi, 0x5000);
+    let before = fast.cpu.snapshot();
+    let time = fast.time();
+    assert_eq!(fast.try_wasm_procedure(1).unwrap(), Some(0));
+    assert!(fast.cpu.matches(&before));
+    assert_eq!(fast.cpu.execution_counts(), [0; 4]);
+    assert_eq!(fast.time(), time);
+    assert_eq!(
+        fast.wasm_procedure_stats().unwrap().translated_instructions,
+        0
+    );
+}
+
+#[test]
+fn copy_site_attribution_declines_a_noncanonical_source_cfg() {
+    let (mut fast, _) = setup(3);
+    let labels = super::tier_tests::labels(&fast, COPY, |site| (site % 4) as u8);
+    fast.set_execution_tiers(Some(labels), [Some(133), Some(8), Some(33)])
+        .unwrap();
+    fast.set_wasm_procedure_tier_accounting(true).unwrap();
+    let binding = &mut fast.wasm_procedures.as_mut().unwrap().bindings[0];
+    let kernel = binding.binding.kernel.unwrap();
+    let instructions = binding.instructions.as_mut().unwrap();
+    assert!(canonical_copy_sources(kernel, ENTRY, instructions));
+    let original = instructions[2].flow;
+    instructions[2].flow = doslet_x86::translation::NearFlow::Next;
+    binding.canonical_copy = canonical_copy_sources(kernel, ENTRY, instructions);
+    assert!(!binding.canonical_copy);
+    assert_eq!(fast.try_wasm_procedure(1).unwrap(), None);
+    assert_eq!(fast.cpu.execution_counts(), [0; 4]);
+    let binding = &mut fast.wasm_procedures.as_mut().unwrap().bindings[0];
+    let instructions = binding.instructions.as_mut().unwrap();
+    instructions[2].flow = original;
+    instructions[4].address += 1;
+    assert!(!canonical_copy_sources(kernel, ENTRY, instructions));
+    instructions[4].address -= 1;
+    let last = instructions.len() - 1;
+    instructions[last].flow = doslet_x86::translation::NearFlow::Return { pop: 4, width: 4 };
+    assert!(!canonical_copy_sources(kernel, ENTRY, instructions));
+}
+
 fn with_interpreted_boundaries(count: u32) -> (PcMachine, PcMachine) {
     let (fast, mut reference) = setup(count);
     let kernel = fast.wasm_procedures.as_ref().unwrap().bindings[0]

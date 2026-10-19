@@ -532,6 +532,10 @@ impl Session {
         };
         Some((c, value))
     }
+    /// A sampling burst single-steps branch conditions.
+    pub(super) fn synchronization_tracing(&self) -> bool {
+        self.observer.enabled && self.synchronization.remaining != 0
+    }
     pub(super) fn synchronization_advance(
         &mut self,
         now: u64,

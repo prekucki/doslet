@@ -46,6 +46,22 @@ fn self_contained_module_loads_without_a_sidecar_by_content() {
 }
 
 #[test]
+fn module_must_match_the_dpmi_mode_that_placed_its_code() {
+    let mut manifest = metadata(EMPTY_MODULE);
+    // Modules generated before the mode was recorded remain loadable.
+    check_dpmi(&manifest, "direct").unwrap();
+    manifest["dpmi"] = json!("direct");
+    check_dpmi(&manifest, "direct").unwrap();
+    let error = check_dpmi(&manifest, "off").unwrap_err().to_string();
+    assert!(
+        error.contains("DPMI direct") && error.contains("DPMI off"),
+        "{error}"
+    );
+    manifest["dpmi"] = json!(1);
+    assert!(check_dpmi(&manifest, "direct").is_err());
+}
+
+#[test]
 fn embedded_hash_covers_code_after_the_metadata_section() {
     // An unrelated custom section follows the metadata. Hash both code pieces
     // in their original order, without including the metadata's own envelope.

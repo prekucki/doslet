@@ -131,6 +131,11 @@ impl Session {
         Ok(())
     }
 
+    /// The installed host, if any. Loaders place protected-mode code by it.
+    pub fn dpmi_mode(&self) -> Option<Mode> {
+        self.dpmi.as_ref().map(|h| h.mode)
+    }
+
     pub fn dpmi_stats(&self) -> Option<Stats> {
         self.dpmi.as_ref().map(|h| Stats {
             memory: h.memory.stats,

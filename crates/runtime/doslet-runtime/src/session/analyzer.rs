@@ -65,6 +65,8 @@ pub struct AnalyzerStats {
     pub enabled: bool,
     pub controller_enabled: bool,
     pub configured_mhz: u16,
+    /// Frontend host capacity cap, or zero.
+    pub host_limit_mhz: u16,
     pub effective_mhz: u16,
     pub reductions: u64,
     pub recoveries: u64,
@@ -335,6 +337,8 @@ pub(super) struct Analyzer {
     pub enabled: bool,
     pub controller: bool,
     pub ceiling: u16,
+    /// Host capacity cap below the user ceiling; zero means none.
+    host_limit: u16,
     next: u64,
     remaining: u64,
     extended: bool,
@@ -360,6 +364,7 @@ impl Default for Analyzer {
             enabled: false,
             controller: false,
             ceiling: 0,
+            host_limit: 0,
             next: 0,
             remaining: 0,
             extended: false,
@@ -379,6 +384,14 @@ impl Default for Analyzer {
     }
 }
 impl Analyzer {
+    /// Highest rate the controller may select: the user ceiling, or a lower
+    /// host capacity cap while the frontend cannot keep pace.
+    fn limit(&self) -> u16 {
+        match self.host_limit {
+            0 => self.ceiling,
+            limit => self.ceiling.min(limit),
+        }
+    }
     fn gap(&mut self, reason: &'static str) {
         self.stats.gaps += 1;
         self.stats.last_gap_reason = reason;
@@ -430,6 +443,7 @@ impl Analyzer {
             self.stats.dropped_candidates += 1;
             return;
         };
+        let limit = self.limit();
         let c = &mut self.candidates[index];
         if c.predicate.is_none() {
             c.predicate = Some(p);
@@ -447,7 +461,7 @@ impl Analyzer {
         c.stats.boundary_accounting = total_wait.is_some();
         let previous_episodes = c.stats.episodes;
         c.branch_measured(waiting, now, mhz, total_wait, source_phase_end);
-        if mhz == self.ceiling
+        if mhz == limit
             && c.qualified_episodes >= c.recent_periods.len() as u32
             && c.stats.episodes != previous_episodes
         {
@@ -515,6 +529,38 @@ impl Session {
             ..Default::default()
         };
     }
+    /// No discovery window, probe, recording or VGA boundary is active, so the
+    /// analyzer only counts steps until its next window.
+    pub(super) fn analyzer_quiescent(&self) -> bool {
+        let a = &self.analyzer;
+        !a.enabled
+            || (a.remaining == 0
+                && a.pending.is_none()
+                && a.boundary_pending.is_none()
+                && a.boundary_suspended.is_none()
+                && a.irq_depth == 0
+                && a.guards.idle()
+                && a.caller.idle()
+                && a.recurrence.idle())
+    }
+    /// Cap adaptive throughput for host capacity without replacing the user
+    /// ceiling. The controller restores at most this rate; zero or a value at
+    /// the ceiling removes the cap. Ignored without the adaptive controller.
+    pub fn set_host_cpu_limit(&mut self, mhz: u16) -> Result<(), RuntimeError> {
+        if !self.analyzer.controller {
+            return Ok(());
+        }
+        self.analyzer.host_limit = if mhz >= self.analyzer.ceiling { 0 } else { mhz };
+        let limit = self.analyzer.limit();
+        if self.hardware_config().cpu_mhz > limit {
+            self.machine.set_cpu_mhz(limit)?;
+            self.analyzer.adjustment_at = self.emulated_nanos();
+        }
+        Ok(())
+    }
+    pub fn host_cpu_limit(&self) -> u16 {
+        self.analyzer.host_limit
+    }
     /// Configured MHz is the ceiling. This controller does not authorize skipping.
     pub fn set_adaptive_cpu(&mut self, enabled: bool) {
         if enabled {
@@ -536,6 +582,7 @@ impl Session {
         s.audio_irq_deadline_misses = audio.block_irq_deadline_misses;
         s.enabled = self.analyzer.enabled;
         s.controller_enabled = self.analyzer.controller;
+        s.host_limit_mhz = self.analyzer.host_limit;
         s.configured_mhz = if self.analyzer.ceiling == 0 {
             self.hardware_config().cpu_mhz
         } else {
@@ -1194,7 +1241,7 @@ impl Session {
             }
         }
         let now = self.emulated_nanos();
-        let ceiling = self.analyzer.ceiling;
+        let ceiling = self.analyzer.limit();
         let audio_misses = self.machine.bus.dsp.diagnostics().block_irq_deadline_misses;
         let audio_missed = audio_misses > self.analyzer.audio_deadline_misses;
         self.analyzer.audio_deadline_misses = audio_misses;
@@ -1657,6 +1704,28 @@ mod tests {
 #[cfg(test)]
 mod controller_tests {
     use super::*;
+    #[test]
+    fn host_capacity_cap_bounds_recovery_without_replacing_the_user_ceiling() {
+        let mut s = super::tests::session(&[0x40, 0xeb, 0xfd]);
+        s.set_cpu_mhz(266).unwrap();
+        s.set_adaptive_cpu(true);
+        s.set_host_cpu_limit(80).unwrap();
+        assert_eq!(s.hardware_config().cpu_mhz, 80);
+        // Missing evidence restores throughput, but only to host capacity.
+        s.machine.set_cpu_mhz(40).unwrap();
+        s.analyzer_control();
+        assert_eq!(s.hardware_config().cpu_mhz, 80);
+        let stats = s.synchronization_analysis();
+        assert_eq!((stats.configured_mhz, stats.host_limit_mhz), (266, 80));
+        // Without the cap the controller may return to the user ceiling.
+        s.set_host_cpu_limit(0).unwrap();
+        s.analyzer_control();
+        assert_eq!(s.hardware_config().cpu_mhz, 266);
+        // Fixed rates ignore host caps.
+        s.set_adaptive_cpu(false);
+        s.set_host_cpu_limit(10).unwrap();
+        assert_eq!(s.hardware_config().cpu_mhz, 266);
+    }
     #[test]
     fn a_new_guest_dma_ack_miss_recovers_but_history_and_diagnostics_do_not_retune() {
         let mut s = super::tests::session(&[0x40, 0xeb, 0xfd]);

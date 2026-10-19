@@ -31,11 +31,39 @@ Run the guest demo without a window:
 cargo run -p doslet-headless --locked -- demo
 ```
 
-Open the desktop workspace:
+Open the desktop workspace with its built-in demo:
 
 ```sh
-cargo run -p doslet --locked
+cargo run -p doslet --locked -- --demo
 ```
+
+### Game library
+
+Without a game, `--config`, `--load-state` or a debugger option, Doslet opens a
+library of the launch profiles in `./games` and in the
+[profile directory](configuration.md#host-directories). Each version-2 profile
+becomes a card with its `[info]` cover, release year and genre:
+- **Sidebar.** Filters all games or one genre.
+- **Search.** Matches titles, developers, publishers, genres and program names.
+- **Game page.** Clicking a card opens it, with the cover over a blurred
+  backdrop, tags, the description and a table of details. **Play**, or Enter
+  on that page, starts the game; Esc returns to the library.
+- **Placeholders.** Profiles without a cover get a colored card with the game's
+  initials.
+
+**Play** prepares the game in the background, then shows it in the same window,
+exactly as `doslet --config PROFILE` would. Options given to the library, such
+as `--experimental-dpmi off` or `--no-audio`, apply to every game it starts.
+**‹ Library** in the game's toolbar returns to the list. So does leaving the
+game itself, for example quitting to DOS, once its last save is committed.
+Returning follows the same rules as Reset: a pending save finishes first, and
+unsaved changes in a temporary drive overlay must be exported or explicitly
+discarded in the machine settings. Closing the window still quits Doslet. A
+game that fails to start reports why above the library.
+**Rescan profiles** reloads the directories. Profiles that fail to parse are
+skipped with a warning in the terminal. Without any profiles, or with `--demo`,
+Doslet opens the workspace and its color-bar demo as before. Describe a game
+with the `[info]` fields in [launch profiles](configuration.md#profiles).
 
 ### Launch a game
 
@@ -48,6 +76,9 @@ cargo run -p doslet --release --locked -- --config games/ROTT.toml
 ```
 
 Use `--program` to choose an EXE or COM path inside the archive, ignoring case.
+With a ZIP profile, `--config` plus `--program` runs another program from the
+same ZIP and save store, for example ROTT's sound setup:
+`--config games/ROTT.toml --program SNDSETUP.EXE`.
 If the archive contains one program, Doslet selects it automatically; otherwise
 it reports the available programs. The selected program's directory becomes C:,
 including its subdirectories. ZIP data remains unchanged. Writes use a temporary
@@ -89,6 +120,64 @@ game. In a browser, Pointer Lock requires a display click and Escape releases it
 Focus loss, pause, settings panels, reset and game termination also release
 capture. **Hide cursor over the game** controls the host cursor during absolute
 input; the cursor stays visible while relative input is waiting for capture.
+
+### Execution core and AOT
+
+The desktop app runs the interpreter by default. If the user cache holds a
+procedure module for the selected program and its DPMI mode, the app installs
+it at launch, and the CPU panel shows **AOT · Wasmtime** as the execution core.
+Whole game procedures then run as native code compiled by Wasmtime, and the
+interpreter runs everything else. The module stays installed for the session,
+including Reset. `--no-aot` keeps the plain interpreter.
+
+A learned or selected speed-tier profile also keeps the plain interpreter,
+because tier labels refuse procedure calls. A cached module that cannot be used
+is reported and ignored; an explicit `--wasm-procedures FILE` stops the launch
+instead.
+
+A module binds live addresses. DOS4GW loads ROTT's code at 0x18e000 without a
+DPMI host and at 0x1e4000 with one, so each DPMI mode keeps its own copy:
+`aot/<exe-sha256>/dpmi-<mode>/procedures.wasm` under the
+[cache directory](configuration.md#host-directories).
+
+The first launch of a 32-bit LE program without that copy prepares it in the
+background while the game starts on the interpreter:
+1. A private copy of the game runs with the same media and DPMI mode, but with
+   a temporary overlay, no save store and no audio output, until its LE code
+   is loaded.
+2. The live object bases found there bind the program's procedures, which are
+   compiled into the cache.
+
+For ROTT this takes about half a second. The module applies after Reset,
+**Play** from the library, or the next start. If preparation fails, an
+`unavailable.txt` file with the reason is left in its place; delete it to try
+again. The terminal names the module in use, the preparation, or why there is
+none. For example, `CIV.EXE is not a 32-bit LE program` means a real-mode MZ
+game without DOS4GW, which the AOT generator cannot translate.
+
+The same two steps are available offline. `capture_procedure_layout` writes the
+live bindings (pass `--dpmi off` for `--experimental-dpmi off`), and
+`prepare_memory_procedures` compiles them into the cache or a chosen directory:
+
+```sh
+cargo run -p doslet-headless --release --locked --features wasm-static-test --example capture_procedure_layout -- games/ROTT.toml target/rott-layout-direct
+cargo run -p doslet-headless --release --locked --features wasm-static-test --example prepare_memory_procedures -- games/ROTT.toml target/rott-layout-direct/bindings.json --computation-kernels --kernel-interrupts before-irq
+```
+
+The module records its mode, and Doslet rejects a copy made for another mode.
+
+**Measurements.** Both comparisons below cover emulated execution only, not
+desktop frame rate:
+- **AOT vs the interpreter.** ROTT starting from boot under DPMI Direct, steps
+  60–100 million: the interpreter took 353 ms and the module 287 ms (1.23×).
+  AOT executed 15% of the instructions, about 660 per call.
+- **JIT vs the interpreter.** On a ROTT gameplay state, the Cranelift JIT took
+  360 ms plus 600 ms of compilation for 20 million steps that the interpreter
+  ran in 205 ms.
+
+The JIT is therefore no longer part of the default build. To compare it, build
+with `--features dynamic-core` and launch with `--dynamic-core`.
+`--no-dynamic-core` is still accepted and has no effect.
 
 By default, MIDI from the guest is rendered by a basic procedural synthesizer
 and mixed with Sound Blaster PCM and AdLib/OPL3 FM on the default audio device.
@@ -179,9 +268,11 @@ CPU ceiling; click to configure CPU execution.
 
 The CPU panel offers fixed speed, Hot/Grey/Cold rates, and the experimental
 adaptive mode. Logarithmic sliders cover 1–1000 MHz; Hot can also run uncapped.
-Grey is the reference speed. Native builds with dynamic-core support offer
-Cranelift JIT and interpreter execution. Browser builds offer fixed speed and
-the interpreter. **Apply** changes execution without restarting the program;
+Grey is the reference speed. Native builds offer the interpreter, or show
+**AOT · Wasmtime** while a cached procedure module is installed (see
+[Execution core and AOT](#execution-core-and-aot)). Builds with the optional
+`dynamic-core` feature can also select the slower Cranelift JIT. Browser builds
+offer fixed speed and the interpreter. **Apply** changes execution without restarting the program;
 **Revert** discards the draft. Controls are unavailable during machine
 preparation or an attached GDB session.
 
@@ -285,12 +376,16 @@ browser, including while paused:
 - **HQ2x** uses the HQx edge-aware algorithm to enlarge the frame 2× before
   linear sampling to the selected display size. It smooths diagonals and can
   change the appearance of small fonts.
+- **xBRZ (GPU)** is available on desktop and in the browser. Its shader smooths pixel-art edges at
+  the selected display size, including fractional scales, without CPU upscaling.
 
 Scaling and filtering are independent. Filters operate on presentation snapshots
 in the UI; guest execution and mouse coordinates still use the original frame.
 Filtered images are cached until the source frame, filter or intermediate zoom
-changes. These filters use CPU preprocessing on both platforms; their live
-frame rate has not been benchmarked.
+changes. Sharp Bilinear and HQ2x use CPU preprocessing on both platforms;
+xBRZ runs through the GPU renderer. In the browser it requires WebGPU or WebGL2;
+if the application falls back to Canvas2D, selecting xBRZ shows a notice and
+keeps the current filter and image. Their live frame rate has not been benchmarked.
 
 Presentation keeps the previous image visible until the renderer has uploaded
 its replacement. At most one upload is in progress; subsequent frames replace
@@ -547,17 +642,22 @@ trunk serve
 Open `http://127.0.0.1:8080`. `trunk build` produces a static bundle in `web/dist`;
 the HTML selects the `web` Cargo profile. The web frontend uses an embedded
 font. No backend service is required for the demo.
-The browser uses iced's tiny-skia software renderer and presents through
-Canvas2D. The native frontend uses wgpu. Browser startup diagnostics are logged
+The browser prefers iced's wgpu renderer through WebGPU or WebGL2, with
+tiny-skia/Canvas2D as a software fallback. The native frontend uses wgpu. Browser startup diagnostics are logged
 to the console.
 
-To build a private ROTT page using the local `games/ROTT.toml`, the latest
-`games/rott-saves` overlay and the CM-32L ROMs in the DOSBox configuration
-folder, run `mise run web-build` followed by `python3 tools/package_rott_web.py`.
-The result is `target/rott-web`; serve that directory at the web root over
-localhost or HTTPS and click **Uruchom grę**. Its first run seeds IndexedDB with
-the bundled sound configuration overlay. Later runs keep the browser's newer
-saves. The package contains the commercial game and ROMs, so keep it private.
+To build a private ROTT page with the local `games/ROTT.toml`, which queues the
+BIOS menu characters `1`, then `5`, run:
+
+```sh
+cargo run -p doslet-web --release --locked -- build games/ROTT.toml \
+  -o target/rott-site
+```
+
+Serve `target/rott-site` at the web root over localhost or HTTPS and click
+**Uruchom grę**. The packager merges the existing `games/rott-saves` overlay
+into its single game ZIP; later browser saves use IndexedDB. The package
+contains the commercial game, so keep it private.
 
 To mount a local game in the browser, pack its complete installation directory
 as a ZIP, including DOS4GW, graphics drivers, music and other data files. The

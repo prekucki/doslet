@@ -123,6 +123,7 @@ impl Default for InputSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputRouting {
     pub audio: bool,
+    pub video_filter: VideoFilter,
     pub game_midi: String,
     pub host_midi: String,
     pub midi_output: String,
@@ -132,10 +133,38 @@ impl Default for OutputRouting {
     fn default() -> Self {
         Self {
             audio: true,
+            video_filter: VideoFilter::Nearest,
             game_midi: "gm".into(),
             host_midi: "gm".into(),
             midi_output: "rust".into(),
             rom_binding: None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoFilter {
+    #[default]
+    Nearest,
+    SharpBilinear,
+    Hq2x,
+}
+impl VideoFilter {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::SharpBilinear => "sharp-bilinear",
+            Self::Hq2x => "hq2x",
+        }
+    }
+}
+impl core::str::FromStr for VideoFilter {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "nearest" => Ok(Self::Nearest),
+            "sharp-bilinear" => Ok(Self::SharpBilinear),
+            "hq2x" => Ok(Self::Hq2x),
+            _ => Err("output.video_filter must be nearest, sharp-bilinear, or hq2x"),
         }
     }
 }
@@ -146,6 +175,8 @@ pub struct GameSpec {
     pub patches: Vec<String>,
     pub arguments: Vec<String>,
     pub working_directory: String,
+    /// ASCII characters queued in the BIOS keyboard buffer at the first wait.
+    pub startup_keys: String,
 }
 impl Default for GameSpec {
     fn default() -> Self {
@@ -154,8 +185,79 @@ impl Default for GameSpec {
             patches: Vec::new(),
             arguments: Vec::new(),
             working_directory: "C:\\".into(),
+            startup_keys: String::new(),
         }
     }
+}
+/// Translate a startup character into the BIOS scan/ASCII pair for a US PC/AT
+/// keyboard. This accepts printable ASCII and common DOS control keys.
+pub fn bios_key_for_ascii(byte: u8) -> Option<(u8, u8)> {
+    match byte {
+        b'\n' | b'\r' => return Some((0x1c, b'\r')),
+        b'\t' => return Some((0x0f, b'\t')),
+        8 => return Some((0x0e, 8)),
+        27 => return Some((0x01, 27)),
+        b' '..=b'~' => {}
+        _ => return None,
+    }
+    const SHIFTED: &[u8] = b"!@#$%^&*()_+{}|:\"~<>?";
+    const BASE: &[u8] = b"1234567890-=[]\\;'`,./";
+    let base = SHIFTED
+        .iter()
+        .position(|candidate| *candidate == byte)
+        .map_or(byte.to_ascii_lowercase(), |index| BASE[index]);
+    for (row, first) in [
+        (&b"qwertyuiop[]"[..], 0x10),
+        (&b"asdfghjkl;'"[..], 0x1e),
+        (&b"zxcvbnm,./"[..], 0x2c),
+    ] {
+        if let Some(index) = row.iter().position(|candidate| *candidate == base) {
+            return Some((first + index as u8, byte));
+        }
+    }
+    let scan = match base {
+        b'1'..=b'9' => base - b'1' + 2,
+        b'0' => 0x0b,
+        b'-' => 0x0c,
+        b'=' => 0x0d,
+        b'`' => 0x29,
+        b'\\' => 0x2b,
+        b' ' => 0x39,
+        _ => return None,
+    };
+    Some((scan, byte))
+}
+#[cfg(test)]
+mod startup_key_tests {
+    use super::bios_key_for_ascii;
+
+    #[test]
+    fn printable_ascii_has_bios_scan_codes() {
+        for ascii in b' '..=b'~' {
+            let (scan, actual) = bios_key_for_ascii(ascii).unwrap();
+            assert_ne!(scan, 0);
+            assert_eq!(actual, ascii);
+        }
+        assert_eq!(bios_key_for_ascii(b'1'), Some((0x02, b'1')));
+        assert_eq!(bios_key_for_ascii(b'5'), Some((0x06, b'5')));
+        assert_eq!(bios_key_for_ascii(b'A'), Some((0x1e, b'A')));
+        assert_eq!(bios_key_for_ascii(b'?'), Some((0x35, b'?')));
+        assert_eq!(bios_key_for_ascii(b'\n'), Some((0x1c, b'\r')));
+        assert_eq!(bios_key_for_ascii(0), None);
+    }
+}
+/// Descriptive metadata for launchers and generated pages. Emulation ignores it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GameInfo {
+    /// Image path, resolved relative to the launch profile.
+    pub cover: Option<String>,
+    pub released: Option<u16>,
+    pub publishers: Vec<String>,
+    pub developers: Vec<String>,
+    pub genres: Vec<String>,
+    pub gameplay: Vec<String>,
+    /// Plain-text summary; blank lines separate paragraphs.
+    pub description: Option<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MachineSpec {
@@ -166,6 +268,7 @@ pub struct MachineSpec {
     pub input: InputSettings,
     pub output: OutputRouting,
     pub game: GameSpec,
+    pub info: GameInfo,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceClaim {

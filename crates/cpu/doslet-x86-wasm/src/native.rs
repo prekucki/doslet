@@ -2,10 +2,13 @@
 extern crate std;
 use crate::host::{Host, Runtime};
 use std::{format, string::String};
-use wasmi::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
+use wasmi::{
+    Caller, Engine, Global, Linker, Memory, MemoryType, Module, Mutability, Store, TypedFunc, Val,
+};
 
 struct State<R: Runtime> {
     host: Host<R>,
+    memory: Option<Memory>,
     error: Option<crate::host::Error<R::Error>>,
 }
 pub struct Runner<R: Runtime> {
@@ -18,17 +21,31 @@ impl<R: Runtime + 'static> Runner<R> {
     pub fn new(host: Host<R>) -> Result<Self, String> {
         let engine = Engine::default();
         let module = Module::new(&engine, host.translation().wasm()).map_err(|e| format!("{e}"))?;
-        let mut store = Store::new(&engine, State { host, error: None });
+        let mut store = Store::new(
+            &engine,
+            State {
+                host,
+                memory: None,
+                error: None,
+            },
+        );
+        // This runner owns the scratch memory; its base is zero.
+        let pages = crate::STATE_BYTES.div_ceil(65536) as u32;
+        let memory = Memory::new(&mut store, MemoryType::new(pages, Some(pages)))
+            .map_err(|e| format!("{e}"))?;
+        store.data_mut().memory = Some(memory);
+        let base = Global::new(&mut store, Val::I32(0), Mutability::Const);
         let mut linker = Linker::new(&engine);
+        linker
+            .define("doslet", "memory", memory)
+            .and_then(|linker| linker.define("doslet", "base", base))
+            .map_err(|e| format!("{e}"))?;
         linker
             .func_wrap(
                 "doslet",
                 "poll",
                 |mut caller: Caller<'_, State<R>>, completed: u32, remaining: u32| -> i32 {
-                    let memory = caller
-                        .get_export("memory")
-                        .and_then(|e| e.into_memory())
-                        .expect("compiler memory export");
+                    let memory = caller.data().memory.expect("runner memory");
                     let (bytes, state) = memory.data_and_store_mut(&mut caller);
                     match state.host.poll(completed, remaining, bytes) {
                         Ok(id) => id,
@@ -46,9 +63,6 @@ impl<R: Runtime + 'static> Runner<R> {
         let run = instance
             .get_typed_func::<u32, u32>(&store, "run")
             .map_err(|e| format!("{e}"))?;
-        let memory = instance
-            .get_memory(&store, "memory")
-            .ok_or("missing memory")?;
         Ok(Self {
             store,
             run,

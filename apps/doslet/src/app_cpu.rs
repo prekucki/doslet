@@ -99,6 +99,12 @@ impl Doslet {
         self.workspace.cpu = Some(self.cpu_settings());
         Ok(())
     }
+    fn aot_installed(&self) -> bool {
+        #[cfg(feature = "wasm-procedures")]
+        return self.session.wasm_procedure_entry_count() != 0;
+        #[cfg(not(feature = "wasm-procedures"))]
+        false
+    }
     pub(super) fn cpu_settings(&self) -> Settings {
         let tiers = self.speed_tiers.as_ref().map(|t| t.stats);
         Settings {
@@ -109,7 +115,9 @@ impl Doslet {
             } else {
                 Mode::Fixed
             },
-            core: if self.session.dynamic_core_enabled() {
+            core: if self.aot_installed() {
+                Core::Aot
+            } else if self.session.dynamic_core_enabled() {
                 Core::Jit
             } else {
                 Core::Interpreter

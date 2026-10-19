@@ -1145,6 +1145,10 @@ impl Cpu {
         Ok(())
     }
 
+    pub fn has_prepared_entries(&self) -> bool {
+        self.decode_cache.prepared_entries.is_some()
+    }
+
     /// Cached registry membership at the current EIP, including when decoding
     /// is disabled. A result is a scheduling hint: the caller must still check
     /// source bytes and its complete execution/context contract before dispatch.

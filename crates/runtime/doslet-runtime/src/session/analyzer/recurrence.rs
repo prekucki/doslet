@@ -58,6 +58,9 @@ pub(super) struct Recurrence {
     next_rejected: usize,
 }
 impl Recurrence {
+    pub(super) fn idle(&self) -> bool {
+        self.anchor.is_none() && self.interval.is_none()
+    }
     pub(super) fn follows(&self, head: u32) -> bool {
         // Multiple callers can visit the same guard in one event iteration.
         // Keep the selected recurrence until it disappears instead of resetting

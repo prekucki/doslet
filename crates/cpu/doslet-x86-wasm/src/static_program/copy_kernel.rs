@@ -40,6 +40,40 @@ impl CopyKernel {
         };
         (work <= u64::from(self.max_work_per_call)).then_some(work as u32)
     }
+
+    /// Number of original sites in canonical fallthrough/loop/tail order.
+    /// The owner must independently prove this source CFG order before using
+    /// these indices; sorted source addresses alone are insufficient.
+    pub fn canonical_sites(self) -> Option<usize> {
+        self.is_valid()
+            .then_some(15 + self.prefix_nops as usize + self.tail_nops as usize)
+    }
+
+    /// Exact dynamic repetitions of one original canonical instruction site.
+    /// Includes padding, all three conditional branches and the outer RET.
+    pub fn canonical_repetitions(self, count: u32, site: usize) -> Option<u32> {
+        self.actual_work(count)?;
+        let sites = self.canonical_sites()?;
+        if site >= sites {
+            return None;
+        }
+        let prefix = self.prefix_nops as usize;
+        let tail = self.tail_nops as usize;
+        let pairs = count / 2;
+        Some(if site < 3 || site == sites - 1 {
+            1
+        } else if site < 3 + prefix {
+            u32::from(pairs != 0)
+        } else if site < 10 + prefix {
+            pairs
+        } else if site < 12 + prefix {
+            u32::from(pairs != 0)
+        } else if site < 12 + prefix + tail {
+            u32::from(pairs != 0 && count & 1 != 0)
+        } else {
+            count & 1
+        })
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

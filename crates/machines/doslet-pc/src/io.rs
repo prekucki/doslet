@@ -38,11 +38,11 @@ pub struct PcBus {
     pub(crate) device_accesses: u64,
     /// Last native procedure's small diagnostic counters; portable device state
     /// excludes compiler statistics and starts them fresh after restoration.
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) wasm_device_effects: doslet_x86_wasm::static_program::memory::Effects,
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) wasm_call_windows: crate::wasm_procedures::CallWindows,
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) wasm_rle_call: Option<crate::wasm_procedures::PreparedRleCall>,
     /// Writes to the CMOS shutdown-status scratch register (no live device
     /// effect). Used only to classify actually executed recurring intervals.
@@ -86,7 +86,7 @@ impl Default for PcBus {
     }
 }
 impl PcBus {
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn interpreter_batch_bus(
         &mut self,
     ) -> Option<crate::memory::batch::BorrowedRamBus<'_>> {
@@ -96,7 +96,7 @@ impl PcBus {
         self.ram.interpreter_batch_bus_with_video(&mut self.vga)
     }
 
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn complete_interpreter_batch(&mut self, effects: crate::memory::batch::Effects) {
         self.device_accesses = self.device_accesses.wrapping_add(effects.device_accesses);
         #[cfg(feature = "profiling")]
@@ -197,11 +197,11 @@ impl PcBus {
             keyboard_irq_line: false,
             vga_status_read_generation: 0,
             device_accesses: 0,
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             wasm_device_effects: Default::default(),
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             wasm_call_windows: Default::default(),
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             wasm_rle_call: None,
             cmos_scratch_writes: 0,
             observe_vga_status: true,

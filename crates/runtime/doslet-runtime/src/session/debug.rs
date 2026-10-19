@@ -114,28 +114,67 @@ impl Session {
         use doslet_bus::MemoryBus;
         self.machine.bus.code_bytes(address, length)
     }
-    /// Bounded experimental register translation. Competing tracing/idle
-    /// policies retain ordinary execution through a zero grant.
+    /// Bounded experimental foreign execution, equivalent to an ordinary batch.
+    /// Policies that single-step (idle proofs, analyzer windows and probes,
+    /// synchronization bursts) or act at this boundary (idle heads, proven
+    /// passes, parked menus) retain ordinary execution through a zero grant;
+    /// the machine also refuses grants while batch yield heads are set.
     pub fn debug_register_engine_budget(&self, remaining: u32) -> u32 {
+        self.register_engine_budget(remaining, false)
+    }
+    pub fn debug_tiered_register_engine_budget(&self, remaining: u32) -> u32 {
+        self.register_engine_budget(remaining, true)
+    }
+    fn register_engine_budget(&self, remaining: u32, allow_tiers: bool) -> u32 {
         if self.status != SessionStatus::Running
             || self.storage_wait
             || self.timeslice_yielded
             || self.continuation.is_some()
             || self.patches_applied < self.patches.len()
-            || self.analyzer.enabled
-            || self.observer.enabled
-            || self.idle.enabled
-            || self.menu_idle_enabled()
-            || self.adaptive_idle_enabled()
+            || !self.analyzer_quiescent()
+            || self.synchronization_tracing()
+            || self.idle_needs_boundary()
+            || self.menu_idle_parked()
             || self.mouse.pending & self.mouse.callback.0 != 0
             || self.dpmi.as_ref().is_some_and(|h| h.direct_return_pending)
         {
             return 0;
         }
-        self.machine.debug_register_engine_budget(remaining)
+        if allow_tiers {
+            self.machine.debug_tiered_register_engine_budget(remaining)
+        } else {
+            self.machine.debug_register_engine_budget(remaining)
+        }
     }
     pub fn debug_account_register_engine(&mut self, steps: u32) -> Result<(), super::RuntimeError> {
         self.machine.debug_account_register_engine(steps)?;
+        self.steps += u64::from(steps);
+        Ok(())
+    }
+    /// Register sorted flat-32 EIPs of a foreign engine. Ordinary batches then
+    /// split and yield at them; installation invalidates decoded blocks.
+    pub fn debug_set_prepared_entries(
+        &mut self,
+        sorted: alloc::vec::Vec<u32>,
+    ) -> Result<(), &'static str> {
+        self.machine.cpu.set_prepared_entries(sorted)
+    }
+    /// Ordinary execution, returning after work once a prepared entry is reached.
+    pub fn debug_advance_to_prepared_entry(&mut self, budget: u32) -> u32 {
+        self.advance_with(budget, true)
+    }
+    pub fn debug_execution_tier_at(&self, address: u32, length: u8) -> u8 {
+        self.machine
+            .cpu
+            .execution_tier_for_instruction_at(&self.machine.bus, address, length)
+    }
+    pub fn debug_account_tiered_register_engine(
+        &mut self,
+        steps: u32,
+        tier: u8,
+    ) -> Result<(), super::RuntimeError> {
+        self.machine
+            .debug_account_tiered_register_engine(steps, tier)?;
         self.steps += u64::from(steps);
         Ok(())
     }
@@ -145,6 +184,16 @@ impl Session {
             .bus
             .code_check(address, length)
             .map(CodeVersion)
+    }
+
+    /// Raw span identity for a foreign engine's own guard table.
+    pub fn debug_code_check(&self, address: u32, length: u8) -> Option<doslet_bus::CodeCheck> {
+        use doslet_bus::MemoryBus;
+        self.machine.bus.code_check(address, length)
+    }
+    pub fn debug_code_check_valid(&self, check: &doslet_bus::CodeCheck) -> bool {
+        use doslet_bus::MemoryBus;
+        self.machine.bus.code_valid(check)
     }
 
     pub fn debug_code_valid(&self, version: &CodeVersion) -> bool {

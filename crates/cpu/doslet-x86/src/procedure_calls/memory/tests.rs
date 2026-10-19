@@ -27,6 +27,48 @@ const BRANCH_BODY: &[u8] = &[
     0xC3, // RET.
 ];
 
+#[test]
+fn complete_tier_proof_charges_exact_counts_only_after_a_validated_result() {
+    let counts = [2, 1, 3, 1];
+    let (mut cpu, mut bus) = enter(Program::ReturnSlot);
+    cpu.set_execution_labels(Some(alloc::vec::Vec::new()))
+        .unwrap();
+    let entries = [entry(&cpu)];
+    assert_eq!(
+        cpu.try_call_memory_procedure_with_tier_counts(&mut bus, &registry(&entries), WORK, counts),
+        Ok(MemoryProcedureOutcome::Complete { instructions: WORK })
+    );
+    assert_eq!(cpu.execution_counts(), counts);
+    assert_eq!(cpu.registers.ip, TARGET);
+
+    for fault in [Fault::Count(WORK - 1, true), Fault::Count(1, false)] {
+        let (mut cpu, mut bus) = enter(Program::ReturnSlot);
+        cpu.set_execution_labels(Some(alloc::vec::Vec::new()))
+            .unwrap();
+        let entries = [entry(&cpu)];
+        let before = cpu.snapshot();
+        bus.fault = Some(fault);
+        assert_eq!(
+            cpu.try_call_memory_procedure_with_tier_counts(
+                &mut bus,
+                &registry(&entries),
+                WORK,
+                counts
+            ),
+            Err(MemoryProcedureError::InvalidResult(
+                MemoryProcedureResultError::InstructionCount
+            ))
+        );
+        assert!(cpu.matches(&before));
+        assert_eq!(cpu.execution_counts(), [0; 4]);
+        assert_eq!(
+            bus.load(DATA),
+            0xDEAD_BEEF,
+            "committed store must remain fatal"
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Program {
     ReturnSlot,

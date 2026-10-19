@@ -87,6 +87,15 @@ impl HostDirs {
     pub fn aot_modules(&self) -> PathBuf {
         self.cache.join("aot")
     }
+    /// One procedure module per executable and DPMI mode (`off`, `reflect` or
+    /// `direct`). DOS4GW loads the same code at different addresses with and
+    /// without a DPMI host, so each mode needs its own bound copy.
+    pub fn aot_module(&self, executable_sha256: &str, dpmi: &str) -> PathBuf {
+        self.aot_modules()
+            .join(executable_sha256)
+            .join(format!("dpmi-{dpmi}"))
+            .join("procedures.wasm")
+    }
     /// Native code compiled from procedure modules.
     pub fn aot_compiled(&self) -> PathBuf {
         self.cache.join("aot-compiled")

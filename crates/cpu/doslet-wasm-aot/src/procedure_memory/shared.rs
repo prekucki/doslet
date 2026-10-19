@@ -281,15 +281,15 @@ impl SharedProcedureMemory {
     ) -> Result<(Exit, memory::Effects), String> {
         use doslet_x86_wasm::static_program::procedure_memory::RleCall;
         admission
-            .call
+            .call()
             .write(&mut self.memory.data_mut(&mut self.store)[RleCall::OFFSET as usize..])
             .expect("fixed RLE call header");
         let charged = frame.charged_work.checked_add(u64::from(admission.work()));
         let (exit, mut effects) = self.execute_index(index, frame, descriptor)?;
         let expected_writes = 6
-            + u64::from(admission.call.output_count)
-            + u64::from(admission.call.count_writes)
-            + u64::from(admission.call.value_writes);
+            + u64::from(admission.call().output_count)
+            + u64::from(admission.call().count_writes)
+            + u64::from(admission.call().value_writes);
         if exit != Exit::Complete
             || frame.exact_total() != charged
             || frame.address.offset != admission.return_target()

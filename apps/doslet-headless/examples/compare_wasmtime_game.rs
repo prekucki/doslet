@@ -159,7 +159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "interpreter_aot_compile_seconds":artifacts.probe.compile_seconds,"interpreter_aot_load_seconds":artifacts.probe.load_seconds,
         "translated_aot_compile_seconds":artifacts.translated.compile_seconds,"translated_aot_load_seconds":artifacts.translated.load_seconds,
         "measurements":measurements,"native_oracle_seconds":native_seconds,
-        "boundary":"Complete interpreter, runtime, devices and fallback execute in WASM under Wasmtime; native poll trampoline copies 65,600-byte scratch via a staging buffer (four copies per poll); no guest RAM/VRAM transport; setup, drain/hash and serialization excluded; one full warmup before resetting guest state; not a browser measurement"});
+        "boundary":"Complete interpreter, runtime, devices and fallback execute in WASM under Wasmtime; the generated module imports the probe memory and scratch base, so polls copy no scratch; no guest RAM/VRAM transport; setup, drain/hash and serialization excluded; one full warmup before resetting guest state; not a browser measurement"});
     fs::write(out.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())

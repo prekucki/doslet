@@ -5,9 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [features]
-default = ["dynamic-core"]
+default = ["wasm-procedures"]
 dynamic-core = ["doslet-runtime/dynamic-core"]
-wasm-procedures = ["doslet-runtime/wasm-procedures"]
+wasm-procedures = ["doslet-runtime/wasm-procedures", "dep:doslet-aot", "dep:doslet-x86-wasm"]
 [dependencies]
 doslet-config.workspace = true
 doslet-input.workspace = true
@@ -28,6 +28,10 @@ iced_runtime = "0.14.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 doslet-runtime = { workspace = true, features = ["save-state"] }
+doslet-executable.workspace = true
+doslet-aot = { path = "../../crates/system/doslet-aot", features = ["wasm"], optional = true }
+doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm", optional = true }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 flate2 = "1"
 doslet-debugger.workspace = true
 doslet-mcp.workspace = true
@@ -43,7 +47,7 @@ iced = { version = "0.14.0", default-features = false, features = ["wgpu", "toki
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 iced = { version = "0.14.0", default-features = false, features = ["wgpu", "webgl", "tiny-skia", "web-colors"] }
 console_error_panic_hook = "0.1.7"
-web-sys = { version = "0.3.106", features = ["Blob", "File", "FileList", "HtmlInputElement", "HtmlElement", "Document", "Window", "Event", "EventTarget", "Node", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioScheduledSourceNode", "GainNode", "AudioParam", "console", "AudioContextOptions"] }
+web-sys = { version = "0.3.106", features = ["Blob", "File", "FileList", "HtmlInputElement", "HtmlElement", "HtmlCanvasElement", "Document", "Window", "Event", "EventTarget", "Node", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioScheduledSourceNode", "GainNode", "AudioParam", "console", "AudioContextOptions"] }
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 js-sys = "0.3.106"

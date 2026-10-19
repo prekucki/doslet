@@ -10,8 +10,8 @@ pub(crate) enum Storage {
         bytes: Box<[u8]>,
         generations: Box<[u64]>,
     },
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
-    Wasm(Box<doslet_wasm_aot::procedure_memory::SharedProcedureMemory>),
+    #[cfg(feature = "wasm-procedures")]
+    Wasm(Box<crate::wasm_procedures::SharedProcedureMemory>),
 }
 
 impl Storage {
@@ -29,7 +29,7 @@ impl Storage {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Owned { bytes, .. } => bytes.len(),
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => owner.layout().ram_bytes,
         }
     }
@@ -38,7 +38,7 @@ impl Storage {
     pub(crate) fn bytes(&self) -> &[u8] {
         match self {
             Self::Owned { bytes, .. } => bytes,
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => owner.ram(),
         }
     }
@@ -47,7 +47,7 @@ impl Storage {
     pub(crate) fn generations(&self) -> &[u64] {
         match self {
             Self::Owned { generations, .. } => generations,
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => owner.generations(),
         }
     }
@@ -57,7 +57,7 @@ impl Storage {
     pub(crate) fn generations_mut(&mut self) -> &mut [u64] {
         match self {
             Self::Owned { generations, .. } => generations,
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => owner.generations_mut(),
         }
     }
@@ -67,12 +67,12 @@ impl Storage {
     pub(crate) fn parts_mut(&mut self) -> (&mut [u8], &mut [u64]) {
         match self {
             Self::Owned { bytes, generations } => (bytes, generations),
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => owner.parts_mut(),
         }
     }
 
-    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn parts_with_video_mut(&mut self) -> Option<(&mut [u8], &mut [u64], &mut [u8])> {
         match self {
             Self::Owned { .. } => None,
@@ -84,7 +84,7 @@ impl Storage {
     pub(crate) fn video(&self) -> Option<&[u8]> {
         match self {
             Self::Owned { .. } => None,
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => Some(owner.video()),
         }
     }
@@ -93,7 +93,7 @@ impl Storage {
     pub(crate) fn video_mut(&mut self) -> Option<&mut [u8]> {
         match self {
             Self::Owned { .. } => None,
-            #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => Some(owner.video_mut()),
         }
     }
