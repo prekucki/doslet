@@ -59,6 +59,10 @@ impl GameArchive {
         Ok(Self { bytes, programs })
     }
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(
+        dead_code,
+        reason = "native tests of the browser worker do not read programs"
+    )]
     pub fn program_bytes(&self, program: &str) -> Result<Vec<u8>, String> {
         let mut zip =
             zip::ZipArchive::new(Cursor::new(self.bytes.as_slice())).map_err(|e| e.to_string())?;

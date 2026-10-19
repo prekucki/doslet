@@ -6,6 +6,7 @@
 /games/
 *.log
 __pycache__/
+/.idea/
 /docs/HANDOFF.md
 /mise.local.toml
 

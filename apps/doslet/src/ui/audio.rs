@@ -7,13 +7,13 @@ use super::{
 };
 use crate::configurator::Edit;
 use doslet_midi_routing::Mode;
+#[cfg(not(target_arch = "wasm32"))]
+use iced::Font;
 use iced::widget::{
     button, checkbox, column, container, pick_list, progress_bar, row, rule, scrollable, slider,
     space, svg, text, toggler,
 };
 use iced::{Border, Color, Element, Fill};
-#[cfg(not(target_arch = "wasm32"))]
-use iced::Font;
 
 /// A dedicated sheet keeps navigation and actions outside the scrolling form.
 pub(super) fn dialog(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
