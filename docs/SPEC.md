@@ -137,8 +137,14 @@ SS.B independently of operand width. Near/far transfers and same-privilege
 LAR/LSL, SETcc, LSS/LFS/LGS and the dword F7 integer group support observed
 startup code. This remains a selected subset, not a complete 386 implementation.
 Paging, virtual-8086 execution, privilege-changing gates/returns, task switching
-and precise exception delivery remain pending. Integer divide errors stop
-explicitly rather than delivering INT 0.
+and delivery of exceptions through the IDT/IVT remain pending; integer divide
+errors stop explicitly rather than delivering INT 0. `CpuError::fault` names the
+architectural fault (#DE, #NP, #SS, #GP and its error code) of divide, segment
+limit and descriptor errors. With `Cpu::set_precise_faults`, `Cpu::step`
+restores the general registers, EIP, EFLAGS, CPL, interrupt shadow and the CS
+and SS caches on such a fault, so a host can deliver it at the instruction;
+memory already written, such as stack slots below ESP, stays written. The DPMI
+host enables this while a client has exception handlers.
 
 `Cpu::default()` has no x87 and starts with CR0.EM/ET set. `with_x87()` installs
 an independent fixed-stack `doslet-x87` unit and clears EM. The default PC uses
@@ -273,10 +279,11 @@ time before a known hardware service deadline. Input, increased work and changed
 MHz reduce or reset waiting; each wait remains bounded to 250 us. This is an
 experimental throughput policy, not a proof that the guest has no useful work.
 
-Architectural exception delivery and
-complete historical CPU-model behavior are not implemented. Unsupported opcodes,
-operands, ports and services stop the session with a diagnostic; a faulted
-instruction is not guaranteed to have rolled back its earlier side effects.
+Architectural exception delivery and complete historical CPU-model behavior are
+not implemented, except for DPMI clients' registered exception handlers.
+Unsupported opcodes, operands, ports and services stop the session with a
+diagnostic; outside precise faults, a faulted instruction is not guaranteed to
+have rolled back its earlier side effects.
 
 Execution steps are scheduling units, not physical clock cycles or retired
 instruction counts. Each repeated string iteration counts as one step. Integer emulated
@@ -613,9 +620,10 @@ BIOS extended-memory queries match installed RAM, and A20 enable/disable/query
 services reflect the actual gate. Other unavailable INT 15h functions return
 AH=86h/CF=1. XMS and VCPI installation probes report absence through their
 defined status registers. Runtime sessions without a DPMI host also report
-its absence. Native desktop launches enable direct DPMI dispatch by default;
-`--experimental-dpmi off` retains the guest extender path. The runtime host supports
-the experimental DOS/4GW service and allocation subset documented in
+its absence. Native desktop launches and browser bundles enable direct DPMI
+dispatch by default; `machine.dpmi = "off"` or `--dpmi off` retains the guest
+extender path. The runtime host supports the DOS/4GW service and allocation
+subset documented in
 [DPMI host](compatibility/dpmi-host.md); it is not a general-purpose DPMI server.
 Their explicit IVT
 shims prevent startup from running uninitialized RAM through a null vector.

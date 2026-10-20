@@ -277,6 +277,12 @@ impl Registers {
             cache
         }
     }
+    pub(crate) fn general(&self) -> [u32; 8] {
+        self.general
+    }
+    pub(crate) fn set_general(&mut self, general: [u32; 8]) {
+        self.general = general;
+    }
     pub(crate) fn set_segment(&mut self, segment: SegmentRegister, cache: SegmentCache) {
         match segment {
             SegmentRegister::Es => self.es = cache.selector,

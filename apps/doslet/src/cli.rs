@@ -29,12 +29,11 @@ pub enum DpmiMode {
     Direct,
 }
 impl DpmiMode {
-    pub fn host_mode(self) -> Option<doslet_runtime::session::dpmi::Mode> {
-        use doslet_runtime::session::dpmi::Mode;
+    pub fn host(self) -> doslet_config::DpmiHost {
         match self {
-            Self::Off => None,
-            Self::Reflect => Some(Mode::Reflect),
-            Self::Direct => Some(Mode::Direct),
+            Self::Off => doslet_config::DpmiHost::Off,
+            Self::Reflect => doslet_config::DpmiHost::Reflect,
+            Self::Direct => doslet_config::DpmiHost::Direct,
         }
     }
 }
@@ -144,9 +143,11 @@ pub struct Cli {
     /// Accepted for older launch commands; the interpreter is now the default
     #[arg(long, hide = true, conflicts_with = "dynamic_core")]
     pub no_dynamic_core: bool,
-    /// DPMI host mode; direct avoids eligible BIOS/DOS switches, off uses the guest extender
-    #[arg(long, value_enum, default_value = "direct")]
-    pub experimental_dpmi: Option<DpmiMode>,
+    /// DPMI host [default: the profile's machine.dpmi, else direct]; direct
+    /// dispatches eligible BIOS/DOS services from protected mode, reflect runs
+    /// them in real mode, off leaves DOS extenders their own host
+    #[arg(long, value_enum, alias = "experimental-dpmi")]
+    pub dpmi: Option<DpmiMode>,
 
     /// Listen for a remote GDB client; attachment stops the guest
     #[arg(long, value_name = "IP:PORT")]
@@ -378,8 +379,13 @@ mod tests {
             Cli::default().resolve().unwrap().launch.dpmi,
             Some(Mode::Direct)
         );
-        for (argument, expected) in [("reflect", Some(Mode::Reflect)), ("off", None)] {
-            let cli = Cli::try_parse_from(["doslet", "--experimental-dpmi", argument])
+        for (flag, argument, expected) in [
+            ("--dpmi", "reflect", Some(Mode::Reflect)),
+            ("--dpmi", "off", None),
+            // Earlier launch commands keep working.
+            ("--experimental-dpmi", "reflect", Some(Mode::Reflect)),
+        ] {
+            let cli = Cli::try_parse_from(["doslet", flag, argument])
                 .unwrap()
                 .resolve()
                 .unwrap();

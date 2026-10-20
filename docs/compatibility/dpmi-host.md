@@ -1,12 +1,12 @@
-# Experimental DPMI host
+# DPMI host
 
 Doslet can provide a DOS Protected Mode Interface (DPMI) host to DOS/4GW.
 The extender discovers it through INT 2Fh/AX=1687h and delegates descriptor,
-memory and real-mode services to the runtime. Native desktop launches enable
-the host in `direct` mode by default. Use `--experimental-dpmi off` to select
-the guest extender's own host.
+memory and real-mode services to the runtime. Native desktop launches and
+browser bundles enable the host in `direct` mode by default. Use `--dpmi off`,
+or `machine.dpmi = "off"` in a profile, to select the guest extender's own host.
 
-The experiment has two modes:
+The host has two modes:
 
 - `reflect`: run real-mode services through guest interrupt vectors and stacks.
 - `direct`: dispatch selected unchanged Doslet BIOS/DOS shims directly from
@@ -18,17 +18,18 @@ Guest executables and DOS4GW.EXE remain ordinary input files.
 
 ## Run and compare
 
-From the experimental checkout, launch a native window with:
+Launch a native window with:
 
 ```sh
 cargo run -p doslet --release --locked -- \
-  --game /path/to/PRINCE.EXE --experimental-dpmi direct
+  --game /path/to/PRINCE.EXE --dpmi direct
 ```
 
-Use `--experimental-dpmi reflect` for the reference host and
-`--experimental-dpmi off` for the original extender path. The setting is a native
-launch option, not a saved machine-profile field or a browser UI option. Native JIT and its interpreter
-fallback retain their existing controls.
+Use `--dpmi reflect` for the reference host and `--dpmi off` for the original
+extender path. Profiles record the choice as `machine.dpmi`, the Machine page of
+the settings offers it, and `--dpmi` overrides it for one launch. Earlier
+commands using `--experimental-dpmi` keep working. Native JIT and its
+interpreter fallback retain their existing controls.
 
 The headless example prints live blocks, requested/committed bytes, peaks,
 failed requests, direct/reflected calls and unsupported DPMI function numbers:
@@ -98,9 +99,44 @@ instrumentation in addition to these allocation counters.
 
 The host implements the subset exercised by the local 32-bit DOS/4GW clients:
 LDT descriptors and aliases, conventional DOS blocks, interrupt vectors,
-real-mode interrupt/IRET/far calls with zero stack-copy words, callbacks,
-raw mode-switch entry points, basic memory information/allocation/free/resize,
-resident-memory lock calls and virtual interrupt-state queries.
+real-mode interrupt/IRET/far calls, callbacks, raw mode-switch entry points,
+basic memory information/allocation/free/resize, resident-memory lock calls,
+paging hints and virtual interrupt-state queries.
+
+- Real-mode calls (0300h–0302h) copy up to 256 words (`CX`) from the client's
+  stack, above the INT 31h frame, to the real-mode stack below the return
+  address, as arguments; they are not copied back. Calls with arguments always
+  reflect instead of using direct dispatch.
+- 0503h resizes in place when the following pages are free and otherwise moves
+  the block to the lowest gap that fits, copying its bytes, as DPMI allows. The
+  handle stays the same. DJGPP's `sbrk` grows its heap this way. The copy is a
+  single host move bounded by installed RAM, not an unbounded guest operation.
+- 000Dh allocates a specific descriptor among LDT entries 1–15 (selectors
+  04h–7Ch); 0000h and the host's own aliases start at entry 16, as DPMI 0.9
+  reserves those entries.
+- Without paging every page is resident, so 0600h–0603h and the paging hints
+  0702h and 0703h succeed without effect.
+
+### Exceptions
+
+A client handler registered with 0203h receives the client's divide errors
+(#DE), not-present (#NP), stack (#SS) and general-protection (#GP) faults with
+their error codes, as DPMI 0.9 describes. The host builds the frame on a locked
+16 KiB stack below its frame stacks: return CS:EIP, error code, the faulting
+CS:EIP, EFLAGS and SS:ESP, as dwords for 32-bit clients and words for 16-bit
+ones; only the 32-bit form is tested. The handler runs with interrupts disabled. Its far return resumes the
+client at the frame's CS:EIP, EFLAGS and SS:ESP, which it may change, for
+example to skip the instruction; IOPL stays the host's. Portable states keep a
+running handler.
+
+Faults are precise while any handler is registered: the CPU restores the
+general registers, EIP, EFLAGS, CPL and the CS and SS caches from before the
+instruction. Memory written before the fault, such as stack slots below ESP,
+stays written. DOS/4GW registers handlers in ROTT, Heroes and PRINCE, so
+precise faults are on there; over 30 guest seconds this cost about 0.8% in ROTT
+(5.64 s against 5.60 s), within run-to-run variation, and nothing measurable in
+Heroes. Unimplemented instructions, paging and bus errors are Doslet
+limitations, not guest faults, and still stop the session.
 
 Direct dispatch currently covers selected VBE/palette, mouse, nonblocking
 keyboard and DOS status/query services. Both the target address and runtime
@@ -145,7 +181,9 @@ stack, uses a private protected stack, and prevents a handler chaining to the
 default reflector from recursively invoking itself. The return restores the
 real-mode registers, flags and stack before executing the original IRET.
 This path requires the unchanged default BIOS `INT 1Ch` shim; reflection of
-`INT 23h` and `INT 24h` remains outside the implemented scope.
+`INT 23h` and `INT 24h` is not needed: Doslet's DOS reports errors through
+return codes and never raises either interrupt, so a client's handlers for them
+are never called.
 
 Without that timer delivery, a PRINCE menu click left its PCM effect in the
 continuous DMA buffer. Sound Blaster block IRQs were acknowledged on time, but
@@ -162,25 +200,27 @@ host, reflected DPMI and direct DPMI:
 cargo test -p doslet --release --locked local_prince_menu_pcm_and_keyboard -- --ignored --nocapture
 ```
 
-This is an experimental subset, not a conforming general-purpose DPMI server:
+Portable save states (version 4) carry the host's records; see
+[save states](../save-states.md). The host is a subset aimed at games, not a
+conforming general-purpose DPMI server. Remaining gaps:
 
-- Portable save states reject sessions with this host enabled: its descriptors,
-  allocation metadata and pending callback contexts do not yet have a portable
-  state representation. In-process diagnostic working copies preserve these
-  fields independently. Ordinary sessions keep their existing file save/restore
-  support.
 
 - Paging, demand commitment, VM86 and privilege-changing gates remain absent.
   Clients execute at CPL 3 with IOPL 3 under the existing CPU model.
-- Exception vectors can be registered, but CPU faults still stop with the
-  existing explicit diagnostic; protected exception delivery is not implemented.
-- Real-mode stack-argument copying (`CX != 0`) is rejected. Metadata is bounded
-  to 8191 allocatable LDT entries, 512 memory blocks, 32 callbacks and 16 nested
-  host frames. Nested real-mode calls have 1 KiB private stack slices.
-- Resizing only succeeds in place. Large tiled conventional allocations for
-  16-bit clients are rejected; 16-bit-client compatibility is unvalidated.
+- Exceptions without a client handler, faults while a handler runs and faults
+  in host code still stop the session with the existing diagnostic. Reflecting
+  exceptions 0–7 to protected-mode interrupts, as hosts may do without a handler,
+  is not implemented.
+- Metadata is bounded to 8176 LDT entries for 0000h plus 15 for 000Dh, 512
+  memory blocks, 32 callbacks and 16 nested host frames. Nested real-mode calls
+  have 1 KiB private stack slices.
+- Large tiled conventional allocations for 16-bit clients are rejected;
+  16-bit-client compatibility is unvalidated.
 - Unsupported functions return DPMI carry/error status and are counted.
-  Observed optional probes include 0A00h, 0702h and 0506h.
+  ROTT, Heroes and PRINCE probe only 0A00h (vendor extensions) and 0506h (DPMI
+  1.0 page attributes), and continue after the error. 0800h (physical address
+  mapping) is unsupported: the VBE 1.2 adapter has no linear frame buffer to
+  map. Debug watchpoints (0B00h–0B03h) are unsupported.
 - External hosts, nested clients, extender replacement after entry and resource
   teardown followed by another protected client in the same session are outside
   the validated scope. There is no mid-run fallback to the original DOS/4GW host.

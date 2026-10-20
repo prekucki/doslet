@@ -68,7 +68,7 @@ manifests that name their LE objects, as below.
 
 A DOS extender loads protected-mode code at other linear addresses with a DPMI
 host or another memory configuration: Heroes' code object starts at 0x19e000
-with `--experimental-dpmi off` and at 0x1e8000 with `reflect` or `direct`. A
+with `--dpmi off` and at 0x1e8000 with `reflect` or `direct`. A
 patch written for one layout never matches the other, so its guards would wait
 until `timeout_steps` faults the session. List the bases of the program's LE
 objects the addresses were taken at, object 1 first, and mark the 32-bit fields
@@ -132,7 +132,7 @@ Transitions synchronize the driver cursor and drain relative motion once.
 The game-specific addresses and screen selection live in the patch, not in
 the generic loader or CPU. They were taken with DOS4GW's own host, so the
 manifest lists those object bases and marks the payload's seven jumps and
-calls into the game and its five data addresses. With `--experimental-dpmi
+calls into the game and its five data addresses. With `--dpmi
 direct` DOS4GW loads the code object 0x4a000 higher and the data object
 0x4b000 higher. Before relocation existed, the guard never matched there and
 the session faulted when `timeout_steps` expired after 500 million steps. Now

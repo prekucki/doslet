@@ -155,6 +155,9 @@ pub struct RuntimeSession {
     patches: Vec<patches::MemoryPatch>,
     #[prost(uint32, tag = "34")]
     patches_applied: u32,
+    /// The runtime DPMI host's own records; its tables live in RAM.
+    #[prost(message, optional, tag = "35")]
+    dpmi: Option<<dpmi::Host as State>::Wire>,
 }
 impl Session {
     pub(super) fn save_wire_referenced(&self) -> RuntimeSession {
@@ -170,6 +173,7 @@ impl Session {
             steps: self.steps,
             patches: self.patches.clone(),
             patches_applied: self.patches_applied as u32,
+            dpmi: self.dpmi.as_deref().map(State::save),
             console: self.console.to_vec(),
             console_truncated: self.console_truncated,
             extended_key: self.extended_key.as_ref().map(|v| u32::from(*(v))),
@@ -319,7 +323,11 @@ impl Session {
             fault: None,
             persistent: None,
             idle: Default::default(),
-            dpmi: None,
+            dpmi: w
+                .dpmi
+                .map(|v| <dpmi::Host as State>::load(v).map(Box::new))
+                .transpose()?,
+            // Set only within one service call, never at a batch boundary.
             service_flags: None,
             menu_idle: Default::default(),
             observer: Default::default(),
@@ -332,6 +340,16 @@ impl Session {
         if value.patches_applied > value.patches.len() {
             return Err(InvalidState("applied patch count exceeds plan length"));
         }
+        if value
+            .dpmi
+            .as_ref()
+            .is_some_and(|host| !host.fits(value.machine.bus.ram_size() as u32))
+        {
+            return Err(InvalidState("DPMI memory exceeds installed RAM"));
+        }
+        let mut value = value;
+        let precise = value.dpmi.as_ref().is_some_and(|h| h.handles_exceptions());
+        value.machine.cpu.set_precise_faults(precise);
         Ok(value)
     }
 }

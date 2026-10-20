@@ -25,9 +25,9 @@ pub struct MemoryStats {
 pub(super) struct Memory {
     pub blocks: [Block; 512],
     pub stats: MemoryStats,
-    start: u32,
-    end: u32,
-    next_handle: u32,
+    pub(super) start: u32,
+    pub(super) end: u32,
+    pub(super) next_handle: u32,
 }
 
 impl Memory {
@@ -80,21 +80,7 @@ impl Memory {
             .position(|b| b.handle == 0)
             .ok_or(0x8016_u16)?;
         let next_handle = self.next_handle.checked_add(1).ok_or(0x8016_u16)?;
-        let mut address = self.start;
-        loop {
-            let end = address
-                .checked_add(size)
-                .filter(|end| *end <= self.end)
-                .ok_or(0x8013_u16)?;
-            match self
-                .blocks
-                .iter()
-                .find(|b| b.handle != 0 && b.address < end && b.address + b.committed > address)
-            {
-                Some(b) => address = b.address + b.committed,
-                None => break,
-            }
-        }
+        let address = self.find(size, None).ok_or(0x8013_u16)?;
         let block = Block {
             handle: self.next_handle,
             address,
@@ -123,7 +109,31 @@ impl Memory {
         Ok(())
     }
 
-    pub fn resize(&mut self, handle: u32, requested: u32) -> Result<Block, u16> {
+    /// The lowest free address for `size` bytes, ignoring block `except`.
+    fn find(&self, size: u32, except: Option<usize>) -> Option<u32> {
+        let mut address = self.start;
+        loop {
+            let end = address.checked_add(size).filter(|end| *end <= self.end)?;
+            match self.blocks.iter().enumerate().find(|&(i, b)| {
+                Some(i) != except
+                    && b.handle != 0
+                    && b.address < end
+                    && b.address + b.committed > address
+            }) {
+                Some((_, b)) => address = b.address + b.committed,
+                None => return Some(address),
+            }
+        }
+    }
+
+    /// Resize in place when the following pages are free, else move the
+    /// block, as DPMI allows. A move also returns the old address and the
+    /// bytes to copy from it; the caller copies them, at most installed RAM.
+    pub fn resize(
+        &mut self,
+        handle: u32,
+        requested: u32,
+    ) -> Result<(Block, Option<(u32, u32)>), u16> {
         let result = self.resize_inner(handle, requested);
         if result.is_err() {
             self.stats.failures += 1;
@@ -131,30 +141,43 @@ impl Memory {
         result
     }
 
-    fn resize_inner(&mut self, handle: u32, requested: u32) -> Result<Block, u16> {
+    fn resize_inner(
+        &mut self,
+        handle: u32,
+        requested: u32,
+    ) -> Result<(Block, Option<(u32, u32)>), u16> {
         let size = rounded(requested).ok_or(0x8021_u16)?;
         let slot = self
             .blocks
             .iter()
             .position(|b| b.handle != 0 && b.handle == handle)
             .ok_or(0x8023_u16)?;
-        let address = self.blocks[slot].address;
-        let end = address
-            .checked_add(size)
-            .filter(|end| *end <= self.end)
-            .ok_or(0x8013_u16)?;
-        if self.blocks.iter().enumerate().any(|(i, b)| {
-            i != slot && b.handle != 0 && b.address < end && b.address + b.committed > address
-        }) {
-            return Err(0x8013);
-        }
-        // In-place growth only: a host call must never copy an unbounded guest
-        // block. Failure leaves the old block and its contents intact.
-        self.blocks[slot].requested = requested;
-        self.blocks[slot].committed = size;
+        let old = self.blocks[slot];
+        let in_place = old.address.checked_add(size).is_some_and(|end| {
+            end <= self.end
+                && !self.blocks.iter().enumerate().any(|(i, b)| {
+                    i != slot
+                        && b.handle != 0
+                        && b.address < end
+                        && b.address + b.committed > old.address
+                })
+        });
+        // A failed move leaves the old block and its contents intact.
+        let address = if in_place {
+            old.address
+        } else {
+            self.find(size, Some(slot)).ok_or(0x8013_u16)?
+        };
+        self.blocks[slot] = Block {
+            address,
+            requested,
+            committed: size,
+            ..old
+        };
         self.stats.resizes += 1;
         self.account();
-        Ok(self.blocks[slot])
+        let moved = (address != old.address).then_some((old.address, old.committed.min(size)));
+        Ok((self.blocks[slot], moved))
     }
 
     fn account(&mut self) {
@@ -188,13 +211,20 @@ mod tests {
         let b = m.allocate(4097).unwrap();
         assert_eq!(m.stats.requested_bytes, 4098);
         assert_eq!(m.stats.committed_bytes, 12288);
-        assert!(m.resize(a.handle, 8192).is_err());
-        assert_eq!(m.blocks[0], a);
+        // Without room after it, the block moves past B; its bytes follow.
+        let (moved, copy) = m.resize(a.handle, 8192).unwrap();
+        assert_eq!(moved.address, b.address + b.committed);
+        assert_eq!(copy, Some((a.address, 4096)));
+        assert_eq!(moved.handle, a.handle);
+        let (back, _) = m.resize(a.handle, 1).unwrap();
+        assert_eq!(back.address, moved.address);
         m.free(b.handle).unwrap();
-        let grown = m.resize(a.handle, 8193).unwrap();
-        assert_eq!(grown.address, a.address);
-        assert_eq!(m.stats.peak_requested_bytes, 8193);
-        assert_eq!(m.stats.peak_committed_bytes, 12288);
+        let (grown, copy) = m.resize(a.handle, 8193).unwrap();
+        assert_eq!(grown.address, moved.address);
+        assert_eq!(copy, None);
+        // The moved A and B coexisted at 8192 + 4097 requested bytes.
+        assert_eq!(m.stats.peak_requested_bytes, 12289);
+        assert_eq!(m.stats.peak_committed_bytes, 16384);
         m.free(a.handle).unwrap();
         assert!(m.free(a.handle).is_err());
         let c = m.allocate(65536).unwrap();

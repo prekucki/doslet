@@ -241,7 +241,7 @@ mod tests {
                 "doslet",
                 "--config",
                 root.join("games/HoMnM.toml").to_str().unwrap(),
-                "--experimental-dpmi",
+                "--dpmi",
                 dpmi,
                 "--no-aot",
             ])

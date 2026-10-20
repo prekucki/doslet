@@ -446,10 +446,13 @@ impl Cli {
         self.launch.adaptive_cpu = self.adaptive_cpu;
         // The interpreter is the default; the JIT was slower on ROTT gameplay.
         self.launch.no_dynamic_core = !self.dynamic_core;
-        self.launch.dpmi = self
-            .experimental_dpmi
-            .unwrap_or(crate::cli::DpmiMode::Direct)
-            .host_mode();
+        let profile_dpmi = self.launch.machine_spec.as_ref().and_then(|s| s.dpmi);
+        self.launch.dpmi = crate::native_input::dpmi_mode(
+            self.dpmi
+                .map(crate::cli::DpmiMode::host)
+                .or(profile_dpmi)
+                .unwrap_or(doslet_config::DpmiHost::Direct),
+        );
         let dirs = crate::host_dirs::HostDirs::detect().ok();
         self.launch.core_profile = self.core_profile.clone();
         if self.core_profile.is_none() && !self.no_core_profile {
@@ -706,6 +709,25 @@ pub(crate) mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn dpmi_host_comes_from_the_command_line_then_the_profile() {
+        use doslet_runtime::session::dpmi::Mode;
+        let fixture =
+            Fixture::new("version=2\n[game]\nexecutable='../TINY.EXE'\n[machine]\ndpmi='off'\n");
+        let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
+        assert_eq!(cli.launch.dpmi, None);
+        let cli = fixture
+            .cli(&["--no-audio", "--dpmi", "reflect"])
+            .resolve()
+            .unwrap();
+        assert_eq!(cli.launch.dpmi, Some(Mode::Reflect));
+        let cli = Fixture::new("version=2\n[game]\nexecutable='../TINY.EXE'\n")
+            .cli(&["--no-audio"])
+            .resolve()
+            .unwrap();
+        assert_eq!(cli.launch.dpmi, Some(Mode::Direct));
     }
 
     #[test]

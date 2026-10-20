@@ -16,6 +16,6 @@ fi
 # The historical bindings were captured without a DPMI host.
 exec target/release/doslet \
     --config games/ROTT.toml \
-    --experimental-dpmi "${DOSLET_ROTT_DPMI:-off}" \
+    --dpmi "${DOSLET_ROTT_DPMI:-off}" \
     --wasm-procedures "$procedure_bundle" \
     --no-speed-tiers "$@"

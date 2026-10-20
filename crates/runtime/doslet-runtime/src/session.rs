@@ -758,6 +758,8 @@ impl Session {
                 Ok(consumed) => {
                     completed += consumed;
                 }
+                // A DPMI client's exception handler receives its faults.
+                Err(error) if self.dpmi_exception(&error) => completed += 1,
                 Err(error) => {
                     self.fault = Some(error);
                     self.status = SessionStatus::Faulted;
@@ -1128,6 +1130,12 @@ impl Session {
                     self.break_check = self.machine.cpu.registers.get_byte(2) != 0;
                 }
             }
+            // Boot drive C:, and the true version 5.0 that 30h reports.
+            (0x21, 0x33) if ax as u8 == 5 => self.machine.cpu.registers.set_byte(2, 3),
+            (0x21, 0x33) if ax as u8 == 6 => {
+                self.machine.cpu.registers.set(Gpr16::Bx, 0x0005);
+                self.machine.cpu.registers.set(Gpr16::Dx, 0);
+            }
             (0x08, _) => {
                 // BIOS floppy-motor timeout is also used as a one-tick delay
                 // by CIV's graphics driver. The counter must advance with IRQ0.
@@ -1161,6 +1169,8 @@ impl Session {
             (0x2F, _) if ax == 0x1600 => {
                 self.machine.cpu.registers.set_byte(0, 0); // Windows is absent.
             }
+            // Without Windows, the version query leaves AX unchanged.
+            (0x2F, _) if ax == 0x160A => {}
             (0x2F, _) if ax == 0x1500 => {
                 self.mscdex_service(ax)?;
             }
@@ -1851,6 +1861,21 @@ impl Session {
                     }
                 }
             }
+            // Without upper memory blocks, first fit is the only allocation
+            // strategy and the UMB link stays off; requests to change either
+            // succeed without effect.
+            (0x21, 0x58) => match ax as u8 {
+                0 => {
+                    self.machine.cpu.registers.set(Gpr16::Ax, 0);
+                    self.set_carry(false)?;
+                }
+                1 | 3 => self.set_carry(false)?,
+                2 => {
+                    self.machine.cpu.registers.set_byte(0, 0);
+                    self.set_carry(false)?;
+                }
+                _ => self.dos_error(1)?,
+            },
             (0x21, 9) => {
                 let ds = self.machine.cpu.registers.ds;
                 let mut offset = self.machine.cpu.registers.get(Gpr16::Dx);

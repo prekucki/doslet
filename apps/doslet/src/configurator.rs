@@ -49,6 +49,7 @@ pub enum Edit {
     Memory(u8),
     CpuMhz(u16),
     X87(bool),
+    Dpmi(doslet_config::DpmiHost),
     Sb16(bool),
     Mpu(bool),
     Irq(u8),
@@ -268,6 +269,7 @@ impl ConfiguratorState {
             Edit::Memory(v) => self.draft.hardware.memory_mib = *v,
             Edit::CpuMhz(v) => self.draft.hardware.cpu_mhz = *v,
             Edit::X87(v) => self.draft.hardware.x87 = *v,
+            Edit::Dpmi(v) => self.draft.dpmi = Some(*v),
             Edit::Sb16(v) => self.draft.hardware.sb16 = *v,
             Edit::Mpu(v) => self.draft.hardware.mpu401 = *v,
             Edit::Irq(v) => self.draft.hardware.sb_irq = *v,
@@ -427,7 +429,7 @@ impl ConfiguratorState {
     }
     pub fn preferred_height(&self) -> f32 {
         match self.page {
-            Page::Machine => 350.0,
+            Page::Machine => 450.0,
             Page::Sound => 390.0,
             Page::Input => {
                 if self.draft.hardware.gameport {
@@ -490,7 +492,24 @@ impl ConfiguratorState {
                                 .into(),
                         ),
                         narrow,
-                    ));
+                    ))
+                    .push(field(
+                        "DPMI host",
+                        pick_list(
+                            &doslet_config::DpmiHost::ALL[..],
+                            Some(s.dpmi.unwrap_or(doslet_config::DpmiHost::Direct)),
+                            Edit::Dpmi,
+                        )
+                        .width(Fill)
+                        .text_size(14)
+                        .padding(8)
+                        .into(),
+                    ))
+                    .push(
+                        text("Protected-mode games use it instead of their extender's own host.")
+                            .size(12)
+                            .color(MUTED),
+                    );
             }
             Page::Sound => {
                 body = body.push(

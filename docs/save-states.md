@@ -21,11 +21,15 @@ OPL state includes oscillators, envelopes and pending writes; replaying its
 register writes alone would not restore the same sound.
 
 The envelope identifies the file format and machine model. Unsupported versions
-are rejected. Version 1 (embedded media) and version 2 (external media) remain
-readable; new captures use version 3. Version 3 also retains pending memory
-patch plans, their deadlines and the completed prefix, so restoration does not
-reapply completed patches. Older readers reject version 3 instead of silently
-dropping pending edits. Very old state formats have no importer. Future compatible changes
+are rejected. Versions 1 (embedded media), 2 (external media) and 3 remain
+readable; new captures use version 4. Version 3 added pending memory patch plans,
+their deadlines and the completed prefix, so restoration does not reapply
+completed patches. Version 4 adds the DPMI host's own records: its mode,
+descriptor allocation map, DOS-block selectors, exception vectors, memory blocks
+and statistics, callbacks, active nested frames with their CPU contexts, and a
+pending direct return. Its descriptor tables, gates and real-mode shims live in
+guest RAM and are saved with it. Older readers reject version 4 instead of
+silently dropping a host. Very old state formats have no importer. Future compatible changes
 must retain field numbers; removed fields must be reserved. A breaking change
 must increment the format or model version instead of guessing how to restore it.
 Lazy VGA time is encoded as the effective raster phase and pixel fraction, so
@@ -162,9 +166,18 @@ independent guest on the profiling thread. It has no live input, output sink,
 storage lease, native code or learned execution policy. Writable overlays and
 handle positions are copied, not shared. This in-process representation is
 separate from the portable Protobuf file format.
-Working copies also retain an enabled experimental DPMI host, including its
-allocator, registered callbacks and active return frames. Speed-tier learning
-can replay these copies even though portable DPMI save files remain unsupported.
+Working copies also retain an enabled DPMI host, including its
+allocator, registered callbacks and active return frames, through the same
+records as portable files.
+
+ROTT, Heroes and PRINCE, launched with `--dpmi direct`, each saved an 18 MB state
+after 10 guest seconds, about 6,500 to 9,400 DPMI calls in. The restored session
+and the original ran 5 more seconds to byte-identical states. Heroes ran without
+its patch, which only the desktop relocates:
+
+```sh
+cargo test -p doslet --release --bin doslet dos4gw_games_resume -- --ignored --nocapture
+```
 
 Headless `heroes_states`, `state_graph_trace`, `state_speed_tiers` and
 `bench_weighted_tiers` accept `--config FILE` to resolve version-2 references.

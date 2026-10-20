@@ -633,6 +633,13 @@ impl NativeStorage {
                     crate::host_dirs::HostDirs::detect,
                 )?;
                 let path = path.as_path();
+                let store_error = |error: StorageError| match error {
+                    StorageError::MissingBase => format!(
+                        "save store {}: {error:?} (store belongs to a different mount or base; use its original media and binding, or choose another save store)",
+                        path.display()
+                    ),
+                    _ => format!("save store {}: {error:?}", path.display()),
+                };
                 if mount.kind == SourceKind::NativeDirectory {
                     let root = fs::canonicalize(spec.binding(&mount.source))?;
                     if destination_path(path)?.starts_with(root) {
@@ -652,15 +659,12 @@ impl NativeStorage {
                     Arc::clone(existing)
                 } else {
                     Arc::new(Mutex::new(
-                        NativeStore::open(path, namespace, base)
-                            .map_err(|error| format!("save store: {error:?}"))?,
+                        NativeStore::open(path, namespace, base).map_err(store_error)?,
                     ))
                 };
                 {
                     let current = selected.lock().map_err(|_| "save store worker failed")?;
-                    let (revision, payload) = current
-                        .committed()
-                        .map_err(|error| format!("save store: {error:?}"))?;
+                    let (revision, payload) = current.committed().map_err(store_error)?;
                     session.attach_persistent_store(
                         namespace,
                         base,

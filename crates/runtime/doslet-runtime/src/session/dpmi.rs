@@ -5,6 +5,8 @@ use super::*;
 use doslet_x86::{Access, CpuContext, DescriptorTable, Gpr32, SegmentRegister as Seg};
 mod memory;
 pub use memory::{Block, MemoryStats};
+#[cfg(feature = "save-state")]
+mod saved;
 
 const ENTRY: u32 = 0x800;
 const RM_RETURN: u32 = 0x810;
@@ -14,15 +16,23 @@ const SAVE_PM: u32 = 0x840;
 const SAVE_RM: u32 = 0x850;
 const CB_RETURN: u32 = 0x860;
 const TIMER_RETURN: u32 = 0x870;
+const EXCEPTION_RETURN: u32 = 0x880;
 const CB_BASE: u32 = 0x2000;
 const PM_BASE: u32 = 0x1000;
 const GDT: u32 = 0x100000;
 const LDT: u32 = 0x101000;
 const IDT: u32 = 0x111000;
 const POOL: u32 = 0x120000;
+/// A 16 KiB locked stack for one exception handler, between the IDT and the
+/// nested frames' stack slices below `POOL`.
+const EXCEPTION_STACK: u32 = POOL - 16 * 0x400;
 const CODE: u16 = 11;
 const DATA: u16 = 19;
 const DESCRIPTORS: usize = 8192;
+/// Stack words 0300h–0302h copy, within a host stack slice of 1 KiB.
+const MAX_STACK_WORDS: u16 = 256;
+/// LDT entries 1–15 (selectors 04h–7Ch) are reserved for 000Dh.
+const SPECIFIC: usize = 16;
 const GENERAL: [Gpr32; 8] = [
     Gpr32::Eax,
     Gpr32::Ecx,
@@ -62,6 +72,8 @@ struct Frame {
     structure: Option<u32>,
     callback: bool,
     timer: bool,
+    /// A client exception handler runs; its RETF reaches `EXCEPTION_RETURN`.
+    exception: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +99,19 @@ pub(super) struct Host {
     bits32: bool,
     callbacks: [Option<Callback>; 32],
     pub(super) direct_return_pending: bool,
+}
+
+impl Host {
+    /// A client registered an exception handler, so faults must be precise.
+    pub(super) fn handles_exceptions(&self) -> bool {
+        self.exceptions.iter().any(|&(selector, _)| selector != 0)
+    }
+
+    /// The host's memory pool lies within `ram` bytes of installed RAM.
+    #[cfg(feature = "save-state")]
+    pub(super) fn fits(&self, ram: u32) -> bool {
+        self.memory.end <= ram
+    }
 }
 
 impl Session {
@@ -119,6 +144,7 @@ impl Session {
             SAVE_RM,
             CB_RETURN,
             TIMER_RETURN,
+            EXCEPTION_RETURN,
         ] {
             self.dpmi_marker(offset)?;
         }
@@ -208,8 +234,10 @@ impl Session {
         let known = if real {
             callback || matches!(ip, ENTRY | RM_RETURN | RAW_PM | SAVE_RM)
         } else {
-            matches!(ip, RAW_RM | SAVE_PM | CB_RETURN | TIMER_RETURN)
-                || ((PM_BASE..PM_BASE + 256 * 8).contains(&ip) && (ip - PM_BASE).is_multiple_of(8))
+            matches!(
+                ip,
+                RAW_RM | SAVE_PM | CB_RETURN | TIMER_RETURN | EXCEPTION_RETURN
+            ) || ((PM_BASE..PM_BASE + 256 * 8).contains(&ip) && (ip - PM_BASE).is_multiple_of(8))
         };
         if !known {
             return Ok(());
@@ -244,6 +272,9 @@ impl Session {
         if ip == CB_RETURN {
             return self.dpmi_callback_return();
         }
+        if ip == EXCEPTION_RETURN {
+            return self.dpmi_exception_return();
+        }
         if ip == TIMER_RETURN {
             let h = self.dpmi.as_mut().unwrap();
             if h.depth == 0 || !h.frames[h.depth - 1].as_ref().unwrap().timer {
@@ -273,6 +304,135 @@ impl Session {
         }
     }
 
+    /// Deliver a CPU fault of the protected-mode client to the handler it
+    /// registered with 0203h, as DPMI 0.9 describes: on a locked host stack
+    /// with interrupts disabled and a frame of the return address, error code,
+    /// CS:EIP, EFLAGS and SS:ESP. Faults in host code, faults while a handler
+    /// runs and vectors without a handler keep stopping the session.
+    pub(super) fn dpmi_exception(&mut self, error: &RuntimeError) -> bool {
+        let RuntimeError::Cpu(error) = error else {
+            return false;
+        };
+        let Some(fault) = error.fault() else {
+            return false;
+        };
+        let Some(h) = &self.dpmi else {
+            return false;
+        };
+        let (selector, offset) = h.exceptions[usize::from(fault.vector)];
+        let cpu = &self.machine.cpu;
+        if !h.stats.entered
+            || selector == 0
+            || !cpu.protected_mode()
+            || cpu.registers.cs == CODE
+            || h.depth == h.frames.len()
+            || h.frames[..h.depth].iter().flatten().any(|f| f.exception)
+        {
+            return false;
+        }
+        let bits32 = h.bits32;
+        let client = [
+            fault.error_code.unwrap_or(0),
+            cpu.registers.ip,
+            u32::from(cpu.registers.cs),
+            cpu.flags,
+            cpu.registers.get32(Gpr32::Esp),
+            u32::from(cpu.registers.ss),
+        ];
+        let context = cpu.context();
+        self.deliver_exception(selector, offset, bits32, client, context)
+            .is_ok()
+    }
+
+    fn deliver_exception(
+        &mut self,
+        selector: u16,
+        offset: u32,
+        bits32: bool,
+        client: [u32; 6],
+        context: CpuContext,
+    ) -> Result<(), RuntimeError> {
+        // States saved before this marker existed restore without it.
+        self.dpmi_marker(EXCEPTION_RETURN)?;
+        let width = if bits32 { 4 } else { 2 };
+        let top = EXCEPTION_STACK - 8 * width;
+        for (index, value) in [EXCEPTION_RETURN, u32::from(CODE)]
+            .into_iter()
+            .chain(client)
+            .enumerate()
+        {
+            let at = top + index as u32 * width;
+            if bits32 {
+                self.machine.bus.write_u32(at, value)?;
+            } else {
+                self.machine.bus.write_u16(at, value as u16)?;
+            }
+        }
+        self.machine
+            .cpu
+            .load_segment(&mut self.machine.bus, Seg::Cs, selector)?;
+        self.machine
+            .cpu
+            .load_segment(&mut self.machine.bus, Seg::Ss, DATA)?;
+        self.machine.cpu.registers.set32(Gpr32::Esp, top);
+        self.machine.cpu.registers.ip = offset;
+        // Interrupts and single-stepping stay off until the handler returns.
+        self.machine.cpu.flags &= !0x300;
+        let h = self.dpmi.as_mut().unwrap();
+        h.frames[h.depth] = Some(Frame {
+            context,
+            structure: None,
+            callback: false,
+            timer: false,
+            exception: true,
+        });
+        h.depth += 1;
+        self.machine.advance_service_step()?;
+        Ok(())
+    }
+
+    /// The handler's RETF consumed the return address; the client resumes at
+    /// the frame's CS:EIP, EFLAGS and SS:ESP, which the handler may change.
+    fn dpmi_exception_return(&mut self) -> Result<(), RuntimeError> {
+        let h = self.dpmi.as_mut().unwrap();
+        if h.depth == 0 || !h.frames[h.depth - 1].as_ref().unwrap().exception {
+            return Err(dpmi_error(0x8021));
+        }
+        let bits32 = h.bits32;
+        h.depth -= 1;
+        h.frames[h.depth] = None;
+        let width = if bits32 { 4 } else { 2 };
+        let stack = self
+            .machine
+            .cpu
+            .registers
+            .segment_cache(Seg::Ss)
+            .base
+            .wrapping_add(self.machine.cpu.stack_pointer());
+        let mut frame = [0u32; 6];
+        for (index, value) in frame.iter_mut().enumerate() {
+            let at = stack.wrapping_add(index as u32 * width);
+            *value = if bits32 {
+                self.machine.bus.read_u32(at)?
+            } else {
+                u32::from(self.machine.bus.read_u16(at)?)
+            };
+        }
+        let [_, eip, cs, eflags, esp, ss] = frame;
+        self.machine
+            .cpu
+            .load_segment(&mut self.machine.bus, Seg::Ss, ss as u16)?;
+        self.machine.cpu.registers.set32(Gpr32::Esp, esp);
+        self.machine
+            .cpu
+            .load_segment(&mut self.machine.bus, Seg::Cs, cs as u16)?;
+        self.machine.cpu.registers.ip = eip;
+        // IOPL and VM stay the host's; reserved bit 1 stays set.
+        let kept = 0x0002_3000;
+        self.machine.cpu.flags = (eflags & !kept) | (self.machine.cpu.flags & kept) | 2;
+        Ok(())
+    }
+
     fn dpmi_timer_tick(&mut self) -> Result<(), RuntimeError> {
         let h = self.dpmi.as_ref().unwrap();
         if !h.stats.entered || h.frames[..h.depth].iter().flatten().any(|f| f.timer) {
@@ -293,6 +453,7 @@ impl Session {
             structure: None,
             callback: false,
             timer: true,
+            exception: false,
         });
         h.depth += 1;
         let sp = POOL - h.depth as u32 * 0x400;
@@ -448,16 +609,53 @@ impl Session {
     fn dpmi_alloc_descriptors(&mut self, count: u16) -> Result<u16, u16> {
         let h = self.dpmi.as_mut().unwrap();
         let count = usize::from(count);
-        if count == 0 || count >= DESCRIPTORS {
+        if count == 0 || count > DESCRIPTORS - SPECIFIC {
             return Err(0x8011);
         }
-        for first in 1..=DESCRIPTORS - count {
+        for first in SPECIFIC..=DESCRIPTORS - count {
             if h.used[first..first + count].iter().all(|v| !v) {
                 h.used[first..first + count].fill(true);
                 return Ok((first as u16 * 8) | 7);
             }
         }
         Err(0x8011)
+    }
+
+    /// A host entered through a gate saves the client's data segments and
+    /// reloads them on return, so descriptor changes take effect at once;
+    /// DJGPP raises its DS limit this way. Selectors that are no longer valid,
+    /// such as one just freed, become null, as 0001h requires. The host's IRET
+    /// reloads CS.
+    fn dpmi_reload_segments(&mut self) -> Result<(), RuntimeError> {
+        for segment in [Seg::Ss, Seg::Ds, Seg::Es, Seg::Fs, Seg::Gs] {
+            let selector = self.machine.cpu.registers.selector(segment);
+            if self
+                .machine
+                .cpu
+                .load_segment(&mut self.machine.bus, segment, selector)
+                .is_err()
+                && segment != Seg::Ss
+            {
+                self.machine
+                    .cpu
+                    .load_segment(&mut self.machine.bus, segment, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy a moved block's contents within installed RAM.
+    fn dpmi_move(&mut self, from: u32, to: u32, length: u32) -> Result<(), RuntimeError> {
+        let start = from.min(to);
+        let span = from.max(to) - start + length;
+        let ram = self
+            .machine
+            .bus
+            .debug_ram_mut(start, span)
+            .ok_or_else(|| dpmi_error(0x8013))?;
+        let source = (from - start) as usize;
+        ram.copy_within(source..source + length as usize, (to - start) as usize);
+        Ok(())
     }
 
     fn dpmi_real_alias(&mut self, segment: u16) -> Result<u16, RuntimeError> {
@@ -526,9 +724,8 @@ impl Session {
             let at = self.dpmi_pointer(Seg::Es, self.dpmi_offset(Gpr32::Edi), 50, Access::Write)?;
             // Old DOS/4GW clients set the historical PIC-reset flag (BH bit
             // zero). This virtual PC retains the same PIC mapping in both modes.
-            if self.registers().get(Gpr16::Cx) != 0
-                || (ax == 0x300 && self.registers().get_byte(7) & !1 != 0)
-            {
+            let words = self.registers().get(Gpr16::Cx);
+            if words > MAX_STACK_WORDS || (ax == 0x300 && self.registers().get_byte(7) & !1 != 0) {
                 return self.dpmi_cf(Some(0x8021));
             }
             let target = if ax == 0x300 {
@@ -539,9 +736,12 @@ impl Session {
                     self.machine.bus.read_u16(at + 42)?,
                 ))
             };
-            return self.dpmi_reflect(vector, Some(at), target, ax == 0x301);
+            return self.dpmi_reflect_with(vector, Some(at), target, ax == 0x301, words);
         }
         let result = self.dpmi_function(ax)?;
+        if matches!(ax, 0x0001 | 0x0007..=0x0009 | 0x000C) {
+            self.dpmi_reload_segments()?;
+        }
         self.dpmi_cf(result)
     }
 
@@ -569,6 +769,17 @@ impl Session {
                 }
                 Err(e) => return Ok(Some(e)),
             },
+            0x000D => {
+                let h = self.dpmi.as_mut().unwrap();
+                if bx & 4 == 0 || !(1..SPECIFIC).contains(&index) {
+                    return Ok(Some(0x8022));
+                }
+                if h.used[index] {
+                    return Ok(Some(0x8011));
+                }
+                h.used[index] = true;
+                self.dpmi_descriptor_at(descriptor, 0, 0, 0x92, 0)?;
+            }
             0x0001 if own => {
                 self.dpmi.as_mut().unwrap().used[index] = false;
                 self.machine.bus.write_u32(descriptor, 0)?;
@@ -763,7 +974,10 @@ impl Session {
                     self.machine.cpu.registers.set32(Gpr32::Edx, off);
                 } else {
                     let off = self.dpmi_offset(Gpr32::Edx);
-                    self.dpmi.as_mut().unwrap().exceptions[usize::from(bx as u8)] = (cx, off);
+                    let h = self.dpmi.as_mut().unwrap();
+                    h.exceptions[usize::from(bx as u8)] = (cx, off);
+                    let handled = h.handles_exceptions();
+                    self.machine.cpu.set_precise_faults(handled);
                 }
             }
             0x0204 => {
@@ -866,12 +1080,15 @@ impl Session {
             0x0501 | 0x0503 => {
                 let memory = &mut self.dpmi.as_mut().unwrap().memory;
                 let result = if function == 0x501 {
-                    memory.allocate(pair)
+                    memory.allocate(pair).map(|block| (block, None))
                 } else {
                     memory.resize(handle, pair)
                 };
                 match result {
-                    Ok(block) => {
+                    Ok((block, moved)) => {
+                        if let Some((from, length)) = moved {
+                            self.dpmi_move(from, block.address, length)?;
+                        }
                         let r = &mut self.machine.cpu.registers;
                         r.set(Gpr16::Bx, (block.address >> 16) as u16);
                         r.set(Gpr16::Cx, block.address as u16);
@@ -886,7 +1103,8 @@ impl Session {
                     return Ok(Some(e));
                 }
             }
-            0x0600 | 0x0601 => {} // No paging: every allocated page is resident.
+            // No paging: every page is resident, and paging hints change nothing.
+            0x0600..=0x0603 | 0x0702 | 0x0703 => {}
             0x0604 => {
                 self.machine.cpu.registers.set(Gpr16::Bx, 0);
                 self.machine.cpu.registers.set(Gpr16::Cx, 4096);
@@ -910,6 +1128,9 @@ impl Session {
                     )?;
                 }
             }
+            // The x87 is present or absent for the whole machine; a client
+            // that emulates it handles its own #NM through the exceptions.
+            0x0E01 => {}
             0x0E00 => self.machine.cpu.registers.set(
                 Gpr16::Ax,
                 if self.machine.cpu.fpu.is_some() {
@@ -937,6 +1158,30 @@ impl Session {
         procedure: Option<(u16, u16)>,
         far_return: bool,
     ) -> Result<(), RuntimeError> {
+        self.dpmi_reflect_with(vector, structure, procedure, far_return, 0)
+    }
+
+    /// Reflect to real mode, first copying `words` stack words of the client,
+    /// from above the INT 31h frame, to the real-mode stack, as arguments of
+    /// the called procedure or interrupt handler. They are not copied back.
+    fn dpmi_reflect_with(
+        &mut self,
+        vector: u8,
+        structure: Option<u32>,
+        procedure: Option<(u16, u16)>,
+        far_return: bool,
+        words: u16,
+    ) -> Result<(), RuntimeError> {
+        let mut arguments = [0u8; 2 * MAX_STACK_WORDS as usize];
+        let arguments = &mut arguments[..2 * usize::from(words)];
+        if words != 0 {
+            // Host gates are 32-bit: INT 31h pushed EIP, CS and EFLAGS dwords.
+            let top = self.machine.cpu.stack_pointer().wrapping_add(12);
+            for (i, byte) in arguments.iter_mut().enumerate() {
+                let at = self.dpmi_pointer(Seg::Ss, top.wrapping_add(i as u32), 1, Access::Read)?;
+                *byte = self.machine.bus.read_u8(at)?;
+            }
+        }
         let h = self.dpmi.as_ref().unwrap();
         if h.depth == h.frames.len() {
             return if structure.is_some() {
@@ -985,7 +1230,8 @@ impl Session {
             None
         };
         let service = service.filter(|s| {
-            (procedure.is_some() || s.vector() == vector)
+            words == 0
+                && (procedure.is_some() || s.vector() == vector)
                 && direct_service(s.vector(), rm.general[0] as u16)
         });
         if !far_return
@@ -1044,6 +1290,7 @@ impl Session {
             structure,
             callback: false,
             timer: false,
+            exception: false,
         });
         h.depth += 1;
         h.stats.reflected += 1;
@@ -1066,6 +1313,16 @@ impl Session {
         }
         self.machine.cpu.registers.ip = RM_RETURN;
         self.machine.cpu.flags = u32::from(rm.flags) | 2;
+        if words != 0 {
+            let sp = self.registers().get(Gpr16::Sp).wrapping_sub(2 * words);
+            let stack = self.registers().ss;
+            for (i, &byte) in arguments.iter().enumerate() {
+                self.machine
+                    .bus
+                    .write_u8(linear_address(stack, sp.wrapping_add(i as u16)), byte)?;
+            }
+            self.machine.cpu.registers.set(Gpr16::Sp, sp);
+        }
         if let Some((seg, off)) = procedure {
             let sp = self
                 .registers()
@@ -1195,6 +1452,7 @@ impl Session {
             structure: Some(callback.structure),
             callback: true,
             timer: false,
+            exception: false,
         });
         h.depth += 1;
         let sp = POOL - h.depth as u32 * 0x400;

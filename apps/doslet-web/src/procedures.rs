@@ -12,22 +12,19 @@ pub struct Prepared {
     pub entries: usize,
 }
 
-/// Browser bundles always run with DPMI Direct, which places DOS4GW code at
-/// other addresses than a launch without a DPMI host.
-const BROWSER_DPMI: &str = "direct";
-
 /// Use exactly the native application's executable-specific cache: one
-/// module per live layout, of which the newest bound under the browser's DPMI
-/// mode and not declined. An explicit observed-code profile selects the
+/// module per live layout, of which the newest bound under the bundle's DPMI
+/// host (`dpmi`, as in its profile) and not declined. DOS4GW places code
+/// elsewhere with another host. An explicit observed-code profile selects the
 /// register backend instead.
-pub fn cached_path(executable_sha256: &str) -> crate::Result<Option<PathBuf>> {
+pub fn cached_path(executable_sha256: &str, dpmi: &str) -> crate::Result<Option<PathBuf>> {
     let Ok(dirs) = crate::host_dirs::HostDirs::detect() else {
         return Ok(None);
     };
-    newest_browser_module(&dirs.aot_modules().join(executable_sha256))
+    newest_module(&dirs.aot_modules().join(executable_sha256), dpmi)
 }
 
-fn newest_browser_module(directory: &Path) -> crate::Result<Option<PathBuf>> {
+fn newest_module(directory: &Path, dpmi: &str) -> crate::Result<Option<PathBuf>> {
     let Ok(layouts) = std::fs::read_dir(directory) else {
         return Ok(None);
     };
@@ -42,7 +39,7 @@ fn newest_browser_module(directory: &Path) -> crate::Result<Option<PathBuf>> {
             continue;
         };
         let metadata: Value = serde_json::from_slice(embedded.metadata)?;
-        if metadata.get("dpmi").and_then(Value::as_str) != Some(BROWSER_DPMI) {
+        if metadata.get("dpmi").and_then(Value::as_str) != Some(dpmi) {
             continue;
         }
         let modified = std::fs::metadata(&path)?.modified()?;
@@ -53,10 +50,11 @@ fn newest_browser_module(directory: &Path) -> crate::Result<Option<PathBuf>> {
     Ok(newest.map(|(_, path)| path))
 }
 
-pub fn load(path: &Path, executable_sha256: &str) -> crate::Result<Prepared> {
+pub fn load(path: &Path, executable_sha256: &str, dpmi: &str) -> crate::Result<Prepared> {
     prepare(
         crate::read(path, bundle::MAX_BUNDLE_BYTES)?,
         executable_sha256,
+        dpmi,
     )
 }
 
@@ -68,7 +66,7 @@ fn word(value: &Value, key: &str) -> crate::Result<u32> {
         .ok_or_else(|| format!("invalid procedure bundle field {key}").into())
 }
 
-fn prepare(module: Vec<u8>, executable_sha256: &str) -> crate::Result<Prepared> {
+fn prepare(module: Vec<u8>, executable_sha256: &str, dpmi: &str) -> crate::Result<Prepared> {
     let embedded = bundle::read(&module)?.ok_or("WASM module has no procedure metadata")?;
     let metadata: Value = serde_json::from_slice(embedded.metadata)?;
     if word(&metadata, "version")? != 2 {
@@ -85,9 +83,9 @@ fn prepare(module: Vec<u8>, executable_sha256: &str) -> crate::Result<Prepared> 
     // Older modules carry no mode; their live source checks still apply.
     if let Some(mode) = metadata.get("dpmi") {
         let mode = mode.as_str().ok_or("invalid procedure bundle field dpmi")?;
-        if mode != BROWSER_DPMI {
+        if mode != dpmi {
             return Err(format!(
-                "procedure bundle was generated with DPMI {mode}; browser bundles use DPMI {BROWSER_DPMI}"
+                "procedure bundle was generated with DPMI {mode}; this bundle uses DPMI {dpmi}"
             )
             .into());
         }
@@ -165,30 +163,32 @@ mod tests {
     #[test]
     fn preserves_native_bundle_bytes_and_rejects_different_identity_or_code() {
         let module = packaged(&metadata());
-        let prepared = prepare(module.clone(), "test-executable").unwrap();
+        let prepared = prepare(module.clone(), "test-executable", "direct").unwrap();
         assert_eq!(prepared.module, module);
         assert_eq!(prepared.entries, 1);
-        assert!(prepare(module, "other-executable").is_err());
+        assert!(prepare(module, "other-executable", "direct").is_err());
         let mut metadata = metadata();
         metadata["code_sha256"] = json!("wrong");
-        assert!(prepare(packaged(&metadata), "test-executable").is_err());
+        assert!(prepare(packaged(&metadata), "test-executable", "direct").is_err());
     }
     #[test]
-    fn accepts_only_the_copy_bound_under_browser_dpmi() {
+    fn accepts_only_the_copy_bound_under_the_bundle_dpmi() {
         let mut metadata = metadata();
         metadata["dpmi"] = json!("direct");
-        assert!(prepare(packaged(&metadata), "test-executable").is_ok());
+        assert!(prepare(packaged(&metadata), "test-executable", "direct").is_ok());
         metadata["dpmi"] = json!("off");
-        let error = prepare(packaged(&metadata), "test-executable")
+        let error = prepare(packaged(&metadata), "test-executable", "direct")
             .err()
             .unwrap()
             .to_string();
         assert!(error.contains("DPMI off"), "{error}");
+        // A profile naming machine.dpmi = "off" packages the copy bound there.
+        assert!(prepare(packaged(&metadata), "test-executable", "off").is_ok());
         metadata["dpmi"] = json!(1);
-        assert!(prepare(packaged(&metadata), "test-executable").is_err());
+        assert!(prepare(packaged(&metadata), "test-executable", "direct").is_err());
     }
     #[test]
-    fn picks_a_cached_layout_bound_under_browser_dpmi() {
+    fn picks_a_cached_layout_bound_under_the_bundle_dpmi() {
         let directory =
             std::env::temp_dir().join(format!("doslet-web-layouts-{}", std::process::id()));
         let write = |layout: &str, dpmi: &str, declined: bool| {
@@ -202,12 +202,13 @@ mod tests {
             }
             path
         };
-        assert_eq!(newest_browser_module(&directory).unwrap(), None);
-        write("le-19e000-240000-00000000", "off", false);
+        assert_eq!(newest_module(&directory, "direct").unwrap(), None);
+        let off = write("le-19e000-240000-00000000", "off", false);
         write("le-1e8000-28b000-11111111", "direct", true);
-        assert_eq!(newest_browser_module(&directory).unwrap(), None);
+        assert_eq!(newest_module(&directory, "direct").unwrap(), None);
+        assert_eq!(newest_module(&directory, "off").unwrap(), Some(off));
         let direct = write("le-1e8000-28b000-22222222", "direct", false);
-        assert_eq!(newest_browser_module(&directory).unwrap(), Some(direct));
+        assert_eq!(newest_module(&directory, "direct").unwrap(), Some(direct));
         std::fs::remove_dir_all(&directory).unwrap();
     }
     #[test]
@@ -219,17 +220,17 @@ mod tests {
         ] {
             let mut metadata = metadata();
             metadata[change.0] = change.1;
-            assert!(prepare(packaged(&metadata), "test-executable").is_err());
+            assert!(prepare(packaged(&metadata), "test-executable", "direct").is_err());
         }
         let mut invalid = metadata();
         invalid["functions"][0]["sources"][0]["bytes"] = json!([256]);
-        assert!(prepare(packaged(&invalid), "test-executable").is_err());
+        assert!(prepare(packaged(&invalid), "test-executable", "direct").is_err());
         invalid = metadata();
         invalid["functions"][0]["sources"][0]["linear"] = json!(u32::MAX);
-        assert!(prepare(packaged(&invalid), "test-executable").is_err());
+        assert!(prepare(packaged(&invalid), "test-executable", "direct").is_err());
         invalid = metadata();
         let duplicate = invalid["functions"][0].clone();
         invalid["functions"].as_array_mut().unwrap().push(duplicate);
-        assert!(prepare(packaged(&invalid), "test-executable").is_err());
+        assert!(prepare(packaged(&invalid), "test-executable", "direct").is_err());
     }
 }

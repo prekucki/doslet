@@ -98,6 +98,13 @@ own rates. This functional timing model is not a cycle-accurate historical CPU.
 Legacy `machine.clock_hz` is accepted in whole MHz; if both fields are present,
 they must agree. Export writes `cpu_mhz`.
 
+`machine.dpmi` selects the DPMI host Doslet offers protected-mode programs:
+`direct` (the default) dispatches eligible BIOS/DOS services from protected
+mode, `reflect` runs them through the guest's real-mode handlers, and `off`
+leaves DOS extenders such as DOS/4GW their own host. The Machine page offers the
+same choice; `--dpmi` overrides the profile for one launch, and browser bundles
+use the profile's value. See [DPMI host](compatibility/dpmi-host.md).
+
 AT keyboard mode uses physical key locations and release events. BIOS mode
 retains scan-code/ASCII injection. Text entered in application controls stays
 out of the guest. Pause, focus/capture loss and disconnect release guest input;
@@ -268,6 +275,7 @@ memory_mib = 16
 x87 = true
 video = "vga-vbe"
 vram_kib = 512
+dpmi = "direct"
 
 [sound]
 sb16 = true

@@ -134,8 +134,8 @@ fn main() -> Result<()> {
                 // Capture ran with raw polling for reproducible layout probes.
                 // The exported native test starts with normal bounded VGA waits.
                 session.set_vga_wait_acceleration(true);
-                // Module generation needs only the bindings; states cannot yet
-                // capture the DPMI host.
+                // Module generation needs only the bindings; the state is a
+                // convenience for headless replays.
                 match session.save_state() {
                     Ok(state) => fs::write(directory.join("start.state"), state)?,
                     Err(error) => eprintln!("No start.state under DPMI {dpmi_name}: {error:?}"),

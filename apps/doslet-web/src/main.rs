@@ -529,16 +529,18 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
         );
     }
     stage(bar, 2, "Preparing guarded AOT code");
+    // The worker runs bundles with the profile's DPMI host, direct by default.
+    let dpmi = spec.dpmi.unwrap_or(doslet_config::DpmiHost::Direct);
     let procedure_path = if args.aot == Aot::Off || args.aot_profile.is_some() {
         None
     } else if let Some(path) = &args.wasm_procedures {
         Some(path.clone())
     } else {
-        procedures::cached_path(&identity)?
+        procedures::cached_path(&identity, dpmi.as_str())?
     };
     let procedure_bundle = procedure_path
         .as_deref()
-        .map(|path| procedures::load(path, &identity))
+        .map(|path| procedures::load(path, &identity, dpmi.as_str()))
         .transpose()?;
     let prepared = if args.aot == Aot::Off || procedure_bundle.is_some() {
         None

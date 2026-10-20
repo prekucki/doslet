@@ -1194,7 +1194,7 @@ be dispatched in protected mode while preserving the reflected path's memory
 effects and logical time. The PC supplies one bounded timing step for a replaced
 IRET, charged to the protected dispatcher label when speed tiers are active.
 Native desktop launches select direct dispatch by default, including profiling
-copies; `--experimental-dpmi off` selects the original guest extender. Bus-observed
+copies; `--dpmi off` selects the original guest extender. Bus-observed
 analyzer steps and debugger attachment retain reflection for instruction tracing.
 
 The CPU implements ordinary INT and IRET stack/vector behavior. The runtime

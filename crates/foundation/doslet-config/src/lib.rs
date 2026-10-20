@@ -246,6 +246,40 @@ mod startup_key_tests {
         assert_eq!(bios_key_for_ascii(0), None);
     }
 }
+/// The DPMI host Doslet offers protected-mode programs. DOS extenders such as
+/// DOS/4GW use it when present and their own host otherwise; DJGPP programs
+/// use it instead of loading CWSDPMI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DpmiHost {
+    /// No host: extenders switch modes themselves.
+    Off,
+    /// BIOS/DOS services run through the guest's real-mode handlers.
+    Reflect,
+    /// Eligible unchanged BIOS/DOS services are dispatched from protected mode.
+    Direct,
+}
+impl DpmiHost {
+    pub const ALL: [Self; 3] = [Self::Direct, Self::Reflect, Self::Off];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Reflect => "reflect",
+            Self::Direct => "direct",
+        }
+    }
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|host| host.as_str() == text)
+    }
+}
+impl fmt::Display for DpmiHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "Off (the extender's own host)",
+            Self::Reflect => "Reflect",
+            Self::Direct => "Direct",
+        })
+    }
+}
 /// Descriptive metadata for launchers and generated pages. Emulation ignores it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GameInfo {
@@ -269,6 +303,8 @@ pub struct MachineSpec {
     pub output: OutputRouting,
     pub game: GameSpec,
     pub info: GameInfo,
+    /// `None` leaves the frontend's default, direct.
+    pub dpmi: Option<DpmiHost>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceClaim {

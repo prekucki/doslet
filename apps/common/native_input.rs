@@ -71,7 +71,29 @@ impl Default for LaunchSettings {
     }
 }
 
-/// The DPMI mode a procedure module or patch is bound to, as named in its metadata.
+/// The runtime host for a configured DPMI setting.
+#[allow(dead_code, reason = "headless runners select modes directly")]
+pub fn dpmi_mode(host: doslet_config::DpmiHost) -> Option<doslet_runtime::session::dpmi::Mode> {
+    use doslet_runtime::session::dpmi::Mode;
+    match host {
+        doslet_config::DpmiHost::Off => None,
+        doslet_config::DpmiHost::Reflect => Some(Mode::Reflect),
+        doslet_config::DpmiHost::Direct => Some(Mode::Direct),
+    }
+}
+
+/// The configured DPMI setting of a runtime host.
+#[allow(dead_code, reason = "headless runners select modes directly")]
+pub fn dpmi_host(mode: Option<doslet_runtime::session::dpmi::Mode>) -> doslet_config::DpmiHost {
+    use doslet_runtime::session::dpmi::Mode;
+    match mode {
+        None => doslet_config::DpmiHost::Off,
+        Some(Mode::Reflect) => doslet_config::DpmiHost::Reflect,
+        Some(Mode::Direct) => doslet_config::DpmiHost::Direct,
+    }
+}
+
+/// The DPMI mode a procedure module is bound to, as named in its metadata.
 pub fn dpmi_layout(mode: Option<doslet_runtime::session::dpmi::Mode>) -> &'static str {
     use doslet_runtime::session::dpmi::Mode;
     match mode {

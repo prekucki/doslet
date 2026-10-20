@@ -50,9 +50,7 @@ impl fmt::Display for MzError {
             Self::InvalidStack => {
                 f.write_str("MZ stack is outside the process or lacks an interrupt frame")
             }
-            Self::UnsupportedMode => {
-                f.write_str("MZ overlays and NE/PE/LE/LX execution are unsupported")
-            }
+            Self::UnsupportedMode => f.write_str("NE/PE/LE/LX execution is unsupported"),
             Self::Bus(error) => error.fmt(f),
         }
     }
@@ -126,7 +124,8 @@ fn load_image<B: MemoryBus>(
 ) -> Result<Registers, MzError> {
     let image = MzImage::parse(bytes)?;
     let header = image.header;
-    if header.overlay_number != 0 || (image.extended.is_some() && !allow_dos_stub) {
+    // DOS EXEC ignores the overlay number; DJGPP's stub keeps text there.
+    if image.extended.is_some() && !allow_dos_stub {
         return Err(MzError::UnsupportedMode);
     }
     // The inspector exposes LE/LX metadata; other known extended formats are

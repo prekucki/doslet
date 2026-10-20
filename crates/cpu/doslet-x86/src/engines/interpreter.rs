@@ -122,6 +122,47 @@ impl From<BusError> for CpuError {
         Self::Bus(value)
     }
 }
+
+/// An architectural fault: an exception vector and its optional error code,
+/// raised at the faulting instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fault {
+    pub vector: u8,
+    pub error_code: Option<u32>,
+}
+
+impl CpuError {
+    /// The fault a guest exception handler could receive. Unimplemented
+    /// instructions, paging, VM86 and bus errors are Doslet limitations, not
+    /// guest faults, and have none.
+    pub fn fault(&self) -> Option<Fault> {
+        let fault = |vector, error_code| Some(Fault { vector, error_code });
+        match *self {
+            Self::DivideError { .. } => fault(0, None),
+            Self::SegmentAccess { segment, .. } => fault(
+                if segment == SegmentRegister::Ss {
+                    12
+                } else {
+                    13
+                },
+                Some(0),
+            ),
+            Self::Descriptor { selector, reason } => {
+                let code = Some(u32::from(selector & !3));
+                match reason {
+                    DescriptorError::NotPresent => fault(11, code),
+                    DescriptorError::NullSelector => fault(13, Some(0)),
+                    DescriptorError::TableBounds
+                    | DescriptorError::WrongType
+                    | DescriptorError::Privilege
+                    | DescriptorError::LocalTableUnavailable
+                    | DescriptorError::InvalidGate => fault(13, code),
+                }
+            }
+            _ => None,
+        }
+    }
+}
 impl fmt::Display for CpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -233,6 +274,9 @@ pub struct Cpu {
     execution_skipped: [u64; 4],
     /// Changes whenever labels are set, replaced or removed.
     execution_labels_generation: u64,
+    /// Restore pre-instruction state on faults; a host enables this while a
+    /// guest exception handler could receive them.
+    precise_faults: bool,
     #[cfg(all(
         feature = "dynamic-core",
         not(target_arch = "wasm32"),
@@ -373,6 +417,7 @@ impl Default for Cpu {
             execution_counts: [0; 4],
             execution_skipped: [0; 4],
             execution_labels_generation: 0,
+            precise_faults: false,
             #[cfg(all(
                 feature = "dynamic-core",
                 not(target_arch = "wasm32"),
@@ -505,9 +550,52 @@ impl Cpu {
         self.interrupt_shadow != 0
     }
 
+    /// With precise faults, a fault (`CpuError::fault`) restores the
+    /// registers, flags and control state from before the instruction, so a
+    /// host can deliver it there. Memory written before a fault, such as stack
+    /// slots of a multi-push instruction below ESP, is not restored.
+    pub fn set_precise_faults(&mut self, enabled: bool) {
+        self.precise_faults = enabled;
+    }
+    pub fn precise_faults_enabled(&self) -> bool {
+        self.precise_faults
+    }
+
     /// One bounded execution step. REP STOSB performs at most one write per step.
-    /// Errors stop execution; precise guest exception delivery is not implemented yet.
     pub fn step<B: CpuBus>(&mut self, bus: &mut B) -> Result<StepOutcome, CpuError> {
+        if !self.precise_faults {
+            return self.step_counted(bus);
+        }
+        // Only these change before a later fault of the same instruction:
+        // far transfers load CS or SS before pushing or popping. Other
+        // segment and control register loads fault before changing anything.
+        let r = &self.registers;
+        let general = r.general();
+        let (ip, flags, cpl, shadow) = (r.ip, self.flags, r.cpl, self.interrupt_shadow);
+        let (cs, ss) = (
+            r.caches[SegmentRegister::Cs as usize],
+            r.caches[SegmentRegister::Ss as usize],
+        );
+        let result = self.step_counted(bus);
+        if let Err(error) = &result
+            && error.fault().is_some()
+        {
+            let r = &mut self.registers;
+            r.set_general(general);
+            r.ip = ip;
+            r.cpl = cpl;
+            for (segment, cache) in [(SegmentRegister::Cs, cs), (SegmentRegister::Ss, ss)] {
+                if r.caches[segment as usize] != cache || r.selector(segment) != cache.selector {
+                    r.set_segment(segment, cache);
+                }
+            }
+            self.flags = flags;
+            self.interrupt_shadow = shadow;
+        }
+        result
+    }
+
+    fn step_counted<B: CpuBus>(&mut self, bus: &mut B) -> Result<StepOutcome, CpuError> {
         if !self.execution_labels_enabled() {
             return self.step_uncounted(bus);
         }

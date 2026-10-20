@@ -18,7 +18,7 @@ pub use engines::{DYNAMIC_PROFILE_MAX_BYTES, DynamicExitReason, DynamicExitRecor
 
 #[cfg(feature = "profiling")]
 pub use engines::interpreter::DecodeCacheStats;
-pub use engines::interpreter::{Cpu, CpuContext, CpuError, CpuSnapshot, StepOutcome};
+pub use engines::interpreter::{Cpu, CpuContext, CpuError, CpuSnapshot, Fault, StepOutcome};
 pub use state::{
     Access, ControlRegisters, DescriptorTable, Gpr16, Gpr32, Registers, SegmentCache,
     SegmentRegister,

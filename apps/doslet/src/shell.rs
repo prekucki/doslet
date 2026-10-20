@@ -6,6 +6,7 @@ use doslet_runtime::SessionStatus;
 use iced::{Element, Subscription, Task, Theme};
 use std::{
     ffi::OsString,
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -35,6 +36,14 @@ pub struct Shell {
     exited: bool,
 }
 impl Shell {
+    fn report_start_error(&mut self, name: &str, profile: &Path, error: &str) {
+        eprintln!(
+            "[ERROR doslet] Cannot start {name} (profile {}): {error}",
+            profile.display()
+        );
+        self.library.notice = Some(format!("Cannot start {name}: {error}"));
+    }
+
     pub fn new(library: library::Library, forwarded: Vec<OsString>) -> Self {
         Self {
             library,
@@ -59,7 +68,9 @@ impl Shell {
         let cli = match <crate::cli::Cli as clap::Parser>::try_parse_from(arguments) {
             Ok(cli) => cli,
             Err(error) => {
-                self.library.notice = Some(error.to_string());
+                let name = game.name.clone();
+                let profile = game.profile.clone();
+                self.report_start_error(&name, &profile, &error.to_string());
                 return Task::none();
             }
         };
@@ -91,19 +102,22 @@ impl Shell {
             Message::Library(message) => self.library.update(message).map(Message::Library),
             Message::Started(result) => {
                 let index = self.library.starting.take();
-                let name = index
+                let game = index
                     .and_then(|index| self.library.games.get(index))
-                    .map_or("the game", |game| game.name.as_str());
+                    .map(|game| (game.name.clone(), game.profile.clone()))
+                    .unwrap_or_else(|| ("the game".into(), Path::new("<unknown>").into()));
                 match result.map(|slot| slot.0.lock().ok().and_then(|mut slot| slot.take())) {
                     Ok(Some(mut game)) => {
                         game.from_library = true;
                         self.game = Some(game);
                         self.exited = false;
                     }
-                    Ok(None) => self.library.notice = Some(format!("Cannot start {name}.")),
-                    Err(error) => {
-                        self.library.notice = Some(format!("Cannot start {name}: {error}"));
-                    }
+                    Ok(None) => self.report_start_error(
+                        &game.0,
+                        &game.1,
+                        "game preparation did not return a game",
+                    ),
+                    Err(error) => self.report_start_error(&game.0, &game.1, &error),
                 }
                 Task::none()
             }

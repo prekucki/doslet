@@ -226,6 +226,7 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
                 "x87",
                 "video",
                 "vram_kib",
+                "dpmi",
             ],
             "machine.",
         )?;
@@ -253,6 +254,10 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
         }
         if let Some(v) = boolean(m, "x87")? {
             spec.hardware.x87 = v;
+        }
+        if let Some(v) = string(m, "dpmi")? {
+            spec.dpmi =
+                Some(DpmiHost::parse(&v).ok_or("machine.dpmi must be direct, reflect or off")?);
         }
     }
     if let Some(s) = section(t, "sound")? {
@@ -614,6 +619,9 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
     d["machine"]["vram_kib"] = value(512);
     d["machine"]["memory_mib"] = value(i64::from(spec.hardware.memory_mib));
     d["machine"]["x87"] = value(spec.hardware.x87);
+    if let Some(dpmi) = spec.dpmi {
+        d["machine"]["dpmi"] = value(dpmi.as_str());
+    }
     d["sound"]["sb16"] = value(spec.hardware.sb16);
     d["sound"]["mpu401"] = value(spec.hardware.mpu401);
     for (k, v) in [
@@ -828,6 +836,16 @@ mod tests {
         );
     }
     #[test]
+    fn machine_names_its_dpmi_host() {
+        let profile = |dpmi: &str| {
+            parse_machine_profile(&format!("version = 2\n[machine]\ndpmi = \"{dpmi}\"\n"))
+        };
+        assert_eq!(profile("off").unwrap().dpmi, Some(DpmiHost::Off));
+        assert_eq!(profile("direct").unwrap().dpmi, Some(DpmiHost::Direct));
+        assert!(profile("vcpi").is_err());
+        assert_eq!(parse_machine_profile("version = 2\n").unwrap().dpmi, None);
+    }
+    #[test]
     fn round_trip() {
         let mut s = MachineSpec {
             name: "quotes \" and \\".into(),
@@ -835,6 +853,7 @@ mod tests {
         };
         s.hardware.keyboard = KeyboardMode::At;
         s.hardware.cpu_mhz = 132;
+        s.dpmi = Some(DpmiHost::Reflect);
         s.input.deadzone_percent = 20;
         s.input.mouse_mode = MouseMode::NoCapture;
         s.input.hide_cursor = true;

@@ -308,13 +308,13 @@ sh tools/run-rott-aot.sh
 ```
 
 These historical bindings were captured without a DPMI host (object 1 at
-0x18e000), so `tools/run-rott-aot.sh` launches with `--experimental-dpmi off`.
+0x18e000), so `tools/run-rott-aot.sh` launches with `--dpmi off`.
 `capture_procedure_layout` now enables DPMI Direct by default, as the desktop
 does, where object 1 starts at 0x1e4000; pass `--dpmi off` or `--dpmi reflect`
 for other launches. The capture records the mode in `bindings.json`; the
 generator copies it into the module metadata, and loaders reject a module
 recorded for another mode. Bindings without the field are treated as `off`.
-States cannot yet hold the DPMI host, so such captures write no `start.state`.
+Captures under a DPMI host write a version-4 `start.state` that includes it.
 
 Without `OUTPUT_DIR`, the generator writes `procedures.wasm` to the user cache
 under `aot/<executable-sha256>/<layout>/`, where `<layout>` is the key of the

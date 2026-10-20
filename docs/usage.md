@@ -57,7 +57,7 @@ release year and genre:
 
 **Play** prepares the game in the background, then shows it in the same window,
 exactly as `doslet --config PROFILE` would. Options given to the library, such
-as `--experimental-dpmi off` or `--no-audio`, apply to every game it starts.
+as `--dpmi off` or `--no-audio`, apply to every game it starts.
 **‹ Library** in the game's toolbar returns to the list. So does leaving the
 game itself, for example quitting to DOS, once its last save is committed.
 Returning follows the same rules as Reset: a pending save finishes first, and
@@ -103,13 +103,13 @@ cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE
 The game starts automatically. Its containing directory is preloaded as C:;
 guest writes use an in-memory overlay and do not modify your installation.
 Keep the executable alongside its original DOS4GW and data files. DOS text
-screens render during startup. Native launches use the experimental DPMI host
+screens render during startup. Native launches use Doslet's DPMI host
 in `direct` mode, including background speed-tier profiling. Select
-`--experimental-dpmi reflect` for reflected services or `--experimental-dpmi off`
-for the guest extender path. Learned speed tiers, relocatable patches and AOT
-procedures follow the program to wherever the mode loads it. Portable emulator
-save files require the host to be off;
-in-process profiling copies support both host modes.
+`--dpmi reflect` for reflected services or `--dpmi off` for the guest
+extender path, or set `machine.dpmi` in the profile. Learned speed tiers,
+relocatable patches and AOT procedures follow the program to wherever the mode
+loads it. Portable emulator save files and in-process profiling copies support
+every host mode.
 The recorded PRINCE HDI logo appears around
 7.3 seconds of emulated time. Host speed may affect how long startup takes.
 BIOS/DOS keyboard input is available. DOS mouse input includes position, buttons, ranges, a graphics cursor and guest callbacks.
@@ -171,7 +171,7 @@ there is none. For example, `CIV.EXE is not a 32-bit LE program` means a
 real-mode MZ game without DOS4GW, which the AOT generator cannot translate.
 
 The same steps are available offline. `capture_procedure_layout` writes the
-live bindings (pass `--dpmi off` for `--experimental-dpmi off`), and
+live bindings (pass `--dpmi off` for a launch with `--dpmi off`), and
 `prepare_memory_procedures` compiles them into the cache entry of that layout
 or a chosen directory:
 

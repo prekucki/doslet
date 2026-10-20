@@ -301,6 +301,8 @@ impl Doslet {
         machine_spec.output.game_midi = app.midi_mode.as_str().into();
         machine_spec.output.host_midi = app.midi_output_mode.as_str().into();
         machine_spec.output.midi_output = cli.midi_output.clone().unwrap_or_else(|| "rust".into());
+        // The settings show the host in effect, including a --dpmi choice.
+        machine_spec.dpmi = Some(crate::native_input::dpmi_host(app.launch.dpmi));
         app.display_sizing.filter = machine_spec.output.video_filter.into();
         app.configurator.set_active(machine_spec);
         if cli.game.is_none() && cli.load_state.is_none() {
@@ -1342,6 +1344,9 @@ impl Doslet {
             return Task::none();
         }
         settings.hardware = plan.hardware;
+        if let Some(host) = spec.dpmi {
+            settings.dpmi = crate::native_input::dpmi_mode(host);
+        }
         settings.machine_spec = Some(spec.clone());
         settings.command_tail = plan.command_tail;
         settings.patches = spec
@@ -5792,7 +5797,7 @@ enabled = false
             "doslet",
             "--config",
             root.join("games/HoMnM.toml").to_str().unwrap(),
-            "--experimental-dpmi",
+            "--dpmi",
             "direct",
             "--no-audio",
             "--speed-tier-cache",
@@ -5819,5 +5824,64 @@ enabled = false
         );
         assert!(labelled > 80.0, "{labelled}");
         std::fs::remove_dir_all(&copy).unwrap();
+    }
+
+    /// `cargo test -p doslet --release --bin doslet dos4gw_games_resume -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires the local ROTT, Heroes and PRINCE profiles"]
+    fn dos4gw_games_resume_from_states_under_dpmi_direct() {
+        use clap::Parser;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let run = |session: &mut Session, until: u64| {
+            let mut pcm = [doslet_pcm::EMPTY; 4096];
+            let mut midi = [0; 4096];
+            while session.emulated_nanos() < until && session.status() == SessionStatus::Running {
+                session.advance(10_000);
+                while session.drain_pcm_timed(&mut pcm) != 0 {}
+                while session.drain_midi(&mut midi) != 0 {}
+            }
+        };
+        for profile in ["ROTT.toml", "HoMnM.toml", "PRINCE.toml"] {
+            let cli = crate::cli::Cli::parse_from([
+                "doslet",
+                "--config",
+                root.join("games").join(profile).to_str().unwrap(),
+                "--dpmi",
+                "direct",
+                "--no-aot",
+            ])
+            .resolve()
+            .unwrap();
+            let game = cli.game.clone().unwrap();
+            let mut launch = cli.launch;
+            launch.persist = false;
+            launch.preload_local_media = true;
+            // Patches move only with the desktop's layout watcher.
+            launch.patches.clear();
+            let mut original = crate::native_zip::load_game_with_settings(&game, &launch).unwrap();
+            original.start();
+            run(&mut original, 10_000_000_000);
+            assert_eq!(original.status(), SessionStatus::Running);
+            let calls = original.dpmi_stats().unwrap().calls;
+            let state = original.save_state().unwrap();
+            let media = crate::native_zip::load_game_with_settings(&game, &launch).unwrap();
+            let mut restored = Session::load_state_with_media(&state, &media).unwrap();
+            assert_eq!(restored.save_state().unwrap(), state);
+            run(&mut original, 15_000_000_000);
+            run(&mut restored, 15_000_000_000);
+            let (a, b) = (
+                original.save_state().unwrap(),
+                restored.save_state().unwrap(),
+            );
+            eprintln!(
+                "{profile}: {} KiB state at 10 s ({calls} DPMI calls); {:?} and {:?} at 15 s, states equal: {}",
+                state.len() / 1024,
+                original.status(),
+                restored.status(),
+                a == b
+            );
+            assert!(a == b);
+            assert!(original.dpmi_stats().unwrap().calls >= calls);
+        }
     }
 }

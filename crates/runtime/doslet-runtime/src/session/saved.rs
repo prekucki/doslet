@@ -3,7 +3,8 @@ use super::*;
 use doslet_state::InvalidState;
 use prost::Message;
 
-const VERSION: u32 = 3;
+/// Version 4 adds the DPMI host's records.
+const VERSION: u32 = 4;
 const MODEL: u32 = 1;
 const MAX_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -39,9 +40,6 @@ pub struct WorkingState {
     wire: super::saved_state::RuntimeSession,
     drive: ReadOnlyDrive,
     cdrom: Option<CdromImage>,
-    // Runtime-owned guest metadata has no portable representation yet, but
-    // diagnostic replays must retain descriptors, allocations and active frames.
-    dpmi: Option<Box<dpmi::Host>>,
 }
 impl WorkingState {
     pub fn restore(&self) -> Result<Session, InvalidState> {
@@ -50,7 +48,6 @@ impl WorkingState {
         // load_wire deliberately leaves persistent=None: no lease, commit queue
         // or host writeback adapter is ever inherited by a diagnostic owner.
         session.cdrom = self.cdrom.as_ref().map(|cd| cd.fork_local().unwrap());
-        session.dpmi = self.dpmi.clone();
         // Diagnostic copies start without native code, tier timing or learned proofs.
         session.set_dynamic_core(false);
         Ok(session)
@@ -73,7 +70,6 @@ impl Session {
             wire: self.save_wire_media(false),
             drive: self.drive.clone(),
             cdrom: self.cdrom.as_ref().map(|cd| cd.fork_local().unwrap()),
-            dpmi: self.dpmi.clone(),
         })
     }
 
@@ -108,11 +104,6 @@ impl Session {
     /// contents are external typed references; overlays and handle positions are
     /// saved. No host paths, leases, native code or analyzer proofs enter it.
     pub fn save_state(&self) -> Result<Vec<u8>, InvalidState> {
-        if self.dpmi.is_some() {
-            return Err(InvalidState(
-                "save states do not yet support the experimental DPMI host",
-            ));
-        }
         self.check_snapshot_boundary()?;
         let file = SavedSession {
             format: "doslet-state".into(),
@@ -152,7 +143,7 @@ impl Session {
         }
         let file = SavedSession::decode(bytes).map_err(|_| InvalidState("Protobuf encoding"))?;
         if file.format != "doslet-state"
-            || !matches!(file.version, 1 | 2 | VERSION)
+            || !matches!(file.version, 1..=VERSION)
             || file.machine_model != MODEL
         {
             return Err(InvalidState("unsupported format/version/machine model"));

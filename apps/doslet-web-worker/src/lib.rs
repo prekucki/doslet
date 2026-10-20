@@ -22,6 +22,19 @@ use std::sync::Arc;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+/// Bundles run with the profile's DPMI host, direct unless it names another.
+fn bundle_dpmi(spec: Option<&MachineSpec>) -> Option<doslet_runtime::session::dpmi::Mode> {
+    use doslet_runtime::session::dpmi::Mode;
+    match spec
+        .and_then(|spec| spec.dpmi)
+        .unwrap_or(doslet_config::DpmiHost::Direct)
+    {
+        doslet_config::DpmiHost::Off => None,
+        doslet_config::DpmiHost::Reflect => Some(Mode::Reflect),
+        doslet_config::DpmiHost::Direct => Some(Mode::Direct),
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct WorkerEngine {
     session: BrowserSession,
@@ -289,12 +302,15 @@ impl WorkerEngine {
         let spec = machine_profile::parse_machine_profile(profile)?;
         self.prepare(spec, program, false)
     }
-    /// Enable direct DPMI and adaptive CPU throughput for the bundled game.
+    /// Enable the profile's DPMI host and adaptive CPU throughput for the bundled game.
     pub fn prepare_bundle_runtime(&mut self) -> Result<(), String> {
+        let host = bundle_dpmi(self.candidate_spec.as_ref());
         let candidate = self.candidate.as_mut().ok_or("No prepared machine")?;
-        candidate
-            .enable_dpmi(doslet_runtime::session::dpmi::Mode::Direct)
-            .map_err(|error| error.to_string())?;
+        if let Some(mode) = host {
+            candidate
+                .enable_dpmi(mode)
+                .map_err(|error| error.to_string())?;
+        }
         candidate.set_adaptive_cpu(true);
         self.candidate_bundle_runtime = true;
         self.candidate_adaptive_cpu = true;
@@ -933,9 +949,11 @@ impl WorkerEngine {
         };
         self.candidate_tiers_active = reset && self.tiers_active;
         if reset && self.bundle_runtime {
-            session
-                .enable_dpmi(doslet_runtime::session::dpmi::Mode::Direct)
-                .map_err(|error| error.to_string())?;
+            if let Some(mode) = bundle_dpmi(Some(&spec)) {
+                session
+                    .enable_dpmi(mode)
+                    .map_err(|error| error.to_string())?;
+            }
             if self.adaptive_cpu {
                 session.set_adaptive_cpu(true);
             } else if !self.tiers_active {
