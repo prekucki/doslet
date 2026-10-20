@@ -57,6 +57,9 @@ struct Proof {
     at_head: bool,
     /// Started right after an empty keyboard or mouse poll.
     from_poll: bool,
+    /// Whether one initial pass already refreshed the baseline at `start`.
+    warmed_up: bool,
+    start: (u16, u32),
     cpu: CpuSnapshot,
     input: InputState,
     mark: IdleProofMark,
@@ -82,7 +85,9 @@ pub(super) struct IdleLoops {
     proven: Option<Proven>,
     /// CS selector and IP where the last proof succeeded: a pass is likely
     /// idle again once interrupts have changed the counters it waits for.
-    head: Option<(u16, u32)>,
+    pub(super) head: Option<(u16, u32)>,
+    head_proven: bool,
+    head_skipped: u32,
     next_attempt: u64,
     backoff: u64,
     /// Polls in loops too long or busy to prove must not retry each frame:
@@ -100,6 +105,8 @@ impl Default for IdleLoops {
             proof: None,
             proven: None,
             head: None,
+            head_proven: false,
+            head_skipped: 0,
             next_attempt: 0,
             backoff: BACKOFF_MIN,
             poll_attempt: 0,
@@ -206,6 +213,8 @@ impl Session {
             self.idle_abandon();
             self.idle.proven = None;
             self.idle.head = None;
+            self.idle.head_proven = false;
+            self.idle.head_skipped = 0;
         }
         self.idle.enabled = enabled;
     }
@@ -223,6 +232,20 @@ impl Session {
                     .proven
                     .as_ref()
                     .is_some_and(|proven| self.machine.cpu.matches(&proven.cpu)))
+    }
+
+    pub(super) fn idle_yield_ip(&self) -> Option<u32> {
+        if self.idle.enabled
+            && self.idle.proof.is_none()
+            && self.idle.proven.is_none()
+            && self.machine.batch_yield_ips().is_none()
+            && let Some((head_cs, head_ip)) = self.idle.head
+            && self.machine.cpu.registers.cs == head_cs
+        {
+            Some(head_ip)
+        } else {
+            None
+        }
     }
 
     pub fn idle_loop_stats(&self) -> IdleLoopStats {
@@ -254,28 +277,37 @@ impl Session {
     }
 
     fn idle_fail(&mut self, now: u64, reason: &'static str) {
-        // A loop head whose own proof fails no longer bypasses the backoff.
-        if self.idle.proof.as_ref().is_some_and(|proof| proof.at_head) {
-            self.idle.head = None;
-        }
-        if let Some(proof) = &self.idle.proof {
-            self.idle.stats.head_failures += u64::from(proof.at_head);
-            self.idle.stats.poll_failures += u64::from(proof.from_poll);
-        }
-        if self
+        let (at_head, from_poll) = self
             .idle
             .proof
             .as_ref()
-            .is_some_and(|proof| proof.from_poll)
-        {
+            .map_or((false, false), |proof| (proof.at_head, proof.from_poll));
+        if at_head && self.idle.head_proven {
+            // A proven wait loop eventually wakes up and leaves its loop head.
+            // Retain the head for the next wait; if the next visit fails on
+            // entry without proving a pass, that failure will clear `head`.
+            self.idle.head_proven = false;
+            self.idle.head_skipped = 0;
+            self.idle_abandon();
+            return;
+        }
+        // A loop head whose own proof fails no longer bypasses the backoff.
+        if at_head {
+            self.idle.head = None;
+            self.idle.head_skipped = 0;
+        }
+        self.idle.stats.head_failures += u64::from(at_head);
+        self.idle.stats.poll_failures += u64::from(from_poll);
+        if from_poll {
             self.idle.poll_attempt = now + self.idle.poll_backoff;
             self.idle.poll_backoff = (self.idle.poll_backoff * 2).min(BACKOFF_MAX);
+        } else {
+            self.idle.next_attempt = now + self.idle.backoff;
+            self.idle.backoff = (self.idle.backoff * 2).min(BACKOFF_MAX);
         }
         self.idle_abandon();
         self.idle.stats.failures += 1;
         self.idle.stats.last_failure = reason;
-        self.idle.next_attempt = now + self.idle.backoff;
-        self.idle.backoff = (self.idle.backoff * 2).min(BACKOFF_MAX);
     }
 
     /// Skip proven passes, single-step a running proof or start one. Returns
@@ -292,6 +324,12 @@ impl Session {
         {
             self.idle_abandon();
             return Ok(None);
+        }
+        if self.idle.proof.as_ref().is_some_and(|proof| !proof.at_head) {
+            let r = &self.machine.cpu.registers;
+            if self.idle.head == Some((r.cs, r.ip)) {
+                self.idle_abandon();
+            }
         }
         if self.idle.proof.is_none() {
             if let Some(proven) = &self.idle.proven
@@ -317,8 +355,10 @@ impl Session {
                                 tiers_after[i].saturating_sub(tiers_before[i]);
                         }
                         self.analyzer_proven_idle(elapsed);
-                        if skipped >= USEFUL_SKIP {
+                        self.idle.head_skipped = self.idle.head_skipped.saturating_add(skipped);
+                        if self.idle.head_skipped >= USEFUL_SKIP {
                             self.idle.backoff = BACKOFF_MIN;
+                            self.idle.poll_backoff = BACKOFF_MIN;
                         }
                         self.idle.stats.skips += 1;
                         self.idle.stats.skipped_steps += u64::from(skipped);
@@ -347,19 +387,29 @@ impl Session {
             return Ok(None);
         }
         let consumed = self.execute_step(1)?;
+        let input = self.input_state();
+        let device_accesses = self.machine.device_accesses();
         let proof = self.idle.proof.as_mut().expect("running proof");
         proof.steps += consumed;
+        let r = &self.machine.cpu.registers;
+        let at_start = (r.cs, r.ip) == proof.start;
         let failure = if let Some(reason) = proof.failure {
             Some(reason)
         } else if consumed != 1 || self.continuation.is_some() || self.storage_wait {
             Some("schedule")
         } else if self.machine.cpu.matches(&proof.cpu) {
-            let proof = self.idle.proof.take().expect("running proof");
-            let devices_unchanged = self.machine.device_accesses() == proof.device_accesses;
+            let mut proof = self.idle.proof.take().expect("running proof");
+            let devices_unchanged = device_accesses == proof.device_accesses;
             let unchanged = self.machine.end_idle_proof(proof.mark);
-            if unchanged && self.input_state() == proof.input {
+            let input_unchanged = input == proof.input;
+            if unchanged && input_unchanged {
                 let r = &self.machine.cpu.registers;
-                self.idle.head = Some((r.cs, r.ip));
+                let head = (r.cs, r.ip);
+                if self.idle.head != Some(head) {
+                    self.idle.head = Some(head);
+                    self.idle.head_skipped = 0;
+                }
+                self.idle.head_proven = true;
                 self.idle.proven = Some(Proven {
                     cpu: proof.cpu,
                     input: proof.input,
@@ -368,13 +418,28 @@ impl Session {
                         self.machine.cpu.execution_counts()[i] - proof.tier_counts[i]
                     }),
                     ram_writes: self.machine.ram_writes(),
-                    device_accesses: self.machine.device_accesses(),
+                    device_accesses,
                 });
                 self.idle.stats.proofs += 1;
                 if proof.from_poll {
                     self.idle.poll_backoff = BACKOFF_MIN;
                 }
                 self.idle.next_attempt = now + self.idle.backoff;
+                None
+            } else if !proof.warmed_up
+                && devices_unchanged
+                && input_unchanged
+                && proof.steps.saturating_mul(2) <= proof.limit
+            {
+                proof.warmed_up = true;
+                proof.limit -= proof.steps;
+                proof.steps = 0;
+                proof.cpu = self.machine.cpu.snapshot();
+                proof.input = input;
+                proof.mark = self.machine.begin_idle_proof();
+                proof.device_accesses = device_accesses;
+                proof.tier_counts = self.machine.cpu.execution_counts();
+                self.idle.proof = Some(proof);
                 None
             } else {
                 let reason = if !devices_unchanged {
@@ -389,6 +454,24 @@ impl Session {
                 self.idle.proof = Some(proof);
                 Some(reason)
             }
+        } else if at_start
+            && !proof.warmed_up
+            && device_accesses == proof.device_accesses
+            && input == proof.input
+            && proof.steps.saturating_mul(2) <= proof.limit
+        {
+            let mut proof = self.idle.proof.take().expect("running proof");
+            let _ = self.machine.end_idle_proof(proof.mark);
+            proof.warmed_up = true;
+            proof.limit -= proof.steps;
+            proof.steps = 0;
+            proof.cpu = self.machine.cpu.snapshot();
+            proof.input = input;
+            proof.mark = self.machine.begin_idle_proof();
+            proof.device_accesses = device_accesses;
+            proof.tier_counts = self.machine.cpu.execution_counts();
+            self.idle.proof = Some(proof);
+            None
         } else if proof.steps >= proof.limit {
             Some("length")
         } else {
@@ -408,9 +491,12 @@ impl Session {
         if self.machine.interrupt_pending() || self.machine.cpu.is_halted() {
             return;
         }
+        let r = &self.machine.cpu.registers;
         self.idle.proof = Some(Proof {
             at_head,
             from_poll,
+            warmed_up: false,
+            start: (r.cs, r.ip),
             cpu: self.machine.cpu.snapshot(),
             input: self.input_state(),
             mark: self.machine.begin_idle_proof(),
