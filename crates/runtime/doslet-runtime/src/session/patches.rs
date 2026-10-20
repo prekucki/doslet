@@ -60,6 +60,20 @@ impl Session {
         &self.patches
     }
 
+    /// Replace the pending patches of the plan, for example with addresses
+    /// moved to where a DOS extender loaded the program in this run. Applied
+    /// patches must stay unchanged; no RAM is changed here.
+    pub fn relocate_patches(&mut self, patches: Vec<MemoryPatch>) -> Result<(), &'static str> {
+        if patches.len() != self.patches.len()
+            || patches[..self.patches_applied] != self.patches[..self.patches_applied]
+        {
+            return Err("relocated patches must keep the plan and its applied patches");
+        }
+        self.validate_patches(&patches)?;
+        self.patches = patches;
+        Ok(())
+    }
+
     /// Patches are applied in configuration order; this prefix is complete.
     pub fn applied_patch_count(&self) -> usize {
         self.patches_applied
@@ -207,6 +221,28 @@ mod tests {
         assert!(s.debug_write_memory(0x10300, &[99]));
         s.advance(5);
         assert_eq!(s.ram_view(0x10300..0x10302).unwrap(), &[99, 8]);
+    }
+
+    #[test]
+    fn relocation_replaces_only_pending_patches() {
+        let mut s = Session::new(&[0xeb, 0xfe]).unwrap();
+        s.configure_patches(vec![plan(0x10300, &[0], &[7]), plan(0x10400, &[1], &[8])])
+            .unwrap();
+        s.start();
+        s.advance(1);
+        assert_eq!(s.applied_patch_count(), 1);
+        // The pending write waits at an address the guest never fills.
+        let moved = vec![plan(0x10300, &[0], &[7]), plan(0x10500, &[0], &[9])];
+        assert!(
+            s.relocate_patches(vec![plan(0x10310, &[0], &[7]), plan(0x10500, &[0], &[9])])
+                .is_err()
+        );
+        assert!(s.relocate_patches(moved[..1].to_vec()).is_err());
+        s.relocate_patches(moved).unwrap();
+        s.advance(1);
+        assert_eq!(s.applied_patch_count(), 2);
+        assert_eq!(s.ram_view(0x10500..0x10501).unwrap(), &[9]);
+        assert_eq!(s.ram_view(0x10400..0x10401).unwrap(), &[0]);
     }
 
     #[test]

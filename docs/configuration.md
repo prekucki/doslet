@@ -220,7 +220,7 @@ Linux and BSD these follow the XDG Base Directory specification; relative
 | Save export/import file | `$XDG_DATA_HOME/doslet/exports` | `~/Library/Application Support/doslet/exports` | `%LOCALAPPDATA%\doslet\exports` |
 | Speed-tier labels and their **Save as** files | `$XDG_CACHE_HOME/doslet/speed-tiers` (`~/.cache/doslet/speed-tiers`) | `~/Library/Caches/doslet/speed-tiers` | `%LOCALAPPDATA%\doslet\cache\speed-tiers` |
 | Dynamic-core profiles, one per executable | `$XDG_CACHE_HOME/doslet/core-profiles` | `~/Library/Caches/doslet/core-profiles` | `%LOCALAPPDATA%\doslet\cache\core-profiles` |
-| Generated AOT procedure modules, one per DPMI mode | `$XDG_CACHE_HOME/doslet/aot/<exe-sha256>/dpmi-<mode>` | `~/Library/Caches/doslet/aot/<exe-sha256>/dpmi-<mode>` | `%LOCALAPPDATA%\doslet\cache\aot\<exe-sha256>\dpmi-<mode>` |
+| Generated AOT procedure modules, one per live layout | `$XDG_CACHE_HOME/doslet/aot/<exe-sha256>/<layout>` | `~/Library/Caches/doslet/aot/<exe-sha256>/<layout>` | `%LOCALAPPDATA%\doslet\cache\aot\<exe-sha256>\<layout>` |
 | Native code compiled from those modules | `$XDG_CACHE_HOME/doslet/aot-compiled` | `~/Library/Caches/doslet/aot-compiled` | `%LOCALAPPDATA%\doslet\cache\aot-compiled` |
 
 These are defaults; edited paths, profile bindings and explicit CLI paths such
@@ -235,9 +235,10 @@ Native game launches load and save a dynamic-core profile named by the SHA-256
 of the executable; `--no-core-profile` disables this and `--core-profile FILE`
 selects one file for every game. ZIP launches and the demo use no profile unless
 one is given explicitly; they apply only to builds with the optional JIT.
-`<mode>` is `off`, `reflect` or `direct`, matching `--experimental-dpmi`,
-because DOS4GW loads code at other addresses with a DPMI host. The desktop
-installs the module for the launched program and mode automatically unless
+`<layout>` names where the DOS extender loaded the program's LE objects, such
+as `le-1e4000-265000-266000-268000-2697eb6b`: DOS4GW loads code at other
+addresses with a DPMI host or another memory configuration. The desktop
+compiles and installs the module of the live layout while the game runs unless
 `--no-aot` is given. Compiled AOT files hold host machine code for this
 Wasmtime version, configuration and CPU. Each records a SHA-256 of its contents;
 a mismatch, or code Wasmtime rejects, is compiled again. Only one compilation per

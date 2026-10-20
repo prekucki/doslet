@@ -191,13 +191,12 @@ fn read(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Profiles beside the working directory, then those saved by Doslet.
+/// The user's profile directory only: a `games` directory beside the working
+/// directory may hold unrelated TOML files, such as a `mise.toml`.
 pub fn directories() -> Vec<PathBuf> {
-    let mut directories = vec![PathBuf::from("games")];
-    if let Ok(dirs) = crate::host_dirs::HostDirs::detect() {
-        directories.push(dirs.profiles());
-    }
-    directories
+    crate::host_dirs::HostDirs::detect()
+        .map(|dirs| vec![dirs.profiles()])
+        .unwrap_or_default()
 }
 
 fn scan(directories: &[PathBuf]) -> Vec<Game> {

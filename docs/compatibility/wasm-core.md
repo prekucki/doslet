@@ -317,13 +317,24 @@ recorded for another mode. Bindings without the field are treated as `off`.
 States cannot yet hold the DPMI host, so such captures write no `start.state`.
 
 Without `OUTPUT_DIR`, the generator writes `procedures.wasm` to the user cache
-under `aot/<executable-sha256>/dpmi-<mode>/`. The desktop installs that copy
-for the launched program and DPMI mode automatically; `--no-aot` disables this,
-and `--wasm-procedures` without a path requires it. When the copy is missing,
-the desktop prepares it in the background with the same capture and the
-`--computation-kernels --kernel-interrupts before-irq` recipe, shared with both
-examples through `apps/common/procedure_cache.rs`. For ROTT the result equals
-the offline module byte for byte and took 0.52 s in a release build. Under DPMI Direct from boot,
+under `aot/<executable-sha256>/<layout>/`, where `<layout>` is the key of the
+bindings' layout (`le_layout::Layout::key`: object bases and a digest of their
+selectors). The desktop finds the live layout itself: `apps/common/le_layout.rs`
+probes the running session every million steps of flat 32-bit code, searches
+page-aligned candidates for 32-byte relocation-free anchors of the image
+(every offset on one probe in 32), and binds every object as the offline
+capture does. It then installs the cached module of that layout, or compiles
+one on a background thread with the
+`--computation-kernels --kernel-interrupts before-irq` recipe shared through
+`apps/common/procedure_cache.rs`, and installs it at the next batch boundary
+without recorded RAM. The first 10,000 calls decide: an average below 32
+instructions suspends the procedures and leaves `unavailable.txt` beside the
+module. `--no-aot` disables this. For ROTT the live module's code equals the
+offline module's byte for byte; it compiled in 0.1 s and averaged 702
+instructions per call. HEROES.EXE first calls procedures after about 90
+million steps and averages 7 instructions per call; its module ran 20% slower
+than the interpreter over 40 guest seconds (7.0 s against 5.9 s), so it is
+suspended. Under DPMI Direct from boot,
 the regenerated 202-entry ROTT module ran steps 60–100 million in 287 ms against
 353 ms interpreted (1.23×). AOT executed 15% of those instructions in 8,992
 calls, and both runs ended at the same PC and guest time. The desktop stores the module's native

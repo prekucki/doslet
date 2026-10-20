@@ -132,15 +132,14 @@ version-2 `procedures.wasm` produced by the existing
 The browser uses its own machine memory and still verifies live instruction
 sources, CPU context and memory capabilities before each admitted call.
 Bound addresses must match the browser loader: ROTT loads at different bases
-with and without a DPMI host. Modules record the DPMI mode of their captured
-layout; the packager accepts `direct`, the browser's mode, and older modules
+with and without a DPMI host. Modules record the DPMI mode and layout of their
+bindings; the packager accepts `direct`, the browser's mode, and older modules
 without a recorded mode. Packaging a native module alone does not establish
 that its procedures run in the browser or improve performance.
 
 Without `--wasm-procedures` or `--aot-profile`, `--aot auto` and `--aot required`
-first look for the native cache's
-`aot/<executable-sha256>/dpmi-direct/procedures.wasm`, the copy bound under the
-browser's DPMI Direct mode.
+first look in the native cache's `aot/<executable-sha256>/` for the newest
+module recorded under DPMI Direct, the browser's mode, that was not declined.
 An invalid discovered bundle is reported as an error. `--aot-profile` explicitly
 selects the register-code backend; `--aot off` disables both backends and cannot
 be combined with either explicit AOT input.

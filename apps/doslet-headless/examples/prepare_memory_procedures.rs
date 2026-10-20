@@ -3,6 +3,9 @@
 #[path = "../../common/host_dirs.rs"]
 mod host_dirs;
 #[allow(dead_code)]
+#[path = "../../common/le_layout.rs"]
+mod le_layout;
+#[allow(dead_code)]
 #[path = "../../common/procedure_cache.rs"]
 mod procedure_cache;
 #[allow(dead_code)]
@@ -164,15 +167,26 @@ fn main() -> Result<()> {
         kernel_interrupts,
         hot_profile: profile_path.is_some(),
     };
-    let module =
-        procedure_cache::build(&exe, &declarations, dpmi, &recipe, &mut keep, &mut |line| {
-            println!("{line}")
-        })?;
+    // The desktop finds a cached module by the key of its live layout.
+    let layout = {
+        let le =
+            doslet_executable::LeImage::discover(&exe, doslet_executable::LeLimits::default())?;
+        let image = SymbolicImage::from_le(&le, doslet_aot::ImageLimits::default())?;
+        le_layout::Layout::new(&image, declarations.clone())?.key()
+    };
+    let module = procedure_cache::build(
+        &exe,
+        &declarations,
+        dpmi,
+        &layout,
+        &recipe,
+        &mut keep,
+        &mut |line| println!("{line}"),
+    )?;
     let output = match explicit_output {
         Some(path) => PathBuf::from(path),
-        // The desktop finds this module for its DPMI mode without options.
         None => host_dirs::HostDirs::detect()?
-            .aot_module(&format!("{:x}", Sha256::digest(&exe)), dpmi)
+            .aot_module(&format!("{:x}", Sha256::digest(&exe)), &layout)
             .parent()
             .ok_or("invalid AOT cache path")?
             .to_path_buf(),

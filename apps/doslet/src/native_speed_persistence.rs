@@ -11,6 +11,7 @@ use std::{
 };
 
 type Nodes = BTreeMap<(u32, bool), Node>;
+type Layout = Option<Vec<(u32, u32)>>;
 type CachedGame = (PathBuf, [Option<u16>; 3], bool);
 const LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -103,6 +104,9 @@ impl Persistence {
             return Err("profile node limit".into());
         }
         profile.nodes = combined;
+        if profile.layout.is_none() {
+            profile.layout = learned.layout;
+        }
         Ok(loaded)
     }
     pub fn changed(&mut self) {
@@ -124,19 +128,20 @@ impl Persistence {
         if !self.dirty || self.writer.is_some() {
             return;
         }
-        let (path, identity, rates, learning, nodes) = (
+        let (path, identity, rates, learning, nodes, layout) = (
             self.path.clone(),
             self.identity.clone(),
             self.rates,
             self.learning,
             profile.nodes.clone(),
+            profile.layout.clone(),
         );
         // One writer at a time. Changes during a write coalesce into the next snapshot.
         self.dirty = false;
         match thread::Builder::new()
             .name("doslet-tier-save".into())
             .spawn(move || {
-                write(&path, &identity, rates, learning, &nodes).map_err(|e| e.to_string())
+                write(&path, &identity, rates, learning, &nodes, &layout).map_err(|e| e.to_string())
             }) {
             Ok(writer) => self.writer = Some(writer),
             Err(e) => self.error = Some(format!("Cannot save learned tiers: {e}")),
@@ -163,6 +168,7 @@ impl Persistence {
                 self.rates,
                 self.learning,
                 &profile.nodes,
+                &profile.layout,
             ) {
                 Ok(()) => self.writes += 1,
                 Err(e) => self.error = Some(format!("Cannot save learned tiers: {e}")),
@@ -283,10 +289,12 @@ fn write(
     rates: [Option<u16>; 3],
     learning: bool,
     nodes: &Nodes,
+    layout: &Layout,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rows = node_rows(nodes);
     let bytes = serde_json::to_vec(&serde_json::json!({"learning_version":1,
-        "identity":identity, "rates":rates, "learning":learning, "unknown":"grey", "irq_policy":"static-grey", "nodes":rows}))?;
+        "identity":identity, "rates":rates, "learning":learning, "unknown":"grey", "irq_policy":"static-grey",
+        "layout":layout, "nodes":rows}))?;
     write_bytes(path, &bytes)
 }
 fn node_rows(nodes: &Nodes) -> Vec<serde_json::Value> {
@@ -300,9 +308,11 @@ pub(super) fn export_new(
     path: &Path,
     rates: [Option<u16>; 3],
     nodes: &Nodes,
+    layout: &Layout,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = serde_json::to_vec_pretty(&serde_json::json!({"version":1,
-        "rates":rates, "learning":false, "unknown":"grey", "irq_policy":"static-grey", "nodes":node_rows(nodes)}))?;
+        "rates":rates, "learning":false, "unknown":"grey", "irq_policy":"static-grey",
+        "layout":layout, "nodes":node_rows(nodes)}))?;
     if bytes.len() as u64 > LIMIT {
         return Err("profile exceeds 64 MiB".into());
     }

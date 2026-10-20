@@ -17,6 +17,8 @@ mod native_effects;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_jit;
 #[cfg(not(target_arch = "wasm32"))]
+mod native_layout;
+#[cfg(not(target_arch = "wasm32"))]
 mod native_speed_tiers;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_state;
@@ -48,6 +50,9 @@ mod browser_input;
 mod cli;
 mod configurator;
 mod keyboard;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/le_layout.rs"]
+mod le_layout;
 #[cfg(not(target_arch = "wasm32"))]
 mod library;
 #[path = "../../common/machine_profile.rs"]

@@ -52,6 +52,23 @@ pub(crate) struct Controller {
 pub fn executable_sha256(path: &Path) -> Result<String, std::io::Error> {
     persistence::fingerprint(path)
 }
+fn labels(profile: &Profile) -> Vec<doslet_x86::ExecutionLabel> {
+    profile
+        .nodes
+        .iter()
+        .map(|(&(address, code32), node)| doslet_x86::ExecutionLabel {
+            address,
+            code32,
+            bytes: node.code,
+            tier: match node.tier {
+                Tier::Fast => 0,
+                Tier::Slow => 1,
+                Tier::Grey => 2,
+                Tier::Irq => 3,
+            },
+        })
+        .collect()
+}
 impl Controller {
     pub fn profile_info(&self) -> crate::cpu_config::ProfileInfo {
         crate::cpu_config::ProfileInfo {
@@ -81,7 +98,7 @@ impl Controller {
         path: &Path,
         rates: [Option<u16>; 3],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        persistence::export_new(path, rates, &self.profile.nodes)
+        persistence::export_new(path, rates, &self.profile.nodes, &self.profile.layout)
     }
     pub fn load_ui(
         path: &Path,
@@ -289,22 +306,7 @@ impl Controller {
         session.set_event_idle_site(None);
         session.set_idle_observation(false);
         session.set_synchronization_analysis(false);
-        let labels = self
-            .profile
-            .nodes
-            .iter()
-            .map(|(&(address, code32), node)| doslet_x86::ExecutionLabel {
-                address,
-                code32,
-                bytes: node.code,
-                tier: match node.tier {
-                    Tier::Fast => 0,
-                    Tier::Slow => 1,
-                    Tier::Grey => 2,
-                    Tier::Irq => 3,
-                },
-            })
-            .collect();
+        let labels = self.labels();
         session
             .set_execution_tiers(
                 Some(labels),
@@ -315,8 +317,64 @@ impl Controller {
                 ],
             )
             .expect("validated tier profile");
+        // Procedures run where byte-validated labels prove their tier, as in
+        // the browser; others fall back to labelled interpretation.
+        #[cfg(feature = "wasm-procedures")]
+        let _ = session.set_wasm_procedure_tier_accounting(true);
         // Capture fresh program entry before the first live execution batch.
         self.maintain_learning(session);
+    }
+    fn labels(&self) -> Vec<doslet_x86::ExecutionLabel> {
+        labels(&self.profile)
+    }
+    /// `(object, base)` of the LE objects the labels were recorded at.
+    pub fn label_layout(&self) -> Option<&[(u32, u32)]> {
+        self.profile.layout.as_deref()
+    }
+    /// Address and code of every 32-bit label.
+    pub fn code_labels(&self) -> impl Iterator<Item = (u32, &[u8; 15])> {
+        self.profile
+            .nodes
+            .iter()
+            .filter(|((_, code32), _)| *code32)
+            .map(|(&(address, _), node)| (address, &node.code))
+    }
+    /// Record `layout` as the labels' layout, moving every 32-bit label to
+    /// the address and code `relocate` returns, or dropping it on `None`.
+    /// The session's labels follow when tiers are enabled. Returns the
+    /// numbers of moved and dropped labels.
+    pub fn relocate_labels(
+        &mut self,
+        session: &mut Session,
+        layout: Vec<(u32, u32)>,
+        mut relocate: impl FnMut(u32, &[u8; 15]) -> Option<(u32, [u8; 15])>,
+    ) -> (usize, usize) {
+        let (mut moved, mut dropped) = (0, 0);
+        let nodes = core::mem::take(&mut self.profile.nodes);
+        for ((address, code32), mut node) in nodes {
+            if !code32 {
+                self.profile.nodes.insert((address, code32), node);
+                continue;
+            }
+            match relocate(address, &node.code) {
+                Some((target, code)) => {
+                    moved += usize::from(target != address);
+                    node.code = code;
+                    self.profile.nodes.insert((target, code32), node);
+                }
+                None => dropped += 1,
+            }
+        }
+        self.profile.layout = Some(layout);
+        if let Some(p) = &mut self.persistence {
+            p.changed();
+        }
+        if self.stats.enabled && self.epoch == session.epoch() {
+            session
+                .replace_execution_labels(self.labels())
+                .expect("bounded relocated labels");
+        }
+        (moved, dropped)
     }
     pub fn learn_in_background(&mut self) {
         self.set_learning(true);
@@ -348,22 +406,7 @@ impl Controller {
             return;
         };
         if learner.maintain(session, &mut self.profile, self.stats.grey_mhz) {
-            let labels = self
-                .profile
-                .nodes
-                .iter()
-                .map(|(&(address, code32), node)| doslet_x86::ExecutionLabel {
-                    address,
-                    code32,
-                    bytes: node.code,
-                    tier: match node.tier {
-                        Tier::Fast => 0,
-                        Tier::Slow => 1,
-                        Tier::Grey => 2,
-                        Tier::Irq => 3,
-                    },
-                })
-                .collect();
+            let labels = labels(&self.profile);
             session
                 .replace_execution_labels(labels)
                 .expect("bounded learned labels");
@@ -619,6 +662,7 @@ mod tests {
                 irq_grey: true,
                 prepared: Vec::new(),
                 index: crate::speed_tiers::PlanIndex::default(),
+                layout: None,
             },
             stats: Stats {
                 cold_mhz: 8,

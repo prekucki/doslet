@@ -231,6 +231,8 @@ pub struct Cpu {
     decode_cache: cache::Cache,
     execution_counts: [u64; 4],
     execution_skipped: [u64; 4],
+    /// Changes whenever labels are set, replaced or removed.
+    execution_labels_generation: u64,
     #[cfg(all(
         feature = "dynamic-core",
         not(target_arch = "wasm32"),
@@ -370,6 +372,7 @@ impl Default for Cpu {
             decode_cache: cache::Cache::default(),
             execution_counts: [0; 4],
             execution_skipped: [0; 4],
+            execution_labels_generation: 0,
             #[cfg(all(
                 feature = "dynamic-core",
                 not(target_arch = "wasm32"),
@@ -392,6 +395,7 @@ impl Cpu {
         self.decode_cache.profile = profile;
         self.execution_counts = [0; 4];
         self.execution_skipped = [0; 4];
+        self.execution_labels_generation += 1;
         #[cfg(all(
             feature = "dynamic-core",
             not(target_arch = "wasm32"),
@@ -426,6 +430,10 @@ impl Cpu {
     }
     pub fn execution_labels_enabled(&self) -> bool {
         self.decode_cache.profile.is_some()
+    }
+    /// Classifications of unchanged code bytes hold while this is unchanged.
+    pub fn execution_labels_generation(&self) -> u64 {
+        self.execution_labels_generation
     }
     pub fn execution_counts(&self) -> [u64; 4] {
         self.execution_counts

@@ -497,6 +497,16 @@ on Linux); the first use moves that directory into the cache.
 an explicit base profile uses `<profile>.learned.json`, keyed by the base file's
 content hash. The original profile remains unchanged.
 
+Profiles record `layout`, the `(object, base)` pairs of the program's LE objects
+at the time the 32-bit labels were recorded. When the desktop finds the objects
+elsewhere, for example under another DPMI mode, labels inside them move with
+their object. Only bytes of LE relocation fields may differ from the moved code,
+whose bytes then replace the recorded ones; other labels are dropped. Profiles
+without `layout` are placed by votes: the first four bytes of each label, where
+they occur once without relocations in the image's code, name a base. Learned
+Heroes labels taken without a DPMI host matched 3.5% of steps under DPMI Direct
+before this and 95.5% after it, against 96.5% without the host.
+
 Loaded overlays/modules are not separately fingerprinted. Each label retains
 its address, execution mode and instruction-byte guard: changed code falls back
 to GREY. This guards code replacement at known addresses; it does not establish

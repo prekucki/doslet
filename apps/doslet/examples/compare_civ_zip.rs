@@ -34,11 +34,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut keys = b"151".iter();
     let (mut directory_midi, mut packed_midi) = (Vec::new(), Vec::new());
     while directory.steps() < budget && directory.status() == SessionStatus::Running {
-        if directory.waiting_for_key() && packed.waiting_for_key() {
-            if let Some(&key) = keys.next() {
-                directory.push_key(0, key)?;
-                packed.push_key(0, key)?;
-            }
+        if directory.waiting_for_key()
+            && packed.waiting_for_key()
+            && let Some(&key) = keys.next()
+        {
+            directory.push_key(0, key)?;
+            packed.push_key(0, key)?;
         }
         let count = ((budget - directory.steps()).min(10_000)) as u32;
         let a = directory.advance(count);

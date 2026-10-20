@@ -2,7 +2,7 @@
 use doslet_dos::files::ReadOnlyDrive;
 use doslet_runtime::Session;
 #[path = "native_patches.rs"]
-mod patches;
+pub(crate) mod patches;
 use std::{
     error::Error,
     fs,
@@ -33,14 +33,9 @@ pub struct LaunchSettings {
     /// Without an explicit `core_profile`, one profile per executable lives here.
     #[allow(dead_code, reason = "headless runners select profiles explicitly")]
     pub core_profile_cache: Option<PathBuf>,
+    /// An explicit module, installed at load. The desktop otherwise installs
+    /// the cached module of the live layout while the game runs.
     pub wasm_procedures: Option<PathBuf>,
-    /// The module was found in the cache rather than requested; speed-tier
-    /// labels then take precedence instead of rejecting the launch.
-    #[allow(dead_code, reason = "headless runners select modules explicitly")]
-    pub automatic_procedures: bool,
-    /// Cache path of a module to prepare in the background for this program.
-    #[allow(dead_code, reason = "only the desktop prepares modules")]
-    pub prepare_procedures: Option<PathBuf>,
     pub interpret_procedures: bool,
     /// Native code compiled from procedure modules; `None` compiles every launch.
     #[allow(dead_code, reason = "read only with the wasm-procedures feature")]
@@ -70,16 +65,13 @@ impl Default for LaunchSettings {
             core_profile: None,
             core_profile_cache: None,
             wasm_procedures: None,
-            automatic_procedures: false,
-            prepare_procedures: None,
             interpret_procedures: false,
             compiled_cache: None,
         }
     }
 }
 
-/// The DPMI mode a procedure module is bound to, as named in its metadata.
-#[allow(dead_code, reason = "read only with the wasm-procedures feature")]
+/// The DPMI mode a procedure module or patch is bound to, as named in its metadata.
 pub fn dpmi_layout(mode: Option<doslet_runtime::session::dpmi::Mode>) -> &'static str {
     use doslet_runtime::session::dpmi::Mode;
     match mode {
@@ -158,7 +150,15 @@ pub fn configure_runtime(
         session.enable_dpmi(mode)?;
     }
     session.set_dynamic_core(!settings.no_dynamic_core);
-    set_heroes_menu_idle(session, settings.heroes_menu_idle);
+    // These sites are linear addresses of the layout without a DPMI host.
+    let heroes_sites = settings.dpmi.is_none();
+    if !heroes_sites && (settings.heroes_menu_idle || settings.heroes_timer_waits) {
+        eprintln!(
+            "[WARN doslet] Experimental Heroes sites use the DPMI off layout; ignored with DPMI {}",
+            dpmi_layout(settings.dpmi)
+        );
+    }
+    set_heroes_menu_idle(session, settings.heroes_menu_idle && heroes_sites);
     session.set_idle_observation(settings.observe_idle);
     if settings.adaptive_idle {
         session.set_adaptive_idle(true);
@@ -170,7 +170,7 @@ pub fn configure_runtime(
     if let Some(path) = &settings.core_profile {
         load_core_profile(session, path);
     }
-    if settings.heroes_timer_waits {
+    if settings.heroes_timer_waits && heroes_sites {
         session.set_memory_wait_sites(0x281098, [0x1E281C, 0x1E2881, 0x1E331A]);
         eprintln!(
             "[INFO doslet] Experimental Heroes timer waits enabled (three validated polling sites)"
@@ -189,35 +189,16 @@ pub fn install_wasm_procedures(
     }
     #[cfg(not(feature = "wasm-procedures"))]
     let _ = session;
-    // The cached copy was chosen for the configured DPMI mode. A restored
-    // state without that host places code elsewhere; keep the interpreter.
-    if settings.automatic_procedures && session.dpmi_mode() != settings.dpmi {
-        eprintln!(
-            "[INFO doslet] AOT: cached procedures need DPMI {}; this session uses DPMI {}",
-            dpmi_layout(settings.dpmi),
-            dpmi_layout(session.dpmi_mode())
-        );
-        return Ok(());
-    }
     if let Some(path) = &settings.wasm_procedures {
-        // Validation precedes any session change, so a rejected cached module
-        // leaves the ordinary interpreter; an explicit one stops the launch.
+        // Validation precedes any session change; a rejected module stops the launch.
         #[cfg(feature = "wasm-procedures")]
-        if let Err(error) = wasm_procedures::install(
+        wasm_procedures::install(
             session,
             path,
-            dpmi_layout(session.dpmi_mode()),
+            wasm_procedures::Expect::Dpmi(dpmi_layout(session.dpmi_mode())),
             settings.interpret_procedures,
             settings.compiled_cache.as_deref(),
-        ) {
-            if !settings.automatic_procedures {
-                return Err(error);
-            }
-            eprintln!(
-                "[WARN doslet] AOT: ignoring cached {}: {error}",
-                path.display()
-            );
-        }
+        )?;
         #[cfg(not(feature = "wasm-procedures"))]
         return Err(format!(
             "{} requires the wasm-procedures Cargo feature",
@@ -226,6 +207,28 @@ pub fn install_wasm_procedures(
         .into());
     }
     Ok(())
+}
+
+/// Install a cached module into a running session whose LE objects were
+/// found at `layout` (`le_layout::Layout::key`).
+#[cfg(feature = "wasm-procedures")]
+#[allow(
+    dead_code,
+    reason = "only the desktop installs modules while a game runs"
+)]
+pub fn install_layout_procedures(
+    session: &mut Session,
+    path: &Path,
+    layout: &str,
+    compiled_cache: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    wasm_procedures::install(
+        session,
+        path,
+        wasm_procedures::Expect::Layout(layout),
+        false,
+        compiled_cache,
+    )
 }
 
 #[cfg(feature = "wasm-procedures")]

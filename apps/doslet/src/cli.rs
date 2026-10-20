@@ -43,7 +43,7 @@ impl DpmiMode {
 #[derive(Debug, Default, Parser)]
 #[command(
     version,
-    after_help = "Without a game source, opens the game library from ./games and saved profiles, or the color-bar demo when there are none.\nGame support is experimental. Use --game EXE, --zip ZIP [--program EXE], or --config TOML [--program EXE] for a ZIP profile."
+    after_help = "Without a game source, opens the game library of the user's profile directory, or the color-bar demo when it holds none.\nGame support is experimental. Use --game EXE, --zip ZIP [--program EXE], or --config TOML [--program EXE] for a ZIP profile."
 )]
 pub struct Cli {
     /// Load a TOML launch profile; explicit CLI options override profile values
@@ -162,10 +162,10 @@ pub struct Cli {
     /// Neither load nor save a dynamic-core profile
     #[arg(long, conflicts_with = "core_profile")]
     pub no_core_profile: bool,
-    /// Use AOT procedures with embedded metadata (.wasm; legacy .json also accepted); without a path, the module cached for this executable and DPMI mode
-    #[arg(long, value_name = "WASM_OR_JSON", requires = "no_speed_tiers", num_args = 0..=1, default_missing_value = "")]
+    /// Install this AOT procedure module at launch (.wasm with embedded metadata; legacy .json also accepted)
+    #[arg(long, value_name = "WASM_OR_JSON")]
     pub wasm_procedures: Option<PathBuf>,
-    /// Do not install the AOT procedures cached for this executable and DPMI mode
+    /// Do not compile or install procedures for the live layout of the program
     #[arg(long, conflicts_with = "wasm_procedures")]
     pub no_aot: bool,
     /// Interpret marked procedures with the bundle's IRQ boundary policy
@@ -234,24 +234,17 @@ mod tests {
     }
 
     #[test]
-    fn wasm_procedure_launch_requires_explicit_tier_policy() {
-        assert!(Cli::try_parse_from(["doslet", "--wasm-procedures", "procedures.wasm"]).is_err());
-        let cli = Cli::try_parse_from([
-            "doslet",
-            "--wasm-procedures",
-            "procedures.wasm",
-            "--no-speed-tiers",
-        ])
-        .unwrap();
+    fn explicit_procedure_modules_need_a_path() {
+        // Speed tiers account the calls of a module, so neither excludes the other.
+        let cli = Cli::try_parse_from(["doslet", "--wasm-procedures", "procedures.wasm"]).unwrap();
         assert_eq!(cli.wasm_procedures, Some(PathBuf::from("procedures.wasm")));
-        assert!(cli.no_speed_tiers);
         assert!(!cli.interpret_procedures);
+        assert!(Cli::try_parse_from(["doslet", "--wasm-procedures"]).is_err());
         assert!(Cli::try_parse_from(["doslet", "--interpret-procedures"]).is_err());
         let reference = Cli::try_parse_from([
             "doslet",
             "--wasm-procedures",
             "procedures.json",
-            "--no-speed-tiers",
             "--interpret-procedures",
         ])
         .unwrap();
@@ -371,7 +364,9 @@ mod tests {
             assert!(jit.is_err_and(|e| e.to_string().contains("--features dynamic-core")));
         }
         assert!(Cli::try_parse_from(["doslet", "--dynamic-core", "--no-dynamic-core"]).is_err());
-        assert!(Cli::try_parse_from(["doslet", "--no-aot", "--wasm-procedures"]).is_err());
+        assert!(
+            Cli::try_parse_from(["doslet", "--no-aot", "--wasm-procedures", "a.wasm"]).is_err()
+        );
     }
 
     #[test]

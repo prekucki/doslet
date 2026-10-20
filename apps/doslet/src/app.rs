@@ -58,9 +58,14 @@ pub struct Doslet {
     pub workspace: crate::ui::Workspace,
     pub configurator: crate::configurator::ConfiguratorState,
     storage: Option<crate::native_storage::NativeStorage>,
-    /// Background preparation of this game's AOT module.
+    /// Finds where a DOS extender loaded the program in each session.
+    #[cfg(not(target_arch = "wasm32"))]
+    layout: Option<crate::le_layout::Watcher>,
+    /// The layout found in the session of this epoch.
+    #[cfg(not(target_arch = "wasm32"))]
+    live_layout: Option<(u64, crate::le_layout::Layout)>,
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasm-procedures"))]
-    aot_job: Option<crate::native_aot::Job>,
+    aot: Option<crate::native_aot::Aot>,
     gamepads: Option<crate::native_gamepad::NativeGamepads>,
     pad_axes: [i16; 2],
     pad_buttons: [bool; 2],
@@ -184,8 +189,12 @@ impl Doslet {
             workspace: crate::ui::Workspace::default(),
             configurator: crate::configurator::ConfiguratorState::default(),
             storage: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            layout: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            live_layout: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "wasm-procedures"))]
-            aot_job: None,
+            aot: None,
             gamepads: None,
             pad_axes: [0; 2],
             pad_buttons: [false; 2],
@@ -278,18 +287,6 @@ impl Doslet {
         } else {
             None
         };
-        // Labelled tiers refuse every procedure call without tier proofs, so
-        // a learned profile keeps the plain interpreter instead.
-        if automatic_tiers.is_some()
-            && (app.launch.automatic_procedures || app.launch.prepare_procedures.is_some())
-        {
-            eprintln!(
-                "[INFO doslet] AOT: learned speed tiers take precedence; using the interpreter"
-            );
-            app.launch.wasm_procedures = None;
-            app.launch.automatic_procedures = false;
-            app.launch.prepare_procedures = None;
-        }
         app.launch.preload_local_media = cli.learn_speed_tiers
             || cli.load_state.is_some()
             || automatic_tiers.as_ref().is_some_and(|t| t.stats.learning);
@@ -336,10 +333,6 @@ impl Doslet {
                     &app.launch,
                 )?);
                 app.name = path.file_name().unwrap().to_string_lossy().into_owned();
-                #[cfg(feature = "wasm-procedures")]
-                {
-                    app.aot_job = crate::native_aot::Job::start(&path, &app.launch);
-                }
                 app.source = Some(path);
                 session.start();
                 app.session = session.into();
@@ -347,6 +340,12 @@ impl Doslet {
             if let Some(name) = cli.profile_name {
                 app.name = name;
             }
+            // Procedures bind live addresses, so AOT also waits for the layout.
+            let aot = !cli.no_aot
+                && app.launch.wasm_procedures.is_none()
+                && !cli.learn_speed_tiers
+                && app.launch.no_dynamic_core;
+            app.watch_layout(aot);
         }
 
         if let Some(directory) = cli.mt32_rom_dir {
@@ -2751,19 +2750,106 @@ impl Doslet {
             }
         }
     }
-    /// A module prepared during this run applies from the next Reset.
-    #[cfg(feature = "wasm-procedures")]
-    fn poll_aot_job(&mut self) {
-        if let Some(path) = self.aot_job.as_ref().and_then(crate::native_aot::Job::poll) {
-            self.aot_job = None;
-            self.launch.prepare_procedures = None;
-            self.launch.wasm_procedures = Some(path);
-            self.launch.automatic_procedures = true;
+    /// Watch for the live layout of a 32-bit LE program: learned tiers,
+    /// relocatable patches and AOT procedures follow it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn watch_layout(&mut self, aot: bool) {
+        let Some(path) = &self.source else {
+            return;
+        };
+        let exe: std::sync::Arc<[u8]> = match crate::native_zip::program_bytes(path, &self.launch) {
+            Ok(bytes) => bytes.into(),
+            Err(error) => {
+                eprintln!("[WARN doslet] Cannot read the program for its layout: {error}");
+                return;
+            }
+        };
+        let program = path.file_name().unwrap_or_default().to_string_lossy();
+        self.layout = crate::le_layout::Watcher::new(exe.clone());
+        if self.layout.is_none() {
+            if aot {
+                eprintln!(
+                    "[INFO doslet] AOT: {program} is not a 32-bit LE program; using the interpreter"
+                );
+            }
+            return;
+        }
+        #[cfg(feature = "wasm-procedures")]
+        if aot {
+            use sha2::{Digest, Sha256};
+            match crate::host_dirs::HostDirs::detect() {
+                Ok(dirs) => {
+                    let directory = dirs
+                        .aot_modules()
+                        .join(format!("{:x}", Sha256::digest(&exe)));
+                    self.aot = Some(crate::native_aot::Aot::new(
+                        program.into_owned(),
+                        exe,
+                        directory,
+                        self.launch.compiled_cache.clone(),
+                    ));
+                }
+                Err(error) => eprintln!(
+                    "[INFO doslet] AOT: no user cache directory for modules: {error}; using the interpreter"
+                ),
+            }
+        }
+        #[cfg(not(feature = "wasm-procedures"))]
+        let _ = aot;
+    }
+    /// Speed tiers installed after the layout was found follow it as well.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn follow_layout_with_tiers(&mut self) {
+        let (Some(watcher), Some((epoch, layout))) = (&self.layout, &self.live_layout) else {
+            return;
+        };
+        if *epoch == self.session.epoch() {
+            crate::native_layout::follow(
+                &mut self.session,
+                &[],
+                self.speed_tiers.as_mut(),
+                watcher.exe(),
+                layout,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn track_layout(&mut self) {
+        let Some(watcher) = &mut self.layout else {
+            return;
+        };
+        if let Some(layout) = watcher.poll(&self.session) {
+            eprintln!(
+                "[INFO doslet] {}: LE objects at {}",
+                self.name,
+                layout
+                    .objects
+                    .iter()
+                    .map(|o| format!("{}:{:#x}", o.number, o.base))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            crate::native_layout::follow(
+                &mut self.session,
+                &self.launch.patches,
+                self.speed_tiers.as_mut(),
+                watcher.exe(),
+                &layout,
+            );
+            #[cfg(feature = "wasm-procedures")]
+            if let Some(aot) = &mut self.aot {
+                aot.layout_found(&mut self.session, &layout);
+            }
+            self.live_layout = Some((self.session.epoch(), layout));
+        }
+        #[cfg(feature = "wasm-procedures")]
+        if let Some(aot) = &mut self.aot {
+            aot.poll(&mut self.session);
         }
     }
     pub(crate) fn worker_tick(&mut self) -> Task<Message> {
-        #[cfg(feature = "wasm-procedures")]
-        self.poll_aot_job();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.track_layout();
         let computer_effects = if let Some(mut computer) = self.computer.take() {
             let effects = computer.poll(self);
             let closing = computer.is_closing();
@@ -5688,5 +5774,50 @@ enabled = false
         assert_eq!(app.session.steps(), 0);
         assert_eq!(app.audio_engine.stats().notes, 0);
         assert_eq!(app.name, "PRINCE.EXE");
+    }
+
+    /// `cargo test -p doslet --release --bin doslet heroes_direct -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires the local Heroes profile and its learned speed tiers; runs 20 s"]
+    fn heroes_direct_follows_its_layout_in_the_app() {
+        use clap::Parser;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cache = std::path::Path::new(&std::env::var_os("HOME").unwrap())
+            .join(".cache/doslet/speed-tiers");
+        let copy = std::env::temp_dir().join(format!("doslet-app-tiers-{}", std::process::id()));
+        std::fs::create_dir_all(&copy).unwrap();
+        let name = "0e87d3025f437158dfb9099ca2921c83bac5bf9e4708bad04e4d5fc8297218a2.json";
+        std::fs::copy(cache.join(name), copy.join(name)).unwrap();
+        let mut app = Doslet::from_cli(crate::cli::Cli::parse_from([
+            "doslet",
+            "--config",
+            root.join("games/HoMnM.toml").to_str().unwrap(),
+            "--experimental-dpmi",
+            "direct",
+            "--no-audio",
+            "--speed-tier-cache",
+            copy.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(20) {
+            let _ = app.worker_tick();
+            std::thread::sleep(app.worker_delay(true).min(Duration::from_millis(4)));
+        }
+        let (_, layout) = app.live_layout.clone().expect("live layout");
+        assert_eq!(app.session.status(), SessionStatus::Running);
+        assert_eq!(app.session.applied_patch_count(), 1);
+        let tiers = app.speed_tiers.as_ref().unwrap();
+        assert_eq!(tiers.label_layout(), Some(layout.bases().as_slice()));
+        let steps = tiers.stats.steps;
+        let labelled = 100.0 * (steps[0] + steps[1] + steps[3]) as f64
+            / steps.iter().sum::<u64>().max(1) as f64;
+        eprintln!(
+            "{:.1} guest s, labelled {labelled:.1}%, AOT active {}",
+            app.session.emulated_nanos() as f64 / 1e9,
+            app.session.wasm_procedures_active()
+        );
+        assert!(labelled > 80.0, "{labelled}");
+        std::fs::remove_dir_all(&copy).unwrap();
     }
 }

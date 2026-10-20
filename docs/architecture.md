@@ -35,7 +35,15 @@ Tier-aware register grants use the existing instruction labels and scheduler:
 every bound block must have one live tier, transitions end the grant, and the
 runtime charges that tier's counters before advancing devices. Other foreign
 engines retain their existing refusal of labels unless they explicitly provide
-live classification and matching tier accounting.
+live classification and matching tier accounting. Memory procedures provide
+it: a call needs one live tier for all source instructions, or exact per-tier
+counts for a canonical copy. The browser always enables it, and native speed
+tiers enable it with their labels. The uniform tier is kept per procedure for
+the CPU's label generation while the guarded source bytes match.
+On the desktop, `apps/common/le_layout.rs` finds where a DOS extender loaded a
+running LE program's objects from relocation-free code anchors. Procedure
+modules are cached per layout and installed while the game runs; learned
+speed-tier labels and relocatable patches move with their objects.
 
 `doslet-storage` defines bounded positional reads, source identities, request
 epochs and atomic commit messages. `doslet-iso9660` parses either an owned

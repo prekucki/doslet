@@ -46,19 +46,29 @@ fn self_contained_module_loads_without_a_sidecar_by_content() {
 }
 
 #[test]
-fn module_must_match_the_dpmi_mode_that_placed_its_code() {
+fn module_must_match_the_dpmi_mode_or_layout_that_placed_its_code() {
     let mut manifest = metadata(EMPTY_MODULE);
     // Modules generated before the mode was recorded remain loadable.
-    check_dpmi(&manifest, "direct").unwrap();
+    check(&manifest, &Expect::Dpmi("direct")).unwrap();
+    // Cached modules must name the layout they were bound at.
+    assert!(check(&manifest, &Expect::Layout("le-1e8000")).is_err());
     manifest["dpmi"] = json!("direct");
-    check_dpmi(&manifest, "direct").unwrap();
-    let error = check_dpmi(&manifest, "off").unwrap_err().to_string();
+    manifest["layout"] = json!("le-1e8000");
+    check(&manifest, &Expect::Dpmi("direct")).unwrap();
+    check(&manifest, &Expect::Layout("le-1e8000")).unwrap();
+    let error = check(&manifest, &Expect::Dpmi("off"))
+        .unwrap_err()
+        .to_string();
     assert!(
-        error.contains("DPMI direct") && error.contains("DPMI off"),
+        error.contains("dpmi direct") && error.contains("dpmi off"),
         "{error}"
     );
+    let error = check(&manifest, &Expect::Layout("le-19e000"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("le-1e8000"), "{error}");
     manifest["dpmi"] = json!(1);
-    assert!(check_dpmi(&manifest, "direct").is_err());
+    assert!(check(&manifest, &Expect::Dpmi("direct")).is_err());
 }
 
 #[test]

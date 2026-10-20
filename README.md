@@ -52,8 +52,9 @@ The browser version needs no installation and no server.
   so the parts can be reused in other projects.
 - **Fast where it counts.** A decode cache speeds up the interpreter. A game
   procedure module generated offline runs whole procedures as WebAssembly
-  compiled by Wasmtime; the desktop installs it automatically for the matching
-  program and DPMI mode (ROTT: 1.23× in a measured window). An optional
+  compiled by Wasmtime; the desktop compiles and installs it while the game
+  runs, for wherever the DOS extender loaded the program (ROTT: 1.23× in a
+  measured window). An optional
   [Cranelift](https://cranelift.dev) JIT remains behind a Cargo feature.
   Differential tests check them against a reference interpreter. Loops that
   only wait for the VGA retrace are skipped ahead instead of being executed
@@ -107,7 +108,7 @@ sudo apt install build-essential pkg-config libasound2-dev libudev-dev
 ### On the desktop
 
 ```sh
-# Browse the launch profiles in ./games (covers, details, Play)
+# Browse the launch profiles in ~/.config/doslet/profiles (covers, details, Play)
 cargo run -p doslet --release --locked
 # Without profiles, or with --demo: the workspace and its built-in demo
 cargo run -p doslet --release --locked -- --demo

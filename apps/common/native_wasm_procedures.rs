@@ -155,29 +155,42 @@ impl doslet_runtime::wasm_procedures::CompiledCache for DiskCache<'_> {
     }
 }
 
-/// Bindings are live addresses; a module generated under another DPMI mode
-/// names a different copy of the code. Older modules carry no mode.
-fn check_dpmi(manifest: &serde_json::Value, dpmi: &str) -> Result<(), Box<dyn Error>> {
-    match manifest.get("dpmi").map(serde_json::Value::as_str) {
-        None => Ok(()),
-        Some(Some(mode)) if mode == dpmi => Ok(()),
-        Some(Some(mode)) => Err(format!(
-            "AOT module was generated with DPMI {mode}; this launch uses DPMI {dpmi}"
+/// What the module's bindings must have been captured under. Bindings are
+/// live addresses: a module generated under another DPMI mode or layout
+/// names a different copy of the code.
+pub enum Expect<'a> {
+    /// The session's DPMI mode; older modules carry no mode.
+    Dpmi(&'a str),
+    /// The key of the live layout, which the module must record.
+    Layout(&'a str),
+}
+
+fn check(manifest: &serde_json::Value, expect: &Expect<'_>) -> Result<(), Box<dyn Error>> {
+    let (key, expected) = match expect {
+        Expect::Dpmi(dpmi) => ("dpmi", *dpmi),
+        Expect::Layout(layout) => ("layout", *layout),
+    };
+    match manifest.get(key).map(serde_json::Value::as_str) {
+        None if matches!(expect, Expect::Dpmi(_)) => Ok(()),
+        Some(Some(value)) if value == expected => Ok(()),
+        Some(Some(value)) => Err(format!(
+            "AOT module was generated with {key} {value}; this session has {key} {expected}"
         )
         .into()),
-        Some(None) => Err("invalid AOT field dpmi".into()),
+        None => Err(format!("AOT module records no {key}").into()),
+        Some(None) => Err(format!("invalid AOT field {key}").into()),
     }
 }
 
 pub fn install(
     session: &mut Session,
     path: &Path,
-    dpmi: &str,
+    expect: Expect<'_>,
     interpret: bool,
     compiled_cache: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let ProcedureBundle { manifest, module } = load(path)?;
-    check_dpmi(&manifest, dpmi)?;
+    check(&manifest, &expect)?;
     let mut bindings = procedure_manifest::bindings(&manifest)?;
     let entry_count = bindings.len();
     if interpret {

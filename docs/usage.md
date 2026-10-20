@@ -40,9 +40,13 @@ cargo run -p doslet --locked -- --demo
 ### Game library
 
 Without a game, `--config`, `--load-state` or a debugger option, Doslet opens a
-library of the launch profiles in `./games` and in the
-[profile directory](configuration.md#host-directories). Each version-2 profile
-becomes a card with its `[info]` cover, release year and genre:
+library of the launch profiles in the
+[profile directory](configuration.md#host-directories), on Linux
+`~/.config/doslet/profiles`. The working directory is not scanned, since a
+`games` directory there may hold unrelated TOML files. A symbolic link from the
+profile directory to your own profile folder keeps relative cover and drive
+paths working. Each version-2 profile becomes a card with its `[info]` cover,
+release year and genre:
 - **Sidebar.** Filters all games or one genre.
 - **Search.** Matches titles, developers, publishers, genres and program names.
 - **Game page.** Clicking a card opens it, with the cover over a blurred
@@ -102,8 +106,10 @@ Keep the executable alongside its original DOS4GW and data files. DOS text
 screens render during startup. Native launches use the experimental DPMI host
 in `direct` mode, including background speed-tier profiling. Select
 `--experimental-dpmi reflect` for reflected services or `--experimental-dpmi off`
-for the guest extender path. Portable emulator save files require the host to
-be off; in-process profiling copies support both host modes.
+for the guest extender path. Learned speed tiers, relocatable patches and AOT
+procedures follow the program to wherever the mode loads it. Portable emulator
+save files require the host to be off;
+in-process profiling copies support both host modes.
 The recorded PRINCE HDI logo appears around
 7.3 seconds of emulated time. Host speed may affect how long startup takes.
 BIOS/DOS keyboard input is available. DOS mouse input includes position, buttons, ranges, a graphics cursor and guest callbacks.
@@ -123,48 +129,59 @@ input; the cursor stays visible while relative input is waiting for capture.
 
 ### Execution core and AOT
 
-The desktop app runs the interpreter by default. If the user cache holds a
-procedure module for the selected program and its DPMI mode, the app installs
-it at launch, and the CPU panel shows **AOT · Wasmtime** as the execution core.
-Whole game procedures then run as native code compiled by Wasmtime, and the
-interpreter runs everything else. The module stays installed for the session,
-including Reset. `--no-aot` keeps the plain interpreter.
+The desktop app runs the interpreter by default. For a 32-bit LE program
+(DOS4GW and similar extenders), it finds where the loader placed each LE object
+shortly after that code starts, and installs the procedure module of that
+layout from the user cache. The CPU panel then shows **AOT · Wasmtime** as the
+execution core. Whole game procedures run as native code compiled by Wasmtime,
+and the interpreter runs everything else. Reset finds the layout again and
+reinstalls the module. `--no-aot` keeps the plain interpreter.
 
-A learned or selected speed-tier profile also keeps the plain interpreter,
-because tier labels refuse procedure calls. A cached module that cannot be used
-is reported and ignored; an explicit `--wasm-procedures FILE` stops the launch
-instead.
+Speed tiers and the module run together. A procedure call is charged to the
+tier its labels prove: all of its instructions in one tier, or exact per-tier
+counts for a copy kernel. Mixed or changed code runs on the labelled
+interpreter instead. On ROTT under DPMI off with its learned labels, 40
+guest seconds from boot took 8.3 s with tiers alone and 7.3 s with the module
+(1.13×). Background tier learning (`--learn-speed-tiers`) keeps the plain
+interpreter. A cached module that cannot be used is reported and ignored; an
+explicit `--wasm-procedures FILE` is installed at launch and stops it instead.
 
 A module binds live addresses. DOS4GW loads ROTT's code at 0x18e000 without a
-DPMI host and at 0x1e4000 with one, so each DPMI mode keeps its own copy:
-`aot/<exe-sha256>/dpmi-<mode>/procedures.wasm` under the
-[cache directory](configuration.md#host-directories).
+DPMI host and at 0x1e4000 with one; another memory configuration can move it
+as well. Each layout keeps its own module,
+`aot/<exe-sha256>/<layout>/procedures.wasm` under the
+[cache directory](configuration.md#host-directories). `<layout>` names the
+object bases and a digest of their selectors, for example
+`le-1e4000-265000-266000-268000-2697eb6b`.
 
-The first launch of a 32-bit LE program without that copy prepares it in the
-background while the game starts on the interpreter:
-1. A private copy of the game runs with the same media and DPMI mode, but with
-   a temporary overlay, no save store and no audio output, until its LE code
-   is loaded.
-2. The live object bases found there bind the program's procedures, which are
-   compiled into the cache.
+When a layout has no module yet:
+1. Its live bindings compile on a background thread while the game continues
+   on the interpreter. ROTT's 202 procedures take about 0.1 s.
+2. The module is installed at the next batch boundary at which RAM is not
+   being recorded for an idle-loop proof.
+3. The first 10,000 calls are measured. If they average fewer than 32
+   instructions, the procedures are suspended for the session and an
+   `unavailable.txt` file with the reason is left beside the module; delete
+   it to try again. Shorter calls cost more than they save.
 
-For ROTT this takes about half a second. The module applies after Reset,
-**Play** from the library, or the next start. If preparation fails, an
-`unavailable.txt` file with the reason is left in its place; delete it to try
-again. The terminal names the module in use, the preparation, or why there is
-none. For example, `CIV.EXE is not a 32-bit LE program` means a real-mode MZ
-game without DOS4GW, which the AOT generator cannot translate.
+ROTT averages about 700 instructions per call and keeps its module. HEROES.EXE
+averages 7; its module ran 20% slower than the interpreter and is suspended.
+The terminal names the live layout, the compilation, the module in use, or why
+there is none. For example, `CIV.EXE is not a 32-bit LE program` means a
+real-mode MZ game without DOS4GW, which the AOT generator cannot translate.
 
-The same two steps are available offline. `capture_procedure_layout` writes the
+The same steps are available offline. `capture_procedure_layout` writes the
 live bindings (pass `--dpmi off` for `--experimental-dpmi off`), and
-`prepare_memory_procedures` compiles them into the cache or a chosen directory:
+`prepare_memory_procedures` compiles them into the cache entry of that layout
+or a chosen directory:
 
 ```sh
 cargo run -p doslet-headless --release --locked --features wasm-static-test --example capture_procedure_layout -- games/ROTT.toml target/rott-layout-direct
 cargo run -p doslet-headless --release --locked --features wasm-static-test --example prepare_memory_procedures -- games/ROTT.toml target/rott-layout-direct/bindings.json --computation-kernels --kernel-interrupts before-irq
 ```
 
-The module records its mode, and Doslet rejects a copy made for another mode.
+A module records its DPMI mode and layout. Doslet installs a cached module only
+for its own layout, and an explicit one only under its DPMI mode.
 
 **Measurements.** Both comparisons below cover emulated execution only, not
 desktop frame rate:

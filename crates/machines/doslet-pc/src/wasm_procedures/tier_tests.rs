@@ -109,6 +109,35 @@ fn mixed_changed_and_replaced_labels_are_reclassified_before_effects() {
 }
 
 #[test]
+fn a_kept_uniform_tier_follows_relabelling_and_source_changes() {
+    let mut fast = installed();
+    set_tiers(&mut fast, CODE, 0, [Some(133), Some(8), Some(33)]);
+    fast.set_wasm_procedure_tier_accounting(true).unwrap();
+    let call = |fast: &mut PcMachine| {
+        fast.cpu.registers.ip = ENTRY;
+        fast.cpu.registers.set32(Gpr32::Esp, STACK);
+        fast.try_wasm_procedure(32).unwrap()
+    };
+    assert_eq!(call(&mut fast), Some(4));
+    assert_eq!(call(&mut fast), Some(4));
+    assert_eq!(fast.cpu.execution_counts(), [8, 0, 0, 0]);
+    let relabelled = labels(&fast, CODE, |_| 1);
+    fast.cpu.replace_execution_labels(relabelled).unwrap();
+    assert_eq!(call(&mut fast), Some(4));
+    assert_eq!(fast.cpu.execution_counts(), [8, 4, 0, 0]);
+    // A changed source byte refuses the call; restored bytes keep the labels.
+    let original = fast
+        .bus
+        .ram_view(ENTRY as usize..ENTRY as usize + 1)
+        .unwrap()[0];
+    fast.bus.debug_ram_mut(ENTRY, 1).unwrap()[0] = original ^ 0xff;
+    assert_eq!(call(&mut fast), None);
+    fast.bus.debug_ram_mut(ENTRY, 1).unwrap()[0] = original;
+    assert_eq!(call(&mut fast), Some(4));
+    assert_eq!(fast.cpu.execution_counts(), [8, 8, 0, 0]);
+}
+
+#[test]
 fn tiered_side_exit_charges_only_its_exact_completed_prefix() {
     for tier in 0..4 {
         let (mut fast, mut reference) = (installed(), machine());
@@ -126,6 +155,18 @@ fn tiered_side_exit_charges_only_its_exact_completed_prefix() {
         counts[usize::from(tier)] = 2;
         assert_eq!(fast.cpu.execution_counts(), counts);
     }
+}
+
+#[test]
+fn suspended_procedures_leave_their_entries_to_the_interpreter() {
+    let mut fast = installed();
+    fast.set_wasm_procedures_suspended(true).unwrap();
+    assert!(!fast.wasm_procedures_active());
+    assert!(!fast.cpu.has_prepared_entries());
+    assert_eq!(fast.try_wasm_procedure(32).unwrap(), None);
+    fast.set_wasm_procedures_suspended(false).unwrap();
+    assert!(fast.wasm_procedures_active());
+    assert_eq!(fast.try_wasm_procedure(32).unwrap(), Some(4));
 }
 
 #[test]

@@ -161,6 +161,9 @@ struct PreparedBinding {
     /// Unsupported or oversized proofs retain the ordinary interpreter path.
     instructions: Option<Vec<SourceInstruction>>,
     canonical_copy: bool,
+    /// The uniform tier of the guarded source bytes and the label generation
+    /// it was classified under.
+    uniform: Option<(u64, Option<u8>)>,
 }
 
 struct SourceInstruction {
@@ -247,8 +250,23 @@ impl PreparedBinding {
         common
     }
 
-    fn tier_proof(&self, cpu: &Cpu, bus: &PcBus) -> Option<TierProof> {
-        if let Some(tier) = self.uniform_tier(cpu, bus) {
+    /// Classifying every source instruction costs a label search each, so
+    /// the uniform result is kept per label generation. Labels compare code
+    /// bytes, so the result is cached only while the guarded bytes match.
+    fn tier_proof(&mut self, cpu: &Cpu, bus: &PcBus) -> Option<TierProof> {
+        let generation = cpu.execution_labels_generation();
+        let uniform = if !self.source_matches(bus) {
+            self.uniform_tier(cpu, bus)
+        } else if let Some((cached, tier)) = self.uniform
+            && cached == generation
+        {
+            tier
+        } else {
+            let tier = self.uniform_tier(cpu, bus);
+            self.uniform = Some((generation, tier));
+            tier
+        };
+        if let Some(tier) = uniform {
             return Some(TierProof::Uniform(tier));
         }
         if !self.canonical_copy {
@@ -297,6 +315,8 @@ pub(crate) struct Plan {
     failure: Option<ExecutionError>,
     last_error: Option<String>,
     tier_accounting: bool,
+    /// Calls stop; the shared backing and statistics remain.
+    suspended: bool,
     #[cfg(feature = "wasm-procedure-diagnostics")]
     diagnostic_mode: DiagnosticMode,
 }
@@ -768,6 +788,7 @@ impl PcMachine {
                 matches: false,
                 instructions,
                 canonical_copy,
+                uniform: None,
             });
         }
         // Publish hints only after every fallible preparation step. They never
@@ -798,13 +819,54 @@ impl PcMachine {
             stats: Stats::default(),
             failure: None,
             last_error: None,
-            // Native callers retain their existing refusal unless they opt in.
-            // Browser procedures use this conservative byte-validated policy.
+            // Native callers retain their existing refusal unless they opt in,
+            // as speed tiers do. Browser procedures always use this
+            // conservative byte-validated policy.
             tier_accounting: cfg!(target_arch = "wasm32"),
+            suspended: false,
             #[cfg(feature = "wasm-procedure-diagnostics")]
             diagnostic_mode: DiagnosticMode::Normal,
         });
         Ok(())
+    }
+
+    /// Stop or resume procedure calls, for example when they are too short
+    /// to beat the interpreter. Memory stays shared with the installed plan.
+    pub fn set_wasm_procedures_suspended(&mut self, suspended: bool) -> Result<(), &'static str> {
+        let plan = self
+            .wasm_procedures
+            .as_ref()
+            .ok_or("WASM procedures are not installed")?;
+        if plan.suspended == suspended {
+            return Ok(());
+        }
+        let entries = if suspended {
+            Vec::new()
+        } else {
+            plan.bindings
+                .iter()
+                .map(|binding| binding.binding.entry_ip)
+                .collect()
+        };
+        self.cpu.set_prepared_entries(entries)?;
+        self.wasm_procedures
+            .as_mut()
+            .expect("installed plan")
+            .suspended = suspended;
+        Ok(())
+    }
+
+    /// None is installed and RAM is not being recorded for an idle or
+    /// recurrence proof, which ends at a later batch boundary.
+    pub fn wasm_procedures_installable(&self) -> bool {
+        self.wasm_procedures.is_none() && self.bus.ram.direct_execution_ready()
+    }
+
+    /// Installed and not suspended.
+    pub fn wasm_procedures_active(&self) -> bool {
+        self.wasm_procedures
+            .as_ref()
+            .is_some_and(|plan| !plan.suspended)
     }
 
     pub fn wasm_procedure_stats(&self) -> Option<Stats> {
@@ -826,7 +888,8 @@ impl PcMachine {
     }
 
     /// Allow byte-validated uniform procedures and proved per-site copy counts.
-    /// This is enabled by the browser adapter; native behavior stays opt-in.
+    /// The browser adapter enables this; native speed tiers enable it with
+    /// their labels.
     pub fn set_wasm_procedure_tier_accounting(
         &mut self,
         enabled: bool,
@@ -900,7 +963,7 @@ impl PcMachine {
         if !self.wasm_procedure_dispatch_enabled() {
             return Ok(None);
         }
-        let Some(plan) = &self.wasm_procedures else {
+        let Some(plan) = self.wasm_procedures.as_ref().filter(|plan| !plan.suspended) else {
             return Ok(None);
         };
         // Membership is cached independently of code bytes. This hint avoids
@@ -909,13 +972,13 @@ impl PcMachine {
         let Some(index) = self.cpu.prepared_entry_index() else {
             return Ok(None);
         };
-        let Some(binding) = plan
+        if plan
             .bindings
             .get(index)
-            .filter(|binding| binding.binding.entry_ip == self.cpu.registers.ip)
-        else {
+            .is_none_or(|binding| binding.binding.entry_ip != self.cpu.registers.ip)
+        {
             return Ok(None);
-        };
+        }
         if self.vga_wait.candidate.is_some()
             || self.memory_wait_sites.is_some()
             || self.batch_yield_ip.is_some()
@@ -929,22 +992,21 @@ impl PcMachine {
             return Ok(None);
         };
         let tier = if self.cpu.execution_labels_enabled() {
+            let plan = self.wasm_procedures.as_mut().expect("prepared plan");
             let tier = plan
                 .tier_accounting
-                .then(|| binding.tier_proof(&self.cpu, &self.bus))
+                .then(|| plan.bindings[index].tier_proof(&self.cpu, &self.bus))
                 .flatten();
             let Some(tier) = tier else {
-                self.wasm_procedures
-                    .as_mut()
-                    .expect("prepared plan")
-                    .stats
-                    .tier_refusals += 1;
+                plan.stats.tier_refusals += 1;
                 return Ok(None);
             };
             Some(tier)
         } else {
             None
         };
+        let plan = self.wasm_procedures.as_ref().expect("prepared plan");
+        let binding = &plan.bindings[index];
         self.bus.wasm_rle_call = None;
         let atomic = binding.binding.kernel.is_some()
             || binding.binding.rle_kernel.is_some()

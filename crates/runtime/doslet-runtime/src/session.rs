@@ -867,6 +867,24 @@ impl Session {
         self.machine.wasm_procedure_copy_tier_entries()
     }
 
+    /// Stop or resume calls into installed procedures.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn set_wasm_procedures_suspended(&mut self, suspended: bool) -> Result<(), &'static str> {
+        self.machine.set_wasm_procedures_suspended(suspended)
+    }
+
+    /// Procedures are installed and not suspended.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedures_active(&self) -> bool {
+        self.machine.wasm_procedures_active()
+    }
+
+    /// Procedures can be installed at this batch boundary.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedures_installable(&self) -> bool {
+        self.machine.wasm_procedures_installable()
+    }
+
     #[cfg(feature = "wasm-procedures")]
     pub fn set_wasm_procedure_tier_accounting(
         &mut self,

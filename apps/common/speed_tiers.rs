@@ -57,6 +57,9 @@ pub(crate) struct Profile {
     pub(crate) irq_grey: bool,
     pub(crate) prepared: Vec<Prepared>,
     pub(crate) index: PlanIndex,
+    /// `(object, base)` of the LE objects the 32-bit labels were recorded
+    /// at; DOS extenders load code elsewhere in other configurations.
+    pub(crate) layout: Option<Vec<(u32, u32)>>,
 }
 // Sparse address index, allocated at load time; no tree search during execution.
 type CodePages = Vec<Option<Box<[u64]>>>;
@@ -148,6 +151,11 @@ impl Profile {
             .map(|v| Ok(u32::try_from(v.as_u64().ok_or("probe integer")?)?))
             .collect::<Result<BTreeSet<_>, Box<dyn Error>>>()?;
         let unknown = Tier::parse(&c["unknown"])?;
+        let layout = if c["layout"].is_null() {
+            None
+        } else {
+            Some(serde_json::from_value(c["layout"].clone()).map_err(|_| "invalid layout")?)
+        };
         let mut profile = Self {
             nodes,
             probes,
@@ -155,6 +163,7 @@ impl Profile {
             irq_grey: c["irq_policy"] == "static-grey",
             prepared: Vec::new(),
             index: PlanIndex::default(),
+            layout,
         };
         if prepare {
             profile.prepare();
@@ -329,6 +338,7 @@ mod tests {
             irq_grey: true,
             prepared: Vec::new(),
             index: PlanIndex::default(),
+            layout: None,
         };
         let plan = profile.plan(&s);
         assert!(plan.tier == Tier::Grey && plan.steps == 1 && !plan.invalid);
@@ -360,6 +370,7 @@ mod tests {
             irq_grey: true,
             prepared: Vec::new(),
             index: PlanIndex::default(),
+            layout: None,
         };
         for pc in 0..8 {
             p.nodes.insert(

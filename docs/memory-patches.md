@@ -60,8 +60,46 @@ be enabled; they never edit an aliased low-memory address.
 
 This permits a DOS extender to load the actual game code after the initial MZ
 stub starts. Patch authors must select signatures that identify the loaded code
-and ensure the guest will not subsequently overwrite the patched region. This
-mechanism does not locate code, relocate payloads or reserve guest memory.
+and ensure the guest will not subsequently overwrite the patched region. The
+runtime does not locate code or reserve guest memory; the desktop relocates
+manifests that name their LE objects, as below.
+
+### Relocatable patches
+
+A DOS extender loads protected-mode code at other linear addresses with a DPMI
+host or another memory configuration: Heroes' code object starts at 0x19e000
+with `--experimental-dpmi off` and at 0x1e8000 with `reflect` or `direct`. A
+patch written for one layout never matches the other, so its guards would wait
+until `timeout_steps` faults the session. List the bases of the program's LE
+objects the addresses were taken at, object 1 first, and mark the 32-bit fields
+of each replacement that hold addresses:
+
+```toml
+objects = [0x19e000, 0x240000]
+
+[[writes]]
+address = 0x213fab
+expected = "be 0b 00 00 00"
+replacement = "e9 50 d8 ed ff"
+rel32 = [1]          # displacement of the JMP, measured from the field's end
+
+[[writes]]
+address = 0x0f1800
+expected_zeroes = 1536
+file = "mouse.bin"
+rel32 = [24, 62]     # jumps into the game's code
+abs32 = [516]        # an address of the game's data
+```
+
+When the desktop finds the live layout of the program's objects, it moves each
+pending patch: guard and write addresses inside an object move with it, while
+addresses outside every object, such as BIOS RAM, stay. An `abs32` field must
+hold an address inside an object; a `rel32` field keeps its target, moving it
+only if the target lies in an object. Applied patches are left as they are.
+Fields that overlap, exceed the replacement or appear without `objects` are
+errors. Guard and expected bytes are compared as written, so choose signatures
+without absolute addresses. Without `objects`, addresses are fixed, which suits
+real-mode programs.
 
 Patches apply once, in list order. `timeout_steps` is a positive absolute guest
 step deadline since launch, including time spent waiting for earlier patches.
@@ -92,7 +130,13 @@ The payload uses absolute coordinates only while the town screen is active.
 The adventure map and other screens retain the original relative polling.
 Transitions synchronize the driver cursor and drain relative motion once.
 The game-specific addresses and screen selection live in the patch, not in
-the generic loader or CPU.
+the generic loader or CPU. They were taken with DOS4GW's own host, so the
+manifest lists those object bases and marks the payload's seven jumps and
+calls into the game and its five data addresses. With `--experimental-dpmi
+direct` DOS4GW loads the code object 0x4a000 higher and the data object
+0x4b000 higher. Before relocation existed, the guard never matched there and
+the session faulted when `timeout_steps` expired after 500 million steps. Now
+the patch applies in the off, reflect and direct modes alike.
 
 The payload was exercised live through GDB for town positions, return to the
 map and re-entry into town. This establishes those transitions for this build;

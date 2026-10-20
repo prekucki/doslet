@@ -247,7 +247,7 @@ fn library_page(library: &Library, width: f32, compact: bool) -> Element<'_, Mes
             column![
                 text("No games here").size(20).font(semibold()),
                 text(if library.search.trim().is_empty() {
-                    "Add a launch profile to ./games or save one from Doslet's settings."
+                    "Add a launch profile to the profile directory or save one from Doslet's settings."
                 } else {
                     "Try another search or choose All games."
                 })

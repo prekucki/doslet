@@ -16,14 +16,41 @@ pub struct Prepared {
 /// other addresses than a launch without a DPMI host.
 const BROWSER_DPMI: &str = "direct";
 
-/// Use exactly the native application's executable-specific cache convention.
-/// An explicit observed-code profile selects the register backend instead.
+/// Use exactly the native application's executable-specific cache: one
+/// module per live layout, of which the newest bound under the browser's DPMI
+/// mode and not declined. An explicit observed-code profile selects the
+/// register backend instead.
 pub fn cached_path(executable_sha256: &str) -> crate::Result<Option<PathBuf>> {
     let Ok(dirs) = crate::host_dirs::HostDirs::detect() else {
         return Ok(None);
     };
-    let path = dirs.aot_module(executable_sha256, BROWSER_DPMI);
-    Ok(path.try_exists()?.then_some(path))
+    newest_browser_module(&dirs.aot_modules().join(executable_sha256))
+}
+
+fn newest_browser_module(directory: &Path) -> crate::Result<Option<PathBuf>> {
+    let Ok(layouts) = std::fs::read_dir(directory) else {
+        return Ok(None);
+    };
+    let mut newest = None;
+    for layout in layouts {
+        let path = layout?.path().join("procedures.wasm");
+        if !path.is_file() || path.with_file_name("unavailable.txt").exists() {
+            continue;
+        }
+        let module = crate::read(&path, bundle::MAX_BUNDLE_BYTES)?;
+        let Some(embedded) = bundle::read(&module)? else {
+            continue;
+        };
+        let metadata: Value = serde_json::from_slice(embedded.metadata)?;
+        if metadata.get("dpmi").and_then(Value::as_str) != Some(BROWSER_DPMI) {
+            continue;
+        }
+        let modified = std::fs::metadata(&path)?.modified()?;
+        if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
+            newest = Some((modified, path));
+        }
+    }
+    Ok(newest.map(|(_, path)| path))
 }
 
 pub fn load(path: &Path, executable_sha256: &str) -> crate::Result<Prepared> {
@@ -159,6 +186,29 @@ mod tests {
         assert!(error.contains("DPMI off"), "{error}");
         metadata["dpmi"] = json!(1);
         assert!(prepare(packaged(&metadata), "test-executable").is_err());
+    }
+    #[test]
+    fn picks_a_cached_layout_bound_under_browser_dpmi() {
+        let directory =
+            std::env::temp_dir().join(format!("doslet-web-layouts-{}", std::process::id()));
+        let write = |layout: &str, dpmi: &str, declined: bool| {
+            let mut metadata = metadata();
+            metadata["dpmi"] = json!(dpmi);
+            let path = directory.join(layout).join("procedures.wasm");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, packaged(&metadata)).unwrap();
+            if declined {
+                std::fs::write(path.with_file_name("unavailable.txt"), "short calls").unwrap();
+            }
+            path
+        };
+        assert_eq!(newest_browser_module(&directory).unwrap(), None);
+        write("le-19e000-240000-00000000", "off", false);
+        write("le-1e8000-28b000-11111111", "direct", true);
+        assert_eq!(newest_browser_module(&directory).unwrap(), None);
+        let direct = write("le-1e8000-28b000-22222222", "direct", false);
+        assert_eq!(newest_browser_module(&directory).unwrap(), Some(direct));
+        std::fs::remove_dir_all(&directory).unwrap();
     }
     #[test]
     fn rejects_unsupported_or_unbounded_metadata_before_packaging() {

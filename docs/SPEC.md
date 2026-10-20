@@ -511,8 +511,11 @@ See [architecture.md](architecture.md#native-dynamic-core) for cache/profile bou
 Native profiles support ordered, SHA-256-qualified RAM patches through
 `game.patches`. The runtime waits for original bytes/guards at bounded batch
 boundaries, validates all spans before an atomic edit, and faults at a configured
-guest step deadline if they never match. Plans survive portable state restoration;
-restart reloads their manifests. See [memory patches](memory-patches.md).
+guest step deadline if they never match. A manifest may list the LE object bases
+its addresses were taken at and mark address fields in its payloads; the desktop
+then moves pending patches to the live layout of the program's objects through
+`Session::relocate_patches`. Plans survive portable state restoration; restart
+reloads their manifests. See [memory patches](memory-patches.md).
 
 The bootstrap COM loader creates a minimal PSP at segment 1000h, loads code at
 offset 0100h, initializes CS/DS/ES/SS and reserves the stack return word at FFFEh.

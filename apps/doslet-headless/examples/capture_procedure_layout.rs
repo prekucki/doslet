@@ -5,14 +5,14 @@
 mod procedure_input;
 
 #[allow(dead_code)]
-#[path = "../../common/procedure_cache.rs"]
-mod procedure_cache;
+#[path = "../../common/le_layout.rs"]
+mod le_layout;
 
 use doslet_aot::{ImageLimits, SymbolicImage};
 use doslet_executable::{LeImage, LeLimits};
 use doslet_runtime::SessionStatus;
 use doslet_x86::SegmentRegister;
-use procedure_cache::{anchors, discover};
+use le_layout::{anchors, discover};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{error::Error, fs, path::Path, time::Instant};

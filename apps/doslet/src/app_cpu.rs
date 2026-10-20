@@ -101,7 +101,7 @@ impl Doslet {
     }
     fn aot_installed(&self) -> bool {
         #[cfg(feature = "wasm-procedures")]
-        return self.session.wasm_procedure_entry_count() != 0;
+        return self.session.wasm_procedures_active();
         #[cfg(not(feature = "wasm-procedures"))]
         false
     }
@@ -210,6 +210,9 @@ impl Doslet {
             if settings.mode == Mode::Tiers {
                 tiers.enable(&mut self.session);
             }
+        }
+        if settings.mode == Mode::Tiers {
+            self.follow_layout_with_tiers();
         }
         self.anchor = None;
         Ok(())

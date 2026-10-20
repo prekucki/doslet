@@ -863,6 +863,47 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+fn run(cli: Cli) -> Result<()> {
+    let (mut args, port) = match cli.command {
+        Action::Build(args) => (args, None),
+        Action::Serve { build, port } => (build, Some(port)),
+    };
+    let temporary = if port.is_some() && args.output.is_none() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        fs::create_dir_all(&root)?;
+        let temporary = tempfile::Builder::new()
+            .prefix("doslet-preview-")
+            .tempdir_in(root)?;
+        args.output = Some(temporary.path().join("site"));
+        Some(temporary)
+    } else {
+        None
+    };
+    let bar = ProgressBar::new(6);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.cyan} [{bar:28.cyan/blue}] {pos}/{len} {msg} [{elapsed_precise}]",
+        )
+        .expect("progress template")
+        .progress_chars("=>-"),
+    );
+    bar.enable_steady_tick(Duration::from_millis(100));
+    match build(&args, &bar) {
+        Ok(path) => {
+            println!("{}", path.display());
+            if let Some(port) = port {
+                server::serve(&path, port)?;
+            }
+            drop(temporary);
+            Ok(())
+        }
+        Err(error) => {
+            bar.abandon_with_message("Build failed");
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,45 +1401,5 @@ mod tests {
         let profile = fs::read_to_string(site.join("bundle/game.toml")).unwrap();
         assert!(profile.contains("TEST.COM"));
         assert!(!profile.contains(root.to_str().unwrap()));
-    }
-}
-fn run(cli: Cli) -> Result<()> {
-    let (mut args, port) = match cli.command {
-        Action::Build(args) => (args, None),
-        Action::Serve { build, port } => (build, Some(port)),
-    };
-    let temporary = if port.is_some() && args.output.is_none() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
-        fs::create_dir_all(&root)?;
-        let temporary = tempfile::Builder::new()
-            .prefix("doslet-preview-")
-            .tempdir_in(root)?;
-        args.output = Some(temporary.path().join("site"));
-        Some(temporary)
-    } else {
-        None
-    };
-    let bar = ProgressBar::new(6);
-    bar.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.cyan} [{bar:28.cyan/blue}] {pos}/{len} {msg} [{elapsed_precise}]",
-        )
-        .expect("progress template")
-        .progress_chars("=>-"),
-    );
-    bar.enable_steady_tick(Duration::from_millis(100));
-    match build(&args, &bar) {
-        Ok(path) => {
-            println!("{}", path.display());
-            if let Some(port) = port {
-                server::serve(&path, port)?;
-            }
-            drop(temporary);
-            Ok(())
-        }
-        Err(error) => {
-            bar.abandon_with_message("Build failed");
-            Err(error)
-        }
     }
 }

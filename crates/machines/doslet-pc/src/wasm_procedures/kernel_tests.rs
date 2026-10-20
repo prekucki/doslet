@@ -357,7 +357,7 @@ fn mixed_copy_labels_match_exact_original_sites_and_time_for_every_path() {
                     machine.set_execution_tiers(Some(labels), rates).unwrap();
                 }
                 fast.set_wasm_procedure_tier_accounting(true).unwrap();
-                let proof = fast.wasm_procedures.as_ref().unwrap().bindings[0]
+                let proof = fast.wasm_procedures.as_mut().unwrap().bindings[0]
                     .tier_proof(&fast.cpu, &fast.bus);
                 assert!(matches!(proof, Some(TierProof::Complete(_))));
                 let cost = fast.wasm_procedures.as_ref().unwrap().bindings[0]

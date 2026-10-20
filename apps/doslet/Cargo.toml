@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = ["wasm-procedures"]
 dynamic-core = ["doslet-runtime/dynamic-core"]
-wasm-procedures = ["doslet-runtime/wasm-procedures", "dep:doslet-aot", "dep:doslet-x86-wasm"]
+wasm-procedures = ["doslet-runtime/wasm-procedures", "doslet-aot/wasm", "dep:doslet-x86-wasm"]
 [dependencies]
 doslet-config.workspace = true
 doslet-input.workspace = true
@@ -29,7 +29,7 @@ zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 doslet-runtime = { workspace = true, features = ["save-state"] }
 doslet-executable.workspace = true
-doslet-aot = { path = "../../crates/system/doslet-aot", features = ["wasm"], optional = true }
+doslet-aot = { path = "../../crates/system/doslet-aot" }
 doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 flate2 = "1"

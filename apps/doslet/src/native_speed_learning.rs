@@ -1328,6 +1328,7 @@ mod tests {
                 irq_grey: true,
                 prepared: Vec::new(),
                 index: Default::default(),
+                layout: None,
             };
             for candidate in [Tier::Fast, Tier::Slow, Tier::Grey, Tier::Irq] {
                 for locked in [false, true] {
@@ -1343,6 +1344,7 @@ mod tests {
             irq_grey: true,
             prepared: Vec::new(),
             index: Default::default(),
+            layout: None,
         };
         let mut changed = nodes(Tier::Fast, false);
         p.nodes.get_mut(&key).unwrap().manual = true;

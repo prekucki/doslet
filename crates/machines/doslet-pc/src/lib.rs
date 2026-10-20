@@ -471,8 +471,7 @@ impl PcMachine {
             // Foreign engines such as the register AOT host register entries
             // directly; batches then yield there instead of running through.
             #[cfg(feature = "wasm-procedures")]
-            let prepared_entries =
-                self.wasm_procedures.is_some() || self.cpu.has_prepared_entries();
+            let prepared_entries = self.wasm_procedures_active() || self.cpu.has_prepared_entries();
             #[cfg(feature = "wasm-procedure-diagnostics")]
             let prepared_entries = prepared_entries && self.wasm_procedure_dispatch_enabled();
             #[cfg(not(feature = "wasm-procedures"))]
