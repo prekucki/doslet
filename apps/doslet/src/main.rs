@@ -1,9 +1,39 @@
 #[cfg(not(target_arch = "wasm32"))]
+mod adaptive_meter;
+#[cfg(not(target_arch = "wasm32"))]
 mod app;
+mod cpu_config;
+mod cpu_meter;
 #[cfg(not(target_arch = "wasm32"))]
 mod desktop;
+mod disk_activity;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/global_settings.rs"]
+mod global_settings;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/host_dirs.rs"]
+mod host_dirs;
+#[allow(dead_code)]
+#[path = "../../common/i18n.rs"]
+mod i18n;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_computer;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_effects;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_jit;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_layout;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_speed_tiers;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_state;
+#[cfg(not(target_arch = "wasm32"))]
+mod speed_tier_meter;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/speed_tiers.rs"]
+#[allow(dead_code)] // Legacy offline planner remains shared with replay experiments.
+mod speed_tiers;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "native_gamepad/wakeup.rs"]
 mod wakeup;
@@ -14,7 +44,7 @@ use desktop as frontend;
 #[cfg(target_arch = "wasm32")]
 #[path = "browser_app.rs"]
 mod app;
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 mod archive;
 #[cfg(not(target_arch = "wasm32"))]
 mod audio;
@@ -26,9 +56,18 @@ mod browser_input;
 mod cli;
 mod configurator;
 mod keyboard;
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/le_layout.rs"]
+mod le_layout;
+#[cfg(not(target_arch = "wasm32"))]
+mod library;
 #[path = "../../common/machine_profile.rs"]
 mod machine_profile;
 mod midi_activity;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasm-procedures"))]
+mod native_aot;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_audio;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_gamepad;
 #[cfg(not(target_arch = "wasm32"))]
@@ -37,14 +76,28 @@ mod native_input;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_midi;
 #[cfg(not(target_arch = "wasm32"))]
+mod native_roms;
+#[cfg(not(target_arch = "wasm32"))]
 #[path = "../../common/native_storage.rs"]
 mod native_storage;
 #[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/native_store_format.rs"]
+#[allow(dead_code, reason = "native tools read committed snapshots")]
+mod native_store_format;
+#[cfg(not(target_arch = "wasm32"))]
 mod native_synth;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_zip;
 mod presentation;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasm-procedures"))]
+#[path = "../../common/procedure_cache.rs"]
+mod procedure_cache;
 #[cfg(not(target_arch = "wasm32"))]
 mod profile;
+#[cfg(not(target_arch = "wasm32"))]
+mod shell;
 mod ui;
+mod xbrz;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,6 +111,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for name in native_midi::ports()?.names {
             println!("{name}");
         }
+        return Ok(());
+    }
+    // Without a game, always open the game library (including when empty).
+    if cli.opens_library() {
+        let library = library::Library::discover();
+        let forwarded = std::env::args_os().skip(1).collect();
+        shell::run(shell::Shell::new(library, forwarded))?;
         return Ok(());
     }
     let app = desktop::Doslet::from_cli(cli)?;
@@ -96,7 +156,7 @@ fn run(
     };
 
     iced::application(boot, frontend::Doslet::update, frontend::Doslet::view)
-        .title("Doslet · A little DOS")
+        .title(|app: &frontend::Doslet| format!("{} — Doslet", app.name))
         .theme(frontend::Doslet::theme)
         .subscription(frontend::Doslet::subscription)
         .window(window)

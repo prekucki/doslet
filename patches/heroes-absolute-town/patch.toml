@@ -1,0 +1,34 @@
+version = 1
+name = "Heroes: absolute mouse in town"
+executable_sha256 = "0e87d3025f437158dfb9099ca2921c83bac5bf9e4708bad04e4d5fc8297218a2"
+# Addresses below were taken with DOS4GW's own host, which loads the LE code
+# object at 0x19e000 and the data object at 0x240000. With a DPMI host they
+# load elsewhere; the guards, writes and fields named by rel32/abs32 move with
+# their objects once Doslet finds the live layout.
+objects = [0x19e000, 0x240000]
+timeout_steps = 500000000
+
+# The DOS/4GW guest loader must have installed the interrupt wrapper and polls.
+[[guards]]
+address = 0x21213d
+expected = "51 83 ec 0c 89 c1 89 e0 e8 3c 8f 01 00 89 c8 89"
+
+[[writes]]
+address = 0x0f1800
+expected_zeroes = 1536
+file = "mouse.bin"
+# Jumps and the call back into the game's code, then its data addresses.
+rel32 = [24, 62, 80, 280, 316, 334, 821]
+abs32 = [516, 520, 529, 539, 557]
+
+[[writes]]
+address = 0x213fab
+expected = "be 0b 00 00 00"
+replacement = "e9 50 d8 ed ff"
+rel32 = [1]
+
+[[writes]]
+address = 0x214a55
+expected = "ba 0b 00 00 00"
+replacement = "e9 a6 ce ed ff"
+rel32 = [1]

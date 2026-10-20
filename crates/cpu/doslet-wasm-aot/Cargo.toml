@@ -1,0 +1,28 @@
+[package]
+name = "doslet-wasm-aot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+procedure-calls = ["dep:doslet-x86", "doslet-x86/procedure-calls"]
+
+[dependencies]
+doslet-x86-wasm = { path = "../doslet-x86-wasm" }
+doslet-x86 = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bytemuck = "=1.25.2"
+wasmtime = { version = "=45.0.3", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation"] }
+
+[dev-dependencies]
+allocation-counter = "0.8.1"
+doslet-static-probe = { path = "../../../apps/doslet-static-probe" }
+doslet-x86.workspace = true
+doslet-bus.workspace = true
+wasm-encoder = { version = "0.262", default-features = false }
+
+# Only the private loaders for artifacts compiled by this adapter may be unsafe.
+[lints.rust]
+unsafe_code = "deny"

@@ -11,6 +11,7 @@ struct Profile {
     cpu_mhz: Option<u16>,
     name: Option<String>,
     executable: Option<PathBuf>,
+    patches: Vec<PathBuf>,
     arguments: Vec<String>,
     working_directory: Option<String>,
     root: Option<PathBuf>,
@@ -104,13 +105,17 @@ impl Profile {
         if let Some(game) = section(table, "game")? {
             fields(
                 game,
-                &["executable", "arguments", "working_directory"],
+                &["executable", "arguments", "working_directory", "patches"],
                 "game.",
             )?;
             profile.executable = string(game, "executable", "game.")?
                 .map(|value| path(base, value, "game.executable"))
                 .transpose()?;
             profile.working_directory = string(game, "working_directory", "game.")?;
+            profile.patches = crate::machine_profile::patch_paths(game)?
+                .iter()
+                .map(|p| std::path::absolute(base.join(p)).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
             if let Some(arguments) = game.get("arguments") {
                 let array = arguments
                     .as_array()
@@ -243,24 +248,82 @@ fn command_tail(arguments: &[String]) -> Result<Vec<u8>, String> {
     Ok(tail)
 }
 
+/// Without an explicit file, each executable keeps its own dynamic-core profile
+/// in the cache. An unreadable executable leaves profiling off.
+pub fn select_core_profile(settings: &mut crate::native_input::LaunchSettings, executable: &Path) {
+    if let Some(directory) = &settings.core_profile_cache {
+        settings.core_profile = crate::native_speed_tiers::executable_sha256(executable)
+            .ok()
+            .map(|hash| directory.join(format!("{hash}.bin")));
+    }
+}
+
 impl Cli {
-    pub fn resolve(mut self) -> Result<Self, Box<dyn Error>> {
+    pub fn resolve(self) -> Result<Self, Box<dyn Error>> {
+        self.resolve_with_roms(crate::native_roms::detect)
+    }
+    pub(crate) fn resolve_with_roms(
+        mut self,
+        discover: impl FnOnce() -> Option<PathBuf>,
+    ) -> Result<Self, Box<dyn Error>> {
         let explicit_drive_mode = self.drive_mode;
         if let Some(config) = &self.config {
             let text = std::fs::read_to_string(config)
                 .map_err(|error| format!("Cannot read {}: {error}", config.display()))?;
             let base = config.parent().unwrap_or(Path::new("."));
-            let is_v2 = text
-                .parse::<DocumentMut>()?
-                .get("version")
-                .and_then(Item::as_integer)
-                == Some(2);
+            let document = text.parse::<DocumentMut>()?;
+            let is_v2 = document.get("version").and_then(Item::as_integer) == Some(2);
             let profile = if is_v2 {
                 let mut spec = crate::machine_profile::parse_machine_profile(&text)?;
+                if let Some(action_id) = &self.action {
+                    let action = spec
+                        .game
+                        .actions
+                        .iter()
+                        .find(|a| a.id == *action_id)
+                        .ok_or_else(|| format!("unknown game action: {action_id}"))?
+                        .clone();
+                    if !spec.name.is_empty() {
+                        spec.name = format!("{} · {}", spec.name, action.name);
+                    } else {
+                        spec.name = action.name;
+                    }
+                    spec.game.executable = action.executable;
+                    spec.game.arguments = action.arguments;
+                    spec.game.patches.clear();
+                    spec.game.startup_keys.clear();
+                }
+                if let Some(cpu_mode) = spec.cpu_mode {
+                    match cpu_mode {
+                        doslet_config::CpuMode::Adaptive => {
+                            if !self.adaptive_idle
+                                && !self.experimental_heroes_menu_idle
+                                && !self.experimental_heroes_timer_waits
+                                && self.speed_tier_profile.is_none()
+                            {
+                                self.adaptive_cpu = true;
+                                self.no_speed_tiers = true;
+                            }
+                        }
+                        doslet_config::CpuMode::Fixed => {
+                            self.adaptive_cpu = false;
+                            self.no_speed_tiers = true;
+                        }
+                        doslet_config::CpuMode::SpeedTiers => {
+                            self.adaptive_cpu = false;
+                        }
+                    }
+                }
+                for path in &mut spec.game.patches {
+                    *path = std::path::absolute(base.join(&*path))?
+                        .to_string_lossy()
+                        .into_owned();
+                }
                 for binding in &mut spec.host.bindings {
                     if matches!(
                         binding.kind,
                         doslet_config::BindingKind::NativeDirectory
+                            | doslet_config::BindingKind::BrowserZip
                             | doslet_config::BindingKind::LocalIso
                             | doslet_config::BindingKind::NativeStore
                     ) {
@@ -271,6 +334,7 @@ impl Cli {
                 let mut profile = Profile {
                     name: (!spec.name.is_empty()).then(|| spec.name.clone()),
                     arguments: spec.game.arguments.clone(),
+                    patches: spec.game.patches.iter().map(PathBuf::from).collect(),
                     working_directory: Some(spec.game.working_directory.clone()),
                     writable: true,
                     audio: Some(spec.output.audio),
@@ -284,7 +348,11 @@ impl Cli {
                     } else {
                         MidiMode::Gm
                     }),
-                    output: Some(spec.output.midi_output.clone()),
+                    output: document
+                        .get("output")
+                        .and_then(Item::as_table_like)
+                        .and_then(|output| output.get("midi_output"))
+                        .map(|_| spec.output.midi_output.clone()),
                     ..Profile::default()
                 };
                 if !spec.game.executable.is_empty() {
@@ -302,6 +370,7 @@ impl Cli {
                     if matches!(
                         mount.kind,
                         doslet_config::SourceKind::NativeDirectory
+                            | doslet_config::SourceKind::BrowserZip
                             | doslet_config::SourceKind::LocalIso
                     ) && !spec.host.bindings.iter().any(|b| b.id == mount.source)
                     {
@@ -309,6 +378,7 @@ impl Cli {
                     }
                     if let Some(store) = &mut mount.store
                         && !spec.host.bindings.iter().any(|b| b.id == *store)
+                        && Path::new(&*store).components().count() > 1
                     {
                         *store = base.join(&*store).to_string_lossy().into_owned();
                     }
@@ -320,6 +390,14 @@ impl Cli {
                         PathBuf::from(&mount.source)
                     };
                     match mount.kind {
+                        doslet_config::SourceKind::BrowserZip => {
+                            profile.executable = Some(PathBuf::from(&spec.game.executable));
+                            profile.drive_mode = Some(match mount.policy {
+                                doslet_config::WritePolicy::ReadOnly => DriveMode::Ro,
+                                doslet_config::WritePolicy::LegacyWriteback => DriveMode::Rw,
+                                _ => DriveMode::Overlay,
+                            });
+                        }
                         doslet_config::SourceKind::NativeDirectory => {
                             profile.root = Some(source);
                             profile.drive_mode = Some(match mount.policy {
@@ -332,11 +410,6 @@ impl Cli {
                             profile.cdrom = Some((mount.letter, source))
                         }
                         doslet_config::SourceKind::HttpsIso => {}
-                        _ => {
-                            return Err(
-                                "native profiles require directory and local ISO sources".into()
-                            );
-                        }
                     }
                 }
                 self.launch.hardware = spec.hardware;
@@ -358,10 +431,16 @@ impl Cli {
             if self.launch.machine_spec.is_none() {
                 let mut spec = doslet_config::MachineSpec::default();
                 spec.game.arguments = profile.arguments.clone();
+                spec.game.patches = profile
+                    .patches
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
                 self.launch.machine_spec = Some(spec);
             }
             self.profile_name = profile.name;
             self.launch.command_tail = command_tail(&profile.arguments)?;
+            self.launch.patches = profile.patches;
             if let Some(directory) = profile.working_directory {
                 if !directory.is_ascii()
                     || directory.bytes().any(|byte| byte < 0x20 || byte == 0x7F)
@@ -400,8 +479,41 @@ impl Cli {
         }
         self.midi_mode.get_or_insert(MidiMode::Gm);
         self.launch.heroes_timer_waits = self.experimental_heroes_timer_waits;
-        self.launch.no_dynamic_core = self.no_dynamic_core;
+        self.launch.heroes_menu_idle = self.experimental_heroes_menu_idle;
+        self.launch.observe_idle = self.observe_idle || self.adaptive_idle;
+        self.launch.adaptive_idle = self.adaptive_idle;
+        self.launch.analyze_synchronization = self.analyze_synchronization || self.adaptive_cpu;
+        self.launch.adaptive_cpu = self.adaptive_cpu;
+        // The interpreter is the default; the JIT was slower on ROTT gameplay.
+        self.launch.no_dynamic_core = !self.dynamic_core;
+        let profile_dpmi = self.launch.machine_spec.as_ref().and_then(|s| s.dpmi);
+        self.launch.dpmi = crate::native_input::dpmi_mode(
+            self.dpmi
+                .map(crate::cli::DpmiMode::host)
+                .or(profile_dpmi)
+                .unwrap_or(doslet_config::DpmiHost::Direct),
+        );
+        let dirs = crate::host_dirs::HostDirs::detect().ok();
         self.launch.core_profile = self.core_profile.clone();
+        if self.core_profile.is_none() && !self.no_core_profile {
+            self.launch.core_profile_cache =
+                dirs.as_ref().map(crate::host_dirs::HostDirs::core_profiles);
+        }
+        if let Some(exe) = &self.game {
+            select_core_profile(&mut self.launch, exe);
+        }
+        self.launch.compiled_cache = dirs.as_ref().map(crate::host_dirs::HostDirs::aot_compiled);
+        self.launch.wasm_procedures = self.wasm_procedures.clone();
+        self.launch.interpret_procedures = self.interpret_procedures;
+        #[cfg(not(feature = "wasm-procedures"))]
+        if self.wasm_procedures.is_some() {
+            return Err("--wasm-procedures requires cargo --features wasm-procedures".into());
+        }
+        if self.dynamic_core && !crate::cpu_config::JIT_AVAILABLE {
+            return Err(
+                "--dynamic-core requires cargo --features dynamic-core on x86-64 or AArch64".into(),
+            );
+        }
         if let Some(mode) = self.drive_mode {
             self.launch.writable = mode != DriveMode::Ro;
             self.launch.persist = mode == DriveMode::Rw;
@@ -414,7 +526,14 @@ impl Cli {
         if self.midi_output.as_deref() == Some("apple") && !cfg!(target_os = "macos") {
             return Err("Apple MIDI output is available only on native macOS".into());
         }
-        if let Some(game) = &self.game {
+        if let Some(game) = &self.game
+            && self.zip.is_none()
+            && !self
+                .launch
+                .machine_spec
+                .as_ref()
+                .is_some_and(|s| crate::native_zip::mount(s).is_some())
+        {
             if !game.is_file() {
                 return Err(format!("game.executable is not a file: {}", game.display()).into());
             }
@@ -429,6 +548,9 @@ impl Cli {
                 }
             }
         }
+        if self.game.is_none() && !self.launch.patches.is_empty() {
+            return Err("game.patches requires game.executable or --game".into());
+        }
         if let Some((_, image)) = &self.launch.cdrom
             && !image.is_file()
         {
@@ -438,19 +560,39 @@ impl Cli {
             )
             .into());
         }
-        if let Some(directory) = &self.mt32_rom_dir {
-            for name in ["CM32L_CONTROL.ROM", "CM32L_PCM.ROM"] {
-                if !directory.join(name).is_file() {
-                    return Err(format!(
-                        "midi.rom_directory is missing {name}: {}",
-                        directory.display()
-                    )
-                    .into());
-                }
+        if !self.no_audio && self.mt32_rom_dir.is_none() {
+            self.mt32_rom_dir = discover();
+            if let Some(directory) = &self.mt32_rom_dir {
+                eprintln!(
+                    "[INFO doslet] CM-32L ROMs detected: {}",
+                    directory.display()
+                );
             }
         }
+        if let Some(directory) = &self.mt32_rom_dir {
+            crate::native_roms::paths(directory)?;
+            self.midi_output.get_or_insert_with(|| "moont".into());
+        }
         if self.midi_output.as_deref() == Some("moont") && self.mt32_rom_dir.is_none() {
-            return Err("midi.output=moont requires midi.rom_directory or --mt32-rom-dir".into());
+            return Err("midi.output=moont requires compatible CM-32L ROMs in a DOSBox folder, midi.rom_directory, or --mt32-rom-dir".into());
+        }
+        if let Some(zip) = &self.zip {
+            if self
+                .launch
+                .machine_spec
+                .as_ref()
+                .is_some_and(|s| !s.mounts.is_empty())
+                || self.launch.root.is_some()
+            {
+                return Err(
+                    "--zip cannot override configured drives; use a version-2 ZIP profile".into(),
+                );
+            }
+            let archive = crate::native_zip::read(zip)?;
+            self.game = Some(PathBuf::from(crate::native_zip::select(
+                &archive,
+                self.program.as_deref(),
+            )?));
         }
         let mut spec = self.launch.machine_spec.take().unwrap_or_default();
         spec.hardware = self.launch.hardware;
@@ -478,7 +620,19 @@ impl Cli {
             spec.output.rom_binding = Some(path.to_string_lossy().into_owned());
         }
         if spec.mounts.is_empty() {
-            if let Some(game) = &self.game {
+            if let Some(zip) = &self.zip {
+                spec.mounts.push(doslet_config::MountSpec {
+                    letter: b'C',
+                    source: zip.to_string_lossy().into_owned(),
+                    kind: doslet_config::SourceKind::BrowserZip,
+                    policy: if self.launch.writable {
+                        doslet_config::WritePolicy::Temporary
+                    } else {
+                        doslet_config::WritePolicy::ReadOnly
+                    },
+                    store: None,
+                });
+            } else if let Some(game) = &self.game {
                 let root = self
                     .launch
                     .root
@@ -516,6 +670,32 @@ impl Cli {
                 DriveMode::Rw => doslet_config::WritePolicy::LegacyWriteback,
             };
         }
+        if (self.autosave_path.is_some() || self.action.is_some())
+            && explicit_drive_mode.is_none()
+            && let Some(config) = &self.config
+            && let Some(stem) = config
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+            && let Some(c) = spec.mounts.iter_mut().find(|m| m.letter == b'C')
+            && c.policy == doslet_config::WritePolicy::Temporary
+            && c.store.is_none()
+        {
+            c.policy = doslet_config::WritePolicy::Persistent;
+            c.store = Some(stem);
+        }
+        if let Some(mount) = crate::native_zip::mount(&spec) {
+            if self.launch.persist || mount.policy == doslet_config::WritePolicy::LegacyWriteback {
+                return Err("ZIP sources cannot use rw; use overlay, ro, or a separate persistent save store".into());
+            }
+            let archive = crate::native_zip::read(Path::new(spec.binding(&mount.source)))?;
+            // --program picks another program from the same ZIP and save store.
+            let wanted = self.program.as_deref().unwrap_or(&spec.game.executable);
+            spec.game.executable = crate::native_zip::select(&archive, Some(wanted))?;
+            self.game = Some(PathBuf::from(&spec.game.executable));
+        } else if self.program.is_some() {
+            return Err("--program selects an EXE inside a ZIP; use --zip or a ZIP profile".into());
+        }
         spec.resolve().map_err(|e| e.to_string())?;
         self.launch.machine_spec = Some(spec);
         Ok(self)
@@ -529,6 +709,81 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     include!("../../../tests/fixtures/relocated_mz.rs");
     include!("../../../tests/fixtures/iso9660.rs");
+    #[test]
+    fn patch_files_resolve_from_profile_and_survive_export_and_reload() {
+        use sha2::{Digest, Sha256};
+        for version in [1, 2] {
+            let fixture = Fixture::new(&format!(
+                "version={version}\n[game]\nexecutable='../TINY.EXE'\npatches=['change.toml']\n"
+            ));
+            let digest = Sha256::digest(relocated_mz());
+            let manifest = format!(
+                "version=1\nname='fixture'\nexecutable_sha256='{digest:x}'\ntimeout_steps=10000\n[[writes]]\naddress=0xf1800\nexpected_zeroes=2\nfile='payload.bin'\n"
+            );
+            std::fs::write(fixture.root.join("profiles/change.toml"), &manifest).unwrap();
+            std::fs::write(fixture.root.join("profiles/payload.bin"), [12, 34]).unwrap();
+            let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
+            assert_eq!(
+                cli.launch.patches,
+                [fixture.root.join("profiles/change.toml")]
+            );
+            let spec = cli.launch.machine_spec.as_ref().unwrap();
+            let exported = crate::machine_profile::export_machine_profile(spec);
+            assert_eq!(
+                &crate::machine_profile::parse_machine_profile(&exported).unwrap(),
+                spec
+            );
+            // A fresh load (the same recipe used by restart) reapplies the patch.
+            for _ in 0..2 {
+                let mut session = crate::native_input::load_game_with_settings(
+                    cli.game.as_deref().unwrap(),
+                    &cli.launch,
+                )
+                .unwrap();
+                assert_eq!(session.applied_patch_count(), 0);
+                session.start();
+                session.advance(1);
+                assert_eq!(session.applied_patch_count(), 1);
+                assert_eq!(session.ram_view(0xf1800..0xf1802).unwrap(), &[12, 34]);
+            }
+            std::fs::write(
+                fixture.root.join("profiles/change.toml"),
+                manifest.replace(&format!("{digest:x}"), &"00".repeat(32)),
+            )
+            .unwrap();
+            let error = crate::native_input::load_game_with_settings(
+                cli.game.as_deref().unwrap(),
+                &cli.launch,
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(
+                error.contains("change.toml") && error.contains("SHA-256"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn dpmi_host_comes_from_the_command_line_then_the_profile() {
+        use doslet_runtime::session::dpmi::Mode;
+        let fixture =
+            Fixture::new("version=2\n[game]\nexecutable='../TINY.EXE'\n[machine]\ndpmi='off'\n");
+        let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
+        assert_eq!(cli.launch.dpmi, None);
+        let cli = fixture
+            .cli(&["--no-audio", "--dpmi", "reflect"])
+            .resolve()
+            .unwrap();
+        assert_eq!(cli.launch.dpmi, Some(Mode::Reflect));
+        let cli = Fixture::new("version=2\n[game]\nexecutable='../TINY.EXE'\n")
+            .cli(&["--no-audio"])
+            .resolve()
+            .unwrap();
+        assert_eq!(cli.launch.dpmi, Some(Mode::Direct));
+    }
+
     #[test]
     fn cpu_clock_profile_cli_precedence_and_machine_construction() {
         for version in [1, 2] {
@@ -594,6 +849,47 @@ pub(crate) mod tests {
         assert_eq!(
             cli.launch.machine_spec.unwrap().mounts[0].policy,
             doslet_config::WritePolicy::Temporary
+        );
+    }
+
+    #[test]
+    fn program_selects_another_exe_from_a_zip_profile_and_keeps_its_saves() {
+        use std::io::Write;
+        let fixture = Fixture::new(
+            "version=2\n[game]\nexecutable='GAME.EXE'\n[[drives]]\nletter='C'\nkind='zip'\nsource='../GAME.ZIP'\npolicy='persistent'\nstore='../saves'\n",
+        );
+        let mut zip =
+            zip::ZipWriter::new(std::fs::File::create(fixture.root.join("GAME.ZIP")).unwrap());
+        for name in ["GAME.EXE", "SETUP.EXE"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&relocated_mz()).unwrap();
+        }
+        zip.finish().unwrap();
+        let spec = |extra: &[&str]| {
+            let mut arguments = vec!["--no-audio"];
+            arguments.extend_from_slice(extra);
+            fixture
+                .cli(&arguments)
+                .resolve()
+                .unwrap()
+                .launch
+                .machine_spec
+                .unwrap()
+        };
+        let game = spec(&[]);
+        let setup = spec(&["--program", "setup.exe"]);
+        assert_eq!(game.game.executable, "GAME.EXE");
+        assert_eq!(setup.game.executable, "SETUP.EXE");
+        assert_eq!(setup.mounts, game.mounts);
+        let directory = Fixture::new("version=2\n[game]\nexecutable='../TINY.EXE'\n");
+        assert!(
+            directory
+                .cli(&["--program", "OTHER.EXE", "--no-audio"])
+                .resolve()
+                .unwrap_err()
+                .to_string()
+                .contains("--program selects")
         );
     }
 
@@ -680,13 +976,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn dynamic_core_profiles_default_to_one_cache_file_per_executable() {
+        let fixture = Fixture::new("version=1\n[game]\nexecutable='../TINY.EXE'\n");
+        let hash =
+            crate::native_speed_tiers::executable_sha256(&fixture.root.join("TINY.EXE")).unwrap();
+        let cache = crate::host_dirs::HostDirs::detect()
+            .unwrap()
+            .core_profiles();
+        let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
+        assert_eq!(
+            cli.launch.core_profile,
+            Some(cache.join(format!("{hash}.bin")))
+        );
+        let explicit = fixture
+            .cli(&["--no-audio", "--core-profile", "fixed.bin"])
+            .resolve()
+            .unwrap();
+        assert_eq!(explicit.launch.core_profile, Some("fixed.bin".into()));
+        assert!(explicit.launch.core_profile_cache.is_none());
+        let disabled = fixture
+            .cli(&["--no-audio", "--no-core-profile"])
+            .resolve()
+            .unwrap();
+        assert!(disabled.launch.core_profile.is_none());
+        // Another game never inherits this file; an unreadable one disables it.
+        let mut settings = cli.launch.clone();
+        select_core_profile(&mut settings, &fixture.root.join("MISSING.EXE"));
+        assert!(settings.core_profile.is_none());
+    }
+
+    #[test]
     fn cursor_visibility_and_capture_survive_native_profile_resolution() {
         let fixture = Fixture::new(
             "version=2\n[game]\nexecutable='../TINY.EXE'\n[input]\ncapture=false\nhide_cursor=true\n",
         );
         let cli = fixture.cli(&["--no-audio"]).resolve().unwrap();
         let spec = cli.launch.machine_spec.unwrap();
-        assert!(!spec.input.capture);
+        assert_eq!(spec.input.mouse_mode, doslet_config::MouseMode::NoCapture);
         assert!(spec.input.hide_cursor);
     }
 

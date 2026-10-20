@@ -3,17 +3,791 @@
 Validation commands, implementation status, headless diagnostics and
 execution-engine details. For everyday use, see [using Doslet](usage.md).
 
+For the optional profile-guided x86-to-WebAssembly compiler, native differential
+runner and browser CPU acceptance, see [the experimental WASM core](compatibility/wasm-core.md).
+
+For native desktop/headless remote debugging, RAM patches and mixed 16/32-bit guest
+inspection, see [debugging with GDB](debugging.md).
+
+For the optional DOS/4GW host, direct BIOS/DOS dispatch experiment, allocation
+telemetry and bounded game comparisons, see [DPMI host](compatibility/dpmi-host.md).
+
+For repeatable scene tests without a window or audio device, see
+[portable guest states and Heroes fixtures](save-states.md). The optional
+Protobuf format uses checked-in Rust bindings and does not require `protoc`.
+
+To investigate idle behavior without a game-specific recipe, add
+`--observe-idle` to the desktop command or choose **Observe idle loops** in
+Details. The observer works independently of Heroes adaptive idle. **Idle
+candidate** identifies sampled recurring execution with input queries, not a
+proven empty loop; Details lists writes, device accesses and uncertainty reasons.
+MCP `status` exposes the same window in `idle_observer_*` fields. Keep the guest
+running and avoid input for at least 250 ms of guest time to collect a window.
+Details also shows **Synchronization**: a frequently observed supported
+RAM/port condition, comparison or mask, taken/fallthrough evidence (aged between
+bursts), value changes, and the last traced step across which a watched RAM value
+changed. IRQ-pending and device-access flags describe that step boundary; they
+do not identify the writer. This runs limited interpreter bursts even with JIT
+enabled. MCP exposes the same diagnostics in `synchronization`. **Provisional budget**
+shows the observed recurrence peak, reserve, next known service source and
+remaining time/nominal steps. It requires four recent samples at unchanged MHz.
+It does not measure useful-work demand or prove that the condition waits for that
+service. Session Details retains the RAM/port trace evidence even if the
+display-based candidate test rejects the screen. Disable the
+Heroes idle recipe when comparing guest state with reference execution.
+A local Heroes menu trace independently discovered the dword comparison at
+206FC0h against RAM 2810A8h (value 2 compared with zero), and VGA port 3DAh tests
+with mask 08h at 22427Ah. These addresses are observations, not decoder recipes.
+The sampled run did not capture the RAM counter's writer, so IRQ/timer ownership
+is not established by this diagnostic. Each 500-ms window at 133 MHz traced
+4,608 scheduling units; this is coverage evidence, not a host overhead benchmark.
+This diagnostic does not reduce CPU use by itself. A local Heroes menu run
+recorded 279 samples, 6,559 input queries and recurring PCs in one window with
+the Heroes recipe disabled. It rejected candidacy because the display revision
+changed. That is real-game diagnostic evidence, not validation of generalized
+sleeping, map behavior or battle compatibility.
+
+To try actual address-independent waiting, use `--adaptive-idle` or **Enable
+learned idle** in Details. It enables tracing automatically and replaces the
+fixed Heroes recipe. RAM/port trace evidence means observation. The CPU indicator reports active
+guest time; its Idle portion includes actual time advanced without executing
+the CPU, rather than idle candidacy alone. This experimental heuristic learns
+changing countdown guards and caps each wait at 250 us. Disable it for exact
+reference comparisons or if game responsiveness changes.
+Details also reports **Learned guards** arrivals and the last checked IP and eligibility reason:
+relearning counter changes, a due counter, an approaching service deadline or
+an input constraint. The observation point refreshes learning even when sparse
+trace bursts miss that function. The reason describes the last evaluated guard;
+input grace and time spent elsewhere can also prevent current waiting.
+The learned policy does not use pointer position or screen edges to infer CPU
+demand. Actual input still reserves a short grace period before waiting.
+**Empty-poll waits** reports the additional budget at empty relative-motion
+queries. Its work peak excludes the emulator's own waits; increased work leaves
+less spare time. It targets short polling intervals while reserving hardware
+service time, without game addresses or screen-specific rules. It remains an
+experimental cadence change; check animation speed, responsiveness and audio.
+Two candidate points retain separate evidence. A live city capture found 96
+positive and four zero countdown values in 100 calls, next to a static zero
+guard. A regression test models this competing-guard sequence; actual city
+coverage cannot be inferred from the menu test. The subsequent live Necropolis
+city measurement at 133 MHz still advanced only 0.424% of 19.58 guest seconds
+through countdown waiting, with no input wakes. After adding empty-poll budgets,
+a live Tundara city run advanced 41.20% of 23.01 guest seconds through cooperative
+waiting, with one input wake and observed inter-query work around 98–123 us.
+These are runtime idle counters on different city screens, not a paired host
+CPU benchmark or evidence of identical guest state. Audible playback and game
+responsiveness still require user observation.
+
+The ignored `local_heroes_learned_idle_experiment` test boots the local read-only
+Heroes image with a RAM overlay. After arrival-based learning, a menu run at
+133 MHz advanced 8.31 of 10 guest
+seconds through learned waiting, with ongoing nonzero PCM output. This verifies
+activation in that menu, not puzzle/battle compatibility or audible playback.
+
+## Game web packages
+
+`doslet-web` is the user-facing Rust CLI; `doslet-web-build` remains Trunk's
+internal worker/audio build hook. Install the pinned Cargo, Trunk,
+wasm-bindgen and Binaryen tools from `mise.toml` before building a site.
+
+```sh
+cargo run -p doslet-web --release --locked -- build games/ROTT.toml -o target/rott-site
+cargo run -p doslet-web --release --locked -- serve games/ROTT.toml --port 8080
+```
+
+Both commands build the release frontend through Trunk. `serve` then starts
+a Rust HTTP server bound to loopback; it prints the localhost URL. Without
+`--output`, previews use a fresh directory under `target`; `build` defaults to
+`target/<profile-name>-web`. Existing output directories are never overwritten.
+Use `--web-dist web/dist` to reuse a previously built frontend and `--offline`
+to build without downloading tool dependencies. No Node tooling is involved.
+`games/ROTT.toml` sets `[game] startup_keys = "15"`; both native and browser
+frontends queue that text at the first BIOS keyboard wait. The optional
+`--startup-keys` build argument overrides this profile value for one web
+package.
+
+The current packager accepts one C: directory or ZIP mount, resolves paths
+beside the TOML, and validates the selected EXE/COM with the browser loader.
+Without an explicit mount it uses the executable's directory as C:.
+It generates a portable profile and launch manifest, and converts native save
+store bindings to IndexedDB for new browser writes. At build time, an existing
+native C: save overlay is validated against the original game files and merged
+into the single `bundle/game.zip`; no native database or separate save seed is
+shipped. Pass `--no-saves` to package only the original files. An `info.cover`
+image becomes `bundle/cover.<ext>` and the start page's artwork and blurred
+backdrop; other `[info]` fields are listed under the title. Empty directories
+created only in the native overlay cannot yet be represented by the ZIP loader,
+so the packager rejects that case instead of silently dropping them.
+Additional drives, ISO media and native memory-patch manifests are rejected.
+Directory media must contain at most 4,096 files, 256 MiB expanded and 64 MiB
+per file; the resulting ZIP must fit the browser's 64 MiB limit. Symlinks and
+special files inside a game directory are rejected. Source media stay unchanged.
+
+`--wasm-procedures FILE` packages the same embedded `procedure_memory` bundle
+used by the native frontend. The packager preserves its bytes, checks the
+executable identity, module checksum and memory ABI, and emits
+`aot.kind = "procedure-memory"` in the launch manifest. The input must be the
+version-2 `procedures.wasm` produced by the existing
+[`prepare_memory_procedures` generator](compatibility/wasm-core.md#direct-memory-procedures-with-internal-branches).
+The browser uses its own machine memory and still verifies live instruction
+sources, CPU context and memory capabilities before each admitted call.
+Bound addresses must match the browser loader: ROTT loads at different bases
+with and without a DPMI host. Modules record the DPMI mode and layout of their
+bindings; the packager accepts `direct`, the browser's mode, and older modules
+without a recorded mode. Packaging a native module alone does not establish
+that its procedures run in the browser or improve performance.
+
+Without `--wasm-procedures` or `--aot-profile`, `--aot auto` and `--aot required`
+first look in the native cache's `aot/<executable-sha256>/` for the newest
+module recorded under DPMI Direct, the browser's mode, that was not declined.
+An invalid discovered bundle is reported as an error. `--aot-profile` explicitly
+selects the register-code backend; `--aot off` disables both backends and cannot
+be combined with either explicit AOT input.
+
+When no procedure bundle is selected, `--aot auto` analyzes reachable original
+LE instructions and emits a guarded register-code module when supported entries
+exist and average at least four instructions per block. Shorter pieces cost
+more per grant than they run, so the build reports their average and keeps the
+interpreter; `--aot required` or `--aot-profile` packages them anyway. It declares each LE code
+object at its preferred base; the runtime verifies one live load delta per object,
+since DOS4GW places ROTT at different addresses with and without a DPMI host. Relocated instructions and
+unsupported code stay in the interpreter. `--aot required` fails if there are
+no entries; `--aot off` disables preparation. `--aot-profile FILE` accepts DSJ1
+or speed-tier instruction observations as an alternative source. An explicit
+executable identity must match the selected EXE; runtime source-byte, CPU-context
+and device-budget checks still apply. AOT input does not install speed-tier
+labels or authorize skipping instructions. The browser loads the generated
+module, checks its profile and asset hashes, and retains AOT across Reset.
+The runtime reads its profile directly from the module's `doslet.profile`
+custom section; new packages do not duplicate it as `aot-profile.bin`. Older
+manifests with an external profile remain readable and are checked against the
+embedded profile before installation.
+Register-code AOT keeps the configured pacing (HOT/COLD/GREY tiers or adaptive
+CPU) and idle policies. Grants yield to idle-loop proofs, known idle heads, analyzer windows and
+synchronization bursts, so the same wait loops are detected and skipped with AOT.
+
+To enable actual HOT/COLD/GREY pacing, use `--speed-tiers FILE.json` with an
+exact-executable profile (`identity = "exe-sha256:..."`). The packager validates
+and includes it, and the browser starts in the tiered CPU mode. The CPU menu then
+exposes the three rates and preserves the mode across Reset. Example:
+
+```sh
+cargo run -p doslet-web --release --locked -- serve games/ROTT.toml \
+  --speed-tiers "$HOME/.cache/doslet/speed-tiers/2deedf54c45178792483114c017223407e3044abcc0863526aa477654a78569a.json" \
+  --aot required
+```
+
+With `--speed-tiers`, AOT preparation uses that profile's observed code unless
+`--aot-profile` supplies another input. `--aot off` keeps tier pacing with the
+ordinary interpreter. A tiered AOT grant binds only blocks whose instructions
+all have the same live, byte-guarded tier; a tier transition returns to the
+runtime. It charges completed instruction counts to that tier before advancing
+devices through the existing scheduler. The slowest configured tier bounds
+grants before hardware events, including for HOT/MAX. Mixed blocks and refused
+grants keep the interpreter fallback. IRQ labels retain their existing static
+meaning; AOT does not infer a label from the caller or current interrupt depth.
+
+The register-code backend currently translates flat protected-mode 32-bit
+register code, with interpreter fallback for real mode, memory instructions and other forms.
+Its coverage and callback overhead depend on the game. Generated entry counts
+are not evidence of a browser speedup; compare the production browser bundle
+with `--aot off` before claiming a gain. On a ROTT gameplay state under native
+Wasmtime, three guest seconds took 2–8% longer than the interpreter: this
+register-only backend translated 0.03–0.3% of steps. Its static ROTT blocks
+average 2.5 instructions, because every memory access ends a block, so
+`--aot auto` leaves it out. Entries that do not repay
+their batch stop become cold, which bounds that overhead.
+
+For a bundled game, inspect `window.dosletBundleBridge.state.aot` in the browser
+console. `active` and `installed` confirm the worker has installed the module;
+increasing `translatedSteps` proves execution. `translatedTiers` counts translated
+HOT/COLD/GREY/IRQ instructions. `zeroBudget`, `rejectedContext`
+and `missingCode` count decisions to use the interpreter because the runtime
+gave no translated grant, the CPU context was unsuitable, or no guarded code
+matched. `regions` lists each relocatable span with its verified live `delta`
+(null until found); `interpreterBatches`, `pageValidations`, `rebaseAttempts`
+and `coldEntries` show fallback batching, code-page checks, rebase work and
+entries no longer stopping batches. These are cumulative counts; the adjacent `code32`, `protectedMode`,
+`paging`, `executionLabels`, `csBase` and `csLimit` describe the latest CPU state.
+
+Use `output.midi_output = "rust"` for ROM-free portable audio. MT-32 profiles
+require a configured ROM directory or `--rom-dir DIRECTORY`; only that CONTROL/PCM pair
+is included. The resulting site includes local game media and any supplied
+ROMs. The output is a static directory; serve it on localhost or over HTTPS.
+
+## Comparison baseline
+
+The annotated tag `baseline/pre-adaptive-cpu` points to commit
+`cd57ff9c4280095685c4c9343aeff6e26d8898b1`, the `origin/main` revision selected
+before the adaptive-profile and portable-state changes. Use this immutable tag
+for comparisons; `origin/main` can move.
+
+Build both revisions with the same toolchain, release options and CPU target.
+Use separate build directories, identical guest inputs and clock settings, a
+warmup, and at least three alternating pairs. The baseline predates portable
+states: replay an identical input sequence from startup for comparisons with
+that revision. Snapshot comparisons require two revisions that support the same
+state format. Report guest-state and timing checks separately from host speed
+and interactive audio observations.
+
+The workspace test command uses `RUST_MIN_STACK=8388608` for debug tests that
+construct large machine states. This changes the test-thread stack limit, not
+the emulator's guest memory. The `mise test` task and CI set it for tests too.
+MCP/GDB integration tests require permission to bind local TCP sockets.
+
+The native effect accumulator regression runs 100000 owner/mailbox-style merges
+on a 256-KiB thread stack, checks all retained outputs, and drops a large pending
+queue. Run it with `cargo test -p doslet --locked native_effects`. Previously,
+repeated `Task::batch([pending, Task::none()])` created nested `SelectAll`
+streams even when no actions were pending. A 50000-iteration standalone probe
+reproduced main-thread stack exhaustion under host GDB in `poll_next`, without
+a game or guest debugger connection. The flat accumulator removes that chain;
+this reproduction identifies a concrete failure mechanism, not the missing
+historical core dump's exact stack.
+
+## Bounded synchronization analyzer
+
+Use `--analyze-synchronization` for diagnostics and `--adaptive-cpu` for the
+separate experimental throughput controller. Both are off by default. The latter
+uses configured MHz as a ceiling and disables competing heuristic waits. Manual
+`set_cpu_mhz` remains available. GDB attachment suspends analysis/control and
+restores their selection after detach.
+
+MCP `set_synchronization_analysis` accepts `enabled` and optional `adaptive`
+booleans, so a scene can be compared without restarting it. MCP `status` publishes
+`synchronization_analysis` as structured fields, including graph coverage,
+observed steps, gaps, invalidations, candidate predicates, writer PCs/IRQ contexts,
+partial writes, complete episodes, work/wait times, a work histogram and predicted
+MHz. Details shows the same model. `host_audio_underruns` is separate from
+`guest_audio_service_deadline_misses`. The latter counts an unacknowledged SB16
+DMA block IRQ when the next block of the same continuous transfer completes.
+`guest_audio_service_deadline_checks` counts completed observation windows and
+`guest_audio_service_deadline_source` names that scope. Before the first complete
+window, misses/source are `null`, rather than claiming zero measured misses.
+Only the matching 8/16-bit IRQ acknowledgement closes its service obligation.
+Pause, reset, reprogramming and single-cycle transfers do not invent deadlines.
+Counters survive DSP reset within a session. They do not measure guest buffer
+refill deadlines, OPL/MIDI sequencing or audible continuity; those remain unknown.
+Candidate deadline misses refer to learned episode periods, not guaranteed
+hardware deadlines. A new DMA IRQ acknowledgement miss restores the configured
+CPU ceiling when adaptation is enabled; historical misses at enable time and
+diagnostic-only mode do not retune the CPU. Host missing PCM frames never count
+as a guest IRQ deadline miss.
+
+Current recognition covers flat 32-bit code and direct backward JZ/JNZ loops
+on absolute RAM comparisons, a simple register load/compare chain, or VGA
+`IN AL,DX; TEST/AND AL,08h` or `TEST AL,AH` with an observed AH value of 08h.
+It rejects returning guards as a substitute for a
+caller's complete frame. The graph follows at most 64 instruction nodes and
+three levels of direct calls. Unsupported instructions, unknown operands,
+indirect transfers, unavailable code, changed generations and exhausted bounds
+remain explicit incomplete coverage.
+
+RAM observation starts with a 4,096-step discovery window every eight million
+scheduling units. Only a discovered predicate with a complete bounded graph
+extends that window to at most two million steps. An evidence gap ends the
+extension after at most 4,096 further steps. A traced RAM work/wait episode must begin and end inside a contiguous
+observed interval; no time across a gap is charged as measured work. Repeated
+fallthrough/catch-up visits remain part of the work phase. Each candidate needs
+eight fresh complete episodes at the current MHz. RAM budgets additionally need
+repeated observed decrements by a writer inside an actually entered IRQ. A
+pending IRQ alone does not establish a writer. Runtime-service and device RAM
+changes outside the observed CPU bus are reported as unobserved and discard
+budget eligibility. They are not attributed to an adjacent guest instruction.
+
+VGA uses a separate boundary measurement. Port instructions already end native
+RAM/register batches. The analyzer observes the admitted IN/test/branch sequence
+there, retaining ordinary JIT execution between visits and the existing strict
+VGA wait-batching proof. It accumulates only confirmed wait iterations; all other
+elapsed guest time, including interrupts, other loops and unknown code, is
+charged as a **work upper bound**. The `boundary_accounting` field distinguishes
+this measurement from instruction-trace episodes. Short trace gaps do not erase
+these independently observed boundaries. A returning guard still cannot qualify
+as a wait, and no new general skipping proof is introduced.
+
+Caller and IRQ instruction probes feed the same VGA boundary observer. Otherwise
+a port loop completed inside one probe would disappear from the presentation
+model, even though it executed normally. Time traced inside those probes remains
+work; recording a boundary does not credit it as waiting. An initial taken poll
+establishes the hardware phase, so later immediate exits in new phases can finish
+episodes without inventing a period for the initial partial frame.
+
+The analyzer also excludes elapsed time already skipped by the independent
+strict idle engine, after its unchanged CPU/RAM/input and device-event checks.
+`proven_idle_nanos` reports this contribution. An empty input query or a
+cooperative delay does not supply this evidence. Proven idle time alone does
+not establish a clock source, complete episode or eligible CPU budget.
+
+The prediction uses the largest current work sample, a 25% period reserve and a
+100-us margin. The prediction's maximum covers the last 16 complete episodes;
+the displayed historical maximum remains separate, so an old heavy phase does
+not permanently prevent relearning. Adjustment checks run between bounded batches, with a 100-ms
+minimum reduction cadence and a gradual step of approximately 1/16 of current
+MHz. Missing evidence or a missed learned episode deadline restores the ceiling.
+After a reduction, a bounded 500-ms to 2-second relearning interval allows fresh
+measurements. It includes the initial partial frame, eight complete episodes and
+jitter already observed at the configured ceiling;
+code invalidation, interrupted coverage or missed deadlines cancel that interval.
+Device clocks continue independently. This is a heuristic throughput policy,
+not strict loop skipping or instruction-count equivalence.
+
+Focused checks:
+
+```sh
+cargo test -p doslet-runtime --locked session::analyzer
+cargo test -p doslet-pc --features profiling --locked observation_tests
+cargo test -p doslet-bus --locked observation
+cargo test -p doslet --release --locked local_heroes_synchronization_analysis -- --ignored --nocapture
+```
+
+The last command requires the local read-only Heroes installation and ISO. It
+boots to the scripted menu boundary and records three alternating diagnostic
+off/on pairs with audio synthesis and no output device. Wall duration is not
+host process CPU time or an audible-playback check. Live scene navigation,
+matched host-CPU measurements, music continuity and generalized caller-loop
+coverage remain acceptance work; no game CPU saving is established by these
+synthetic tests.
+
+An initial native menu measurement at 133 MHz used three alternating five-second
+pairs. With diagnostics off, process CPU times were 4.40/4.32/4.46 seconds,
+guest progress was approximately 5.00 seconds, and no host audio underruns were
+added. With the initial unconditional two-million-step observation windows,
+CPU times were 5.25/5.24/5.24 seconds, guest progress fell to
+3.42/3.36/3.42 seconds, and underruns increased by 70,171/72,644/69,269 frames.
+No complete episodes qualified. This failed acceptance and motivated the bounded
+discovery windows above; it does not measure the revised implementation.
+
+The next live menu run with bounded discovery used 4.35/4.37/4.34 CPU seconds
+with analysis off and 4.45/4.40/4.37 with analysis on. All six five-second samples
+advanced about five guest seconds. Underrun increments were 434/183/145 off and
+63/177/421 on. Puzzle samples, with the controller enabled in the on condition,
+used 4.88/4.92/4.89 CPU seconds off and 4.84/4.83/4.84 on; only the first off
+sample added underruns (259 frames). Both scenes stayed at 133 MHz with zero
+complete episodes. These differences do not establish savings from adaptation.
+These runs preceded VGA boundary accounting. The release build used native JIT
+and did not enable the Cargo `profiling` feature; instruction observation itself
+was the source of the initial additional interpreter work.
+
+### Live VGA boundary measurements
+
+The following native JIT runs used three alternating off/on pairs per scene,
+with one second to settle followed by five seconds of measurement. The on
+condition enabled both analysis and the controller. All samples advanced about
+five guest seconds and stayed at 133 MHz. CPU values cover the whole process;
+audio values are increments in host underrun frames. These runs preceded the
+additional strict-idle time accounting above.
+
+| Scene | CPU seconds off | CPU seconds on | Underrun frames off | Underrun frames on |
+| --- | --- | --- | --- | --- |
+| Puzzle | 4.98 / 4.94 / 5.01 | 5.07 / 5.01 / 5.03 | 204 / 193 / 270 | 343 / 0 / 0 |
+| City, no building dialog | 2.94 / 2.93 / 2.97 | 2.85 / 2.91 / 2.93 | 221 / 0 / 0 | 0 / 0 / 0 |
+| Discovered map, manual scrolling | 2.74 / 3.25 / 3.27 | 3.03 / 3.03 / 3.17 | 0 / 0 / 0 | 0 / 0 / 0 |
+| Battle, player's turn | 4.83 / 4.82 / 4.80 | 4.79 / 4.79 / 4.85 | 448 / 47 / 86 | 64 / 0 / 0 |
+
+VGA wait sites were discovered at guest addresses `0x224274` and `0x22427a`;
+these are observations, not recognition constants. The latter produced 34–35
+complete episodes per enabled six-second interval, including settling. Recent
+work upper bounds were about 162–167 ms, generally leaving too little confirmed
+waiting for the configured reserve. Battle samples reported 6/5/4 learned-period
+misses; these are not guest audio deadline measurements. Interactive checks reported
+smooth battle music and normal cursor/unit-selection response. A prior map run
+was excluded because the viewport showed unexplored black terrain. Scrolling
+trajectories in the replacement run were manual and not identical.
+
+A diagnostic puzzle cross-check at 133 → 33 → 133 MHz recorded recent episode
+periods of 166.832 → 200.199 → 166.832 ms and work upper bounds of
+164.86 → 184.17 → 161.64 ms. A listening check reported smooth music at 33 MHz. The work
+upper bound did not scale with CPU throughput: it includes other waiting loops
+that the current VGA model cannot separate. This limits its demand estimate.
+
+These measurements establish real VGA source/episode discovery and removal of
+the initial severe observation overhead. They do **not** demonstrate automatic
+CPU reduction, recovery under increased work, or battery savings. Generic
+caller-loop analysis for returning RAM countdown guards and continuous writer
+attribution remain incomplete; the plan's final acceptance criteria are unmet.
+
+After adding strict-idle accounting, the headless menu check passed with
+off/on wall times of 100.70/100.12, 100.25/101.37 and 102.42/101.89 ms.
+`proven_idle_nanos` remained zero in all three enabled intervals, so this
+additional evidence source did not resolve the menu's unidentified waiting.
+
+### Returning countdown guards and IRQ sources
+
+The diagnostic model also admits an absolute flat-32-bit `CMP [RAM],0` followed
+by a forward `JNE` to a plain `RET` within 256 bytes. It verifies a direct caller
+against the actual stack return address and records observed backedges to that
+caller. Two fixed guard records retain code generations and execution context.
+These records do not become complete work/wait episodes merely because a guard
+returns early.
+
+After discovery, IRQ entry starts an independently bounded observation of at
+most 4,096 steps. Actual bus reads and writes establish load/decrement/store
+chains, including stores through indexed operands. Attribution can follow
+16-/32-bit handler transitions; it ends on architectural interrupt return,
+a nested IRQ, an unobserved write or the step limit. A return to a different
+context ends attribution as incomplete, rather than carrying the old IRQ
+identity into the continuation. Ordinary foreground batches keep their JIT path.
+IRQ tracing cancels an in-progress idle proof. A foreground VGA condition can
+resume only after its exact architectural return, excluding IRQ service time;
+an intermediate IRET through a protected-mode bridge does not establish that
+return. The suspended condition remains bounded to 20 ms and is discarded if
+the exact return never arrives. VGA boundaries observed inside the IRQ probe
+remain visible even if its instruction budget expires.
+
+MCP `guards` reports caller/backedge evidence, watched RAM, actual writer PC,
+IRQ vector, write value/time, partial writes and observed decrements.
+`observed_interval_nanos` is the interval between captured decrements, not a
+guaranteed timer period; intervening interrupts can be unobserved.
+`guard_irq_steps` and `guard_interrupted_traces` expose observation cost and gaps.
+No field here authorizes a CPU budget without complete caller-phase coverage.
+
+In the real headless Heroes menu check, generic discovery found guard `206FC0h`,
+operand `2810A8h`, and direct callers `2092E2h` and `217DA2h`. The second caller
+had observed backward transfers. Two enabled windows captured 11 and 13
+decrements at writer `219FABh` inside actual IRQ vector 8, with 63,274 and 61,438
+observed IRQ steps. These addresses are evidence only and are not recognition
+constants. A third enabled window had no discovered guard. This establishes
+source attribution, not complete caller work/wait coverage or adaptive savings.
+
+A live native menu check through direct MCP used three alternating off/on pairs
+at 133 MHz, with one second of settling and five seconds per sample. Guest time
+tracked wall time in all six samples (5.008–5.013 guest seconds). Host audio
+underrun frame deltas were 0/0/0 with diagnostics off and 65/0/0 with diagnostics
+on. Enabled windows, including settling, captured 174/180/183 decrements from
+IRQ vector 8 and 765,535/782,853/760,069 IRQ observation steps. This confirms
+live source attribution and pacing for this menu sample, not CPU headroom:
+the running process was unavailable in the measurement shell's process view,
+so host CPU usage was not measured. The adaptive controller remained disabled;
+diagnostics were switched off after the comparison. Audio smoothness was not
+independently checked by listening for this particular run.
+
+A diagnostic experiment focused the existing strict idle proof on the discovered
+caller `217DA2h`. It produced no successful proof: the returning loop accessed
+devices, which violates that proof's unchanged-device contract. The extra batch
+boundary and proof hint were removed because they did not establish additional
+waiting. Idle diagnostics now distinguish device accesses from RAM changes or
+write-log exhaustion and input-state changes. Caller-phase classification still
+requires explicit treatment of these device effects; it cannot reuse an early
+return as an idle classification.
+
+### Complete caller effect inventory
+
+After a supported returning guard's nonzero read, a separate diagnostic probe
+follows execution back to the same post-compare instruction, stack pointer,
+direct caller and flat context. It traces at most 32,768 steps and starts at most
+once per 250 ms of guest time. IRQ entry/return is attributed explicitly; nested
+IRQs, unavailable effects and service continuations prevent a complete result.
+The inventory holds 512 effect groups, reserving 16 for ports/MMIO so stack
+traffic cannot conceal device accesses. Overflow remains visible. Full details
+are borrowed separately from the lightweight HUD statistics. Fixed-capacity
+buffers are allocated at analyzer setup; tracing does not allocate.
+
+Ordinary RAM writes include their previous value from a side-effect-free bus
+view. Ports and MMIO are never read to obtain a previous value. A separate
+2,048-byte ledger reconciles overlapping writes, and reports changed bytes at
+return. Overflow, missing prior values, unobserved writes or changed/A20-aliased
+mapping make the RAM result unavailable. CPU and input snapshots and the modeled
+CMOS register state are compared separately. These are diagnostic measurements;
+neither a completed iteration nor equal endpoint states supplies a frame budget
+or changes the existing strict idle-skipping contract.
+
+The read-only headless Heroes check at 33 MHz captured two complete iterations
+through guard `206FC0h`, direct caller `2092E2h`, and the surrounding menu event
+path. Each used 1,219 steps and 147,758 ns, with no IRQ, unobserved write or effect
+overflow. CPU, input, written RAM bytes and modeled CMOS state returned to their
+entry values. All four device operations were CMOS writes: select register
+`0Fh` through port `70h`, write zero through `71h`, select `0Fh` again, then write
+nine. This explains the earlier strict proof's device-access rejection. It does
+not establish that every menu iteration is idle: timed updates and IRQ audio
+work still require complete work/wait accounting. See the
+[Heroes inventory](compatibility/heroes-waits.md#complete-menu-caller-observation)
+for the observed sites and remaining acceptance work.
+
+Three adjacent off/on headless interpreter pairs (four million steps per window,
+with audio synthesis/draining) took 106.45/104.13, 102.51/109.89 and 103.48/111.26 ms
+of host wall time. One enabled window discovered no guard. These short sequential
+windows do not measure live JIT CPU headroom, audible playback or adaptive savings.
+
+### Continuous measured recurrence
+
+A complete caller inventory with equal CPU, input, RAM and CMOS endpoint state
+can now install an exact post-compare observation boundary. Interpreter batches
+yield at that instruction even inside a cached block. Native traces intersecting
+the boundary use decoded execution; other native blocks remain eligible.
+
+After four observed IRQ decrements establish a fresh source, the machine journals
+up to 2,048 distinct written RAM bytes per actual interval. Hash storage is
+allocated once during setup and reused without per-step allocation. Writable
+native RAM borrows are unavailable while the journal is valid. The PC selects
+decoded batches once per slice instead of repeatedly attempting native store
+traces that would be rejected. An overflow rejects the interval and permits
+native execution again; ending the journal also restores the ordinary path. IRQ entry, mapping
+changes, unmodeled services and changed CPU/input state also reject or cancel an interval.
+Pure queries already admitted by the strict idle proof, including a zero-motion
+mouse query, use that same service classification; their CPU/RAM/input changes
+remain covered by endpoint comparison.
+The only admitted device operations are writes selecting CMOS register `0Fh`
+and writes to that scratch register. The entire CMOS snapshot must be restored.
+Other port or device-memory accesses reject the interval, even if their final
+values are unchanged. Intervals time out after 5 ms; absent boundaries expire
+after 250 ms.
+
+IRQ source observation also starts when the interrupted foreground is inside a
+16-bit BIOS wrapper. Actual bus addresses and the delivered vector establish
+attribution; the flat caller's code/mapping checks and exact interrupt-return
+boundary remain mandatory. Rejecting all such entries left artificial source
+gaps at lower throughput.
+
+Only fully executed, verified intervals contribute to `recurrence.measured_wait_nanos`.
+This evidence augments continuous VGA work/wait accounting. Successive zero
+arrivals at the established countdown guard also delimit complete caller episodes,
+with a nonzero return starting their waiting phase. These records use the same
+eight-episode qualification, recent work maximum and reserve as direct waits.
+The selected caller remains stable when another caller visits the same guard.
+Evidence is not extrapolated from a sample and never authorizes instruction skipping.
+IRQ service, timed updates
+and incomplete intervals remain in the work upper bound. The original strict
+idle proof still rejects every device access. MCP and Details expose recurrence
+counts, rejected/cancelled intervals and measured waiting separately from skipped
+idle time. Throughput relearning allows at least nine measured periods, bounded
+between 0.5 and 2 seconds, so eight new episodes can qualify. Reduction/recovery
+counters and the last recovery reason are available over MCP. Real-game adaptive
+acceptance remains outstanding.
+
+When no returning-guard boundary with fresh source evidence exists, a bounded
+scout can observe an executed, taken direct backedge instead. Conditional and
+unconditional branches share the same interval checks; a fallthrough is not a
+recurrence. A visited
+guard without observed IRQ writers cannot indefinitely block this alternative;
+an active backedge retains its boundary when later caller traces finish.
+The backedge requires a fresh, stable VGA cadence
+with at least eight complete episodes; a backedge never supplies its own deadline.
+After retuning, actual VGA exits keep this existing source fresh while the first
+new complete episode is measured. Source freshness does not qualify a budget:
+eight complete episodes at the new speed are still required. Without another
+observed exit the source expires after 250 ms, as before.
+The exact same CPU/input/net-RAM/CMOS and IRQ/device-access checks cover complete
+executed iterations, including indirect calls. After eight consecutive unchanged
+iterations, only individually verified intervals augment the VGA waiting total.
+Changing animation work and incomplete intervals remain charged in full. A
+5-ms interval limit cancels the journal while retaining the boundary for the next
+frame. A backedge absent for 250 ms, changed code/context or lost VGA source ends the probe.
+VGA source validation runs at complete arrivals before any wait credit, instead
+of scanning candidates on every intervening instruction. Code mutation checks
+and both time limits remain active away from the boundary.
+Eight rejected or cancelled intervals abandon an unqualified probe. A qualified
+boundary survives bursts of changing animation handlers, but expires after
+250 ms without any unchanged interval; all changed intervals remain work.
+An eight-entry table delays retrying an abandoned head for 250 ms. Losing an
+already qualified boundary invalidates
+the VGA work estimates. MCP exposes `recurrence.backedge` and
+`recurrence.probe_rejections` and `recurrence.last_probe_rejection_reason`
+alongside the existing counters. This path executes
+all guest instructions and contains no game-specific address.
+
+For local native-host measurements, build with
+`RUSTFLAGS='-C target-cpu=native' cargo build -p doslet --release --locked`.
+This binary targets the build host's CPU. Compare fixed and adaptive modes within
+that same build, and record the flags; do not attribute differences from a prior
+generic build solely to the controller. Do not apply this host CPU flag to WASM.
+
+Each active timed candidate learns a reference period at the configured ceiling
+from a full window of 16 complete episodes before the first reduction. A partial
+initial window can underestimate the normal period and freeze that estimate
+when throughput falls. Cadence uses
+up to 16 recent periods and excludes one longest period from its mean. That
+window survives gradual speed changes, while work-cost qualification starts
+again. A speed increase discards the lower-speed cadence window while retaining
+the ceiling reference. At the configured ceiling, a full 16-period window must
+recalibrate it before another reduction. Otherwise at least two complete VGA episodes at the new speed are
+required. The rolling cadence mean tolerates 3.125% plus 100 us of slowdown;
+this is stricter than the spread allowed between individual ceiling-speed
+frames. MCP exposes the measured mean as `cadence_mean_nanos`, separately from
+the last period and the ceiling reference, and Details displays both means.
+Recalibrating an existing reference requires 16 new ceiling-speed episodes, so
+slower periods cannot become a larger accepted budget.
+
+A VGA poll does not by itself prove a fixed presentation rate. After excluding
+one longest ceiling-speed period, the remaining periods must span no more than
+12.5% of the shortest plus 100 us to establish a cadence reference. Otherwise
+`variable_cadence` is true, that candidate has no presentation deadline or MHz
+prediction, and its old cadence floor is cleared. Other independently qualified
+candidates may still provide a budget; with none, execution uses the ceiling.
+
+An unfinished phase subtracts all confirmed waiting from elapsed guest time;
+work exceeding the reserved budget restores the ceiling immediately. Occasional
+long guest waits do not themselves establish insufficient CPU throughput.
+Sustained cadence loss also restores the ceiling. If measured work still fits,
+it establishes a conservative minimum for the current model, 25% above the
+failing throughput; expensive work instead uses the ordinary work-budget model.
+The minimum retains the measured slowdown that justified it. It survives ordinary
+retuning, but a full fresh window at the configured ceiling can disprove it:
+if the failed period now fits the recalibrated reference's unchanged tolerance,
+the floor is cleared. Periods measured at reduced speed cannot clear it.
+Model invalidation also clears the floor.
+Countdown guards use the reference to bound their work budget, but their multiple
+caller/update paths are not treated as a constant presentation cadence. MCP and
+Details expose `reference_period_nanos` and `cadence_floor_mhz` separately.
+
+An IRQ between the VGA port read and its conditional branch suspends that
+condition until an actual IRET returns to the exact CS/IP/SP. The entire interrupt
+duration remains work, including nested handlers and BIOS services. A changed
+code version, missing return or 20-ms timeout discards the incomplete episode;
+it must not merge two presentation periods and create a false cadence miss.
+After an actual waiting episode establishes the source, a poll that immediately
+exits in a later hardware phase also closes a period. Repeated exits in the same
+phase remain catch-up work. The phase identity uses the modeled next retrace
+transition captured at the actual IN instruction, without reading the port again.
+It remains attached to that returned value across TEST/Jcc and interrupts; a
+device transition before the branch must not relabel the earlier read.
+
+Native MCP status reports process CPU ticks on Linux for host-cost comparisons.
+Use deltas over matched wall-time windows and retain guest-time, effective-MHz
+and audio-underrun deltas alongside them. These counters measure the whole
+process, including presentation and audio; guest idle fractions are not a
+substitute. See [MCP host counters](debugging.md#mcp-host-counters).
+
 ## Check the work
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+RUST_MIN_STACK=8388608 cargo test --workspace --locked
 cargo check -p doslet -p doslet-time -p doslet-executable --target wasm32-unknown-unknown --locked
 cargo check -p doslet-web-worker -p doslet-web-audio --target wasm32-unknown-unknown --locked
 cargo run -p doslet-headless --release --locked -- bench --steps 5000000
 cargo run -p doslet-headless --release --locked --example bench_dynamic
 ```
+
+Native synthesis-worker tests run without an audio device:
+
+```sh
+cargo test -p doslet --locked native_audio::
+cargo test -p doslet --locked audio_worker
+```
+
+They compare every output sample with the synchronous renderer at 44.1 and
+48 kHz, including MIDI changes and timed PCM, and exercise pause/resume,
+saturation, reset/output-switch cancellation, failed setup, error recovery and
+shutdown with a full paused sink. App tests verify that saturation stops guest
+progress before the next CPU chunk and that asynchronous errors reach the notice
+while paused. These are synthetic scheduling/correctness checks, not measurements
+of game performance, audible quality, CM-32L ROM playback or macOS Audio Units.
+
+With local CM-32L ROMs, exercise a guest driver sending 6000 expression changes
+through MPU-401 write-ready polling, both inline and on the synthesis worker:
+
+```sh
+DOSLET_MT32_ROM_DIR=/path/to/roms cargo test -p doslet --release --locked local_moont_expression_flood_obeys_uart_backpressure -- --ignored --nocapture
+```
+
+This synthetic reproduction covers the rapid `CC 11` traffic observed while
+entering PRINCE's Doge's Palace. It checks that draining MIDI does not bypass
+the guest UART rate and that notes still reach CM-32L after the flood. It does
+not establish interactive palace compatibility or audible quality.
+
+### Linux PulseAudio protocol probes
+
+These opt-in tests require `pactl` and a running PulseAudio-compatible server.
+Create dedicated null sinks; never use the physical default sink. Save each
+returned module ID and unload those modules when finished. Do not change the
+system default output.
+
+```sh
+pactl load-module module-null-sink sink_name=doslet-audio-probe channels=4 channel_map=front-left,front-right,rear-left,rear-right rate=48000
+pactl load-module module-null-sink sink_name=doslet-audio-probe-output channels=2 rate=48000
+cargo run -p doslet-pulse --locked --example synchronization -- doslet-audio-probe 600 controls
+PULSE_SINK=doslet-audio-probe-output RUST_MIN_STACK=8388608 cargo test -p doslet --locked pulse_loopback_pause_and_reset_discard_old_server_audio -- --ignored --nocapture
+PULSE_SINK=doslet-audio-probe-output RUST_MIN_STACK=8388608 cargo test -p doslet --locked system_mixer_loopback -- --ignored --nocapture
+PULSE_SINK=doslet-audio-probe-output RUST_MIN_STACK=8388608 cargo test -p doslet --locked mixer_selection_prepares -- --ignored --nocapture
+# Replace each placeholder with the ID returned by load-module:
+pactl unload-module FOUR_CHANNEL_MODULE_ID
+pactl unload-module TWO_CHANNEL_MODULE_ID
+```
+
+The synchronization probe captures only the null sink monitor. Four mono streams
+at 11025, 22050, 32000 and 48000 Hz carry periodic markers to separate channels
+of a 48-kHz capture. `controls` corks/uncorks the group every two seconds, with a
+100-ms pause. Without it, playback runs continuously. Ordinal marker offsets
+must remain within 1 ms, and counts must agree. Missing markers can invalidate
+ordinal pairing; a reported offset is not necessarily a measured phase drift.
+The diagnostic retains up to about 463 MB for a ten-minute capture.
+
+On 2026-10-17, PipeWire 1.6.8 (`PulseAudio (on PipeWire 1.6.8)`) passed a
+10-second steady run and a 30-second grouped-control run, with endpoint offsets
+within one capture frame (21 microseconds). Sequential stream control failed
+the 30-second test by about 5.3 ms. The grouped 600-second run, while builds/tests
+also ran, failed marker correspondence: the first/last ordinal offsets were
+1/-101632, 0/-154751 and -1/47233 frames relative to channel zero (570 paired
+markers). This exceeded the original strict 1-ms threshold; it does not identify
+whether lost markers or phase drift caused the mismatch. That threshold is not
+an acceptance requirement for the optional system mixer. The current option
+uses guest-rate PCM plus 48-kHz FM and MIDI streams.
+
+The single-stream adapter's loopback test passed pause/queue retention and reset
+discard of previously buffered positive samples before negative replacement
+samples. It also disconnected only its own playback client four times: three
+reconnections succeeded, then the lifetime retry budget was exhausted. These
+results do not establish audible game quality, physical-device latency, a
+standalone PulseAudio daemon's behavior, or successful runtime CPAL fallback.
+Long-run rate changes and induced underruns remain unaccepted.
+
+The optional two-stream mixer passed a separate virtual-monitor test on the same
+PipeWire server: distinguishable stereo PCM and MIDI inputs summed to the
+expected levels for at least 100 ms, paused without consuming queued samples,
+and resumed after reset with only the replacement samples. Device-free worker
+tests retain application-mixer equivalence at 44.1/48 kHz and verify exact native
+PCM sample counts, saturation of one source, and group pause/reset.
+An application-level test also switched between both modes and verified that a
+failed synthesizer setup retained the old mixer and paused session.
+These checks do not establish long-run clock stability or audible game quality.
+
+The native-rate loopback test sends approximately 100-ms segments at 11025,
+22050 and 32000 Hz. A 48-kHz PipeWire monitor captured 4794, 4794 and 4793 stable
+samples respectively, and reset interrupted a paused rate transition. The test
+uses the dedicated `doslet-audio-probe-output` null sink and test-only media role
+to isolate saved server mute settings. This is synthetic evidence, not a
+real-game listening test.
+
+### Display validation
+
+Display filter and upload-order tests run with
+`cargo test -p doslet --locked presentation::`. On a host with a working wgpu
+adapter, also run the opt-in renderer regression:
+
+```sh
+cargo test -p doslet --locked large_hq2x_frames_remain_visible_during_gpu_upload -- --ignored --nocapture
+```
+
+It renders nine 640×480 synthetic frames enlarged by HQ2x to 1280×960,
+checking image pixels before and after asynchronous texture uploads. It requires
+no window or game data and does not validate live gameplay or display timing.
+
+Validate the desktop xBRZ shader with an available wgpu adapter:
+
+```sh
+cargo test -p doslet --locked gpu_xbrz -- --ignored --nocapture
+```
+
+This offscreen rendering test checks edge smoothing, 1:1 pixels, source borders,
+sRGB output, fractional scaling, frame replacement and video-size changes. It
+prints the adapter so software Vulkan is distinguishable from hardware GPU
+execution. It does not verify interactive window presentation or game performance.
+
+After building `web/dist` with Rust Trunk, check the production iced filter
+selector in an isolated Firefox profile (Python standard library, no Node):
+
+```sh
+python3 tests/browser_xbrz.py
+python3 tests/browser_xbrz.py --software
+```
+
+The first test forces the WebGL path, selects xBRZ through the UI, verifies that
+its shader compiles and draws, and switches back to Nearest before resizing.
+The second disables GPU rendering and checks the visible fallback notice and
+unchanged guest pixels. Screenshots and Firefox logs are written under `target/`.
+This is a synthetic display test, not a game-performance benchmark or WebGPU
+browser acceptance test.
 
 For the local Heroes build, this ignored test compares 40 guest seconds at
 50 MHz with background JIT and with the cached interpreter. Both retain Rust GM
@@ -104,7 +878,7 @@ Tasks that use your own game files belong in an untracked `mise.local.toml`.
 | PIT | Binary modes 0/2/3, latches, gates, channel-2 output at 61h, fractional guest clock input and IRQ0 | Modes 1/4/5, read-back, BCD and precise periodic load timing |
 | VGA/VBE | Mode-13h and banked 640×480×8 pixels, palette writes, borrowed scanout, configuration readback, selected VBE 1.2 BIOS calls | Text/planar modes, register rendering effects, raster timing, more SVGA modes |
 | DOS/BIOS | COM/MZ/overlay setup, bounded memory arena, immutable input files/directories, optional sparse RAM writes, timer/user-hook shims | Full DOS kernel, extender compatibility, raw mouse hardware, persistent storage |
-| MPU-401 / MIDI | UART setup, bounded output at 330h/331h; independent procedural synth, guest-timed WAV, native and Web Audio output | General MIDI instrument fidelity, serial timing, IRQs and intelligent mode |
+| MPU-401 / MIDI | UART setup, guest-time transmit-busy handshake (320 µs/byte), bounded output at 330h/331h; independent procedural synth, guest-timed WAV, native and Web Audio output | General MIDI instrument fidelity, receive-side serial timing, IRQs and intelligent mode |
 | Sound Blaster 16 / AdLib | Independent DSP/mixer and Nuked OPL3 FM, selected DMA PCM playback, guest-clock OPL timers, stereo FM/DMA mixing, auto-init/pause/resume, block IRQs and bounded output queue | More DSP commands, precise timing, digital-PCM mixer gain and real-game FM audio acceptance |
 | Frontends | Shared iced desktop/web view, native emulation thread, browser Worker/AudioWorklet, ZIP mount/program selection, optional system MIDI on both platforms, headless CLI | Further presentation-copy reduction |
 | Executable inspector | Borrowed MZ metadata/relocations and LE/LX header detection | LE/LX loading and execution |
@@ -277,13 +1051,16 @@ to omit the native JIT.
 Headless `--no-decode-cache` disables both engines' caches for the byte-fetching
 reference. Native CLI output reports actual compiled and executed block counts.
 
-Optionally reuse observed code on subsequent launches:
+Native game launches reuse observed code from a per-executable profile in the
+user cache (see [host directories](configuration.md#host-directories)). Select
+one file explicitly, or disable profiling with `--no-core-profile`:
 
 ```sh
 cargo run -p doslet --release --locked -- --game PRINCE/PRINCE.EXE --core-profile target/prince.core-profile
 ```
 
-The same `--core-profile FILE` option works with headless runners. Profiles are
+The same `--core-profile FILE` option works with headless runners, which use no
+profile by default. Profiles are
 local hints containing bounded guest code bytes, never saved host machine code.
 Keep them outside game directories and do not redistribute profiles of commercial
 games. The desktop saves on pause, reset and normal shutdown; headless saves at

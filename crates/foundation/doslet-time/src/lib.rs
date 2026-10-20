@@ -79,3 +79,7 @@ mod tests {
         assert_eq!(actual, 1_000_000_000);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

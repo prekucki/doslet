@@ -6,5 +6,16 @@
 /games/
 *.log
 __pycache__/
+/.idea/
 /docs/HANDOFF.md
 /mise.local.toml
+
+# Local tool credentials and account-linked design exports
+/.claude/
+/.codex/
+/design/stitch/
+
+# Guest memory and learned code profiles stay local
+*.pb.gz
+*.core-profile
+*.csv

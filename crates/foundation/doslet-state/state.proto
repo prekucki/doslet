@@ -1,0 +1,995 @@
+syntax = "proto3";
+package doslet.state.v1;
+
+message SavedSession {
+  string format = 1;
+  uint32 version = 2;
+  uint32 machine_model = 3;
+  RuntimeSession session = 4;
+  bool dynamic_core = 5;
+  bool vga_waits = 6;
+  bool idle_loops = 7;
+}
+
+// Version 2 external immutable assets; checksums detect accidental mismatches.
+enum ResourceKind {
+  RESOURCE_UNSPECIFIED = 0;
+  DIRECTORY_FILE = 1;
+  ISO9660 = 2;
+}
+message ResourceReference {
+  ResourceKind kind = 1;
+  uint32 drive = 2;
+  bytes path = 3;
+  uint64 length = 4;
+  fixed64 checksum = 5;
+}
+message RuntimeCdrom {
+  uint32 drive = 1;
+  bytes image = 2;
+  repeated CdromHandle handles = 3;
+  ResourceReference resource = 4;
+}
+
+message CdromHandle {
+  uint32 slot = 1;
+  uint64 data_start = 2;
+  uint64 data_end = 3;
+  uint64 record_start = 4;
+  uint64 record_end = 5;
+  bool directory = 6;
+  uint32 position = 7;
+}
+
+// Stable wire field numbers. Removed fields must be reserved, never reused.
+
+message ConfigHardwareConfig {
+  uint32 cpu_mhz = 1;
+  uint32 memory_mib = 2;
+  bool x87 = 3;
+  bool sb16 = 4;
+  bool mpu401 = 5;
+  uint32 sb_irq = 6;
+  uint32 sb_dma8 = 7;
+  uint32 sb_dma16 = 8;
+  ConfigKeyboardMode keyboard = 9;
+  bool gameport = 10;
+}
+
+message ConfigKeyboardMode {
+  uint32 value = 1;
+}
+
+message I8259Pic {
+  uint32 pending = 1;
+  uint32 mask = 2;
+  uint32 in_service = 3;
+  uint32 vector_base = 4;
+  uint32 init_word = 5;
+  bool needs_icw4 = 6;
+  bool single = 7;
+  bool read_isr = 8;
+}
+
+message I8254Channel {
+  uint32 reload = 1;
+  uint32 remaining = 2;
+  uint32 access = 3;
+  optional uint32 low_write = 4;
+  bool high_read = 5;
+  optional uint32 latched = 6;
+  bool programmed = 7;
+  uint32 mode = 8;
+  bool gate = 9;
+  bool terminal = 10;
+  bool load_pending = 11;
+}
+
+message I8254Pit {
+  repeated I8254Channel channels = 1;
+}
+
+message I8237Channel {
+  uint32 base_address = 1;
+  uint32 address = 2;
+  uint32 base_count = 3;
+  uint32 count = 4;
+  uint32 mode = 5;
+}
+
+message I8237Dma {
+  repeated I8237Channel channels = 1;
+  bool high = 2;
+  uint32 mask = 3;
+  uint32 command = 4;
+  uint32 software_request = 5;
+  uint32 dreq = 6;
+  uint32 terminal = 7;
+}
+
+message GameportGameport {
+  repeated sint32 axes = 1;
+  repeated bool buttons = 2;
+  repeated uint64 deadlines = 3;
+}
+
+message CmosCmos {
+  bytes registers = 1;
+  uint32 selected = 2;
+}
+
+message SbMixerMixer {
+  uint32 index = 1;
+  bytes registers = 2;
+  bool irq_enable_initialized = 3;
+}
+
+message SbDspFormat {
+  bool word = 1;
+  bool stereo = 2;
+  bool signed = 3;
+}
+
+message SbDspPlayback {
+  SbDspFormat format = 1;
+  uint32 length = 2;
+  uint32 remaining = 3;
+  bool auto_init = 4;
+  bool paused = 5;
+  optional bool previous_block_acknowledged = 6;
+}
+
+message SbDspDiagnostics {
+  uint64 resets = 1;
+  uint64 commands = 2;
+  uint32 last_command = 3;
+  uint64 dma_requests = 4;
+  uint32 last_dma_command = 5;
+  uint64 dma_units = 6;
+  uint64 block_irq_deadlines = 7;
+  uint64 block_irq_deadline_misses = 8;
+}
+
+message SbDspDsp {
+  SbDspDiagnostics diagnostics = 1;
+  bool reset = 2;
+  bytes reply = 3;
+  uint32 reply_len = 4;
+  uint32 last = 5;
+  optional uint32 parameter = 6;
+  optional uint32 rate_high = 7;
+  uint32 test = 8;
+  bool speaker = 9;
+  uint32 sample_rate = 10;
+  uint32 input_rate = 11;
+  bytes dma_parameters = 12;
+  uint64 dma_parameter_len = 13;
+  optional SbDspPlayback playback = 14;
+  optional SbDspFormat configured_format = 15;
+  optional sint32 left = 16;
+  bool irq8 = 17;
+  bool irq16 = 18;
+}
+
+message MpuQueue {
+  bytes bytes = 1;
+  uint64 head = 2;
+  uint64 len = 3;
+}
+
+message MpuMpu401 {
+  bool uart = 1;
+  optional uint32 acknowledgement = 2;
+  MpuQueue output = 3;
+  uint64 commands = 4;
+  uint64 transmitted = 5;
+  uint64 transmit_ready_nanos = 6;
+}
+
+message PcmFrame {
+  uint64 nanos = 1;
+  uint32 duration = 2;
+  repeated sint32 samples = 3;
+}
+
+message VgaVideoMode {
+  uint32 value = 1;
+}
+
+message VgaVgaPaletteItem {
+  bytes value = 1;
+}
+
+message VgaVga {
+  bytes memory = 1;
+  repeated VgaVgaPaletteItem palette = 2;
+  uint64 dac_cursor = 3;
+  uint64 dac_read_cursor = 4;
+  bool dac_reading = 5;
+  uint32 dac_mask = 6;
+  VgaRegisters registers = 7;
+  VgaVideoMode mode = 8;
+  uint32 bank = 9;
+  uint32 raster_ticks = 10;
+  uint64 pending_nanos = 11;
+  uint64 pixel_fraction = 12;
+  uint64 revision = 13;
+  uint32 latches = 14;
+}
+
+message VgaRegisters {
+  uint32 misc = 1;
+  uint32 sequencer_index = 2;
+  bytes sequencer = 3;
+  uint32 graphics_index = 4;
+  bytes graphics = 5;
+  uint32 crtc_index = 6;
+  bytes crtc = 7;
+  bytes attribute = 8;
+  uint32 attribute_index = 9;
+  bool attribute_data = 10;
+}
+
+message AtPending {
+  uint32 value = 1;
+}
+
+message AtKeyboard {
+  AtPending pending = 1;
+  uint32 leds = 2;
+  uint32 typematic = 3;
+  uint32 scan_set = 4;
+  bool scanning = 5;
+  uint32 last_reply = 6;
+  repeated uint64 pressed = 7;
+  optional InputPhysicalKey repeat = 8;
+  uint64 deadline = 9;
+}
+
+message I8042Pending {
+  uint32 value = 1;
+}
+
+message I8042Controller {
+  uint32 command_byte = 1;
+  uint32 output_port = 2;
+  I8042Pending pending = 3;
+  bool last_command = 4;
+  AtKeyboard protocol = 5;
+  uint64 nanos = 6;
+  bytes output = 7;
+  uint64 head = 8;
+  uint64 len = 9;
+  bytes releases = 10;
+  uint64 release_head = 11;
+  uint64 release_len = 12;
+}
+
+message InputPhysicalKey {
+  uint32 value = 1;
+}
+
+message InputInputSourceId {
+  uint32 value = 1;
+}
+
+message InputControlKey {
+  InputPhysicalKey value0 = 1;
+}
+
+message InputControlButton {
+  uint32 value0 = 1;
+}
+
+message InputControlAxis {
+  uint32 value0 = 1;
+}
+
+message InputControl {
+  oneof kind {
+    InputControlKey key = 1;
+    InputControlButton button = 2;
+    InputControlAxis axis = 3;
+  }
+}
+
+message InputEndpointKey {
+  InputPhysicalKey value0 = 1;
+}
+
+message InputEndpointButton {
+  uint32 value0 = 1;
+}
+
+message InputEndpointAxis {
+  uint32 value0 = 1;
+}
+
+message InputEndpoint {
+  oneof kind {
+    InputEndpointKey key = 1;
+    InputEndpointButton button = 2;
+    InputEndpointAxis axis = 3;
+  }
+}
+
+message InputBinding {
+  InputInputSourceId source = 1;
+  InputControl control = 2;
+  InputEndpoint target = 3;
+  sint32 scale = 4;
+}
+
+message InputGuestEventKey {
+  InputPhysicalKey key = 1;
+  bool pressed = 2;
+}
+
+message InputGuestEventButton {
+  uint32 button = 1;
+  bool pressed = 2;
+}
+
+message InputGuestEventAxis {
+  uint32 axis = 1;
+  sint32 value = 2;
+}
+
+message InputGuestEventReleaseAll {
+}
+
+message InputGuestEvent {
+  oneof kind {
+    InputGuestEventKey key = 1;
+    InputGuestEventButton button = 2;
+    InputGuestEventAxis axis = 3;
+    InputGuestEventReleaseAll releaseall = 4;
+  }
+}
+
+message InputSource {
+  uint64 generation = 1;
+  uint64 sequence = 2;
+  bool connected = 3;
+  bool seen = 4;
+  bool registered = 5;
+  repeated uint64 keys = 6;
+  uint32 buttons = 7;
+  repeated sint32 axes = 8;
+  bool keyboard = 9;
+  bool joystick = 10;
+  repeated uint64 suppressed_keys = 11;
+  uint32 suppressed_buttons = 12;
+  repeated bool suppressed_axes = 13;
+}
+
+message InputInputRouterBindingsItem {
+  optional InputBinding value = 1;
+}
+
+message InputInputRouter {
+  uint64 epoch = 1;
+  repeated InputSource sources = 2;
+  repeated InputInputRouterBindingsItem bindings = 3;
+  uint64 count = 4;
+  repeated sint32 values = 5;
+  repeated bool held = 6;
+  repeated bool suppressed = 7;
+  repeated InputGuestEvent edges = 8;
+  uint64 head = 9;
+  uint64 len = 10;
+  bool release_latch = 11;
+}
+
+message X86ControlRegisters {
+  uint32 cr0 = 1;
+  uint32 cr2 = 2;
+  uint32 cr3 = 3;
+  X86DescriptorTable gdtr = 4;
+  X86DescriptorTable idtr = 5;
+  optional X86DescriptorTable ldtr = 6;
+  uint32 ldtr_selector = 7;
+  optional X86SegmentCache task = 8;
+}
+
+message X86DescriptorTable {
+  uint32 base = 1;
+  uint32 limit = 2;
+}
+
+message X86SegmentCache {
+  uint32 selector = 1;
+  uint32 base = 2;
+  uint32 limit = 3;
+  uint32 access = 4;
+  uint32 flags = 5;
+  bool default32 = 6;
+  bool usable = 7;
+}
+
+message X86CpuSnapshot {
+  repeated uint32 general = 1;
+  uint32 ip = 2;
+  repeated uint32 selectors = 3;
+  repeated X86SegmentCache caches = 4;
+  bool protected = 5;
+  uint32 cpl = 6;
+  uint32 flags = 7;
+  X86ControlRegisters control = 8;
+  optional X87X87 fpu = 9;
+  bool halted = 10;
+  uint32 interrupt_shadow = 11;
+}
+
+message X87X87FiniteItem {
+  optional X87Finite value = 1;
+}
+
+message X87X87 {
+  uint32 control = 1;
+  uint32 status = 2;
+  uint32 tags = 3;
+  repeated double values = 4;
+  repeated X87X87FiniteItem finite = 5;
+  repeated bytes encodings = 6;
+  X87Pointers pointers = 7;
+}
+
+message X87Finite {
+  bool negative = 1;
+  sint32 exponent = 2;
+  uint64 mantissa = 3;
+}
+
+message X87Pointers {
+  uint32 ip = 1;
+  uint32 cs = 2;
+  uint32 data = 3;
+  uint32 ds = 4;
+  uint32 opcode = 5;
+}
+
+message PcPcmQueue {
+  repeated PcmFrame frames = 1;
+  uint64 head = 2;
+  uint64 len = 3;
+  uint64 generated = 4;
+  uint64 nonzero = 5;
+}
+
+message PcStepClock {
+  uint64 fraction = 1;
+  uint64 mhz = 2;
+  uint64 whole = 3;
+  uint64 remainder = 4;
+}
+
+message PcTiming {
+  PcStepClock cpu = 1;
+  TimeEmuTime time = 2;
+  uint64 pit_fraction = 3;
+  uint64 pcm_fraction = 4;
+}
+
+message TimeEmuTime {
+  uint64 value = 1;
+}
+
+message DosButtonHistory {
+  uint32 count = 1;
+  uint32 x = 2;
+  uint32 y = 3;
+}
+
+message DosMouseXRangeTuple {
+  uint32 item0 = 1;
+  uint32 item1 = 2;
+}
+
+message DosMouseYRangeTuple {
+  uint32 item0 = 1;
+  uint32 item1 = 2;
+}
+
+message DosMouseMotionTuple {
+  sint32 item0 = 1;
+  sint32 item1 = 2;
+}
+
+message DosMouseMickeyRatioTuple {
+  uint32 item0 = 1;
+  uint32 item1 = 2;
+}
+
+message DosMouseHotspotTuple {
+  sint32 item0 = 1;
+  sint32 item1 = 2;
+}
+
+message DosMouseCallbackTuple {
+  uint32 item0 = 1;
+  uint32 item1 = 2;
+  uint32 item2 = 3;
+}
+
+message DosMouse {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 buttons = 3;
+  DosMouseXRangeTuple x_range = 4;
+  DosMouseYRangeTuple y_range = 5;
+  sint32 visible = 6;
+  DosMouseMotionTuple motion = 7;
+  DosMouseMickeyRatioTuple mickey_ratio = 8;
+  uint32 double_speed_threshold = 9;
+  repeated DosButtonHistory presses = 10;
+  repeated DosButtonHistory releases = 11;
+  repeated uint32 masks = 12;
+  DosMouseHotspotTuple hotspot = 13;
+  uint64 revision = 14;
+  DosMouseCallbackTuple callback = 15;
+  uint32 pending = 16;
+  bool callback_active = 17;
+}
+
+message DosBlock {
+  uint32 segment = 1;
+  uint32 paragraphs = 2;
+  uint32 owner = 3;
+}
+
+message DosMemoryArena {
+  repeated DosBlock blocks = 1;
+  uint64 len = 2;
+}
+
+message VfsTreeName {
+  bytes bytes = 1;
+  uint64 len = 2;
+}
+
+message VfsTreeFile {
+  VfsTreeName name = 1;
+  bytes bytes = 2;
+  VfsTreeName base_name = 3;
+  bool deleted = 4;
+  bool directory = 5;
+  ResourceReference resource = 6;
+}
+
+message VfsTreeHandle {
+  uint64 file = 1;
+  uint32 position = 2;
+  uint32 mode = 3;
+}
+
+message VfsTreeDirectoryTreeHandlesItem {
+  optional uint64 value = 1;
+}
+
+message VfsTreeDirectoryTreeDescriptionsItem {
+  optional VfsTreeHandle value = 1;
+}
+
+message VfsTreeDirectoryTreeLastMidiRequestTuple {
+  VfsTreeName item0 = 1;
+  uint32 item1 = 2;
+  uint32 item2 = 3;
+}
+
+message VfsTreeDirectoryTree {
+  repeated VfsTreeFile files = 1;
+  repeated VfsTreeDirectoryTreeHandlesItem handles = 2;
+  repeated VfsTreeDirectoryTreeDescriptionsItem descriptions = 3;
+  bool namespace_dirty = 4;
+  VfsTreeName current = 5;
+  uint64 opens = 6;
+  uint64 reads = 7;
+  optional uint64 last_midi = 8;
+  VfsTreeDirectoryTreeLastMidiRequestTuple last_midi_request = 9;
+  optional VfsOverlayFs overlay = 10;
+  uint64 new_file_limit = 11;
+}
+
+message VfsMountId {
+  uint32 value = 1;
+}
+
+message VfsNodeId {
+  uint64 value = 1;
+}
+
+message VfsOpenFile {
+  VfsMountId mount = 1;
+  VfsNodeId node = 2;
+  uint64 position = 3;
+  uint32 mode = 4;
+}
+
+message VfsHandleTableHandlesItem {
+  optional uint32 value = 1;
+}
+
+message VfsHandleTableDescriptionsItem {
+  optional VfsOpenFile value = 1;
+}
+
+message VfsHandleTable {
+  repeated VfsHandleTableHandlesItem handles = 1;
+  repeated VfsHandleTableDescriptionsItem descriptions = 2;
+}
+
+message VfsPatch {
+  uint64 file = 1;
+  uint32 position = 2;
+  uint64 offset = 3;
+  uint64 len = 4;
+}
+
+message VfsLength {
+  uint64 file = 1;
+  uint32 len = 2;
+  uint32 base_visible = 3;
+  bool dirty = 4;
+}
+
+message VfsOverlayFsPatchesItem {
+  optional VfsPatch value = 1;
+}
+
+message VfsOverlayFsLengthsItem {
+  optional VfsLength value = 1;
+}
+
+message VfsOverlayFsPendingTuple {
+  uint64 item0 = 1;
+  uint32 item1 = 2;
+  uint64 item2 = 3;
+}
+
+message VfsOverlayFs {
+  bytes bytes = 1;
+  uint64 used = 2;
+  repeated VfsOverlayFsPatchesItem patches = 3;
+  repeated VfsOverlayFsLengthsItem lengths = 4;
+  bytes staging = 5;
+  VfsOverlayFsPendingTuple pending = 6;
+  bool chunked = 7;
+}
+
+message OplCoreSlot {
+  uint64 channel = 1;
+  uint64 mod_idx = 2;
+  sint32 prout = 3;
+  uint32 eg_rout = 4;
+  uint32 eg_out = 5;
+  uint32 eg_gen = 6;
+  uint32 eg_ksl = 7;
+  uint32 eg_tl_ksl = 8;
+  uint32 eg_ks = 9;
+  bytes eg_rate_hi = 10;
+  bytes eg_rate_lo = 11;
+  uint32 eg_rate_nonzero_mask = 12;
+  bool trem_enabled = 13;
+  uint32 reg_vib = 14;
+  uint32 reg_type = 15;
+  uint32 reg_ksr = 16;
+  uint32 reg_mult = 17;
+  uint32 reg_ksl = 18;
+  uint32 reg_tl = 19;
+  uint32 reg_ar = 20;
+  uint32 reg_dr = 21;
+  uint32 reg_sl = 22;
+  uint32 reg_rr = 23;
+  uint32 reg_wf = 24;
+  uint32 key = 25;
+  uint32 pg_reset = 26;
+  uint32 pg_phase = 27;
+  uint32 pg_inc = 28;
+  repeated uint32 pg_inc_vib = 29;
+  uint32 pg_phase_out = 30;
+  uint64 slot_num = 31;
+}
+
+message OplCoreChannel {
+  repeated uint64 slotz = 1;
+  optional uint64 pair = 2;
+  repeated uint64 out = 3;
+  uint32 chtype = 4;
+  uint32 f_num = 5;
+  uint32 block = 6;
+  uint32 fb = 7;
+  uint32 con = 8;
+  uint32 alg = 9;
+  uint32 ksv = 10;
+  uint32 cha = 11;
+  uint32 chb = 12;
+  uint32 chc = 13;
+  uint32 chd = 14;
+  uint32 mix_mask = 15;
+  sint32 leftpan = 16;
+  sint32 rightpan = 17;
+  uint64 ch_num = 18;
+}
+
+message OplCoreWriteBuf {
+  uint64 time = 1;
+  uint32 reg = 2;
+  uint32 data = 3;
+}
+
+message OplCoreChip {
+  repeated OplCoreChannel channels = 1;
+  repeated OplCoreSlot slots = 2;
+  repeated sint32 outputs = 3;
+  uint32 timer = 4;
+  uint64 eg_timer = 5;
+  uint32 eg_timerrem = 6;
+  uint32 eg_state = 7;
+  uint32 eg_add = 8;
+  uint32 eg_timer_lo = 9;
+  uint32 newm = 10;
+  uint32 nts = 11;
+  uint32 rhy = 12;
+  uint32 vibpos = 13;
+  uint32 vibshift = 14;
+  uint32 tremolo = 15;
+  uint32 tremolopos = 16;
+  uint32 tremoloshift = 17;
+  uint32 noise = 18;
+  uint32 noise_hh = 19;
+  uint32 noise_sd = 20;
+  repeated sint32 mixbuff = 21;
+  uint32 rm_hh_bit2 = 22;
+  uint32 rm_hh_bit3 = 23;
+  uint32 rm_hh_bit7 = 24;
+  uint32 rm_hh_bit8 = 25;
+  uint32 rm_tc_bit3 = 26;
+  uint32 rm_tc_bit5 = 27;
+  uint32 stereoext = 28;
+  sint32 rateratio = 29;
+  sint32 samplecnt = 30;
+  repeated sint32 oldsamples = 31;
+  repeated sint32 samples = 32;
+  uint64 writebuf_samplecnt = 33;
+  uint64 writebuf_cur = 34;
+  uint64 writebuf_last = 35;
+  uint64 writebuf_lasttime = 36;
+  repeated OplCoreWriteBuf writebuf = 37;
+}
+
+message OplCoreOpl3Chip {
+  OplCoreChip chip = 1;
+}
+
+message OplTimer {
+  uint32 preset = 1;
+  bool running = 2;
+  bool masked = 3;
+  bool overflow = 4;
+  uint64 deadline = 5;
+}
+
+message OplOpl3 {
+  OplCoreOpl3Chip chip = 1;
+  bytes address = 2;
+  repeated OplTimer timers = 3;
+  bool started = 4;
+  uint64 fraction = 5;
+  uint64 key_on_writes = 6;
+  uint32 peak = 7;
+}
+
+message PcA20Gate {
+  bool enabled = 1;
+  uint64 generation = 2;
+}
+
+message PcRam {
+  reserved 2, 3, 4, 5;
+  bytes bytes = 1;
+}
+
+message PcPcBus {
+  reserved 2, 3, 11;
+  ConfigHardwareConfig config = 1;
+  GameportGameport gameport = 4;
+  uint64 guest_nanos = 5;
+  bool keyboard_irq_line = 6;
+  uint32 vga_status_read_generation = 7;
+  uint64 device_accesses = 8;
+  uint64 cmos_scratch_writes = 9;
+  bool observe_vga_status = 10;
+  PcRam ram = 12;
+  VgaVga vga = 13;
+  I8259Pic pic = 14;
+  I8259Pic slave_pic = 15;
+  I8254Pit pit = 16;
+  MpuMpu401 mpu = 17;
+  SbDspDsp dsp = 18;
+  SbMixerMixer mixer = 19;
+  OplOpl3 opl = 20;
+  repeated I8237Dma dma = 21;
+  bytes dma_pages = 22;
+  PcPcmQueue pcm = 23;
+  repeated PcmFrame digital_pcm = 24;
+  PcA20Gate a20 = 25;
+  I8042Controller keyboard = 26;
+  CmosCmos cmos = 27;
+  uint32 system_control = 28;
+  uint64 awe_writes = 29;
+  optional uint32 audio_use = 30;
+}
+
+message PcPcMachine {
+  reserved 4, 5, 6, 7;
+  X86CpuSnapshot cpu = 1;
+  PcPcBus bus = 2;
+  PcTiming timing = 3;
+  uint64 interrupt_entries = 8;
+}
+
+message RuntimeCopyTargetSegment {
+  uint32 value0 = 1;
+  uint32 value1 = 2;
+}
+
+message RuntimeCopyTargetLinear {
+  uint32 value0 = 1;
+}
+
+message RuntimeCopyTarget {
+  oneof kind {
+    RuntimeCopyTargetSegment segment = 1;
+    RuntimeCopyTargetLinear linear = 2;
+  }
+}
+
+message RuntimeContinuationRawStage {
+  uint64 offset = 1;
+  RuntimeCopyTarget target = 2;
+  uint64 length = 3;
+  uint64 done = 4;
+  uint32 ax = 5;
+}
+
+message RuntimeContinuationWriteStage {
+  uint32 handle = 1;
+  uint32 segment = 2;
+  uint32 offset = 3;
+  uint64 length = 4;
+  uint64 done = 5;
+}
+
+message RuntimeContinuationReadStage {
+  uint32 handle = 1;
+  uint32 position = 2;
+  RuntimeCopyTarget target = 3;
+  uint64 length = 4;
+  uint64 done = 5;
+}
+
+message RuntimeContinuationResolve {
+  uint32 value0 = 1;
+}
+
+message RuntimeContinuationCopy {
+  RuntimeCopyTarget target = 1;
+  uint64 length = 2;
+  uint64 copied = 3;
+  uint32 ax = 4;
+}
+
+message RuntimeContinuationCommit {
+}
+
+message RuntimeContinuationHostCommit {
+}
+
+message RuntimeContinuationExitCommit {
+  uint32 value0 = 1;
+}
+
+message RuntimeContinuationReturn {
+}
+
+message RuntimeContinuation {
+  oneof kind {
+    RuntimeContinuationRawStage rawstage = 1;
+    RuntimeContinuationWriteStage writestage = 2;
+    RuntimeContinuationReadStage readstage = 3;
+    RuntimeContinuationResolve resolve = 4;
+    RuntimeContinuationCopy copy = 5;
+    RuntimeContinuationCommit commit = 6;
+    RuntimeContinuationHostCommit hostcommit = 7;
+    RuntimeContinuationExitCommit exitcommit = 8;
+    RuntimeContinuationReturn return = 9;
+  }
+}
+
+message RuntimeSessionStatusReady {
+}
+
+message RuntimeSessionStatusRunning {
+}
+
+message RuntimeSessionStatusPaused {
+}
+
+message RuntimeSessionStatusExited {
+  uint32 value0 = 1;
+}
+
+message RuntimeSessionStatusHalted {
+}
+
+message RuntimeSessionStatusFaulted {
+}
+
+message RuntimeSessionStatus {
+  oneof kind {
+    RuntimeSessionStatusReady ready = 1;
+    RuntimeSessionStatusRunning running = 2;
+    RuntimeSessionStatusPaused paused = 3;
+    RuntimeSessionStatusExited exited = 4;
+    RuntimeSessionStatusHalted halted = 5;
+    RuntimeSessionStatusFaulted faulted = 6;
+  }
+}
+
+message RuntimeSessionDtaTuple {
+  uint32 item0 = 1;
+  uint32 item1 = 2;
+}
+
+message RuntimeSession {
+  reserved 3, 26;
+  PcPcMachine machine = 1;
+  RuntimeSessionStatus status = 2;
+  uint64 steps = 4;
+  bytes console = 5;
+  bool console_truncated = 6;
+  optional uint32 extended_key = 7;
+  DosMouse mouse = 8;
+  repeated double mouse_fraction = 9;
+  optional uint64 mouse_last_read = 10;
+  uint64 dos_time_origin_nanos = 11;
+  uint32 dos_time_origin_centis = 12;
+  DosMemoryArena memory = 13;
+  VfsTreeDirectoryTree drive = 14;
+  RuntimeSessionDtaTuple dta = 15;
+  uint32 overlays = 16;
+  bool break_check = 17;
+  optional RuntimeCdrom cdrom = 18;
+  VfsHandleTable handles = 19;
+  bytes staging = 20;
+  optional RuntimeContinuation continuation = 21;
+  bool storage_wait = 22;
+  bool timeslice_yielded = 23;
+  uint64 epoch = 24;
+  uint32 active_service = 25;
+  bytes base_identity = 27;
+  bool keyboard_prefix = 28;
+  InputInputRouter input = 29;
+  repeated sint32 joystick_axes = 30;
+  repeated bool joystick_buttons = 31;
+  optional uint64 mouse_last_relative_read = 32;
+  repeated RuntimeMemoryPatch patches = 33;
+  uint32 patches_applied = 34;
+}
+
+message RuntimePatchWrite {
+  uint32 address = 1;
+  bytes expected = 2;
+  bytes replacement = 3;
+}
+message RuntimePatchGuard {
+  uint32 address = 1;
+  bytes expected = 2;
+}
+message RuntimeMemoryPatch {
+  string name = 1;
+  uint64 timeout_steps = 2;
+  repeated RuntimePatchWrite writes = 3;
+  repeated RuntimePatchGuard guards = 4;
+}

@@ -17,6 +17,13 @@ pub const EMPTY: Frame = Frame {
     duration: 0,
     samples: [0; 2],
 };
+/// A hardware source sample before host resampling or card-output mixing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SourceFrame {
+    pub nanos: u64,
+    pub rate: u32,
+    pub samples: [i16; 2],
+}
 const CAPACITY: usize = 16384;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,3 +168,7 @@ impl Mixer {
         self.nonzero
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

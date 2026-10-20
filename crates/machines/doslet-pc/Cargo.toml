@@ -5,9 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [features]
+save-state = ["dep:doslet-state", "dep:prost", "doslet-at-keyboard/save-state", "doslet-config/save-state", "doslet-gameport/save-state", "doslet-i8042/save-state", "doslet-i8237/save-state", "doslet-i8254/save-state", "doslet-i8259/save-state", "doslet-input/save-state", "doslet-mc146818/save-state", "doslet-mpu401/save-state", "doslet-opl3/save-state", "doslet-pcm/save-state", "doslet-sb-dsp/save-state", "doslet-sb-mixer/save-state", "doslet-time/save-state", "doslet-vga/save-state", "doslet-x86/save-state"]
 dynamic-core = ["doslet-x86/dynamic-core"]
 profiling = ["doslet-x86/profiling"]
+wasm-procedures = ["dep:doslet-wasm-aot", "dep:doslet-x86-wasm", "doslet-x86/procedure-calls"]
+wasm-procedure-diagnostics = ["wasm-procedures"]
 [dependencies]
+prost = { workspace = true, optional = true }
+doslet-state = { workspace = true, optional = true }
 doslet-config.workspace = true
 doslet-input.workspace = true
 doslet-at-keyboard.workspace = true
@@ -22,9 +27,14 @@ doslet-opl3.workspace = true
 doslet-bus.workspace = true
 doslet-time.workspace = true
 doslet-x86.workspace = true
+doslet-x86-wasm = { path = "../../cpu/doslet-x86-wasm", optional = true }
 doslet-i8259.workspace = true
 doslet-i8254.workspace = true
 doslet-i8237.workspace = true
 doslet-vga.workspace = true
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+doslet-wasm-aot = { path = "../../cpu/doslet-wasm-aot", optional = true }
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+allocation-counter = "0.8.1"
 [lints]
 workspace = true

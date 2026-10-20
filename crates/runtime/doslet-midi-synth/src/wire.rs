@@ -104,6 +104,17 @@ impl Decoder {
 const CC: [u8; 8] = [0, 32, 7, 10, 11, 64, 1, 91];
 const DEFAULT_CC: [u8; 8] = [0, 0, 100, 64, 127, 0, 0, 0];
 pub const REPLAY_CAPACITY: usize = 16384;
+/// MIDI state, not measured audio amplitude. Notes include sustain-held keys.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelState {
+    pub program: u8,
+    pub volume: u8,
+    pub expression: u8,
+    pub pan: u8,
+    pub sustain: bool,
+    pub notes: u16,
+    pub velocity: u8,
+}
 pub struct State {
     velocity: [[u8; 128]; 16],
     held: [[bool; 128]; 16],
@@ -119,6 +130,17 @@ impl Default for State {
     }
 }
 impl State {
+    pub fn channels(&self) -> [ChannelState; 16] {
+        core::array::from_fn(|c| ChannelState {
+            program: self.program[c],
+            volume: self.controls[c][2],
+            expression: self.controls[c][4],
+            pan: self.controls[c][3],
+            sustain: self.controls[c][5] >= 64,
+            notes: self.velocity[c].iter().filter(|&&v| v != 0).count() as u16,
+            velocity: self.velocity[c].iter().copied().max().unwrap_or(0),
+        })
+    }
     pub const fn new() -> Self {
         Self {
             velocity: [[0; 128]; 16],
@@ -134,7 +156,12 @@ impl State {
         let Some(&status) = message.first() else {
             return;
         };
-        if status == 0xFF {
+        if status == 0xFF
+            || (message.len() == 6
+                && message[..2] == [0xF0, 0x7E]
+                && message[2] < 128
+                && message[3..] == [0x09, 0x01, 0xF7])
+        {
             *self = Self::new();
             return;
         }

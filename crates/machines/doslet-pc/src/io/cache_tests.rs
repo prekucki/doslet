@@ -76,12 +76,70 @@ fn memory(a: &PcMachine, b: &PcMachine) {
     assert_eq!(a.bus.vga.bank(), b.bus.vga.bank());
 }
 
+#[test]
+fn optional_block_yield_preserves_reference_execution_and_makes_progress() {
+    for dynamic in [false, true] {
+        let mut fast = machine(true);
+        let mut reference = machine(false);
+        for m in [&mut fast, &mut reference] {
+            code(m, 0x1000, &[0x40, 0xeb, 0xfd]); // INC EAX; JMP head
+            m.cpu.step(&mut m.bus).unwrap(); // End the segment-load shadow.
+            m.cpu.registers.ip = 0x1000;
+        }
+        for _ in 0..20 {
+            let count = if dynamic {
+                fast.cpu
+                    .dynamic_batch_until_blocks(&mut fast.bus, 256, |_| 256, [0x2000, 0x1000])
+            } else {
+                fast.cpu
+                    .interpret_batch_until_blocks(&mut fast.bus, 256, |_| 256, [0x2000, 0x1000])
+            };
+            assert_eq!(count, 2);
+            for _ in 0..count {
+                reference.cpu.step(&mut reference.bus).unwrap();
+            }
+            state(&fast, &reference);
+        }
+        assert_eq!(fast.cpu.interpret_batch(&mut fast.bus, 256, |_| 256), 256);
+    }
+}
+
 #[cfg(all(
     feature = "dynamic-core",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[path = "dynamic_tests.rs"]
 mod dynamic_tests;
+
+#[test]
+fn instruction_yield_inside_cached_block_stops_before_executing_boundary() {
+    for dynamic in [false, true] {
+        let mut fast = machine(true);
+        let mut reference = machine(false);
+        for m in [&mut fast, &mut reference] {
+            // INC EAX; INC EBX; INC ECX; JMP start. The middle instructions
+            // are not block heads, even after the cache has been warmed.
+            code(m, 0x1000, &[0x40, 0x43, 0x41, 0xeb, 0xfb]);
+            m.cpu.step(&mut m.bus).unwrap();
+            m.cpu.registers.ip = 0x1000;
+        }
+        for round in 0..20 {
+            let count = if dynamic {
+                fast.cpu
+                    .dynamic_batch_until_blocks(&mut fast.bus, 256, |_| 256, [0x1002, 0x2000])
+            } else {
+                fast.cpu
+                    .interpret_batch_until_blocks(&mut fast.bus, 256, |_| 256, [0x1002, 0x2000])
+            };
+            assert_eq!(count, if round == 0 { 2 } else { 4 });
+            assert_eq!(fast.cpu.registers.ip, 0x1002);
+            for _ in 0..count {
+                reference.cpu.step(&mut reference.bus).unwrap();
+            }
+            state(&fast, &reference);
+        }
+    }
+}
 
 #[test]
 fn decoded_forms_match_reference_with_dynamic_registers_prefixes_and_faults() {

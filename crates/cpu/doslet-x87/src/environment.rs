@@ -263,3 +263,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "environment_saved.rs"]
+mod saved_state;

@@ -230,12 +230,17 @@ impl SegmentCache {
 /// Offsets accepted by `Registers::address` for one segment and access kind.
 /// Valid while the selector, its hidden cache and PE mode stay unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SegmentWindow {
+pub struct SegmentWindow {
     base: u32,
     first: u32,
     last: u32,
 }
 impl SegmentWindow {
+    /// Copy the validated base and inclusive offset bounds. The snapshot stays
+    /// valid only while selector, hidden cache and CPU mode remain unchanged.
+    pub const fn parts(self) -> (u32, u32, u32) {
+        (self.base, self.first, self.last)
+    }
     #[inline]
     pub(crate) fn address(self, offset: u32, length: u8) -> Option<u32> {
         let last = offset.checked_add(u32::from(length) - 1)?;
@@ -244,6 +249,12 @@ impl SegmentWindow {
 }
 
 impl Registers {
+    /// The materialized mode used by segment access checks. A direct public
+    /// CR0 write takes effect here only after the CPU synchronizes its caches.
+    pub fn protected_mode(&self) -> bool {
+        self.protected
+    }
+
     pub fn selector(&self, segment: SegmentRegister) -> u16 {
         match segment {
             SegmentRegister::Es => self.es,
@@ -265,6 +276,12 @@ impl Registers {
         } else {
             cache
         }
+    }
+    pub(crate) fn general(&self) -> [u32; 8] {
+        self.general
+    }
+    pub(crate) fn set_general(&mut self, general: [u32; 8]) {
+        self.general = general;
     }
     pub(crate) fn set_segment(&mut self, segment: SegmentRegister, cache: SegmentCache) {
         match segment {
@@ -340,7 +357,7 @@ impl Registers {
         Ok(cache.base.wrapping_add(offset))
     }
     /// Resolve the offset-independent checks of `address` once.
-    pub(crate) fn window(&self, segment: SegmentRegister, access: Access) -> Option<SegmentWindow> {
+    pub fn window(&self, segment: SegmentRegister, access: Access) -> Option<SegmentWindow> {
         let cache = self.segment_cache(segment);
         if !cache.usable || (self.protected && cache.selector != self.selector(segment)) {
             return None;
@@ -498,3 +515,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "state_saved.rs"]
+mod saved_state;

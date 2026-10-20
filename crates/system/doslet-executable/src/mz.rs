@@ -62,6 +62,16 @@ pub struct MzImage<'a> {
 
 impl<'a> MzImage<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, ExecutableError> {
+        Self::parse_inner(bytes, true)
+    }
+
+    // LE discovery must validate the DOS envelope independently of an optional
+    // extended header, so a malformed pointer cannot hide another bound image.
+    pub(crate) fn parse_envelope(bytes: &'a [u8]) -> Result<Self, ExecutableError> {
+        Self::parse_inner(bytes, false)
+    }
+
+    fn parse_inner(bytes: &'a [u8], inspect_extended: bool) -> Result<Self, ExecutableError> {
         if bytes.len() < 28 {
             return Err(ExecutableError::Truncated);
         }
@@ -113,12 +123,13 @@ impl<'a> MzImage<'a> {
         // Old MZ files can put their relocation table across offset 3Ch.
         // In that layout those four bytes are relocations, not e_lfanew.
         let has_extended_pointer = relocation_count == 0 || word(bytes, 24)? >= 64;
-        if header_bytes >= 64 && has_extended_pointer {
+        if inspect_extended && header_bytes >= 64 && has_extended_pointer {
             let offset = dword(bytes, 60)? as usize;
-            if offset != 0 {
-                let signature = bytes
-                    .get(offset..offset.saturating_add(2))
-                    .ok_or(ExecutableError::Truncated)?;
+            // Plain DOS programs may keep anything at 3Ch: DJGPP's stub stores
+            // its build text there. Only a pointer to a header names one.
+            if offset != 0
+                && let Some(signature) = bytes.get(offset..offset.saturating_add(2))
+            {
                 if signature == b"LE" || signature == b"LX" {
                     let ext = bytes.get(offset..).ok_or(ExecutableError::Truncated)?;
                     if *ext.get(2).ok_or(ExecutableError::Truncated)? != 0
@@ -199,6 +210,15 @@ mod tests {
         assert_eq!(image.relocations().len(), 9);
         let last = image.relocations().last().unwrap();
         assert_eq!((last.segment, last.offset), (0xFFFF, 0xFFFF));
+    }
+    #[test]
+    fn text_at_3c_beyond_the_file_is_not_an_extended_header() {
+        // DJGPP's go32-v2 stub keeps "stub.h generated from stub.asm by
+        // djasm" in its header, so 3Ch holds "djas".
+        let mut bytes = fixture();
+        bytes[60..64].copy_from_slice(b"djas");
+        let image = MzImage::parse(&bytes).unwrap();
+        assert!(image.extended.is_none());
     }
     #[test]
     fn le_metadata_and_malformed_boundaries() {

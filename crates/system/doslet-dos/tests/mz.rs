@@ -89,7 +89,6 @@ fn rejects_invalid_files_and_layout_before_writing_ram() {
         (16, 4, MzError::InvalidStack),
         (16, 258, MzError::InvalidStack),
         (12, 15, MzError::InvalidMemoryRequest),
-        (26, 1, MzError::UnsupportedMode),
         (8, 10, MzError::Empty),
     ];
     for (offset, value, expected) in cases {
@@ -202,6 +201,16 @@ fn rejects_extended_formats_before_loading_the_stub() {
         );
         assert_eq!(ram.writes, 0);
     }
+}
+
+#[test]
+fn loads_programs_with_text_in_the_overlay_number() {
+    // DOS ignores the overlay number; DJGPP's go32-v2 stub keeps the text
+    // "stub.h generated from stub.asm by djasm" in its header from 1Ah on.
+    let mut ram = Ram::new();
+    let mut file = relocated_mz();
+    word(&mut file, 26, u16::from_le_bytes(*b"st"));
+    assert!(load_mz(&mut ram, &file, MEMORY).is_ok());
 }
 
 #[test]

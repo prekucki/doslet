@@ -8,6 +8,7 @@ rust = { version = "1.99.0", components = ["rustfmt", "clippy"], targets = ["was
 
 [tasks.test]
 description = "Run the component and allocation tests"
+env = { RUST_MIN_STACK = "8388608" }
 run = "cargo test --workspace --locked"
 
 [tasks.check]

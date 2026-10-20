@@ -1,6 +1,32 @@
 use super::*;
 use doslet_bus::PortBus;
 
+/// Small, allocation-free description of the current scanout geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoModeLabel {
+    mode: doslet_vga::VideoMode,
+    dimensions: Option<(usize, usize)>,
+}
+impl VideoModeLabel {
+    pub(super) fn new(mode: doslet_vga::VideoMode, dimensions: Option<(usize, usize)>) -> Self {
+        Self { mode, dimensions }
+    }
+}
+impl fmt::Display for VideoModeLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some((width, height)) = self.dimensions {
+            let adapter = if self.mode == doslet_vga::VideoMode::Vbe101 {
+                "SVGA"
+            } else {
+                "VGA"
+            };
+            write!(f, "{width}×{height}×8 {adapter}")
+        } else {
+            f.write_str("80×25 VGA text")
+        }
+    }
+}
+
 impl Session {
     pub(super) fn palette_service(&mut self, ax: u16) -> Result<(), RuntimeError> {
         let r = self.registers();
@@ -66,6 +92,17 @@ impl Session {
         let r = &self.machine.cpu.registers;
         let (bx, cx, dx) = (r.get(Gpr16::Bx), r.get(Gpr16::Cx), r.get(Gpr16::Dx));
         let page = (bx >> 8) as u8;
+        // AH=01h takes only CH/CL; BH is not a page parameter. Programs
+        // commonly leave unrelated values in BX when hiding the cursor.
+        if ax >> 8 == 1 {
+            self.machine.bus.write_u16(0x460, cx)?;
+            let port = self.machine.bus.vga.input_status_port() - 6;
+            self.machine.bus.vga.write_port(port, 0x0A);
+            self.machine.bus.vga.write_port(port + 1, (cx >> 8) as u8);
+            self.machine.bus.vga.write_port(port, 0x0B);
+            self.machine.bus.vga.write_port(port + 1, cx as u8);
+            return Ok(());
+        }
         if self.video_mode() == doslet_vga::VideoMode::Mode13
             && matches!(ax >> 8, 9 | 10)
             && page == 0
@@ -94,7 +131,6 @@ impl Session {
             return Err(RuntimeError::UnsupportedService { vector: 0x10, ax });
         }
         match ax >> 8 {
-            1 => self.machine.bus.write_u16(0x460, cx)?,
             5 if (ax as u8) < 8 => {
                 self.machine.bus.write_u8(0x462, ax as u8)?;
                 self.machine
@@ -190,5 +226,46 @@ impl Session {
             .bus
             .write_u16(cursor_address, (row << 8) | col)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mode_label_tests {
+    use super::*;
+    use alloc::string::ToString;
+    fn register(s: &mut Session, port: u16, index: u8, value: u8) {
+        s.machine.bus.write_port_u8(port, index).unwrap();
+        s.machine.bus.write_port_u8(port + 1, value).unwrap();
+    }
+    #[test]
+    fn labels_follow_crtc_width_height_and_scanline_repeats_without_changing_state() {
+        let mut s = Session::new(&[0xeb, 0xfe]).unwrap();
+        assert_eq!(s.video_mode_label().to_string(), "80×25 VGA text");
+        s.machine.bus.vga.set_mode_13h();
+        assert_eq!(s.video_mode_label().to_string(), "320×200×8 VGA");
+        register(&mut s, 0x3c4, 4, 6); // Unchain planes.
+        assert_eq!(s.video_mode_label().to_string(), "320×200×8 VGA");
+        register(&mut s, 0x3d4, 0x11, 0); // Unlock CRTC overflow.
+        register(&mut s, 0x3d4, 7, 0x3e);
+        register(&mut s, 0x3d4, 0x12, 0xdf);
+        assert_eq!(s.video_mode_label().to_string(), "320×240×8 VGA");
+        register(&mut s, 0x3d4, 1, 89);
+        register(&mut s, 0x3d4, 9, 0);
+        let before = (
+            s.steps(),
+            s.emulated_nanos(),
+            s.machine.bus.vga.frame().unwrap().revision,
+        );
+        assert_eq!(s.video_mode_label().to_string(), "360×480×8 VGA");
+        assert_eq!(
+            (
+                s.steps(),
+                s.emulated_nanos(),
+                s.machine.bus.vga.frame().unwrap().revision
+            ),
+            before
+        );
+        s.machine.bus.vga.set_vbe_101h(false);
+        assert_eq!(s.video_mode_label().to_string(), "640×480×8 SVGA");
     }
 }

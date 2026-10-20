@@ -4,6 +4,8 @@ use crate::{Gpr16, Gpr32, Registers, decode, flags};
 use core::fmt;
 use doslet_bus::{BusError, CpuBus, MemoryBus};
 mod cache;
+pub use cache::analysis;
+pub use cache::translation;
 #[cfg(all(
     feature = "dynamic-core",
     not(target_arch = "wasm32"),
@@ -120,6 +122,47 @@ impl From<BusError> for CpuError {
         Self::Bus(value)
     }
 }
+
+/// An architectural fault: an exception vector and its optional error code,
+/// raised at the faulting instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fault {
+    pub vector: u8,
+    pub error_code: Option<u32>,
+}
+
+impl CpuError {
+    /// The fault a guest exception handler could receive. Unimplemented
+    /// instructions, paging, VM86 and bus errors are Doslet limitations, not
+    /// guest faults, and have none.
+    pub fn fault(&self) -> Option<Fault> {
+        let fault = |vector, error_code| Some(Fault { vector, error_code });
+        match *self {
+            Self::DivideError { .. } => fault(0, None),
+            Self::SegmentAccess { segment, .. } => fault(
+                if segment == SegmentRegister::Ss {
+                    12
+                } else {
+                    13
+                },
+                Some(0),
+            ),
+            Self::Descriptor { selector, reason } => {
+                let code = Some(u32::from(selector & !3));
+                match reason {
+                    DescriptorError::NotPresent => fault(11, code),
+                    DescriptorError::NullSelector => fault(13, Some(0)),
+                    DescriptorError::TableBounds
+                    | DescriptorError::WrongType
+                    | DescriptorError::Privilege
+                    | DescriptorError::LocalTableUnavailable
+                    | DescriptorError::InvalidGate => fault(13, code),
+                }
+            }
+            _ => None,
+        }
+    }
+}
 impl fmt::Display for CpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -227,6 +270,13 @@ pub struct Cpu {
     halted: bool,
     interrupt_shadow: u8,
     decode_cache: cache::Cache,
+    execution_counts: [u64; 4],
+    execution_skipped: [u64; 4],
+    /// Changes whenever labels are set, replaced or removed.
+    execution_labels_generation: u64,
+    /// Restore pre-instruction state on faults; a host enables this while a
+    /// guest exception handler could receive them.
+    precise_faults: bool,
     #[cfg(all(
         feature = "dynamic-core",
         not(target_arch = "wasm32"),
@@ -250,6 +300,72 @@ pub struct CpuSnapshot {
     fpu: Option<doslet_x87::X87>,
     halted: bool,
     interrupt_shadow: u8,
+}
+
+/// Integer execution context for a machine-provided service boundary. Floating
+/// point state and execution caches remain owned by the CPU across the switch.
+#[derive(Clone)]
+pub struct CpuContext {
+    general: [u32; 8],
+    ip: u32,
+    caches: [crate::SegmentCache; 6],
+    protected: bool,
+    cpl: u8,
+    flags: u32,
+    control: ControlRegisters,
+    halted: bool,
+    interrupt_shadow: u8,
+}
+
+impl Cpu {
+    pub fn context(&self) -> CpuContext {
+        CpuContext {
+            general: core::array::from_fn(|i| self.registers.get32(Gpr32::decode(i as u8))),
+            ip: self.registers.ip,
+            caches: crate::SegmentRegister::ALL.map(|s| self.registers.segment_cache(s)),
+            protected: self.protected_mode(),
+            cpl: self.registers.cpl,
+            flags: self.flags,
+            control: self.control.clone(),
+            halted: self.halted,
+            interrupt_shadow: self.interrupt_shadow,
+        }
+    }
+
+    pub fn restore_context(&mut self, context: &CpuContext) {
+        for (i, value) in context.general.iter().enumerate() {
+            self.registers.set32(Gpr32::decode(i as u8), *value);
+        }
+        self.registers.protected = context.protected;
+        self.registers.cpl = context.cpl;
+        for (segment, cache) in crate::SegmentRegister::ALL.into_iter().zip(context.caches) {
+            // Invalidate the CS context hint even if the numeric selector is
+            // unchanged. The same selector can have a different hidden cache.
+            self.registers.set_segment(segment, cache);
+        }
+        self.registers.ip = context.ip;
+        self.flags = context.flags;
+        self.control = context.control.clone();
+        self.halted = context.halted;
+        self.interrupt_shadow = context.interrupt_shadow;
+    }
+
+    /// Change PE while retaining hidden caches, as a control-register write
+    /// does. Segment reloads are explicit operations by the caller.
+    pub fn set_protected_mode(&mut self, protected: bool) {
+        self.control.cr0 = (self.control.cr0 & !1) | u32::from(protected);
+        self.registers.sync_mode(protected);
+        if !protected {
+            self.registers.cpl = 0;
+        }
+    }
+
+    /// Set the privilege of a host-established context before reloading its
+    /// segments. Guest control transfers continue to use ordinary validation.
+    pub fn set_current_privilege_level(&mut self, level: u8) {
+        assert!(level < 4);
+        self.registers.cpl = level;
+    }
 }
 
 impl Cpu {
@@ -298,6 +414,10 @@ impl Default for Cpu {
             halted: false,
             interrupt_shadow: 0,
             decode_cache: cache::Cache::default(),
+            execution_counts: [0; 4],
+            execution_skipped: [0; 4],
+            execution_labels_generation: 0,
+            precise_faults: false,
             #[cfg(all(
                 feature = "dynamic-core",
                 not(target_arch = "wasm32"),
@@ -309,6 +429,99 @@ impl Default for Cpu {
 }
 
 impl Cpu {
+    pub fn set_execution_labels(
+        &mut self,
+        labels: Option<alloc::vec::Vec<crate::ExecutionLabel>>,
+    ) -> Result<(), &'static str> {
+        let profile = labels
+            .map(crate::execution_tiers::ExecutionProfile::new)
+            .transpose()?;
+        self.decode_cache.clear();
+        self.decode_cache.profile = profile;
+        self.execution_counts = [0; 4];
+        self.execution_skipped = [0; 4];
+        self.execution_labels_generation += 1;
+        #[cfg(all(
+            feature = "dynamic-core",
+            not(target_arch = "wasm32"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            let enabled = self.dynamic_core_enabled();
+            self.dynamic = dynamic::Cache::default();
+            self.set_dynamic_core(enabled);
+        }
+        Ok(())
+    }
+    /// Recolour at a batch boundary without losing cumulative counts.
+    pub fn replace_execution_labels(
+        &mut self,
+        labels: alloc::vec::Vec<crate::ExecutionLabel>,
+    ) -> Result<(), &'static str> {
+        let (counts, skipped) = (self.execution_counts, self.execution_skipped);
+        self.set_execution_labels(Some(labels))?;
+        self.execution_counts = counts;
+        self.execution_skipped = skipped;
+        Ok(())
+    }
+    pub fn executed_tier_counts(&self) -> [u64; 4] {
+        core::array::from_fn(|i| self.execution_counts[i].saturating_sub(self.execution_skipped[i]))
+    }
+    pub fn account_skipped_execution(&mut self, counts: [u64; 4]) {
+        self.account_execution(counts);
+        for (total, count) in self.execution_skipped.iter_mut().zip(counts) {
+            *total += count;
+        }
+    }
+    pub fn execution_labels_enabled(&self) -> bool {
+        self.decode_cache.profile.is_some()
+    }
+    /// Classifications of unchanged code bytes hold while this is unchanged.
+    pub fn execution_labels_generation(&self) -> u64 {
+        self.execution_labels_generation
+    }
+    pub fn execution_counts(&self) -> [u64; 4] {
+        self.execution_counts
+    }
+    pub fn account_execution(&mut self, counts: [u64; 4]) {
+        for (total, n) in self.execution_counts.iter_mut().zip(counts) {
+            *total += n;
+        }
+    }
+    pub fn execution_tier_at<B: MemoryBus>(&self, bus: &B, address: u32) -> u8 {
+        self.decode_cache.profile.as_ref().map_or(2, |profile| {
+            bus.code_bytes(address, 15).map_or(2, |bytes| {
+                // Prepared batches classify the decoded prefix. Keep scalar
+                // register execution and foreign register engines consistent
+                // when bytes after an otherwise unchanged instruction change.
+                let length = self
+                    .registers
+                    .code32()
+                    .then(|| cache::translation::decode(bytes))
+                    .flatten()
+                    .map_or(bytes.len(), |i| usize::from(i.length));
+                profile.classify(address, self.registers.code32(), &bytes[..length])
+            })
+        })
+    }
+    /// Match the actual decoded instruction prefix, as the prepared interpreter
+    /// does. The caller supplies a validated instruction length, never a hint.
+    pub fn execution_tier_for_instruction_at<B: MemoryBus>(
+        &self,
+        bus: &B,
+        address: u32,
+        length: u8,
+    ) -> u8 {
+        if !(1..=15).contains(&length) {
+            return 2;
+        }
+        self.decode_cache.profile.as_ref().map_or(2, |p| {
+            bus.code_bytes(address, length).map_or(2, |bytes| {
+                p.classify(address, self.registers.code32(), bytes)
+            })
+        })
+    }
+
     /// Keep the original byte-fetching interpreter available as a reference.
     pub fn set_decode_cache(&mut self, enabled: bool) {
         self.decode_cache.clear();
@@ -337,9 +550,70 @@ impl Cpu {
         self.interrupt_shadow != 0
     }
 
+    /// With precise faults, a fault (`CpuError::fault`) restores the
+    /// registers, flags and control state from before the instruction, so a
+    /// host can deliver it there. Memory written before a fault, such as stack
+    /// slots of a multi-push instruction below ESP, is not restored.
+    pub fn set_precise_faults(&mut self, enabled: bool) {
+        self.precise_faults = enabled;
+    }
+    pub fn precise_faults_enabled(&self) -> bool {
+        self.precise_faults
+    }
+
     /// One bounded execution step. REP STOSB performs at most one write per step.
-    /// Errors stop execution; precise guest exception delivery is not implemented yet.
     pub fn step<B: CpuBus>(&mut self, bus: &mut B) -> Result<StepOutcome, CpuError> {
+        if !self.precise_faults {
+            return self.step_counted(bus);
+        }
+        // Only these change before a later fault of the same instruction:
+        // far transfers load CS or SS before pushing or popping. Other
+        // segment and control register loads fault before changing anything.
+        let r = &self.registers;
+        let general = r.general();
+        let (ip, flags, cpl, shadow) = (r.ip, self.flags, r.cpl, self.interrupt_shadow);
+        let (cs, ss) = (
+            r.caches[SegmentRegister::Cs as usize],
+            r.caches[SegmentRegister::Ss as usize],
+        );
+        let result = self.step_counted(bus);
+        if let Err(error) = &result
+            && error.fault().is_some()
+        {
+            let r = &mut self.registers;
+            r.set_general(general);
+            r.ip = ip;
+            r.cpl = cpl;
+            for (segment, cache) in [(SegmentRegister::Cs, cs), (SegmentRegister::Ss, ss)] {
+                if r.caches[segment as usize] != cache || r.selector(segment) != cache.selector {
+                    r.set_segment(segment, cache);
+                }
+            }
+            self.flags = flags;
+            self.interrupt_shadow = shadow;
+        }
+        result
+    }
+
+    fn step_counted<B: CpuBus>(&mut self, bus: &mut B) -> Result<StepOutcome, CpuError> {
+        if !self.execution_labels_enabled() {
+            return self.step_uncounted(bus);
+        }
+        let tier = self.execution_tier_at(
+            bus,
+            self.registers
+                .segment_cache(SegmentRegister::Cs)
+                .base
+                .wrapping_add(self.registers.ip),
+        );
+        let result = self.step_uncounted(bus);
+        if result.is_ok() {
+            self.execution_counts[usize::from(tier)] += 1;
+        }
+        result
+    }
+
+    fn step_uncounted<B: CpuBus>(&mut self, bus: &mut B) -> Result<StepOutcome, CpuError> {
         if self.halted {
             return Ok(StepOutcome::Halted);
         }
@@ -1420,4 +1694,41 @@ fn write_word<B: MemoryBus>(bus: &mut B, address: u32, value: u16) -> Result<(),
     let [low, high] = value.to_le_bytes();
     bus.write_u8(address, low)?;
     bus.write_u8(address.wrapping_add(1), high)
+}
+
+#[cfg(feature = "save-state")]
+#[path = "interpreter_saved.rs"]
+mod saved_state;
+
+#[cfg(feature = "save-state")]
+impl doslet_state::State for Cpu {
+    type Wire = <CpuSnapshot as doslet_state::State>::Wire;
+
+    fn save(&self) -> Self::Wire {
+        self.snapshot().save()
+    }
+
+    fn load(wire: Self::Wire) -> Result<Self, doslet_state::InvalidState> {
+        let saved = CpuSnapshot::load(wire)?;
+        if saved.cpl > 3 || saved.interrupt_shadow > 2 {
+            return Err(doslet_state::InvalidState("CPU privilege/interrupt shadow"));
+        }
+        // Fresh lineage and empty decode/JIT caches: host addresses never enter a state.
+        let mut cpu = Self::default();
+        for (code, value) in saved.general.into_iter().enumerate() {
+            cpu.registers.set32(Gpr32::decode(code as u8), value);
+        }
+        let r = &mut cpu.registers;
+        [r.es, r.cs, r.ss, r.ds, r.fs, r.gs] = saved.selectors;
+        r.ip = saved.ip;
+        r.caches = saved.caches;
+        r.protected = saved.protected;
+        r.cpl = saved.cpl;
+        cpu.flags = saved.flags;
+        cpu.control = saved.control;
+        cpu.fpu = saved.fpu;
+        cpu.halted = saved.halted;
+        cpu.interrupt_shadow = saved.interrupt_shadow;
+        Ok(cpu)
+    }
 }

@@ -50,11 +50,15 @@ The browser version needs no installation and no server.
   VGA, SB16 DSP and mixer, MPU-401 and gameport are separate `no_std` libraries,
   each with its own tests. The CPU depends only on a bus contract, not on a PC,
   so the parts can be reused in other projects.
-- **Fast where it counts.** A decode cache speeds up the interpreter. On x86-64
-  and AArch64, a [Cranelift](https://cranelift.dev) JIT compiles frequently
-  executed protected-mode code. Differential tests check both against a
-  reference interpreter. Loops that only wait for the VGA retrace are skipped
-  ahead instead of being executed step by step.
+- **Fast where it counts.** A decode cache speeds up the interpreter. A game
+  procedure module generated offline runs whole procedures as WebAssembly
+  compiled by Wasmtime; the desktop compiles and installs it while the game
+  runs, for wherever the DOS extender loaded the program (ROTT: 1.23× in a
+  measured window). An optional
+  [Cranelift](https://cranelift.dev) JIT remains behind a Cargo feature.
+  Differential tests check them against a reference interpreter. Loops that
+  only wait for the VGA retrace are skipped ahead instead of being executed
+  step by step.
 - **Flexible MIDI.** Play music through the built-in Rust synthesizer, Apple's
   system General MIDI synth on macOS, a MIDI
   port on your computer (TiMidity, Munt or a hardware synth), Web MIDI in the
@@ -104,15 +108,17 @@ sudo apt install build-essential pkg-config libasound2-dev libudev-dev
 ### On the desktop
 
 ```sh
-# Open the workspace, then press Run to start the built-in demo
+# Browse the launch profiles in ~/.config/doslet/profiles (covers, details, Play)
 cargo run -p doslet --release --locked
+# Without profiles, or with --demo: the workspace and its built-in demo
+cargo run -p doslet --release --locked -- --demo
 
 # Start your own game directly
 cargo run -p doslet --release --locked -- --game path/to/GAME.EXE
 ```
 
 The game's directory becomes drive C:. Click the picture to capture the mouse,
-and press **Esc** to release it. `--help` lists the audio, MIDI, MT-32 and
+and press **Ctrl+Esc** to release it. `--help` lists the audio, MIDI, MT-32 and
 machine options.
 
 ### In the browser
@@ -126,6 +132,18 @@ Open <http://127.0.0.1:8080>, choose **Open… → Choose ZIP…**, select the
 game's EXE and press **Start game**. `mise run web-build` builds a static
 bundle in `web/dist`. It needs no backend.
 
+Package a game from its TOML profile, or build and serve a quick localhost preview:
+
+```sh
+cargo run -p doslet-web --release --locked -- build games/ROTT.toml -o target/rott-site
+cargo run -p doslet-web --release --locked -- serve games/ROTT.toml --port 8080
+```
+
+The Rust CLI shows build progress and prepares experimental guarded AOT WASM
+for supported 32-bit register code. Other code keeps the interpreter. `serve`
+builds first; `--web-dist web/dist` explicitly reuses an existing frontend for
+faster packaging. See [web packaging](docs/development.md#game-web-packages).
+
 ### Without a window
 
 ```sh
@@ -135,6 +153,7 @@ cargo run -p doslet-headless --locked -- inspect path/to/GAME.EXE
 
 The [user guide](docs/usage.md) covers launch profiles, saves, MIDI routing,
 MT-32 ROMs and the Linux desktop launcher.
+For reusable headless scene tests, see [portable guest states](docs/save-states.md).
 
 ## Under the hood
 
@@ -175,7 +194,7 @@ describe these design rules in detail.
 - Real-game acceptance of Sound Blaster digital audio and OPL (AdLib) music
 - More VGA/SVGA modes and register-level effects
 - A fuller DOS kernel and support for more DOS extenders
-- MT-32 ROM selection and launch profiles in the browser
+- General user-selected MT-32 ROM loading in the browser
 - More games verified beyond startup, into actual gameplay
 
 ## Development
@@ -183,7 +202,7 @@ describe these design rules in detail.
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+RUST_MIN_STACK=8388608 cargo test --workspace --locked
 cargo check -p doslet -p doslet-time -p doslet-executable --target wasm32-unknown-unknown --locked
 cargo check -p doslet-web-worker -p doslet-web-audio --target wasm32-unknown-unknown --locked
 ```

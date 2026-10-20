@@ -4,7 +4,9 @@ export class MediaError extends Error {
 }
 export function hex(bytes) { return [...bytes].map(v => v.toString(16).padStart(2, '0')).join(''); }
 export async function fingerprint(text) {
-    return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+    if (!globalThis.crypto?.subtle)
+        throw new MediaError('Unavailable', 'SHA-256 requires a secure browser context: open this site over HTTPS or http://localhost (not an HTTP LAN address)');
+    return new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
 }
 async function boundedBody(response, limit, signal) {
     const reader = response.body?.getReader();

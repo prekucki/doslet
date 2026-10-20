@@ -1,7 +1,6 @@
 # Prepared interpreter handlers on Linux
 
-Measured on 2026-10-16, Linux x86-64, Intel family 6/model 183 (32 logical
-CPUs), Rust 1.99.0, ordinary Cargo release builds. These measurements replace
+Measured on Linux x86-64 with Rust 1.99.0 and ordinary Cargo release builds. These measurements replace
 neither the earlier macOS baseline nor browser measurements.
 
 ## Fixed-step game measurements
@@ -15,8 +14,7 @@ are drained after each bounded 10,000-step advance; there is no window, host
 audio device or synthesis in the probe.
 
 Each game/version was warmed once, then measured in three pairs, ordered
-A/B, B/A, A/B, without concurrent builds or emulator runs. Load average varied
-from approximately 0.85 to 1.97 (one/five minute readings around the run).
+A/B, B/A, A/B, without concurrent builds or emulator runs.
 CPU time is `/usr/bin/time -p` user plus system time for the whole process,
 including mounting and final hashing. Internal wall time covers the execution
 loop only. Reported ns/step divide by logical guest steps, which can include
@@ -28,7 +26,7 @@ existing accelerated waits; they are not host instruction latency.
 | Prince | 300,000,000 | 9.30 | 7.20 | 22.6% | 9.267 | 7.120 |
 | CIV | 100,000,000 | 9.40 | 8.30 | 11.7% | 9.472 | 8.283 |
 
-[Raw paired samples](interpreter-handlers.csv) include warmup rows (`round=-1`).
+Raw paired samples include warmup rows (`round=-1`).
 Heroes uses the local ISO and a fixed 390-million-step endpoint; this probe does
 not detect the first menu frame, so it does not establish a new exact
 startup-to-menu timing. CIV uses keys `151` (VGA, Roland, keyboard), reaches

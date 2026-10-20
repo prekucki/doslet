@@ -86,8 +86,9 @@ pub use supported::Worker;
     feature = "dynamic-core",
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
+/// Braced so callers construct both variants alike with `Worker::default()`.
 #[derive(Default)]
-pub struct Worker;
+pub struct Worker {}
 #[cfg(not(all(
     feature = "dynamic-core",
     any(target_arch = "x86_64", target_arch = "aarch64")

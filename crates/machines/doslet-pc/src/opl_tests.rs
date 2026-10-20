@@ -50,6 +50,42 @@ fn adlib_and_sb_aliases_share_timer_and_register_latches() {
 }
 
 #[test]
+#[cfg(feature = "save-state")]
+fn observed_and_restored_fm_polls_keep_the_same_bus_and_timer_time() {
+    use doslet_state::State;
+    let mut ordinary = PcMachine::default();
+    let mut observed = PcMachine::default();
+    for machine in [&mut ordinary, &mut observed] {
+        for (address, byte) in [0xec, 0xeb, 0xfd].into_iter().enumerate() {
+            machine.bus.write_u8(address as u32, byte).unwrap();
+        }
+        machine.cpu.registers.set(doslet_x86::Gpr16::Dx, 0x388);
+        write(machine, 2, 0xff);
+        write(machine, 4, 0x21);
+    }
+    for step in 0..200 {
+        ordinary.step().unwrap();
+        observed
+            .step_observed(&mut StepObservation::default())
+            .unwrap();
+        assert_eq!(ordinary.time(), observed.time());
+        assert_eq!(ordinary.cpu.registers.ip, observed.cpu.registers.ip);
+        assert_eq!(
+            ordinary.cpu.registers.get(doslet_x86::Gpr16::Ax),
+            observed.cpu.registers.get(doslet_x86::Gpr16::Ax)
+        );
+        if step == 50 {
+            observed = PcMachine::load(observed.save()).unwrap();
+        }
+    }
+    assert_eq!(
+        ordinary.cpu.registers.get(doslet_x86::Gpr16::Ax) as u8,
+        0xc0
+    );
+    assert!(ordinary.time().as_nanos() >= 100_000);
+}
+
+#[test]
 fn absent_pas_filter_probe_does_not_touch_opl_bank_one_or_hide_other_ports() {
     let mut m = PcMachine::default();
     // Deliberately leave OPL bank one pointing at NEW before the PAS probe.
@@ -69,6 +105,7 @@ fn absent_pas_filter_probe_does_not_touch_opl_bank_one_or_hide_other_ports() {
 fn simultaneous_fm_and_dma_are_summed_on_one_ordered_pcm_timeline() {
     let mut fm = PcMachine::default();
     let mut mixed = PcMachine::default();
+    mixed.capture_audio_sources(true);
     // Existing DMA fixture emits one signed mono sample (1234h) at 1 kHz.
     for m in [&mut fm, &mut mixed] {
         full_volume(m);
@@ -113,6 +150,49 @@ fn simultaneous_fm_and_dma_are_summed_on_one_ordered_pcm_timeline() {
     }
     assert_eq!(digital_samples, 48);
     assert!(b[..count].windows(2).all(|p| p[0].nanos < p[1].nanos));
+    let mut sources = [doslet_pcm::SourceFrame::default(); 256];
+    let pcm_count = mixed.drain_audio_source(false, &mut sources);
+    assert_eq!(pcm_count, 1);
+    assert_eq!(sources[0].rate, 1000);
+    assert_eq!(sources[0].samples, [0x1234; 2]);
+    let fm_count = mixed.drain_audio_source(true, &mut sources);
+    assert!(fm_count >= count);
+    for frame in &sources[..fm_count] {
+        assert_eq!(frame.rate, doslet_opl3::SAMPLE_RATE);
+        if let Some(expected) = a[..count].iter().find(|f| f.nanos == frame.nanos) {
+            assert_eq!(
+                frame.samples, expected.samples,
+                "FM tap must not contain DMA PCM"
+            );
+        } else {
+            assert_eq!(frame.samples, [0; 2]);
+        }
+    }
+}
+
+#[test]
+fn external_device_slices_preserve_fm_samples_and_timestamps() {
+    let mut single = PcMachine::default();
+    let mut external = PcMachine::default();
+    for m in [&mut single, &mut external] {
+        tone(m);
+    }
+    for _ in 0..30 {
+        for _ in 0..8250 {
+            single.advance_hardware_steps(1).unwrap();
+        }
+        assert_eq!(
+            external.debug_advance_device_time(1_000_000).unwrap(),
+            1_000_000
+        );
+    }
+    let mut a = [doslet_pcm::EMPTY; 2048];
+    let mut b = a;
+    let count = single.drain_pcm_timed(&mut a);
+    assert_eq!(count, external.drain_pcm_timed(&mut b));
+    assert_eq!(a, b);
+    assert!(count > 1000);
+    assert!(a[..count].iter().any(|frame| frame.samples != [0; 2]));
 }
 
 #[test]

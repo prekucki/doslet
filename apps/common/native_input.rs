@@ -1,6 +1,8 @@
 //! Native setup adapter shared by the CLI and desktop frontend.
 use doslet_dos::files::ReadOnlyDrive;
 use doslet_runtime::Session;
+#[path = "native_patches.rs"]
+pub(crate) mod patches;
 use std::{
     error::Error,
     fs,
@@ -12,14 +14,32 @@ pub struct LaunchSettings {
     pub hardware: doslet_config::HardwareConfig,
     pub machine_spec: Option<doslet_config::MachineSpec>,
     pub command_tail: Vec<u8>,
+    pub patches: Vec<PathBuf>,
     pub working_directory: Vec<u8>,
     pub root: Option<PathBuf>,
     pub writable: bool,
     pub persist: bool,
+    pub preload_local_media: bool,
     pub cdrom: Option<(u8, PathBuf)>,
     pub heroes_timer_waits: bool,
+    pub heroes_menu_idle: bool,
+    pub observe_idle: bool,
+    pub analyze_synchronization: bool,
+    pub adaptive_cpu: bool,
+    pub adaptive_idle: bool,
     pub no_dynamic_core: bool,
+    pub dpmi: Option<doslet_runtime::session::dpmi::Mode>,
     pub core_profile: Option<PathBuf>,
+    /// Without an explicit `core_profile`, one profile per executable lives here.
+    #[allow(dead_code, reason = "headless runners select profiles explicitly")]
+    pub core_profile_cache: Option<PathBuf>,
+    /// An explicit module, installed at load. The desktop otherwise installs
+    /// the cached module of the live layout while the game runs.
+    pub wasm_procedures: Option<PathBuf>,
+    pub interpret_procedures: bool,
+    /// Native code compiled from procedure modules; `None` compiles every launch.
+    #[allow(dead_code, reason = "read only with the wasm-procedures feature")]
+    pub compiled_cache: Option<PathBuf>,
 }
 impl Default for LaunchSettings {
     fn default() -> Self {
@@ -27,15 +47,59 @@ impl Default for LaunchSettings {
             hardware: doslet_config::HardwareConfig::default(),
             machine_spec: None,
             command_tail: Vec::new(),
+            patches: Vec::new(),
             working_directory: b"C:\\".to_vec(),
             root: None,
             writable: true,
             persist: false,
+            preload_local_media: false,
             cdrom: None,
             heroes_timer_waits: false,
+            heroes_menu_idle: false,
+            observe_idle: false,
+            analyze_synchronization: false,
+            adaptive_cpu: false,
+            adaptive_idle: false,
             no_dynamic_core: false,
+            dpmi: None,
             core_profile: None,
+            core_profile_cache: None,
+            wasm_procedures: None,
+            interpret_procedures: false,
+            compiled_cache: None,
         }
+    }
+}
+
+/// The runtime host for a configured DPMI setting.
+#[allow(dead_code, reason = "headless runners select modes directly")]
+pub fn dpmi_mode(host: doslet_config::DpmiHost) -> Option<doslet_runtime::session::dpmi::Mode> {
+    use doslet_runtime::session::dpmi::Mode;
+    match host {
+        doslet_config::DpmiHost::Off => None,
+        doslet_config::DpmiHost::Reflect => Some(Mode::Reflect),
+        doslet_config::DpmiHost::Direct => Some(Mode::Direct),
+    }
+}
+
+/// The configured DPMI setting of a runtime host.
+#[allow(dead_code, reason = "headless runners select modes directly")]
+pub fn dpmi_host(mode: Option<doslet_runtime::session::dpmi::Mode>) -> doslet_config::DpmiHost {
+    use doslet_runtime::session::dpmi::Mode;
+    match mode {
+        None => doslet_config::DpmiHost::Off,
+        Some(Mode::Reflect) => doslet_config::DpmiHost::Reflect,
+        Some(Mode::Direct) => doslet_config::DpmiHost::Direct,
+    }
+}
+
+/// The DPMI mode a procedure module is bound to, as named in its metadata.
+pub fn dpmi_layout(mode: Option<doslet_runtime::session::dpmi::Mode>) -> &'static str {
+    use doslet_runtime::session::dpmi::Mode;
+    match mode {
+        None => "off",
+        Some(Mode::Reflect) => "reflect",
+        Some(Mode::Direct) => "direct",
     }
 }
 
@@ -82,31 +146,134 @@ pub fn load_game_with_settings(
     } else {
         drive
     };
-    let mut session = Session::from_mz_stub_named_configured(
-        drive
-            .file(filename.as_bytes())
-            .map_err(|code| format!("DOS mount error {code}"))?,
-        dos_name.as_bytes(),
-        settings.hardware,
-    )?
-    .with_drive(drive);
-    if settings.machine_spec.is_none()
+    let program = drive
+        .file(filename.as_bytes())
+        .map_err(|code| format!("DOS mount error {code}"))?;
+    let patch_plan = patches::load(&settings.patches, program)?;
+    let mut session =
+        Session::from_mz_stub_named_configured(program, dos_name.as_bytes(), settings.hardware)?
+            .with_drive(drive);
+    if (settings.machine_spec.is_none() || settings.preload_local_media)
         && let Some((letter, image)) = &settings.cdrom
     {
         session = session.with_cdrom_image(*letter, fs::read(image)?)?;
     }
     session.configure_launch(&settings.command_tail, &settings.working_directory)?;
-    session.set_dynamic_core(!settings.no_dynamic_core);
-    if let Some(path) = &settings.core_profile {
-        load_core_profile(&mut session, path);
+    session.configure_patches(patch_plan)?;
+    configure_runtime(&mut session, settings)?;
+    Ok(session)
+}
+
+pub fn configure_runtime(
+    session: &mut Session,
+    settings: &LaunchSettings,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(mode) = settings.dpmi {
+        session.enable_dpmi(mode)?;
     }
-    if settings.heroes_timer_waits {
+    session.set_dynamic_core(!settings.no_dynamic_core);
+    // These sites are linear addresses of the layout without a DPMI host.
+    let heroes_sites = settings.dpmi.is_none();
+    if !heroes_sites && (settings.heroes_menu_idle || settings.heroes_timer_waits) {
+        eprintln!(
+            "[WARN doslet] Experimental Heroes sites use the DPMI off layout; ignored with DPMI {}",
+            dpmi_layout(settings.dpmi)
+        );
+    }
+    set_heroes_menu_idle(session, settings.heroes_menu_idle && heroes_sites);
+    session.set_idle_observation(settings.observe_idle);
+    if settings.adaptive_idle {
+        session.set_adaptive_idle(true);
+    }
+    session.set_synchronization_analysis(settings.analyze_synchronization);
+    if settings.adaptive_cpu {
+        session.set_adaptive_cpu(true);
+    }
+    if let Some(path) = &settings.core_profile {
+        load_core_profile(session, path);
+    }
+    if settings.heroes_timer_waits && heroes_sites {
         session.set_memory_wait_sites(0x281098, [0x1E281C, 0x1E2881, 0x1E331A]);
         eprintln!(
             "[INFO doslet] Experimental Heroes timer waits enabled (three validated polling sites)"
         );
     }
-    Ok(session)
+    install_wasm_procedures(session, settings)?;
+    Ok(())
+}
+
+pub fn install_wasm_procedures(
+    session: &mut Session,
+    settings: &LaunchSettings,
+) -> Result<(), Box<dyn Error>> {
+    if settings.interpret_procedures && settings.wasm_procedures.is_none() {
+        return Err("interpreted procedure boundaries require a procedure bundle".into());
+    }
+    #[cfg(not(feature = "wasm-procedures"))]
+    let _ = session;
+    if let Some(path) = &settings.wasm_procedures {
+        // Validation precedes any session change; a rejected module stops the launch.
+        #[cfg(feature = "wasm-procedures")]
+        wasm_procedures::install(
+            session,
+            path,
+            wasm_procedures::Expect::Dpmi(dpmi_layout(session.dpmi_mode())),
+            settings.interpret_procedures,
+            settings.compiled_cache.as_deref(),
+        )?;
+        #[cfg(not(feature = "wasm-procedures"))]
+        return Err(format!(
+            "{} requires the wasm-procedures Cargo feature",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Install a cached module into a running session whose LE objects were
+/// found at `layout` (`le_layout::Layout::key`).
+#[cfg(feature = "wasm-procedures")]
+#[allow(
+    dead_code,
+    reason = "only the desktop installs modules while a game runs"
+)]
+pub fn install_layout_procedures(
+    session: &mut Session,
+    path: &Path,
+    layout: &str,
+    compiled_cache: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    wasm_procedures::install(
+        session,
+        path,
+        wasm_procedures::Expect::Layout(layout),
+        false,
+        compiled_cache,
+    )
+}
+
+#[cfg(feature = "wasm-procedures")]
+#[path = "native_wasm_procedures.rs"]
+mod wasm_procedures;
+pub fn set_heroes_menu_idle(session: &mut Session, enabled: bool) {
+    session.set_menu_idle_site(enabled.then_some(doslet_runtime::session::MenuIdleSite {
+        head: 0x217da2,
+        call: 0x206fc0,
+        backedge: 0x217f09,
+        event_offset: 0x10,
+        callback_offset: 0x28,
+        callback: 0x2092dc,
+        timer: 0x2810a8,
+        guard: 0x2832c0,
+    }));
+    session.set_event_idle_site(enabled.then_some(doslet_runtime::session::EventIdleSite {
+        head: 0x219d1a,
+        call: 0x213f4c,
+        backedge: 0x219d8f,
+        queue: 0x2832f0,
+        context: 0x2832c4,
+    }));
 }
 /// Optional preparation hints; malformed input cannot prevent interpretation.
 pub fn load_core_profile(session: &mut Session, path: &Path) {

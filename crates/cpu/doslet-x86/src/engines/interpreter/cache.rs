@@ -1,4 +1,6 @@
 //! Single-instruction cache. Unsupported forms use the original interpreter.
+pub mod analysis;
+pub mod translation;
 use super::{Cpu, CpuError, StepOutcome};
 use crate::state::SegmentWindow;
 use crate::{
@@ -81,6 +83,9 @@ struct Block {
     length: u8,
     code32: bool,
     count: u8,
+    /// Membership of the linear start in the setup-time flat-32 entry set.
+    /// This occupies existing header padding, keeping hot blocks compact.
+    prepared_entry: bool,
     check: CodeCheck,
     instructions: [Prepared; BLOCK_INSTRUCTIONS],
 }
@@ -90,6 +95,7 @@ impl Block {
         length: 0,
         count: 0,
         code32: false,
+        prepared_entry: false,
         check: CodeCheck {
             space: 0,
             pages: [0; 2],
@@ -98,6 +104,40 @@ impl Block {
         instructions: [Prepared::EMPTY; BLOCK_INSTRUCTIONS],
     };
 }
+
+const ENTRY_HINT_CAPACITY: usize = 512;
+
+#[derive(Clone, Copy)]
+struct EntryHint {
+    ip: u32,
+    /// The two largest values mark an unused slot and cached non-membership.
+    index: u32,
+}
+
+/// Immutable registry and replaceable membership hints, allocated only when a
+/// machine installs entries. Hints depend on EIP membership, never code bytes.
+struct PreparedEntries {
+    ips: Box<[u32]>,
+    hints: Box<[EntryHint; ENTRY_HINT_CAPACITY]>,
+}
+impl PreparedEntries {
+    #[inline]
+    fn index(&mut self, ip: u32) -> Option<usize> {
+        let slot = ((ip ^ (ip >> 9)) as usize) & (ENTRY_HINT_CAPACITY - 1);
+        let hint = &mut self.hints[slot];
+        if hint.index == u32::MAX || hint.ip != ip {
+            *hint = EntryHint {
+                ip,
+                index: self
+                    .ips
+                    .binary_search(&ip)
+                    .map_or(u32::MAX - 1, |index| index as u32),
+            };
+        }
+        (hint.index != u32::MAX - 1).then_some(hint.index as usize)
+    }
+}
+
 pub(super) struct Cache {
     /// Reserved once at setup; the fixed length lets masked indexing skip
     /// bounds checks without placing the table on the stack.
@@ -106,6 +146,7 @@ pub(super) struct Cache {
     blocks: Box<[Block; BLOCK_CAPACITY]>,
     /// Cold decoded forms, indexed by block slot and instruction position.
     fallback: Box<[Instruction]>,
+    prepared_entries: Option<PreparedEntries>,
     context: Option<Context>,
     /// Registers lineage, CS version, selector and PE mode under which
     /// `code32` and `context` were last resolved.
@@ -114,6 +155,7 @@ pub(super) struct Cache {
     /// Execute window of `context`; None leaves its faults to the interpreter.
     window: Option<SegmentWindow>,
     pub enabled: bool,
+    pub(super) profile: Option<crate::execution_tiers::ExecutionProfile>,
     #[cfg(feature = "profiling")]
     pub stats: DecodeCacheStats,
 }
@@ -130,11 +172,13 @@ impl Default for Cache {
                 .unwrap_or_else(|_| unreachable!("the vector has BLOCK_CAPACITY blocks")),
             fallback: alloc::vec![Instruction::UNSUPPORTED; BLOCK_CAPACITY * BLOCK_INSTRUCTIONS]
                 .into_boxed_slice(),
+            prepared_entries: None,
             context: None,
             key: None,
             code32: false,
             window: None,
             enabled: true,
+            profile: None,
             #[cfg(feature = "profiling")]
             stats: DecodeCacheStats::default(),
         }
@@ -369,8 +413,31 @@ impl Cache {
             code32: self.code32,
             ..Block::EMPTY
         };
+        // Block keys are linear, so annotate and split by linear addresses even
+        // in a non-flat CS. Only a flat-32 caller may act on these annotations;
+        // compatible CS contexts can therefore continue sharing the same block.
+        let entries = self
+            .prepared_entries
+            .as_ref()
+            .filter(|_| self.code32)
+            .map_or(&[][..], |entries| entries.ips.as_ref());
+        let mut entry_position = entries.partition_point(|&entry| entry < address);
+        block.prepared_entry = entries.get(entry_position) == Some(&address);
+        entry_position += usize::from(block.prepared_entry);
         let mut offset = 0;
         while usize::from(block.count) < BLOCK_INSTRUCTIONS {
+            let current = address.wrapping_add(offset as u32);
+            // A registry address inside an instruction is not an instruction
+            // boundary. Skip it here so it cannot hide a later valid entry.
+            while entries
+                .get(entry_position)
+                .is_some_and(|&entry| entry < current)
+            {
+                entry_position += 1;
+            }
+            if offset != 0 && entries.get(entry_position) == Some(&current) {
+                break;
+            }
             let Some(instruction) = Instruction::decode_mode(&bytes[offset..], self.code32) else {
                 break;
             };
@@ -389,7 +456,14 @@ impl Cache {
                 break;
             }
             let position = usize::from(block.count);
-            let prepared = Prepared::new(instruction);
+            let mut prepared = Prepared::new(instruction);
+            if let Some(profile) = &self.profile {
+                prepared.set_tier(profile.classify(
+                    address.wrapping_add(offset as u32),
+                    self.code32,
+                    &bytes[offset..end],
+                ));
+            }
             if prepared.is_fallback() {
                 self.fallback[index * BLOCK_INSTRUCTIONS + position] = instruction;
             }
@@ -1043,6 +1117,58 @@ impl Windows {
 }
 
 impl Cpu {
+    /// Replace immutable flat-32 procedure-entry EIPs at a setup/batch boundary.
+    /// Entries must be strictly increasing; returned indices retain this order.
+    /// Invalid input preserves the previous registry and caches. Installation
+    /// allocates metadata and invalidates decoded blocks, with no guest changes.
+    /// An empty list removes the registry. Ordinary cache/profile resets retain
+    /// it; a newly created or restored CPU starts without registered entries.
+    pub fn set_prepared_entries(
+        &mut self,
+        sorted_entries: alloc::vec::Vec<u32>,
+    ) -> Result<(), &'static str> {
+        if sorted_entries.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("prepared entries must be sorted and unique");
+        }
+        if sorted_entries.len() as u64 > u64::from(u32::MAX - 1) {
+            return Err("too many prepared entries");
+        }
+        let entries = (!sorted_entries.is_empty()).then(|| PreparedEntries {
+            ips: sorted_entries.into_boxed_slice(),
+            hints: alloc::vec![EntryHint { ip: 0, index: u32::MAX }; ENTRY_HINT_CAPACITY]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("the vector has ENTRY_HINT_CAPACITY hints")),
+        });
+        self.decode_cache.blocks.fill(Block::EMPTY);
+        self.decode_cache.prepared_entries = entries;
+        Ok(())
+    }
+
+    pub fn has_prepared_entries(&self) -> bool {
+        self.decode_cache.prepared_entries.is_some()
+    }
+
+    /// Cached registry membership at the current EIP, including when decoding
+    /// is disabled. A result is a scheduling hint: the caller must still check
+    /// source bytes and its complete execution/context contract before dispatch.
+    /// Only default-32-bit code with CS base zero uses registered flat EIPs.
+    pub fn prepared_entry_index(&mut self) -> Option<usize> {
+        self.decode_cache.prepared_entries.as_ref()?;
+        if self.registers.protected != self.protected_mode() {
+            return None;
+        }
+        let (window, cs) = self.decode_cache.code_context(&self.registers)?;
+        if !self.decode_cache.code32 || cs.base != 0 {
+            return None;
+        }
+        window.address(self.registers.ip, 1)?;
+        self.decode_cache
+            .prepared_entries
+            .as_mut()?
+            .index(self.registers.ip)
+    }
+
     /// Execute a bounded run of decoded ordinary-RAM instructions without the
     /// native core. The machine checks pending IRQs first and supplies the next
     /// hardware deadline. I/O, MMIO, faultable operands and mode/IF changes stop
@@ -1053,19 +1179,177 @@ impl Cpu {
         budget: u32,
         limit: impl FnOnce(&B) -> u32,
     ) -> u32 {
+        if self.execution_labels_enabled() {
+            self.interpret_batch_mode::<B, false, false, false, true>(
+                bus,
+                budget,
+                limit,
+                [0; 2],
+                &[],
+            )
+        } else {
+            self.interpret_batch_mode::<B, false, false, false, false>(
+                bus,
+                budget,
+                limit,
+                [0; 2],
+                &[],
+            )
+        }
+    }
+
+    /// Yield on arrival at a selected instruction after doing work, including
+    /// inside a cached block. The ordinary specialization has no comparison.
+    pub fn interpret_batch_until_block<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        head: u32,
+    ) -> u32 {
+        self.interpret_batch_until_blocks(bus, budget, limit, [head; 2])
+    }
+
+    /// Optional scheduler hints for two selected block heads.
+    pub fn interpret_batch_until_blocks<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        heads: [u32; 2],
+    ) -> u32 {
+        if self.execution_labels_enabled() {
+            self.interpret_batch_mode::<B, true, false, false, true>(bus, budget, limit, heads, &[])
+        } else {
+            self.interpret_batch_mode::<B, true, false, false, false>(
+                bus,
+                budget,
+                limit,
+                heads,
+                &[],
+            )
+        }
+    }
+
+    /// Yield before any sorted entry EIP after completing at least one
+    /// instruction, including an arrival inside a cached block. A declined
+    /// current entry can therefore make ordinary progress without retry loops.
+    pub fn interpret_batch_until_entries<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        sorted_entries: &[u32],
+    ) -> u32 {
+        if self.execution_labels_enabled() {
+            self.interpret_batch_mode::<B, false, true, false, true>(
+                bus,
+                budget,
+                limit,
+                [0; 2],
+                sorted_entries,
+            )
+        } else {
+            self.interpret_batch_mode::<B, false, true, false, false>(
+                bus,
+                budget,
+                limit,
+                [0; 2],
+                sorted_entries,
+            )
+        }
+    }
+
+    /// Yield before reaching another registered flat-32 entry, including by
+    /// fallthrough, CALL, indirect transfer or RET. Cold decoding splits blocks
+    /// at entries; the hot instruction loop performs no registry lookup or
+    /// entry comparison. Starting at a declined entry makes ordinary bounded
+    /// progress before yielding, including when a branch returns to that entry.
+    pub fn interpret_batch_until_prepared_entry<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+    ) -> u32 {
+        if self.execution_labels_enabled() {
+            self.interpret_batch_mode::<B, false, false, true, true>(
+                bus,
+                budget,
+                limit,
+                [0; 2],
+                &[],
+            )
+        } else {
+            self.interpret_batch_mode::<B, false, false, true, false>(
+                bus,
+                budget,
+                limit,
+                [0; 2],
+                &[],
+            )
+        }
+    }
+
+    fn interpret_batch_mode<
+        B: CpuBus,
+        const YIELD: bool,
+        const ENTRIES: bool,
+        const PREPARED: bool,
+        const COUNT: bool,
+    >(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        heads: [u32; 2],
+        sorted_entries: &[u32],
+    ) -> u32 {
         if budget < 2 || !self.batch_ready() || !self.decode_cache.enabled {
             return 0;
         }
         let Some((code, mut windows)) = self.batch_context() else {
             return 0;
         };
+        let stop_at_prepared = PREPARED
+            && self.decode_cache.code32
+            && self
+                .decode_cache
+                .context
+                .is_some_and(|context| context.cs.base == 0);
         let budget = budget.min(BATCH_STEPS).min(limit(bus));
         let mut completed = 0;
         'blocks: while completed < budget {
+            // Cached blocks advance in instruction order; taken branches and
+            // wrapping IPs return to this boundary. Resolve the next selected
+            // EIP once per block, leaving only equality in its inner loop.
+            let entry_head = if ENTRIES {
+                let ip = self.registers.ip;
+                let index = sorted_entries
+                    .partition_point(|&entry| entry < ip || (completed == 0 && entry == ip));
+                sorted_entries.get(index).copied()
+            } else {
+                None
+            };
+            if completed != 0
+                && ((YIELD && heads.contains(&self.registers.ip))
+                    || (ENTRIES && entry_head == Some(self.registers.ip)))
+            {
+                break;
+            }
             let Some((index, count, check)) = self.batch_block(code, bus) else {
                 break;
             };
+            if stop_at_prepared && completed != 0 && self.decode_cache.blocks[index].prepared_entry
+            {
+                break;
+            }
             for position in 0..count {
+                if completed != 0
+                    && ((YIELD && heads.contains(&self.registers.ip))
+                        || (ENTRIES && entry_head == Some(self.registers.ip)))
+                {
+                    break 'blocks;
+                }
                 let instruction = self.block_instruction(index, position);
                 let next = self
                     .registers
@@ -1079,6 +1363,9 @@ impl Cpu {
                     index * BLOCK_INSTRUCTIONS + position,
                 ) {
                     break 'blocks;
+                }
+                if COUNT {
+                    self.execution_counts[instruction.tier()] += 1;
                 }
                 completed += 1;
                 // A taken branch, a repeated string or the budget ends the run;
@@ -2802,11 +3089,11 @@ mod tests {
     }
 
     /// Flat RAM whose single write generation validates every code span.
-    struct Flat {
-        ram: [u8; 0x200],
+    struct Flat<const SIZE: usize = 0x200> {
+        ram: [u8; SIZE],
         generation: u64,
     }
-    impl MemoryBus for Flat {
+    impl<const SIZE: usize> MemoryBus for Flat<SIZE> {
         fn read_u8(&mut self, address: u32) -> Result<u8, BusError> {
             let byte = self.ram.get(address as usize);
             byte.copied().ok_or(BusError::UnmappedMemory(address))
@@ -2832,14 +3119,358 @@ mod tests {
             self.ram
                 .get(start..(start + usize::from(length)).min(self.ram.len()))
         }
+        fn is_batch_memory(&self, address: u32, length: u8) -> bool {
+            address as usize + usize::from(length) <= self.ram.len()
+        }
     }
-    impl PortBus for Flat {
+    impl<const SIZE: usize> PortBus for Flat<SIZE> {
         fn read_port_u8(&mut self, port: u16) -> Result<u8, BusError> {
             Err(BusError::UnmappedPort(port))
         }
         fn write_port_u8(&mut self, port: u16, _: u8) -> Result<(), BusError> {
             Err(BusError::UnmappedPort(port))
         }
+    }
+
+    fn prepared_cpu() -> Cpu {
+        let mut cpu = Cpu::default();
+        cpu.set_protected_mode(true);
+        for segment in SegmentRegister::ALL {
+            cpu.registers.set_segment(
+                segment,
+                SegmentCache {
+                    selector: if segment == SegmentRegister::Cs {
+                        8
+                    } else {
+                        16
+                    },
+                    base: 0,
+                    limit: u32::MAX,
+                    access: if segment == SegmentRegister::Cs {
+                        0x9B
+                    } else {
+                        0x93
+                    },
+                    flags: 0xC0,
+                    default32: true,
+                    usable: true,
+                },
+            );
+        }
+        cpu.registers.set32(Gpr32::Esp, 0x1F0);
+        cpu
+    }
+
+    #[test]
+    fn prepared_entries_split_blocks_warmed_before_registration() {
+        let mut bus = Flat {
+            ram: [0x40; 0x200],
+            generation: 0,
+        };
+        let mut cpu = prepared_cpu();
+        assert_eq!(cpu.interpret_batch(&mut bus, 8, |_| 8), 8);
+        assert_eq!(cpu.decode_cache.blocks[0].count, 8);
+        cpu.set_prepared_entries(alloc::vec![3, 6]).unwrap();
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            3
+        );
+        assert_eq!(cpu.registers.ip, 3);
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        assert_eq!(cpu.decode_cache.blocks[0].count, 3);
+        assert!(cpu.decode_cache.blocks[3].prepared_entry);
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            3
+        );
+        assert_eq!(cpu.registers.ip, 6);
+        assert_eq!(cpu.prepared_entry_index(), Some(1));
+        assert_eq!(cpu.registers.get32(Gpr32::Eax), 14);
+    }
+
+    #[test]
+    fn prepared_entry_replacement_validates_before_mutation_and_clears_hints() {
+        let mut bus = Flat {
+            ram: [0x40; 0x200],
+            generation: 0,
+        };
+        let mut cpu = prepared_cpu();
+        cpu.set_prepared_entries(alloc::vec![3, 6]).unwrap();
+        cpu.registers.ip = 3;
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        for invalid in [alloc::vec![6, 3], alloc::vec![3, 3]] {
+            assert!(cpu.set_prepared_entries(invalid).is_err());
+            assert_eq!(cpu.prepared_entry_index(), Some(0));
+        }
+        cpu.set_prepared_entries(alloc::vec![6]).unwrap();
+        assert_eq!(cpu.prepared_entry_index(), None);
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            6
+        );
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        cpu.set_prepared_entries(alloc::vec![]).unwrap();
+        assert!(cpu.decode_cache.prepared_entries.is_none());
+        assert_eq!(cpu.prepared_entry_index(), None);
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            32
+        );
+    }
+
+    #[test]
+    fn declined_prepared_entry_repeatedly_makes_bounded_progress() {
+        let mut bus = Flat {
+            ram: [0x40; 0x200],
+            generation: 0,
+        };
+        bus.ram[..2].copy_from_slice(&[0xEB, 0xFE]);
+        let mut cpu = prepared_cpu();
+        cpu.set_prepared_entries(alloc::vec![0]).unwrap();
+        for _ in 0..8 {
+            assert_eq!(cpu.prepared_entry_index(), Some(0));
+            assert_eq!(
+                cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+                1
+            );
+            assert_eq!(cpu.registers.ip, 0);
+        }
+    }
+
+    #[test]
+    fn prepared_entries_stop_direct_and_indirect_calls_jumps_and_returns() {
+        for bytes in [
+            &[0xE8, 0x1B, 0, 0, 0][..], // CALL 20h
+            &[0xFF, 0xD0],              // CALL EAX
+            &[0xFF, 0xE0],              // JMP EAX
+            &[0xC3],                    // RET
+        ] {
+            let mut bus = Flat {
+                ram: [0x40; 0x200],
+                generation: 0,
+            };
+            bus.ram[..bytes.len()].copy_from_slice(bytes);
+            bus.ram[0x1F0..0x1F4].copy_from_slice(&0x20_u32.to_le_bytes());
+            let mut cpu = prepared_cpu();
+            cpu.registers.set32(Gpr32::Eax, 0x20);
+            cpu.set_prepared_entries(alloc::vec![0x20]).unwrap();
+            assert_eq!(
+                cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+                1,
+                "{bytes:02X?}"
+            );
+            assert_eq!(cpu.registers.ip, 0x20);
+            assert_eq!(cpu.prepared_entry_index(), Some(0));
+            assert_eq!(cpu.registers.get32(Gpr32::Eax), 0x20);
+        }
+    }
+
+    #[test]
+    fn unaligned_registry_address_cannot_hide_later_fallthrough_entry() {
+        let mut bus = Flat {
+            ram: [0x40; 0x200],
+            generation: 0,
+        };
+        bus.ram[..5].copy_from_slice(&[0xB8, 0, 0, 0, 0]);
+        let mut cpu = prepared_cpu();
+        cpu.set_prepared_entries(alloc::vec![1, 6]).unwrap();
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            2
+        );
+        assert_eq!(cpu.registers.ip, 6);
+        assert_eq!(cpu.prepared_entry_index(), Some(1));
+    }
+
+    #[test]
+    fn prepared_hints_and_block_annotations_survive_slot_collisions() {
+        let mut bus = Flat {
+            ram: [0x40; 0x2000],
+            generation: 0,
+        };
+        let mut cpu = prepared_cpu();
+        cpu.set_prepared_entries(alloc::vec![0, 2, 0x1004]).unwrap();
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        cpu.registers.ip = 0x201; // Same membership-hint slot as EIP zero.
+        assert_eq!(cpu.prepared_entry_index(), None);
+        cpu.registers.ip = 0;
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 8, |_| 8),
+            2
+        );
+        cpu.registers.ip = 0x1004; // Same decoded-block slot as EIP zero.
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 8, |_| 8),
+            8
+        );
+        assert_eq!(cpu.decode_cache.blocks[0].address, 0x1004);
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 8, |_| 8),
+            2
+        );
+        assert_eq!(cpu.registers.ip, 2);
+        assert_eq!(cpu.prepared_entry_index(), Some(1));
+    }
+
+    #[test]
+    fn code_rewrites_rebuild_entry_boundaries_but_keep_membership_hints() {
+        let mut bus = Flat {
+            ram: [0x40; 0x200],
+            generation: 0,
+        };
+        let mut cpu = prepared_cpu();
+        cpu.set_prepared_entries(alloc::vec![3]).unwrap();
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            3
+        );
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        for (address, byte) in [0xB8, 0, 0, 0, 0].into_iter().enumerate() {
+            bus.write_u8(address as u32, byte).unwrap();
+        }
+        // The old entry now lies in MOV's immediate, so no boundary exists.
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 2, |_| 2),
+            2
+        );
+        assert_eq!(cpu.registers.ip, 6);
+        cpu.registers.ip = 3;
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        for address in 0..5 {
+            bus.write_u8(address, 0x40).unwrap();
+        }
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            3
+        );
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+    }
+
+    #[test]
+    fn prepared_entry_annotations_remain_safe_across_cs_aliases_and_modes() {
+        let mut bus = Flat {
+            ram: [0x40; 0x200],
+            generation: 0,
+        };
+        let mut cpu = prepared_cpu();
+        cpu.set_prepared_entries(alloc::vec![0x20]).unwrap();
+        let flat = cpu.registers.segment_cache(SegmentRegister::Cs);
+        cpu.registers.ip = 0x10;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 48, |_| 48),
+            16
+        );
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        cpu.registers
+            .set_segment(SegmentRegister::Cs, SegmentCache { base: 0x10, ..flat });
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 48, |_| 48),
+            48
+        );
+        cpu.registers.ip = 0x20;
+        assert_eq!(cpu.prepared_entry_index(), None);
+        cpu.registers.set_segment(
+            SegmentRegister::Cs,
+            SegmentCache {
+                default32: false,
+                flags: 0x80,
+                ..flat
+            },
+        );
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 48, |_| 48),
+            48
+        );
+        cpu.registers.ip = 0x20;
+        assert_eq!(cpu.prepared_entry_index(), None);
+        cpu.registers.set_segment(SegmentRegister::Cs, flat);
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 48, |_| 48),
+            32
+        );
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+    }
+
+    #[test]
+    fn prepared_registry_survives_disabled_cache_and_profile_replacement() {
+        let mut bus = Flat {
+            ram: [0x40; 0x200],
+            generation: 0,
+        };
+        let mut cpu = prepared_cpu();
+        cpu.set_prepared_entries(alloc::vec![0, 3]).unwrap();
+        cpu.set_decode_cache(false);
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            0
+        );
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ip, 1);
+        cpu.set_decode_cache(true);
+        cpu.set_execution_labels(Some(alloc::vec![])).unwrap();
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            3
+        );
+        assert_eq!(cpu.prepared_entry_index(), Some(1));
+        assert_eq!(cpu.execution_counts(), [0, 0, 3, 0]);
+        cpu.set_execution_labels(None).unwrap();
+        assert_eq!(cpu.prepared_entry_index(), Some(1));
+    }
+
+    #[test]
+    fn prepared_batches_keep_deadlines_and_do_not_allocate_during_execution() {
+        let mut bus = Flat {
+            ram: [0x40; 0x200],
+            generation: 0,
+        };
+        let mut cpu = prepared_cpu();
+        cpu.set_prepared_entries(alloc::vec![7]).unwrap();
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 2),
+            2
+        );
+        assert_eq!(cpu.registers.ip, 2);
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 1, |_| 32),
+            0
+        );
+        let info = allocation_counter::measure(|| {
+            for _ in 0..8 {
+                cpu.registers.ip = 0;
+                assert_eq!(cpu.prepared_entry_index(), None);
+                assert_eq!(
+                    cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+                    7
+                );
+                assert_eq!(cpu.prepared_entry_index(), Some(0));
+            }
+        });
+        assert_eq!(info.count_total, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "save-state")]
+    fn restored_cpu_drops_prepared_registry() {
+        use doslet_state::State;
+        let mut cpu = prepared_cpu();
+        cpu.set_prepared_entries(alloc::vec![0]).unwrap();
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        let mut restored = <Cpu as State>::load(cpu.save()).unwrap();
+        assert_eq!(restored.prepared_entry_index(), None);
+        assert!(restored.decode_cache.prepared_entries.is_none());
     }
 
     #[test]

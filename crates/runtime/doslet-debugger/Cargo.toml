@@ -1,0 +1,14 @@
+[package]
+name = "doslet-debugger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+doslet-runtime.workspace = true
+doslet-x86.workspace = true
+gdbstub = "0.7.10"
+[dev-dependencies]
+allocation-counter = "0.8.1"
+[lints]
+workspace = true

@@ -4,7 +4,7 @@ extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
 use core::fmt;
 pub mod hardware;
-pub use hardware::{HardwareConfig, HardwareError, KeyboardMode};
+pub use hardware::{AudioHardware, HardwareConfig, HardwareError, KeyboardMode};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WritePolicy {
@@ -48,9 +48,54 @@ pub struct HostBinding {
 pub struct HostBindingManifest {
     pub bindings: Vec<HostBinding>,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MouseMode {
+    #[default]
+    Auto,
+    Capture,
+    NoCapture,
+}
+impl MouseMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Capture, Self::NoCapture];
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Capture => "capture",
+            Self::NoCapture => "no-capture",
+        }
+    }
+    pub const fn relative(self, guest_relative: bool) -> bool {
+        match self {
+            Self::Auto => guest_relative,
+            Self::Capture => true,
+            Self::NoCapture => false,
+        }
+    }
+}
+impl core::fmt::Display for MouseMode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "Auto",
+            Self::Capture => "Capture",
+            Self::NoCapture => "No capture",
+        })
+    }
+}
+impl core::str::FromStr for MouseMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "capture" => Ok(Self::Capture),
+            "no-capture" => Ok(Self::NoCapture),
+            _ => Err("input.mouse_mode must be auto, capture, or no-capture"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputSettings {
-    pub capture: bool,
+    pub mouse_mode: MouseMode,
     pub hide_cursor: bool,
     pub pad_index: u8,
     pub pad_id: Option<String>,
@@ -63,7 +108,7 @@ pub struct InputSettings {
 impl Default for InputSettings {
     fn default() -> Self {
         Self {
-            capture: true,
+            mouse_mode: MouseMode::Auto,
             hide_cursor: false,
             pad_index: 0,
             pad_id: None,
@@ -78,6 +123,7 @@ impl Default for InputSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputRouting {
     pub audio: bool,
+    pub video_filter: VideoFilter,
     pub game_midi: String,
     pub host_midi: String,
     pub midi_output: String,
@@ -87,6 +133,7 @@ impl Default for OutputRouting {
     fn default() -> Self {
         Self {
             audio: true,
+            video_filter: VideoFilter::Nearest,
             game_midi: "gm".into(),
             host_midi: "gm".into(),
             midi_output: "rust".into(),
@@ -94,30 +141,293 @@ impl Default for OutputRouting {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoFilter {
+    #[default]
+    Nearest,
+    SharpBilinear,
+    Hq2x,
+}
+impl VideoFilter {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::SharpBilinear => "sharp-bilinear",
+            Self::Hq2x => "hq2x",
+        }
+    }
+}
+impl core::str::FromStr for VideoFilter {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "nearest" => Ok(Self::Nearest),
+            "sharp-bilinear" => Ok(Self::SharpBilinear),
+            "hq2x" => Ok(Self::Hq2x),
+            _ => Err("output.video_filter must be nearest, sharp-bilinear, or hq2x"),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CpuMode {
+    #[default]
+    Fixed,
+    Adaptive,
+    SpeedTiers,
+}
+impl CpuMode {
+    pub const ALL: [Self; 3] = [Self::Fixed, Self::Adaptive, Self::SpeedTiers];
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Adaptive => "adaptive",
+            Self::SpeedTiers => "speed-tiers",
+        }
+    }
+}
+impl core::fmt::Display for CpuMode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Fixed => "Fixed clock",
+            Self::Adaptive => "Adaptive",
+            Self::SpeedTiers => "Speed tiers",
+        })
+    }
+}
+impl core::str::FromStr for CpuMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fixed" => Ok(Self::Fixed),
+            "adaptive" => Ok(Self::Adaptive),
+            "speed-tiers" => Ok(Self::SpeedTiers),
+            _ => Err("machine.cpu_mode must be fixed, adaptive, or speed-tiers"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HardwarePreset {
+    pub id: String,
+    pub name: String,
+    pub cpu_mhz: u16,
+    pub cpu_mode: CpuMode,
+    pub memory_mib: u8,
+    pub x87: bool,
+    pub sb16: bool,
+    pub mpu401: bool,
+}
+impl HardwarePreset {
+    pub fn builtins() -> Vec<Self> {
+        alloc::vec![
+            Self {
+                id: "386sx-16".into(),
+                name: "386SX · 16 MHz".into(),
+                cpu_mhz: 16,
+                cpu_mode: CpuMode::Fixed,
+                memory_mib: 4,
+                x87: true,
+                sb16: true,
+                mpu401: false,
+            },
+            Self {
+                id: "386dx-33".into(),
+                name: "386DX · 33 MHz".into(),
+                cpu_mhz: 33,
+                cpu_mode: CpuMode::Fixed,
+                memory_mib: 8,
+                x87: true,
+                sb16: true,
+                mpu401: true,
+            },
+            Self {
+                id: "486dx2-66".into(),
+                name: "486DX2 · 66 MHz".into(),
+                cpu_mhz: 66,
+                cpu_mode: CpuMode::Adaptive,
+                memory_mib: 16,
+                x87: true,
+                sb16: true,
+                mpu401: true,
+            },
+            Self {
+                id: "pentium-133".into(),
+                name: "Pentium · 133 MHz".into(),
+                cpu_mhz: 133,
+                cpu_mode: CpuMode::SpeedTiers,
+                memory_mib: 32,
+                x87: true,
+                sb16: true,
+                mpu401: true,
+            },
+        ]
+    }
+    pub fn find_builtin(id: &str) -> Option<Self> {
+        Self::builtins().into_iter().find(|p| p.id == id)
+    }
+    pub fn apply_to(&self, hardware: &mut HardwareConfig, cpu_mode: &mut Option<CpuMode>) {
+        hardware.cpu_mhz = self.cpu_mhz;
+        hardware.memory_mib = self.memory_mib;
+        hardware.x87 = self.x87;
+        hardware.sb16 = self.sb16;
+        hardware.mpu401 = self.mpu401;
+        *cpu_mode = Some(self.cpu_mode);
+    }
+}
+
+/// An additional entry point for a game profile, such as `SETUP.EXE` or `SETSOUND.EXE`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GameAction {
+    pub id: String,
+    pub name: String,
+    pub executable: String,
+    pub arguments: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GameSpec {
     pub executable: String,
+    /// Native patch manifests, resolved relative to the launch profile.
+    pub patches: Vec<String>,
     pub arguments: Vec<String>,
     pub working_directory: String,
+    /// ASCII characters queued in the BIOS keyboard buffer at the first wait.
+    pub startup_keys: String,
+    /// Secondary entry points (e.g. `SETUP.EXE`, `SETSOUND.EXE`) sharing the game's save store.
+    pub actions: Vec<GameAction>,
 }
 impl Default for GameSpec {
     fn default() -> Self {
         Self {
             executable: String::new(),
+            patches: Vec::new(),
             arguments: Vec::new(),
             working_directory: "C:\\".into(),
+            startup_keys: String::new(),
+            actions: Vec::new(),
         }
     }
+}
+/// Translate a startup character into the BIOS scan/ASCII pair for a US PC/AT
+/// keyboard. This accepts printable ASCII and common DOS control keys.
+pub fn bios_key_for_ascii(byte: u8) -> Option<(u8, u8)> {
+    match byte {
+        b'\n' | b'\r' => return Some((0x1c, b'\r')),
+        b'\t' => return Some((0x0f, b'\t')),
+        8 => return Some((0x0e, 8)),
+        27 => return Some((0x01, 27)),
+        b' '..=b'~' => {}
+        _ => return None,
+    }
+    const SHIFTED: &[u8] = b"!@#$%^&*()_+{}|:\"~<>?";
+    const BASE: &[u8] = b"1234567890-=[]\\;'`,./";
+    let base = SHIFTED
+        .iter()
+        .position(|candidate| *candidate == byte)
+        .map_or(byte.to_ascii_lowercase(), |index| BASE[index]);
+    for (row, first) in [
+        (&b"qwertyuiop[]"[..], 0x10),
+        (&b"asdfghjkl;'"[..], 0x1e),
+        (&b"zxcvbnm,./"[..], 0x2c),
+    ] {
+        if let Some(index) = row.iter().position(|candidate| *candidate == base) {
+            return Some((first + index as u8, byte));
+        }
+    }
+    let scan = match base {
+        b'1'..=b'9' => base - b'1' + 2,
+        b'0' => 0x0b,
+        b'-' => 0x0c,
+        b'=' => 0x0d,
+        b'`' => 0x29,
+        b'\\' => 0x2b,
+        b' ' => 0x39,
+        _ => return None,
+    };
+    Some((scan, byte))
+}
+#[cfg(test)]
+mod startup_key_tests {
+    use super::bios_key_for_ascii;
+
+    #[test]
+    fn printable_ascii_has_bios_scan_codes() {
+        for ascii in b' '..=b'~' {
+            let (scan, actual) = bios_key_for_ascii(ascii).unwrap();
+            assert_ne!(scan, 0);
+            assert_eq!(actual, ascii);
+        }
+        assert_eq!(bios_key_for_ascii(b'1'), Some((0x02, b'1')));
+        assert_eq!(bios_key_for_ascii(b'5'), Some((0x06, b'5')));
+        assert_eq!(bios_key_for_ascii(b'A'), Some((0x1e, b'A')));
+        assert_eq!(bios_key_for_ascii(b'?'), Some((0x35, b'?')));
+        assert_eq!(bios_key_for_ascii(b'\n'), Some((0x1c, b'\r')));
+        assert_eq!(bios_key_for_ascii(0), None);
+    }
+}
+/// The DPMI host Doslet offers protected-mode programs. DOS extenders such as
+/// DOS/4GW use it when present and their own host otherwise; DJGPP programs
+/// use it instead of loading CWSDPMI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DpmiHost {
+    /// No host: extenders switch modes themselves.
+    Off,
+    /// BIOS/DOS services run through the guest's real-mode handlers.
+    Reflect,
+    /// Eligible unchanged BIOS/DOS services are dispatched from protected mode.
+    Direct,
+}
+impl DpmiHost {
+    pub const ALL: [Self; 3] = [Self::Direct, Self::Reflect, Self::Off];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Reflect => "reflect",
+            Self::Direct => "direct",
+        }
+    }
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|host| host.as_str() == text)
+    }
+}
+impl fmt::Display for DpmiHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "Off (the extender's own host)",
+            Self::Reflect => "Reflect",
+            Self::Direct => "Direct",
+        })
+    }
+}
+/// Descriptive metadata for launchers and generated pages. Emulation ignores it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GameInfo {
+    /// Image path, resolved relative to the launch profile.
+    pub cover: Option<String>,
+    pub released: Option<u16>,
+    pub publishers: Vec<String>,
+    pub developers: Vec<String>,
+    pub genres: Vec<String>,
+    pub gameplay: Vec<String>,
+    /// Plain-text summary; blank lines separate paragraphs.
+    pub description: Option<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MachineSpec {
     pub name: String,
+    /// Optional hardware preset identifier (e.g. `"386sx-16"`, `"486dx2-66"`, or a user preset).
+    pub preset: Option<String>,
+    /// Optional CPU pacing mode (`Fixed`, `Adaptive`, or `SpeedTiers`).
+    pub cpu_mode: Option<CpuMode>,
     pub hardware: HardwareConfig,
     pub mounts: Vec<MountSpec>,
     pub host: HostBindingManifest,
     pub input: InputSettings,
     pub output: OutputRouting,
     pub game: GameSpec,
+    pub info: GameInfo,
+    /// `None` leaves the frontend's default, direct.
+    pub dpmi: Option<DpmiHost>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceClaim {
@@ -348,6 +658,46 @@ impl MachineSpec {
                     "bindings",
                     "binding names must be unique and locations nonempty",
                 ));
+            }
+        }
+        if self.game.patches.len() > 32 || self.game.patches.iter().any(String::is_empty) {
+            return Err(ConfigError::new(
+                "game.patches",
+                "must contain at most 32 nonempty paths",
+            ));
+        }
+        if self.game.actions.len() > 16 {
+            return Err(ConfigError::new(
+                "game.actions",
+                "supports at most 16 entry points",
+            ));
+        }
+        for (index, action) in self.game.actions.iter().enumerate() {
+            if action.id.trim().is_empty()
+                || action.name.trim().is_empty()
+                || action.executable.trim().is_empty()
+            {
+                return Err(ConfigError::new(
+                    "game.actions",
+                    "each action requires a nonempty id, name and executable",
+                ));
+            }
+            if self.game.actions[..index]
+                .iter()
+                .any(|other| other.id == action.id)
+            {
+                return Err(ConfigError::new(
+                    "game.actions",
+                    "action ids must be unique",
+                ));
+            }
+            for arg in &action.arguments {
+                if !arg.is_ascii() || arg.bytes().any(|b| b < 32 || b == 127 || b == b'"') {
+                    return Err(ConfigError::new(
+                        "game.actions.arguments",
+                        "must be printable ASCII without double quotes",
+                    ));
+                }
             }
         }
         let directory = &self.game.working_directory;

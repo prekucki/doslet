@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use doslet_bus::{BusError, MemoryBus};
 use doslet_config::HardwareConfig;
-use doslet_dos::files::ReadOnlyDrive;
+use doslet_dos::files::{ReadOnlyDrive, VisibleFile};
 use doslet_dos::memory::MemoryArena;
 use doslet_dos::{ComError, MzError, ProcessMemory, load_com, load_mz, load_mz_stub};
 use doslet_pc::PcMachine;
@@ -14,16 +14,35 @@ use doslet_storage::{CachedSource, HostCompletion, HostRequest, StorageError};
 use doslet_vfs::{HandleTable, MountId, NodeId, OpenFile};
 use doslet_vga::IndexedFrame;
 use doslet_x86::{CpuError, Gpr16, Registers, StepOutcome, linear_address};
+mod analyzer;
+pub use analyzer::{AnalyzerStats, CallerEffect, CandidateStats};
 mod cdrom;
 mod clock;
+mod cooperative;
+pub use cooperative::{EventIdleSite, MenuIdleSite, MenuIdleStats};
+pub mod debug;
+pub mod dpmi;
 mod idle;
+mod observation;
+mod synchronization;
+pub mod wait_budget;
 use cdrom::CdromImage;
 pub use idle::IdleLoopStats;
+pub use observation::IdleObservation;
+pub use synchronization::SynchronizationStats;
 mod keyboard;
+mod memory_usage;
 mod mouse;
+pub use memory_usage::MemoryUsage;
+pub mod patches;
+#[cfg(feature = "save-state")]
+mod saved;
+#[cfg(feature = "save-state")]
+pub use saved::{StateResources, WorkingState};
 mod storage;
 mod vesa;
 mod video;
+pub use video::VideoModeLabel;
 
 const CONSOLE_CAPACITY: usize = 4096;
 
@@ -52,6 +71,7 @@ pub enum RuntimeError {
     InvalidCdromImage,
     Storage(StorageError),
     Input(doslet_input::InputError),
+    PatchTimeout(u8),
 }
 impl From<ComError> for RuntimeError {
     fn from(error: ComError) -> Self {
@@ -100,6 +120,7 @@ impl fmt::Display for RuntimeError {
             Self::InvalidLaunch => f.write_str("launch setup requires a ready session and a printable ASCII DOS command tail of at most 126 bytes"),
             Self::InvalidWorkingDirectory(code) => write!(f, "invalid DOS working directory (DOS error {code})"),
             Self::Input(error)=>write!(f,"input error: {error:?}"),
+            Self::PatchTimeout(index) => write!(f, "memory patch #{index}: expected RAM bytes not found before the guest step deadline"),
             Self::Storage(error) => write!(f,"storage error: {error:?}"),
             Self::InvalidCdromImage => f.write_str("MSCDEX image must be a sector-aligned ISO 9660 image with a valid primary volume descriptor"),
         }
@@ -112,12 +133,17 @@ pub struct Session {
     status: SessionStatus,
     fault: Option<RuntimeError>,
     steps: u64,
+    /// Transient presentation telemetry; not part of portable guest state.
+    disk_read_bytes: u64,
+    patches: Vec<patches::MemoryPatch>,
+    patches_applied: usize,
     console: Vec<u8>,
     console_truncated: bool,
     extended_key: Option<u8>,
     mouse: doslet_dos::mouse::Mouse,
     mouse_fraction: [f64; 2],
     mouse_last_read: Option<u64>,
+    mouse_last_relative_read: Option<u64>,
     dos_time_origin_nanos: u64,
     dos_time_origin_centis: u32,
     memory: MemoryArena,
@@ -140,6 +166,12 @@ pub struct Session {
     joystick_axes: [i16; 2],
     joystick_buttons: [bool; 2],
     idle: idle::IdleLoops,
+    dpmi: Option<Box<dpmi::Host>>,
+    service_flags: Option<u16>,
+    menu_idle: cooperative::MenuIdle,
+    observer: observation::Observer,
+    synchronization: synchronization::Synchronization,
+    analyzer: analyzer::Analyzer,
 }
 
 impl Session {
@@ -214,7 +246,22 @@ impl Session {
         session.memory = session.memory.with_environment(0x0F00, 0x1000);
         session.memory.write_mcbs(&mut session.machine.bus)?;
         let bus = &mut session.machine.bus;
-        let environment = b"PATH=C:\\\0\0\x01\0";
+        // DOS games commonly consult BLASTER before probing the DSP. Describe
+        // the emulated card, independently of whether host audio is enabled.
+        let mut environment = Vec::from(&b"PATH=C:\\\0"[..]);
+        if config.sb16 {
+            environment.extend_from_slice(
+                alloc::format!(
+                    "BLASTER=A220 I{} D{} H{} T6{}\0",
+                    config.sb_irq,
+                    config.sb_dma8,
+                    config.sb_dma16,
+                    if config.mpu401 { " P330" } else { "" },
+                )
+                .as_bytes(),
+            );
+        }
+        environment.extend_from_slice(b"\0\x01\0");
         for (offset, value) in environment
             .iter()
             .chain(name)
@@ -280,12 +327,16 @@ impl Session {
             status: SessionStatus::Ready,
             fault: None,
             steps: 0,
+            disk_read_bytes: 0,
+            patches: Vec::new(),
+            patches_applied: 0,
             console: Vec::with_capacity(CONSOLE_CAPACITY),
             console_truncated: false,
             extended_key: None,
             mouse: doslet_dos::mouse::Mouse::default(),
             mouse_fraction: [0.0; 2],
             mouse_last_read: None,
+            mouse_last_relative_read: None,
             dos_time_origin_nanos: 0,
             dos_time_origin_centis: 0,
             memory,
@@ -308,6 +359,12 @@ impl Session {
             joystick_axes: [0; 2],
             joystick_buttons: [false; 2],
             idle: idle::IdleLoops::default(),
+            dpmi: None,
+            service_flags: None,
+            menu_idle: cooperative::MenuIdle::default(),
+            observer: observation::Observer::default(),
+            synchronization: synchronization::Synchronization::default(),
+            analyzer: analyzer::Analyzer::default(),
         })
     }
     /// Transfer a preloaded input drive into the session during setup.
@@ -315,6 +372,16 @@ impl Session {
         self.base_identity = drive.base_identity();
         self.drive = drive;
         self
+    }
+    /// Inspect the effective C: file tree during host-side packaging.
+    pub fn visible_drive_files(&self) -> impl Iterator<Item = VisibleFile<'_>> {
+        self.drive.visible_files()
+    }
+    pub fn drive_has_empty_directories(&self) -> bool {
+        self.drive.has_empty_directories()
+    }
+    pub fn drive_base_identity(&self) -> [u8; 32] {
+        self.base_identity
     }
     /// Attach an immutable ISO 9660 image as a DOS CD-ROM drive before execution.
     /// `letter` is the drive letter (D through Z); the MSCDEX unit is zero-based.
@@ -349,8 +416,49 @@ impl Session {
     pub fn drain_pcm_timed(&mut self, output: &mut [doslet_pcm::Frame]) -> usize {
         self.machine.drain_pcm_timed(output)
     }
+    pub fn capture_audio_sources(&mut self, enabled: bool) {
+        self.machine.capture_audio_sources(enabled);
+    }
+    pub fn drain_audio_source(
+        &mut self,
+        fm: bool,
+        output: &mut [doslet_pcm::SourceFrame],
+    ) -> usize {
+        self.machine.drain_audio_source(fm, output)
+    }
     pub fn audio_status(&self) -> doslet_pc::AudioStatus {
         self.machine.audio_status()
+    }
+    pub fn audio_use(&self) -> doslet_pc::AudioUse {
+        self.machine.audio_use()
+    }
+    /// Whether changing audio would invalidate a possibly cached DOS environment.
+    pub fn audio_environment_requires_restart(
+        old: doslet_config::AudioHardware,
+        new: doslet_config::AudioHardware,
+    ) -> bool {
+        old.sb16 != new.sb16
+            || (old.sb16
+                && (old.irq, old.dma8, old.dma16, old.mpu401)
+                    != (new.irq, new.dma8, new.dma16, new.mpu401))
+    }
+    pub fn configure_unused_audio(
+        &mut self,
+        audio: doslet_config::AudioHardware,
+    ) -> Result<(), doslet_pc::AudioConfigError> {
+        let old = self.hardware_config().audio();
+        // The guest may have read or copied BLASTER without touching an audio
+        // port. Rebuilding its environment cannot invalidate that cached value.
+        if Self::audio_environment_requires_restart(old, audio) {
+            return Err(doslet_pc::AudioConfigError::RestartRequired(
+                "The DOS BLASTER environment depends on these audio settings",
+            ));
+        }
+        self.machine.configure_unused_audio(audio)?;
+        let enabled = self.idle.enabled;
+        self.set_idle_loops(false);
+        self.set_idle_loops(enabled);
+        Ok(())
     }
     pub fn flush_writes<E>(
         &mut self,
@@ -429,6 +537,9 @@ impl Session {
     }
     /// Experimental caller-selected memory polling sites; no guest code patches.
     pub fn set_memory_wait_sites(&mut self, operand: u32, starts: [u32; 3]) {
+        if self.analyzer.controller {
+            self.set_adaptive_cpu(false);
+        }
         self.machine
             .set_memory_wait_sites(Some(doslet_pc::MemoryWaitSites { operand, starts }));
     }
@@ -457,11 +568,21 @@ impl Session {
     pub fn file_access_stats(&self) -> (u64, u64, Option<&[u8]>) {
         self.drive.access_stats()
     }
+    /// Successful guest data reads, including cached files and raw CD sectors.
+    pub fn disk_read_bytes(&self) -> u64 {
+        self.disk_read_bytes
+    }
     pub fn midi_file_request(&self) -> Option<(&[u8], u8, u16)> {
         self.drive.midi_request()
     }
     pub fn video_mode(&self) -> doslet_vga::VideoMode {
         self.machine.bus.vga.mode()
+    }
+    /// Register-derived guest mode, independent of host scaling and filters.
+    /// Returns small values; formatting is left to the frontend boundary.
+    pub fn video_mode_label(&self) -> VideoModeLabel {
+        let dimensions = self.frame().map(|frame| (frame.width, frame.height));
+        VideoModeLabel::new(self.video_mode(), dimensions)
     }
     pub fn video_memory_configuration(&self) -> (u8, u8, u8, u16, u8, u8) {
         self.machine.bus.vga.memory_configuration()
@@ -504,7 +625,7 @@ impl Session {
         Ok(())
     }
     pub fn frame(&self) -> Option<IndexedFrame<'_>> {
-        self.machine.bus.vga.frame()
+        self.machine.bus.video_frame()
     }
     pub fn presentation_frame(&self) -> doslet_vga::scanout::PresentationFrame<'_> {
         use doslet_vga::scanout::{PresentationFrame, TextFrame};
@@ -540,7 +661,7 @@ impl Session {
     }
     /// Read-only physical video memory for differential diagnostics.
     pub fn vram_view(&self) -> &[u8] {
-        self.machine.bus.vga.vram_view()
+        self.machine.bus.vram_view()
     }
     pub fn start(&mut self) {
         if matches!(self.status, SessionStatus::Ready | SessionStatus::Paused) {
@@ -554,8 +675,45 @@ impl Session {
             let _ = self.release_keys();
         }
     }
-    /// No wall-clock checks or allocations. Every batch is limited by execution steps.
+    /// No wall-clock checks or allocations. A proved whole computation may
+    /// finish past this soft step budget, returning its actual completed work.
     pub fn advance(&mut self, budget: u32) -> u32 {
+        self.advance_with(budget, false)
+    }
+    /// With `stop_at_entries`, return once execution arrives at a registered
+    /// prepared entry after completing work, for a foreign engine to dispatch.
+    pub(crate) fn advance_with(&mut self, budget: u32, stop_at_entries: bool) -> u32 {
+        if self.status == SessionStatus::Running
+            && budget != 0
+            && self.patches_applied < self.patches.len()
+        {
+            self.check_patches();
+            // Poll pending plans at most 4096 guest steps apart, without adding
+            // signature checks to the per-instruction execution path.
+            let remaining = self
+                .patches
+                .get(self.patches_applied)
+                .map_or(u64::MAX, |p| p.timeout_steps.saturating_sub(self.steps));
+            let completed = self.advance_inner(
+                budget
+                    .min(4096)
+                    .min(remaining.min(u64::from(u32::MAX)) as u32),
+                stop_at_entries,
+            );
+            if self.status == SessionStatus::Running {
+                self.check_patches();
+            }
+            completed
+        } else {
+            self.advance_inner(budget, stop_at_entries)
+        }
+    }
+    fn advance_inner(&mut self, budget: u32, stop_at_entries: bool) -> u32 {
+        // Leave enough room in the u32 result for one complete computation
+        // beyond the requested budget. This is a representation bound, not an
+        // instruction checkpoint inside generated code.
+        #[cfg(feature = "wasm-procedures")]
+        let budget = budget.min(u32::MAX - doslet_pc::wasm_procedures::MAX_ATOMIC_PROCEDURE_WORK);
         self.timeslice_yielded = false;
         self.apply_input();
         let mut completed = 0;
@@ -563,9 +721,35 @@ impl Session {
             && self.status == SessionStatus::Running
             && !self.storage_wait
             && !self.timeslice_yielded
+            && !(stop_at_entries
+                && completed != 0
+                && self.machine.cpu.prepared_entry_index().is_some())
         {
             let now = self.steps + u64::from(completed);
-            let step = match self.idle_advance(now, budget - completed) {
+            let idle = self
+                .analyzer_advance(now, budget - completed)
+                .and_then(|result| {
+                    if result.is_some() {
+                        Ok(result)
+                    } else {
+                        self.synchronization_advance(now, budget - completed)
+                    }
+                })
+                .and_then(|trace| {
+                    if trace.is_some() {
+                        Ok(trace)
+                    } else {
+                        self.menu_idle_advance(budget - completed)
+                    }
+                })
+                .and_then(|result| {
+                    if result.is_some() {
+                        Ok(result)
+                    } else {
+                        self.idle_advance(now, budget - completed)
+                    }
+                });
+            let step = match idle {
                 Ok(Some(consumed)) => Ok(consumed),
                 Ok(None) => self.execute_step(budget - completed),
                 Err(error) => Err(error),
@@ -574,6 +758,8 @@ impl Session {
                 Ok(consumed) => {
                     completed += consumed;
                 }
+                // A DPMI client's exception handler receives its faults.
+                Err(error) if self.dpmi_exception(&error) => completed += 1,
                 Err(error) => {
                     self.fault = Some(error);
                     self.status = SessionStatus::Faulted;
@@ -581,7 +767,147 @@ impl Session {
             }
         }
         self.steps += u64::from(completed);
+        self.observe_idle();
+        self.analyzer_control();
         completed
+    }
+    pub fn set_execution_tiers(
+        &mut self,
+        labels: Option<alloc::vec::Vec<doslet_x86::ExecutionLabel>>,
+        rates: [Option<u16>; 3],
+    ) -> Result<(), &'static str> {
+        let idle = self.idle.enabled;
+        self.set_idle_loops(false);
+        let result = self.machine.set_execution_tiers(labels, rates);
+        self.set_idle_loops(idle);
+        result
+    }
+    pub fn replace_execution_labels(
+        &mut self,
+        labels: alloc::vec::Vec<doslet_x86::ExecutionLabel>,
+    ) -> Result<(), &'static str> {
+        let idle = self.idle.enabled;
+        self.set_idle_loops(false);
+        let result = self.machine.cpu.replace_execution_labels(labels);
+        self.set_idle_loops(idle);
+        result
+    }
+    /// Actual instruction/microstep counts, excluding proven skipped passes.
+    pub fn executed_tier_counts(&self) -> [u64; 4] {
+        self.machine.cpu.executed_tier_counts()
+    }
+    pub fn execution_tier_stats(&self) -> ([u64; 4], [u64; 4]) {
+        self.machine.execution_tier_stats()
+    }
+
+    /// Install an offline module once; native interpretation and WASM borrow
+    /// the same guest RAM and generation table thereafter. Runtime bindings are
+    /// intentionally excluded from portable states and must be reinstalled.
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub fn install_wasm_procedures(
+        &mut self,
+        wasm: &[u8],
+        bindings: alloc::vec::Vec<doslet_pc::wasm_procedures::Binding>,
+    ) -> Result<(), alloc::string::String> {
+        self.machine.install_wasm_procedures(wasm, bindings)
+    }
+
+    /// Browser exports borrow this worker's one linear memory synchronously.
+    #[cfg(all(feature = "wasm-procedures", target_arch = "wasm32"))]
+    pub fn install_browser_wasm_procedures(
+        &mut self,
+        callback: doslet_pc::wasm_procedures::BrowserCall,
+        bindings: alloc::vec::Vec<doslet_pc::wasm_procedures::Binding>,
+    ) -> Result<(), alloc::string::String> {
+        self.machine
+            .install_browser_wasm_procedures(callback, bindings)
+    }
+
+    /// As `install_wasm_procedures`, reusing compatible native code from the host.
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub fn install_wasm_procedures_cached(
+        &mut self,
+        wasm: &[u8],
+        bindings: alloc::vec::Vec<doslet_pc::wasm_procedures::Binding>,
+        cache: &mut dyn doslet_pc::wasm_procedures::CompiledCache,
+    ) -> Result<(), alloc::string::String> {
+        self.machine
+            .install_wasm_procedures_cached(wasm, bindings, cache)
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn install_interpreted_procedure_boundaries(
+        &mut self,
+        bindings: alloc::vec::Vec<doslet_pc::wasm_procedures::Binding>,
+    ) -> Result<(), alloc::string::String> {
+        self.machine
+            .install_interpreted_procedure_boundaries(bindings)
+    }
+
+    /// Select an opt-in diagnostic interpreter variant without replacing the
+    /// installed procedure plan or shared memory owner.
+    #[cfg(all(feature = "wasm-procedure-diagnostics", not(target_arch = "wasm32")))]
+    pub fn set_wasm_procedure_diagnostic_mode(
+        &mut self,
+        mode: doslet_pc::wasm_procedures::DiagnosticMode,
+    ) -> Result<(), &'static str> {
+        self.machine.set_wasm_procedure_diagnostic_mode(mode)
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedure_stats(&self) -> Option<doslet_pc::wasm_procedures::Stats> {
+        self.machine.wasm_procedure_stats()
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedure_entry_count(&self) -> usize {
+        self.machine.wasm_procedure_entry_count()
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedure_copy_tier_entries(&self) -> impl Iterator<Item = u32> + '_ {
+        self.machine.wasm_procedure_copy_tier_entries()
+    }
+
+    /// Stop or resume calls into installed procedures.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn set_wasm_procedures_suspended(&mut self, suspended: bool) -> Result<(), &'static str> {
+        self.machine.set_wasm_procedures_suspended(suspended)
+    }
+
+    /// Procedures are installed and not suspended.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedures_active(&self) -> bool {
+        self.machine.wasm_procedures_active()
+    }
+
+    /// Procedures can be installed at this batch boundary.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedures_installable(&self) -> bool {
+        self.machine.wasm_procedures_installable()
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn set_wasm_procedure_tier_accounting(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        self.machine.set_wasm_procedure_tier_accounting(enabled)
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedure_last_error(&self) -> Option<&str> {
+        self.machine.wasm_procedure_last_error()
+    }
+
+    /// Live CPU throughput change; devices and accumulated guest time continue.
+    pub fn set_cpu_mhz(&mut self, mhz: u16) -> Result<(), RuntimeError> {
+        self.machine.set_cpu_mhz(mhz)?;
+        self.analyzer.ceiling = mhz;
+        let enabled = self.idle.enabled;
+        self.set_idle_loops(false);
+        self.set_idle_loops(enabled);
+        Ok(())
     }
     /// Whether the most recent `advance` ended on INT 2Fh/1680h. Frontends
     /// should return to their event loop before starting another batch.
@@ -596,7 +922,50 @@ impl Session {
         }
     }
     fn execute_step(&mut self, budget: u32) -> Result<u32, RuntimeError> {
+        self.execute_step_mode::<false>(budget, None)
+    }
+    fn execute_step_observed(
+        &mut self,
+        observation: &mut doslet_pc::StepObservation,
+    ) -> Result<u32, RuntimeError> {
+        self.execute_step_mode::<true>(1, Some(observation))
+    }
+    fn execute_step_mode<const OBSERVE: bool>(
+        &mut self,
+        budget: u32,
+        mut observation: Option<&mut doslet_pc::StepObservation>,
+    ) -> Result<u32, RuntimeError> {
+        let before_service_writes = if OBSERVE {
+            self.machine.ram_writes()
+        } else {
+            0
+        };
+        let before_service_devices = if OBSERVE {
+            self.machine.device_accesses()
+        } else {
+            0
+        };
         self.apply_input();
+        if self.continuation.is_none() && self.dpmi.is_some() {
+            // Observed execution needs the actual real-mode instruction and
+            // its bus trace. Retain the configured mode for subsequent calls.
+            let mode = self.dpmi.as_ref().unwrap().mode;
+            if OBSERVE {
+                self.dpmi.as_mut().unwrap().mode = dpmi::Mode::Reflect;
+            }
+            let result = self.dpmi_dispatch();
+            if OBSERVE {
+                self.dpmi.as_mut().unwrap().mode = mode;
+            }
+            result?;
+            if self.status != SessionStatus::Running {
+                return Ok(1);
+            }
+            if self.dpmi.as_ref().is_some_and(|h| h.direct_return_pending) {
+                self.machine.advance_service_step()?;
+                return Ok(1);
+            }
+        }
         if self.continuation.is_some() {
             if !self.resume_storage()? {
                 return Ok(1);
@@ -622,7 +991,17 @@ impl Session {
                 }
             }
         }
-        let (outcome, consumed) = self.machine.step_with_idle_budget(budget)?;
+        let (outcome, consumed) = if OBSERVE {
+            let changed = self.machine.ram_writes() != before_service_writes;
+            let device_accesses = self.machine.device_accesses() != before_service_devices;
+            let observation = observation.as_mut().unwrap();
+            let result = self.machine.step_observed(observation)?;
+            observation.service_writes_unobserved = changed;
+            observation.service_device_accesses_unobserved = device_accesses;
+            result
+        } else {
+            self.machine.step_with_idle_budget(budget)?
+        };
         if outcome == StepOutcome::Halted {
             self.status = SessionStatus::Halted;
         }
@@ -630,6 +1009,8 @@ impl Session {
     }
     fn service(&mut self, vector: u8) -> Result<(), RuntimeError> {
         let ax = self.machine.cpu.registers.get(Gpr16::Ax);
+        // Host services can mutate device state directly, outside port counters.
+        self.analyzer_recurrence_service(vector, ax);
         self.idle_service(vector, ax);
         if vector == 0x10 && ax >> 8 == 0x12 && self.machine.cpu.registers.get(Gpr16::Bx) == 0x80 {
             // Cirrus Logic VGA-type inquiry; no Cirrus extension BIOS is installed.
@@ -749,6 +1130,12 @@ impl Session {
                     self.break_check = self.machine.cpu.registers.get_byte(2) != 0;
                 }
             }
+            // Boot drive C:, and the true version 5.0 that 30h reports.
+            (0x21, 0x33) if ax as u8 == 5 => self.machine.cpu.registers.set_byte(2, 3),
+            (0x21, 0x33) if ax as u8 == 6 => {
+                self.machine.cpu.registers.set(Gpr16::Bx, 0x0005);
+                self.machine.cpu.registers.set(Gpr16::Dx, 0);
+            }
             (0x08, _) => {
                 // BIOS floppy-motor timeout is also used as a one-tick delay
                 // by CIV's graphics driver. The counter must advance with IRQ0.
@@ -777,8 +1164,13 @@ impl Session {
                 self.timeslice_yielded = true;
             }
             (0x2F, _) if ax == 0x1687 => {
-                self.machine.cpu.registers.set(Gpr16::Ax, 1); // No external DPMI host installed.
+                self.dpmi_probe();
             }
+            (0x2F, _) if ax == 0x1600 => {
+                self.machine.cpu.registers.set_byte(0, 0); // Windows is absent.
+            }
+            // Without Windows, the version query leaves AX unchanged.
+            (0x2F, _) if ax == 0x160A => {}
             (0x2F, _) if ax == 0x1500 => {
                 self.mscdex_service(ax)?;
             }
@@ -821,7 +1213,7 @@ impl Session {
                 bios::set_text_mode(&mut self.machine.bus, ax as u8 & 0x80 != 0)?;
             }
             (0x10, 0) if ax as u8 == 0x13 => {
-                self.machine.bus.vga.set_mode_13h();
+                self.machine.bus.set_video_mode_13h();
                 self.mouse_video_mode_changed();
             }
             (0x20, _) => {
@@ -1469,6 +1861,21 @@ impl Session {
                     }
                 }
             }
+            // Without upper memory blocks, first fit is the only allocation
+            // strategy and the UMB link stays off; requests to change either
+            // succeed without effect.
+            (0x21, 0x58) => match ax as u8 {
+                0 => {
+                    self.machine.cpu.registers.set(Gpr16::Ax, 0);
+                    self.set_carry(false)?;
+                }
+                1 | 3 => self.set_carry(false)?,
+                2 => {
+                    self.machine.cpu.registers.set_byte(0, 0);
+                    self.set_carry(false)?;
+                }
+                _ => self.dos_error(1)?,
+            },
             (0x21, 9) => {
                 let ds = self.machine.cpu.registers.ds;
                 let mut offset = self.machine.cpu.registers.get(Gpr16::Dx);
@@ -1642,6 +2049,10 @@ impl Session {
     }
 
     fn set_carry(&mut self, carry: bool) -> Result<(), BusError> {
+        if let Some(flags) = &mut self.service_flags {
+            *flags = (*flags & !1) | u16::from(carry);
+            return Ok(());
+        }
         let r = &self.machine.cpu.registers;
         let address = linear_address(r.ss, r.get(Gpr16::Sp).wrapping_add(4));
         let flags = self.machine.bus.read_u16(address)?;
@@ -1743,6 +2154,9 @@ mod tests {
             skipped.4
         );
         assert_eq!(reference.4.skipped_steps, 0);
+        assert!(skipped.4.skipped_nanos > 0);
+        assert!(skipped.4.skipped_nanos <= skipped.3);
+        assert_eq!(reference.4.skipped_nanos, 0);
     }
 
     #[test]
@@ -2023,6 +2437,54 @@ mod tests {
         }
     }
     #[test]
+    fn cursor_shape_ignores_bh_and_updates_bios_and_crtc_state() {
+        let mut session = Session::new(&[0x90]).unwrap();
+        for bx in [0, 0x0700, 0xA008, 0xFFFF] {
+            for shape in [0x2000, 0x000F, 0x0D0F] {
+                session.machine.cpu.registers.set(Gpr16::Ax, 0x0100);
+                session.machine.cpu.registers.set(Gpr16::Bx, bx);
+                session.machine.cpu.registers.set(Gpr16::Cx, shape);
+                session.machine.cpu.registers.set(Gpr16::Dx, 0x1234);
+                let flags = session.flags();
+                session.service(0x10).unwrap();
+                assert_eq!(session.machine.bus.read_u16(0x460).unwrap(), shape);
+                assert_eq!(session.registers().get(Gpr16::Ax), 0x0100);
+                assert_eq!(session.registers().get(Gpr16::Bx), bx);
+                assert_eq!(session.registers().get(Gpr16::Cx), shape);
+                assert_eq!(session.registers().get(Gpr16::Dx), 0x1234);
+                assert_eq!(session.flags(), flags);
+                session.machine.bus.vga.write_port(0x3D4, 0x0A);
+                assert_eq!(
+                    session.machine.bus.vga.read_port(0x3D5),
+                    Some((shape >> 8) as u8)
+                );
+                session.machine.bus.vga.write_port(0x3D4, 0x0B);
+                assert_eq!(session.machine.bus.vga.read_port(0x3D5), Some(shape as u8));
+                session.machine.cpu.registers.set(Gpr16::Ax, 0x0300);
+                session.machine.cpu.registers.set(Gpr16::Bx, 0);
+                session.machine.cpu.registers.set(Gpr16::Cx, 0);
+                session.service(0x10).unwrap();
+                assert_eq!(session.registers().get(Gpr16::Cx), shape);
+            }
+        }
+    }
+
+    #[test]
+    fn guest_can_hide_cursor_with_rotts_unrelated_bx_value() {
+        let mut session = Session::new(&[
+            0xBB, 0x08, 0xA0, // MOV BX,A008h (not an input to AH=01h).
+            0xB9, 0x00, 0x20, // MOV CX,2000h (hide cursor).
+            0xB8, 0x00, 0x01, // MOV AX,0100h.
+            0xCD, 0x10, 0xB8, 0x00, 0x4C, 0xCD, 0x21,
+        ])
+        .unwrap();
+        session.start();
+        session.advance(100);
+        assert_eq!(session.status(), SessionStatus::Exited(0));
+        assert_eq!(session.machine.bus.read_u16(0x460).unwrap(), 0x2000);
+    }
+
+    #[test]
     fn active_text_cursor_updates_crtc_and_inactive_page_keeps_it() {
         let mut session = Session::new(&[0x90]).unwrap();
         session.machine.cpu.registers.set(Gpr16::Ax, 3);
@@ -2099,3 +2561,7 @@ mod tests {
         assert!(session.frame().is_none());
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "session_saved.rs"]
+mod saved_state;

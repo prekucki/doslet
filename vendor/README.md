@@ -18,3 +18,14 @@ events are suppressed during capture so widgets cannot receive guest clicks.
 Two existing deprecated `try_next` calls use the equivalent `try_recv` API to
 keep local builds free of deprecation warnings. No renderer or guest-machine
 logic is changed. Browser capture uses DOM Pointer Lock in Doslet's bridge.
+
+## Nuked OPL3 portable state
+
+`nuked-opl3/` contains the registry source of `nuked-opl3` 0.1.0,
+licensed under [LGPL-2.1-or-later](nuked-opl3/LICENSE).
+Upstream: <https://github.com/tgies/nuked-opl3-rs>.
+The local patch adds the optional `save-state` feature and checked-in Protobuf
+bindings in `src/core_saved.rs` and `src/lib_saved.rs`. It exposes complete chip
+state through `doslet_state::State`; no synthesis algorithm was changed.
+Cargo builds use `prost` derives and do not invoke `protoc`. Keep the upstream
+license files with this copy. Verify active FM continuation when updating it.

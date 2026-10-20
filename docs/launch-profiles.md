@@ -1,5 +1,9 @@
 # Game launch profiles
 
+Profiles can load RAM patches with `game.patches = ["path/to/patch.toml"]`.
+See [memory patches](memory-patches.md) for the format, validation and deferred
+application after a DOS extender loads game code.
+
 Native Doslet supports version-1 TOML profiles through `--config`. Paths inside
 the profile resolve relative to the TOML file. CLI paths remain relative to the
 shell's working directory. Browser profile selection is not implemented.

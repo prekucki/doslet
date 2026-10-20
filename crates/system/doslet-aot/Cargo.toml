@@ -1,0 +1,27 @@
+[package]
+name = "doslet-aot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+wasm = ["dep:doslet-x86-wasm"]
+
+[dependencies]
+doslet-executable.workspace = true
+doslet-x86-wasm = { path = "../../cpu/doslet-x86-wasm", optional = true }
+iced-x86 = { version = "=1.21.0", default-features = false, features = ["no_std", "decoder", "instr_info"] }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+wasmi = { version = "2", default-features = false, features = ["std", "validate", "stable", "portable-dispatch"] }
+
+[[example]]
+name = "translate-exe"
+required-features = ["wasm"]
+
+[lints]
+workspace = true

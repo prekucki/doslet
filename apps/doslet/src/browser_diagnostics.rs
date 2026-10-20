@@ -21,5 +21,21 @@ pub fn init() {
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Info);
     }
-    log::info!("Starting Doslet with the Canvas2D software renderer");
+    log::info!("Starting Doslet with wgpu (WebGPU/WebGL), with Canvas2D fallback");
+}
+
+/// Check the context already owned by iced, rather than testing a separate
+/// canvas that could support GPU rendering even if iced fell back to Canvas2D.
+pub fn gpu_canvas_active() -> bool {
+    use wasm_bindgen::JsCast;
+    let Some(canvas) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.query_selector("canvas").ok().flatten())
+        .and_then(|element| element.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+    else {
+        return false;
+    };
+    ["webgl2", "webgpu"]
+        .iter()
+        .any(|kind| canvas.get_context(kind).ok().flatten().is_some())
 }

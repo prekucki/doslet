@@ -13,14 +13,19 @@ doslet-input.workspace = true
 doslet-storage.workspace = true
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 doslet-pcm.workspace = true
-doslet-runtime.workspace = true
+doslet-runtime = { workspace = true, features = ["wasm-procedures"] }
 doslet-dos.workspace = true
 doslet-x86.workspace = true
+doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm" }
 doslet-midi-synth.workspace = true
 doslet-midi-routing.workspace = true
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2.129"
+js-sys = "0.3"
 console_error_panic_hook = "0.1.7"
+[dev-dependencies]
+doslet-runtime = { workspace = true, features = ["save-state"] }
+doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm", features = ["native-test"] }
 [lints]
 workspace = true

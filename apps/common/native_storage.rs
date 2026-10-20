@@ -1,10 +1,15 @@
-//! Native positional media and a fenced, atomically published upper save store.
+//! Native positional media and a fenced, transactional upper save store.
+use crate::native_store_format::{
+    HEAD, IDENTITY, LEDGER, MAX_LEDGER, MAX_SNAPSHOT, SCHEMA, SEGMENT, SNAPSHOTS, STORE_FILE,
+    bounded_read, committed, db_error, io_error, read_legacy,
+};
 use doslet_config::{SourceKind, WritePolicy};
 use doslet_runtime::Session;
 use doslet_storage::{
     CachedSource, CommitBatch, HostCompletion, HostRequest, SourceId, SourceIdentity, StorageError,
     payload_digest,
 };
+use redb::{Database, ReadableTable, ReadableTableMetadata};
 use std::{
     error::Error,
     fs::{self, File, OpenOptions},
@@ -19,244 +24,179 @@ use std::{
     time::SystemTime,
 };
 
-const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
-const MAX_LEDGER: usize = 4096;
 const QUEUE: usize = 8;
 static TEMP_ID: AtomicU64 = AtomicU64::new(1);
 static SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 static SESSION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Debug)]
-struct Manifest {
+/// One owner retains the database lock until its host worker has completed all
+/// work. Each commit publishes snapshot, revision and ledger entry together.
+struct NativeStore {
+    directory: PathBuf,
+    database: Database,
     namespace: [u8; 32],
     base: [u8; 32],
     fence: u64,
-    revision: u64,
-    digest: u64,
-    ledger: Vec<(u64, u64, u64)>,
-}
-impl Manifest {
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(100 + self.ledger.len() * 24);
-        out.extend_from_slice(b"DSN1");
-        out.extend_from_slice(&1u32.to_le_bytes());
-        out.extend_from_slice(&self.namespace);
-        out.extend_from_slice(&self.base);
-        for value in [self.fence, self.revision, self.digest] {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        out.extend_from_slice(&(self.ledger.len() as u32).to_le_bytes());
-        for &(id, digest, revision) in &self.ledger {
-            for value in [id, digest, revision] {
-                out.extend_from_slice(&value.to_le_bytes());
-            }
-        }
-        let digest = payload_digest(&out);
-        out.extend_from_slice(&digest.to_le_bytes());
-        out
-    }
-    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        if bytes.get(..4) != Some(b"DSN1") {
-            return Err(StorageError::Corrupt);
-        }
-        if bytes.get(4..8) != Some(&1u32.to_le_bytes()) {
-            return Err(StorageError::UnsupportedSchema);
-        }
-        if bytes.len() < 108 {
-            return Err(StorageError::Corrupt);
-        }
-        let u64_at = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        let count = u32::from_le_bytes(bytes[96..100].try_into().unwrap()) as usize;
-        if count > MAX_LEDGER
-            || bytes.len() != 108 + count * 24
-            || u64_at(bytes.len() - 8) != payload_digest(&bytes[..bytes.len() - 8])
-        {
-            return Err(StorageError::Corrupt);
-        }
-        let mut ledger = Vec::with_capacity(count);
-        for i in 0..count {
-            let start = 100 + i * 24;
-            let entry = (u64_at(start), u64_at(start + 8), u64_at(start + 16));
-            if entry.2 == 0
-                || entry.2 > u64_at(80)
-                || ledger.iter().any(|&(id, _, _)| id == entry.0)
-            {
-                return Err(StorageError::Corrupt);
-            }
-            ledger.push(entry);
-        }
-        Ok(Self {
-            namespace: bytes[8..40].try_into().unwrap(),
-            base: bytes[40..72].try_into().unwrap(),
-            fence: u64_at(72),
-            revision: u64_at(80),
-            digest: u64_at(88),
-            ledger,
-        })
-    }
-    fn snapshot_name(&self) -> String {
-        format!("snapshot-{:016x}-{:016x}.bin", self.revision, self.digest)
-    }
-}
-
-/// One owner retains the OS lock until its host worker has completed all work.
-struct NativeStore {
-    directory: PathBuf,
-    _lock: File,
-    manifest: Manifest,
-    payload: Vec<u8>,
 }
 impl NativeStore {
     fn open(directory: &Path, namespace: [u8; 32], base: [u8; 32]) -> Result<Self, StorageError> {
         fs::create_dir_all(directory).map_err(io_error)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(directory.join("writer.lock"))
-            .map_err(io_error)?;
-        lock.try_lock().map_err(|_| StorageError::BusyWriter)?;
         let directory = fs::canonicalize(directory).map_err(io_error)?;
-        let mut manifest =
-            match bounded_read(&directory.join("manifest.bin"), 108 + MAX_LEDGER * 24) {
-                Ok(bytes) => Manifest::decode(&bytes)?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Manifest {
-                    namespace,
-                    base,
-                    fence: 0,
-                    revision: 0,
-                    digest: 0,
-                    ledger: Vec::new(),
-                },
-                Err(e) => return Err(io_error(e)),
+        let database = Database::builder()
+            .set_cache_size(2 * MAX_SNAPSHOT)
+            .create(directory.join(STORE_FILE))
+            .map_err(db_error)?;
+        let transaction = database.begin_write().map_err(db_error)?;
+        // Held until commit so a version-1 writer cannot publish during import.
+        let mut legacy_lock = None;
+        let fence = {
+            let mut identity = transaction.open_table(IDENTITY).map_err(db_error)?;
+            let mut head = transaction.open_table(HEAD).map_err(db_error)?;
+            let stored = |key| -> Result<_, StorageError> {
+                Ok(identity
+                    .get(key)
+                    .map_err(db_error)?
+                    .map(|value| value.value()))
             };
-        if manifest.namespace != namespace || manifest.base != base {
-            return Err(StorageError::MissingBase);
-        }
-        let payload = if manifest.revision == 0 {
-            Vec::new()
-        } else {
-            let bytes = bounded_read(&directory.join(manifest.snapshot_name()), MAX_SNAPSHOT)
-                .map_err(io_error)?;
-            if payload_digest(&bytes) != manifest.digest {
-                return Err(StorageError::Corrupt);
+            match (stored("namespace")?, stored("base")?) {
+                (Some(stored_namespace), Some(stored_base)) => {
+                    if stored_namespace != namespace || stored_base != base {
+                        return Err(StorageError::MissingBase);
+                    }
+                }
+                (None, None) => {
+                    identity.insert("namespace", namespace).map_err(db_error)?;
+                    identity.insert("base", base).map_err(db_error)?;
+                    head.insert("schema", SCHEMA).map_err(db_error)?;
+                    // An interrupted import leaves the database uninitialized,
+                    // so the next open repeats it. Legacy files stay unchanged.
+                    let legacy = directory.join("writer.lock");
+                    if directory.join("manifest.bin").exists() {
+                        let lock = OpenOptions::new()
+                            .create(true)
+                            .truncate(false)
+                            .write(true)
+                            .open(legacy)
+                            .map_err(io_error)?;
+                        lock.try_lock().map_err(|_| StorageError::BusyWriter)?;
+                        legacy_lock = Some(lock);
+                        let (manifest, payload) = read_legacy(&directory)?;
+                        if manifest.namespace != namespace || manifest.base != base {
+                            return Err(StorageError::MissingBase);
+                        }
+                        let mut ledger = transaction.open_table(LEDGER).map_err(db_error)?;
+                        for &(id, digest, revision) in &manifest.ledger {
+                            ledger.insert(id, (digest, revision)).map_err(db_error)?;
+                        }
+                        if let Some(payload) = payload {
+                            let mut snapshots =
+                                transaction.open_table(SNAPSHOTS).map_err(db_error)?;
+                            insert_snapshot(&mut snapshots, manifest.revision, &payload)?;
+                        }
+                        for (key, value) in [
+                            ("fence", manifest.fence),
+                            ("revision", manifest.revision),
+                            ("digest", manifest.digest),
+                        ] {
+                            head.insert(key, value).map_err(db_error)?;
+                        }
+                    }
+                }
+                _ => return Err(StorageError::Corrupt),
             }
-            bytes
+            let value = |key| -> Result<_, StorageError> {
+                Ok(head.get(key).map_err(db_error)?.map(|value| value.value()))
+            };
+            if value("schema")? != Some(SCHEMA) {
+                return Err(StorageError::UnsupportedSchema);
+            }
+            let fence = value("fence")?
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(StorageError::Quota)?;
+            head.insert("fence", fence).map_err(db_error)?;
+            fence
         };
-        manifest.fence = manifest.fence.checked_add(1).ok_or(StorageError::Quota)?;
-        publish(&directory, "manifest.bin", &manifest.encode()).map_err(io_error)?;
-        let store = Self {
+        transaction.commit().map_err(db_error)?;
+        drop(legacy_lock);
+        Ok(Self {
             directory,
-            _lock: lock,
-            manifest,
-            payload,
-        };
-        store.prune_snapshots();
-        Ok(store)
+            database,
+            namespace,
+            base,
+            fence,
+        })
+    }
+    /// The committed revision and, after the first commit, its snapshot.
+    fn committed(&self) -> Result<(u64, Option<Vec<u8>>), StorageError> {
+        committed(&self.database)
     }
     fn commit(&mut self, batch: &CommitBatch) -> Result<u64, StorageError> {
         batch.validate(MAX_SNAPSHOT)?;
-        if batch.namespace != self.manifest.namespace || batch.base != self.manifest.base {
+        if batch.namespace != self.namespace || batch.base != self.base {
             return Err(StorageError::MissingBase);
         }
-        if batch.fencing_token != self.manifest.fence {
+        if batch.fencing_token != self.fence {
             return Err(StorageError::BusyWriter);
         }
-        if let Some(&(_, digest, revision)) = self
-            .manifest
-            .ledger
-            .iter()
-            .find(|&&(id, _, _)| id == batch.mutation_id)
-        {
-            return if digest == batch.digest
-                && batch.expected_revision.checked_add(1) == Some(revision)
+        let transaction = self.database.begin_write().map_err(db_error)?;
+        let revision = {
+            let mut ledger = transaction.open_table(LEDGER).map_err(db_error)?;
+            if let Some((digest, revision)) = ledger
+                .get(batch.mutation_id)
+                .map_err(db_error)?
+                .map(|entry| entry.value())
             {
-                Ok(revision)
-            } else {
-                Err(StorageError::MutationConflict)
-            };
-        }
-        if batch.expected_revision != self.manifest.revision {
-            return Err(StorageError::StaleRevision);
-        }
-        if self.manifest.ledger.len() == MAX_LEDGER {
-            return Err(StorageError::Quota);
-        }
-        let mut next = self.manifest.clone();
-        next.revision = next.revision.checked_add(1).ok_or(StorageError::Quota)?;
-        next.digest = batch.digest;
-        next.ledger
-            .push((batch.mutation_id, batch.digest, next.revision));
-        let snapshot = self.directory.join(next.snapshot_name());
-        match bounded_read(&snapshot, MAX_SNAPSHOT) {
-            Ok(bytes) => {
-                if bytes != batch.payload {
-                    return Err(StorageError::Corrupt);
-                }
+                // Dropping the transaction leaves the database unchanged.
+                return if digest == batch.digest
+                    && batch.expected_revision.checked_add(1) == Some(revision)
+                {
+                    Ok(revision)
+                } else {
+                    Err(StorageError::MutationConflict)
+                };
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                publish(&self.directory, &next.snapshot_name(), &batch.payload).map_err(io_error)?
+            let mut head = transaction.open_table(HEAD).map_err(db_error)?;
+            let current = head
+                .get("revision")
+                .map_err(db_error)?
+                .map_or(0, |value| value.value());
+            if batch.expected_revision != current {
+                return Err(StorageError::StaleRevision);
             }
-            Err(error) => return Err(io_error(error)),
-        }
-        // Immutable data is synced before the only publication point. Orphaned
-        // snapshots from interruption never change the mounted revision.
-        let published = publish(&self.directory, "manifest.bin", &next.encode());
-        if let Err(error) = published {
-            // A directory-sync failure can happen after rename. Reconcile the
-            // visible transaction so retries cannot overwrite an acknowledged ID.
-            if bounded_read(&self.directory.join("manifest.bin"), 108 + MAX_LEDGER * 24)
-                .ok()
-                .as_deref()
-                == Some(next.encode().as_slice())
-            {
-                self.manifest = next;
-                self.payload = batch.payload.clone();
+            if ledger.len().map_err(db_error)? >= MAX_LEDGER as u64 {
+                return Err(StorageError::Quota);
             }
-            return Err(io_error(error));
-        }
-        self.manifest = next;
-        self.payload = batch.payload.clone();
-        self.prune_snapshots();
-        Ok(self.manifest.revision)
-    }
-    fn prune_snapshots(&self) {
-        // Only exact names recorded in this namespace's committed ledger are
-        // eligible. Keep the current and previous immutable payload. Cleanup
-        // follows durable manifest publication and never changes commit success.
-        for &(_, digest, revision) in
-            &self.manifest.ledger[..self.manifest.ledger.len().saturating_sub(2)]
-        {
-            let name = format!("snapshot-{revision:016x}-{digest:016x}.bin");
-            let _ = fs::remove_file(self.directory.join(name));
-        }
+            let next = current.checked_add(1).ok_or(StorageError::Quota)?;
+            ledger
+                .insert(batch.mutation_id, (batch.digest, next))
+                .map_err(db_error)?;
+            let mut snapshots = transaction.open_table(SNAPSHOTS).map_err(db_error)?;
+            insert_snapshot(&mut snapshots, next, &batch.payload)?;
+            snapshots
+                .retain_in((current, 0)..=(current, u32::MAX), |_, _| false)
+                .map_err(db_error)?;
+            head.insert("revision", next).map_err(db_error)?;
+            head.insert("digest", batch.digest).map_err(db_error)?;
+            next
+        };
+        // An error leaves the outcome unknown; the session retries the same
+        // mutation ID, and the ledger returns its result if it was published.
+        transaction.commit().map_err(db_error)?;
+        Ok(revision)
     }
 }
-fn io_error(error: std::io::Error) -> StorageError {
-    match error.kind() {
-        std::io::ErrorKind::StorageFull => StorageError::Quota,
-        std::io::ErrorKind::NotFound => StorageError::Unavailable,
-        _ => StorageError::Unavailable,
+fn insert_snapshot(
+    table: &mut redb::Table<'_, (u64, u32), &'static [u8]>,
+    revision: u64,
+    payload: &[u8],
+) -> Result<(), StorageError> {
+    for (index, segment) in payload.chunks(SEGMENT).enumerate() {
+        table
+            .insert((revision, index as u32), segment)
+            .map_err(db_error)?;
     }
-}
-fn bounded_read(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    if file.metadata()?.len() > limit as u64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "save data exceeds reserved capacity",
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "save data exceeds reserved capacity",
-        ));
-    }
-    Ok(bytes)
+    Ok(())
 }
 fn destination_path(path: &Path) -> std::io::Result<PathBuf> {
     if path.exists() {
@@ -649,7 +589,14 @@ impl NativeStorage {
         session: &mut Session,
         settings: &crate::native_input::LaunchSettings,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::prepare_inner(session, settings, None)
+        Self::prepare_inner(session, settings, None, false)
+    }
+    #[allow(dead_code)]
+    pub fn prepare_resumed_mut(
+        session: &mut Session,
+        settings: &crate::native_input::LaunchSettings,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::prepare_inner(session, settings, None, true)
     }
     #[allow(dead_code)]
     pub fn prepare_replacement(
@@ -668,12 +615,13 @@ impl NativeStorage {
         if self.in_flight != 0 || self.deferred.is_some() {
             return Err("storage operations must settle before replacing the session".into());
         }
-        Self::prepare_inner(session, settings, self.store.as_ref())
+        Self::prepare_inner(session, settings, self.store.as_ref(), false)
     }
     fn prepare_inner(
         session: &mut Session,
         settings: &crate::native_input::LaunchSettings,
         reuse: Option<&Arc<Mutex<NativeStore>>>,
+        resumed_snapshot: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let mut source = None;
         let mut store = None;
@@ -688,7 +636,18 @@ impl NativeStorage {
                     .store
                     .as_deref()
                     .ok_or("persistent mount requires a save store")?;
-                let path = Path::new(spec.binding(binding));
+                let path = crate::host_dirs::store_directory(
+                    spec.binding(binding),
+                    crate::host_dirs::HostDirs::detect,
+                )?;
+                let path = path.as_path();
+                let store_error = |error: StorageError| match error {
+                    StorageError::MissingBase => format!(
+                        "save store {}: {error:?} (store belongs to a different mount or base; use its original media and binding, or choose another save store)",
+                        path.display()
+                    ),
+                    _ => format!("save store {}: {error:?}", path.display()),
+                };
                 if mount.kind == SourceKind::NativeDirectory {
                     let root = fs::canonicalize(spec.binding(&mount.source))?;
                     if destination_path(path)?.starts_with(root) {
@@ -700,39 +659,43 @@ impl NativeStorage {
                 let existing = reuse.filter(|store| {
                     store.lock().is_ok_and(|store| {
                         fs::canonicalize(path).is_ok_and(|path| path == store.directory)
-                            && store.manifest.namespace == namespace
-                            && store.manifest.base == base
+                            && store.namespace == namespace
+                            && store.base == base
                     })
                 });
                 let selected = if let Some(existing) = existing {
                     Arc::clone(existing)
                 } else {
                     Arc::new(Mutex::new(
-                        NativeStore::open(path, namespace, base)
-                            .map_err(|error| format!("save store: {error:?}"))?,
+                        NativeStore::open(path, namespace, base).map_err(store_error)?,
                     ))
                 };
                 {
                     let current = selected.lock().map_err(|_| "save store worker failed")?;
-                    session.attach_persistent_store(
-                        namespace,
-                        base,
-                        current.manifest.fence,
-                        current.manifest.revision,
-                        if current.manifest.revision == 0 {
-                            None
-                        } else {
-                            Some(&current.payload)
-                        },
-                    )?;
+                    let (revision, payload) = current.committed().map_err(store_error)?;
+                    if resumed_snapshot {
+                        session.attach_resumed_persistent_store(
+                            namespace,
+                            base,
+                            current.fence,
+                            revision,
+                        )?;
+                    } else {
+                        session.attach_persistent_store(
+                            namespace,
+                            base,
+                            current.fence,
+                            revision,
+                            payload.as_deref(),
+                        )?;
+                    }
                 }
                 store = Some(selected);
             }
-            if let Some(mount) = spec
-                .mounts
-                .iter()
-                .find(|mount| matches!(mount.kind, SourceKind::LocalIso | SourceKind::HttpsIso))
-            {
+            if let Some(mount) = spec.mounts.iter().find(|mount| {
+                matches!(mount.kind, SourceKind::LocalIso | SourceKind::HttpsIso)
+                    && !(mount.kind == SourceKind::LocalIso && settings.preload_local_media)
+            }) {
                 let media = match mount.kind {
                     SourceKind::HttpsIso => {
                         MediaSource::Https(HttpSource::open(spec.binding(&mount.source))?)
@@ -885,6 +848,7 @@ impl NativeStorage {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or("export path requires a filename")?;
+        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
         publish(directory, name, &bytes).map_err(|error| error.to_string())
     }
     pub fn import(&mut self, session: &mut Session, path: &Path) -> Result<(), String> {
@@ -904,6 +868,8 @@ impl NativeStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_store_format::Manifest;
+    use redb::ReadableDatabase;
     fn http_fixture(responses: Vec<String>, offset: u64) -> Result<HttpPart, StorageError> {
         use std::net::TcpListener;
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1001,22 +967,41 @@ mod tests {
         assert_eq!(http_fixture(vec![large], offset).unwrap().bytes, b"DATA");
     }
     #[test]
-    fn retention_keeps_two_published_versions_and_preserves_unrelated_files() {
+    fn commits_keep_only_the_current_snapshot_and_preserve_unrelated_files() {
         let directory = Directory::new();
         let mut store = NativeStore::open(&directory.0, [1; 32], [2; 32]).unwrap();
         let unrelated = directory.0.join("snapshot-user-data.bin");
         fs::write(&unrelated, b"user").unwrap();
-        let mut names = Vec::new();
         for id in 1..=4 {
             let request = batch(&store, id, &[id as u8]);
-            store.commit(&request).unwrap();
-            names.push(store.manifest.snapshot_name());
+            assert_eq!(store.commit(&request), Ok(id));
         }
-        assert!(!directory.0.join(&names[0]).exists());
-        assert!(!directory.0.join(&names[1]).exists());
-        assert!(directory.0.join(&names[2]).exists());
-        assert!(directory.0.join(&names[3]).exists());
+        assert_eq!(store.committed(), Ok((4, Some(vec![4]))));
+        let transaction = store.database.begin_read().unwrap();
+        let snapshots = transaction.open_table(SNAPSHOTS).unwrap();
+        assert_eq!(snapshots.len().unwrap(), 1);
         assert_eq!(fs::read(unrelated).unwrap(), b"user");
+    }
+    #[test]
+    fn segmented_snapshots_roundtrip_and_bound_the_database_file() {
+        let directory = Directory::new();
+        let mut store = NativeStore::open(&directory.0, [1; 32], [2; 32]).unwrap();
+        let mut payload: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        for id in 1..=3 {
+            payload[0] = id as u8;
+            store.commit(&batch(&store, id, &payload)).unwrap();
+        }
+        assert_eq!(store.committed(), Ok((3, Some(payload.clone()))));
+        let transaction = store.database.begin_read().unwrap();
+        let snapshots = transaction.open_table(SNAPSHOTS).unwrap();
+        assert_eq!(
+            snapshots.len().unwrap(),
+            payload.len().div_ceil(SEGMENT) as u64
+        );
+        // Copy-on-write keeps the previous revision until the next commit and
+        // the file grows in power-of-two steps. One unsegmented value doubles it.
+        let size = fs::metadata(directory.0.join(STORE_FILE)).unwrap().len();
+        assert!(size <= 4 * payload.len() as u64 + (1 << 20), "{size}");
     }
     struct Directory(PathBuf);
     impl Directory {
@@ -1041,10 +1026,10 @@ mod tests {
     }
     fn batch(store: &NativeStore, id: u64, bytes: &[u8]) -> CommitBatch {
         CommitBatch {
-            namespace: store.manifest.namespace,
-            base: store.manifest.base,
-            fencing_token: store.manifest.fence,
-            expected_revision: store.manifest.revision,
+            namespace: store.namespace,
+            base: store.base,
+            fencing_token: store.fence,
+            expected_revision: store.committed().unwrap().0,
             mutation_id: id,
             digest: payload_digest(bytes),
             payload: bytes.to_vec(),
@@ -1071,48 +1056,102 @@ mod tests {
         conflict.payload = b"changed".to_vec();
         conflict.digest = payload_digest(&conflict.payload);
         assert_eq!(store.commit(&conflict), Err(StorageError::MutationConflict));
-        let fence = store.manifest.fence;
+        let mut stale = batch(&store, 2, b"stale");
+        stale.expected_revision = 0;
+        assert_eq!(store.commit(&stale), Err(StorageError::StaleRevision));
+        let fence = store.fence;
         drop(store);
         let mut reopened = NativeStore::open(&directory.0, [1; 32], [2; 32]).unwrap();
-        assert!(reopened.manifest.fence > fence);
-        assert_eq!(reopened.payload, b"saved");
+        assert!(reopened.fence > fence);
+        assert_eq!(reopened.committed(), Ok((1, Some(b"saved".to_vec()))));
         assert_eq!(reopened.commit(&first), Err(StorageError::BusyWriter));
     }
     #[test]
-    fn orphan_snapshot_and_unpublished_manifest_do_not_replace_revision() {
+    fn version_1_directory_store_is_imported_once_without_changing_it() {
         let directory = Directory::new();
-        let mut store = NativeStore::open(&directory.0, [1; 32], [2; 32]).unwrap();
-        let first = batch(&store, 1, b"first");
-        store.commit(&first).unwrap();
-        let second = batch(&store, 2, b"second");
-        let mut next = store.manifest.clone();
-        next.revision = 2;
-        next.digest = second.digest;
-        fs::write(directory.0.join(next.snapshot_name()), &second.payload).unwrap();
+        let payload = b"legacy".to_vec();
+        let digest = payload_digest(&payload);
+        let manifest = Manifest {
+            namespace: [1; 32],
+            base: [2; 32],
+            fence: 7,
+            revision: 3,
+            digest,
+            ledger: vec![(3, digest, 3)],
+        };
         fs::write(
-            directory.0.join(".manifest.bin.interrupted.tmp"),
-            next.encode(),
+            directory
+                .0
+                .join(format!("snapshot-{:016x}-{digest:016x}.bin", 3)),
+            &payload,
         )
         .unwrap();
+        fs::write(directory.0.join("manifest.bin"), manifest.encode()).unwrap();
+        let legacy = fs::read(directory.0.join("manifest.bin")).unwrap();
+        let writer = File::create(directory.0.join("writer.lock")).unwrap();
+        writer.try_lock().unwrap();
+        assert!(matches!(
+            NativeStore::open(&directory.0, [1; 32], [2; 32]),
+            Err(StorageError::BusyWriter)
+        ));
+        drop(writer);
+        let mut store = NativeStore::open(&directory.0, [1; 32], [2; 32]).unwrap();
+        assert_eq!(store.fence, 8);
+        assert_eq!(store.committed(), Ok((3, Some(payload.clone()))));
+        let retry = CommitBatch {
+            namespace: [1; 32],
+            base: [2; 32],
+            fencing_token: store.fence,
+            expected_revision: 2,
+            mutation_id: 3,
+            digest,
+            payload,
+        };
+        assert_eq!(store.commit(&retry), Ok(3));
+        store.commit(&batch(&store, 4, b"new")).unwrap();
         drop(store);
         let reopened = NativeStore::open(&directory.0, [1; 32], [2; 32]).unwrap();
-        assert_eq!(reopened.manifest.revision, 1);
-        assert_eq!(reopened.payload, b"first");
+        assert_eq!(reopened.committed(), Ok((4, Some(b"new".to_vec()))));
+        assert_eq!(fs::read(directory.0.join("manifest.bin")).unwrap(), legacy);
     }
     #[test]
     fn checksum_and_missing_base_are_visible() {
         let directory = Directory::new();
-        let store = NativeStore::open(&directory.0, [1; 32], [2; 32]).unwrap();
+        let mut store = NativeStore::open(&directory.0, [1; 32], [2; 32]).unwrap();
+        store.commit(&batch(&store, 1, b"saved")).unwrap();
+        let transaction = store.database.begin_write().unwrap();
+        transaction
+            .open_table(HEAD)
+            .unwrap()
+            .insert("digest", 0)
+            .unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(store.committed(), Err(StorageError::Corrupt));
         drop(store);
         assert!(matches!(
             NativeStore::open(&directory.0, [1; 32], [3; 32]),
             Err(StorageError::MissingBase)
         ));
-        let mut bytes = fs::read(directory.0.join("manifest.bin")).unwrap();
+        let legacy = Directory::new();
+        let mut bytes = Manifest {
+            namespace: [1; 32],
+            base: [2; 32],
+            fence: 0,
+            revision: 0,
+            digest: 0,
+            ledger: Vec::new(),
+        }
+        .encode();
         bytes[72] ^= 1;
-        fs::write(directory.0.join("manifest.bin"), bytes).unwrap();
+        fs::write(legacy.0.join("manifest.bin"), bytes).unwrap();
         assert!(matches!(
-            NativeStore::open(&directory.0, [1; 32], [2; 32]),
+            NativeStore::open(&legacy.0, [1; 32], [2; 32]),
+            Err(StorageError::Corrupt)
+        ));
+        let foreign = Directory::new();
+        fs::write(foreign.0.join(STORE_FILE), [0x5a; 4096]).unwrap();
+        assert!(matches!(
+            NativeStore::open(&foreign.0, [1; 32], [2; 32]),
             Err(StorageError::Corrupt)
         ));
     }

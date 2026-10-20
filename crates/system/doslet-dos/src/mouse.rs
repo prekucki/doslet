@@ -111,3 +111,7 @@ impl Mouse {
         }
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "mouse_saved.rs"]
+mod saved_state;

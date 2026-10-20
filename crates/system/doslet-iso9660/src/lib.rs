@@ -1,7 +1,7 @@
 //! Owned immutable ISO 9660 media with borrowed sectors and file extents.
 #![no_std]
 extern crate alloc;
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::ops::Range;
 pub const SECTOR_SIZE: usize = 2048;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,8 +18,9 @@ pub struct Entry {
     pub record: Range<usize>,
     pub directory: bool,
 }
+#[derive(Clone)]
 pub struct Image {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     volume_len: usize,
     primary: usize,
     root: Entry,
@@ -63,7 +64,7 @@ impl Image {
             return Err(Error::InvalidImage);
         }
         Ok(Self {
-            bytes,
+            bytes: Arc::new(bytes),
             volume_len,
             primary,
             root,

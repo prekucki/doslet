@@ -1,11 +1,13 @@
-//! Borrowed indexed scanout for the linear mode-13h bootstrap.
-//! Mode 13h and banked VBE 101h with selected clocked raster status.
-//! Planar memory, programmable raster timing and text rendering are pending.
+//! Borrowed indexed scanout for mode 13h, unchained 256-color VGA and VBE 101h.
+//! Text scanout is composed by the runtime. General EGA/16-color scanout and
+//! programmable raster timing remain pending.
 #![no_std]
 extern crate alloc;
 
 pub mod font;
 mod palette;
+#[cfg(test)]
+mod planar_tests;
 mod registers;
 pub mod scanout;
 use alloc::{boxed::Box, vec};
@@ -23,8 +25,38 @@ pub enum VideoMode {
     Vbe101,
 }
 
+/// Immutable controls and borrowed physical backing for an exclusive foreign
+/// execution slice. Reads must reproduce latch/compare behavior and commit the
+/// final four latch bytes before any ordinary device operation resumes.
+pub struct MemoryReadView<'a> {
+    pub bytes: &'a [u8],
+    pub bank_offset: u32,
+    pub planar: Option<PlanarRead>,
+    pub latches: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanarRead {
+    pub chain4: bool,
+    pub read_plane: u8,
+    /// (compare, care), present only in read mode 1.
+    pub compare: Option<(u8, u8)>,
+}
+
+/// Small register snapshot for an exclusive foreign memory-write slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryWriteControls {
+    pub plane_mask: u8,
+    pub mode: u8,
+    pub set_reset: u8,
+    pub enable_set_reset: u8,
+    pub rotate: u8,
+    pub bit_mask: u8,
+}
+
 pub struct Vga {
     memory: Box<[u8]>,
+    latches: [u8; 4],
     palette: [[u8; 4]; 256],
     dac_cursor: usize,
     dac_read_cursor: usize,
@@ -42,6 +74,7 @@ impl Default for Vga {
     fn default() -> Self {
         Self {
             memory: vec![0; VRAM_LEN].into_boxed_slice(),
+            latches: [0; 4],
             palette: palette::default_palette(),
             dac_cursor: 0,
             dac_read_cursor: 0,
@@ -58,12 +91,84 @@ impl Default for Vga {
     }
 }
 impl Vga {
+    /// No copy or remapping of VRAM. The caller must not retain this borrow
+    /// across foreign execution; only an explicitly bounded pointer descriptor
+    /// may be exported by the application while this owner remains exclusive.
+    pub fn direct_read_view(&self) -> Option<MemoryReadView<'_>> {
+        self.direct_read_view_with_memory(&self.memory)
+    }
+
+    /// The machine supplies the sole physical backing after setup migration.
+    pub fn direct_read_view_with_memory<'a>(&self, memory: &'a [u8]) -> Option<MemoryReadView<'a>> {
+        assert_eq!(memory.len(), VRAM_LEN, "physical VGA backing length");
+        if !self.memory_available(0) {
+            return None;
+        }
+        Some(MemoryReadView {
+            bytes: memory,
+            bank_offset: u32::from(self.bank) * APERTURE_LEN as u32,
+            planar: (self.mode == VideoMode::Mode13).then(|| {
+                let (_, _, _, _, compare) = self.registers.graphics_pipeline();
+                PlanarRead {
+                    chain4: self.registers.chain4(),
+                    read_plane: self.registers.read_plane() as u8,
+                    compare: self.registers.read_compare().map(|care| (compare, care)),
+                }
+            }),
+            latches: self.latches,
+        })
+    }
+
+    /// Commit staged direct-read effects before runtime/device code resumes.
+    /// Linear modes leave the latch registers unchanged, as `read_memory` does.
+    pub fn complete_direct_reads(&mut self, latches: [u8; 4]) {
+        if self.mode == VideoMode::Mode13 {
+            self.latches = latches;
+        }
+    }
+
+    pub fn direct_write_controls(&self) -> MemoryWriteControls {
+        let (set_reset, enable_set_reset, rotate, bit_mask, _) = self.registers.graphics_pipeline();
+        MemoryWriteControls {
+            plane_mask: self.registers.plane_mask(),
+            mode: self.registers.write_mode(),
+            set_reset,
+            enable_set_reset,
+            rotate,
+            bit_mask,
+        }
+    }
+
+    /// Generated writes count physical bytes whose value actually changed,
+    /// exactly as the ordinary write pipeline increments the scanout revision.
+    pub fn complete_direct_writes(&mut self, changes: u64) {
+        self.revision = self.revision.wrapping_add(changes);
+    }
+
+    /// Setup-only migration into the machine's new sole memory owner. Once
+    /// transferred, memory operations must use the explicit backing APIs.
+    pub fn transfer_memory_into(&mut self, memory: &mut [u8]) {
+        assert_eq!(memory.len(), VRAM_LEN, "physical VGA backing length");
+        assert_eq!(
+            self.memory.len(),
+            VRAM_LEN,
+            "VGA backing already transferred"
+        );
+        memory.copy_from_slice(&self.memory);
+        self.memory = Box::default();
+    }
+
     pub fn memory_configuration(&self) -> (u8, u8, u8, u16, u8, u8) {
         self.registers.memory_config()
     }
     /// Borrow physical VRAM for diagnostics, including banks outside scanout.
     /// CPU memory transactions still use the mapped aperture operations.
     pub fn vram_view(&self) -> &[u8] {
+        assert_eq!(
+            self.memory.len(),
+            VRAM_LEN,
+            "VGA backing transferred to machine"
+        );
         &self.memory
     }
     pub fn palette(&self) -> &[[u8; 4]; 256] {
@@ -85,8 +190,21 @@ impl Vga {
         self.revision = self.revision.wrapping_add(1);
     }
     pub fn set_mode_13h(&mut self) {
-        self.flush_raster_time();
+        assert_eq!(
+            self.memory.len(),
+            VRAM_LEN,
+            "VGA backing transferred to machine"
+        );
         self.memory.fill(0);
+        self.configure_mode_13h();
+    }
+    pub fn set_mode_13h_with_memory(&mut self, memory: &mut [u8]) {
+        assert_eq!(memory.len(), VRAM_LEN, "physical VGA backing length");
+        memory.fill(0);
+        self.configure_mode_13h();
+    }
+    fn configure_mode_13h(&mut self) {
+        self.flush_raster_time();
         self.palette = palette::default_palette();
         self.dac_cursor = 0;
         self.dac_read_cursor = 0;
@@ -98,44 +216,205 @@ impl Vga {
         self.raster_ticks = 0;
         self.revision = self.revision.wrapping_add(1);
     }
-    pub fn read_memory(&self, offset: usize) -> Option<u8> {
+    pub fn read_memory(&mut self, offset: usize) -> Option<u8> {
+        assert_eq!(
+            self.memory.len(),
+            VRAM_LEN,
+            "VGA backing transferred to machine"
+        );
+        Self::read_memory_impl(
+            &self.memory,
+            offset,
+            &self.registers,
+            self.mode,
+            self.bank,
+            &mut self.latches,
+        )
+    }
+    pub fn read_memory_with_memory(&mut self, memory: &[u8], offset: usize) -> Option<u8> {
+        assert_eq!(memory.len(), VRAM_LEN, "physical VGA backing length");
+        Self::read_memory_impl(
+            memory,
+            offset,
+            &self.registers,
+            self.mode,
+            self.bank,
+            &mut self.latches,
+        )
+    }
+    fn read_memory_impl(
+        memory: &[u8],
+        offset: usize,
+        registers: &registers::Registers,
+        mode: VideoMode,
+        bank: u16,
+        latches: &mut [u8; 4],
+    ) -> Option<u8> {
         if offset >= APERTURE_LEN {
             return None;
         }
-        self.memory
-            .get(usize::from(self.bank) * APERTURE_LEN + offset)
+        if mode == VideoMode::Mode13 {
+            let group = if registers.chain4() {
+                offset & !3
+            } else {
+                offset * 4
+            };
+            latches.copy_from_slice(&memory[group..group + 4]);
+            if let Some(care) = registers.read_compare() {
+                let (_, _, _, _, compare) = registers.graphics_pipeline();
+                let mut result = 0xFF;
+                for (plane, latch) in latches.iter().enumerate() {
+                    if care & (1 << plane) != 0 {
+                        result &= latch ^ if compare & (1 << plane) != 0 { 0 } else { 0xFF };
+                    }
+                }
+                return Some(result);
+            }
+            let plane = if registers.chain4() {
+                offset & 3
+            } else {
+                registers.read_plane()
+            };
+            return Some(latches[plane]);
+        }
+        memory
+            .get(usize::from(bank) * APERTURE_LEN + offset)
             .copied()
     }
     /// Whether `read_memory` and `write_memory` succeed for this aperture
     /// offset under the current bank. Only mode and bank changes, which are
     /// port or BIOS operations, change the answer.
     pub fn memory_available(&self, offset: usize) -> bool {
-        offset < APERTURE_LEN && usize::from(self.bank) * APERTURE_LEN + offset < self.memory.len()
+        offset < APERTURE_LEN && usize::from(self.bank) * APERTURE_LEN + offset < VRAM_LEN
     }
     pub fn write_memory(&mut self, offset: usize, value: u8) -> bool {
+        assert_eq!(
+            self.memory.len(),
+            VRAM_LEN,
+            "VGA backing transferred to machine"
+        );
+        Self::write_memory_impl(
+            &mut self.memory,
+            offset,
+            value,
+            &self.registers,
+            self.mode,
+            self.bank,
+            &self.latches,
+            &mut self.revision,
+        )
+    }
+    pub fn write_memory_with_memory(
+        &mut self,
+        memory: &mut [u8],
+        offset: usize,
+        value: u8,
+    ) -> bool {
+        assert_eq!(memory.len(), VRAM_LEN, "physical VGA backing length");
+        Self::write_memory_impl(
+            memory,
+            offset,
+            value,
+            &self.registers,
+            self.mode,
+            self.bank,
+            &self.latches,
+            &mut self.revision,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn write_memory_impl(
+        memory: &mut [u8],
+        offset: usize,
+        value: u8,
+        registers: &registers::Registers,
+        mode: VideoMode,
+        bank: u16,
+        latches: &[u8; 4],
+        revision: &mut u64,
+    ) -> bool {
         if offset >= APERTURE_LEN {
             return false;
         }
-        let Some(target) = self
-            .memory
-            .get_mut(usize::from(self.bank) * APERTURE_LEN + offset)
-        else {
+        if mode == VideoMode::Mode13 {
+            let chained = registers.chain4();
+            let group = if chained { offset & !3 } else { offset * 4 };
+            let mask = registers.plane_mask() & if chained { 1 << (offset & 3) } else { 15 };
+            let (set, enable, rotate, bit_mask, _) = registers.graphics_pipeline();
+            let rotated = value.rotate_right(u32::from(rotate & 7));
+            for (plane, &latch) in latches.iter().enumerate() {
+                if mask & (1 << plane) == 0 {
+                    continue;
+                }
+                let (source, bits) = match registers.write_mode() {
+                    1 => (latch, 0xFF),
+                    2 => (if value & (1 << plane) != 0 { 0xFF } else { 0 }, bit_mask),
+                    3 => (
+                        if set & (1 << plane) != 0 { 0xFF } else { 0 },
+                        bit_mask & rotated,
+                    ),
+                    _ => (
+                        if enable & (1 << plane) != 0 {
+                            if set & (1 << plane) != 0 { 0xFF } else { 0 }
+                        } else {
+                            rotated
+                        },
+                        bit_mask,
+                    ),
+                };
+                let source = if registers.write_mode() == 1 {
+                    source
+                } else {
+                    match (rotate >> 3) & 3 {
+                        1 => source & latch,
+                        2 => source | latch,
+                        3 => source ^ latch,
+                        _ => source,
+                    }
+                };
+                let result = (source & bits) | (latch & !bits);
+                if memory[group + plane] != result {
+                    memory[group + plane] = result;
+                    *revision = revision.wrapping_add(1);
+                }
+            }
+            return true;
+        }
+        let Some(target) = memory.get_mut(usize::from(bank) * APERTURE_LEN + offset) else {
             return false;
         };
         if *target != value {
             *target = value;
-            self.revision = self.revision.wrapping_add(1);
+            *revision = revision.wrapping_add(1);
         }
         true
     }
     pub fn mode(&self) -> VideoMode {
         self.mode
     }
+    pub fn is_unchained_256(&self) -> bool {
+        self.mode == VideoMode::Mode13 && !self.registers.chain4()
+    }
     pub fn set_vbe_101h(&mut self, preserve: bool) {
-        self.flush_raster_time();
+        assert_eq!(
+            self.memory.len(),
+            VRAM_LEN,
+            "VGA backing transferred to machine"
+        );
         if !preserve {
             self.memory.fill(0);
         }
+        self.configure_vbe_101h();
+    }
+    pub fn set_vbe_101h_with_memory(&mut self, memory: &mut [u8], preserve: bool) {
+        assert_eq!(memory.len(), VRAM_LEN, "physical VGA backing length");
+        if !preserve {
+            memory.fill(0);
+        }
+        self.configure_vbe_101h();
+    }
+    fn configure_vbe_101h(&mut self) {
+        self.flush_raster_time();
         self.bank = 0;
         self.mode = VideoMode::Vbe101;
         self.raster_ticks = 0;
@@ -294,7 +573,15 @@ impl Vga {
             self.revision = self.revision.wrapping_add(1);
             return true;
         }
-        self.registers.write(port, value)
+        let previous = self.registers.layout_256();
+        if self.registers.write(port, value) {
+            if self.registers.layout_256() != previous {
+                self.revision = self.revision.wrapping_add(1);
+            }
+            true
+        } else {
+            false
+        }
     }
     pub fn write_dac(&mut self, value: u8) {
         let value = u16::from(value & 63);
@@ -303,18 +590,34 @@ impl Vga {
         self.revision = self.revision.wrapping_add(1);
     }
     pub fn frame(&self) -> Option<IndexedFrame<'_>> {
+        self.frame_with_memory(&self.memory)
+    }
+    pub fn frame_with_memory<'a>(&'a self, memory: &'a [u8]) -> Option<IndexedFrame<'a>> {
+        assert_eq!(memory.len(), VRAM_LEN, "physical VGA backing length");
+        let mut layout = scanout::PixelLayout::Linear;
         let (width, height) = match self.mode {
             VideoMode::Text3 => return None,
-            VideoMode::Mode13 => (WIDTH, HEIGHT),
+            VideoMode::Mode13 => {
+                let (width, height, start, pitch) = self.registers.layout_256();
+                if start != 0 || pitch * 4 != width || width * height > 256 * 1024 {
+                    layout = scanout::PixelLayout::Vga256 { start, pitch };
+                }
+                (width, height)
+            }
             VideoMode::Vbe101 => (640, 480),
         };
         Some(IndexedFrame {
             width,
             height,
-            pixels: &self.memory[..width * height],
+            pixels: &memory[..if matches!(layout, scanout::PixelLayout::Linear) {
+                width * height
+            } else {
+                256 * 1024
+            }],
             palette: &self.palette,
             revision: self.revision,
             pixel_mask: self.dac_mask,
+            layout,
         })
     }
 }
@@ -517,3 +820,7 @@ mod tests {
         assert_eq!(frame.palette[0][0], 255);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

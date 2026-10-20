@@ -69,6 +69,19 @@ impl Session {
     pub fn physical_key(&mut self, usage: u16, pressed: bool) -> Result<(), RuntimeError> {
         self.key_event(doslet_input::PhysicalKey(usage), pressed)
     }
+    /// Switch input delivery at a batch boundary without replacing the machine.
+    pub fn set_keyboard_mode(
+        &mut self,
+        mode: doslet_config::KeyboardMode,
+    ) -> Result<(), RuntimeError> {
+        if mode != self.hardware_config().keyboard {
+            self.release_keys()?;
+            let toggles = self.machine.bus.read_u8(0x417)? & 0xf0;
+            self.set_key_modifiers(toggles)?;
+            self.machine.set_keyboard_mode(mode)?;
+        }
+        Ok(())
+    }
     pub fn release_keys(&mut self) -> Result<(), RuntimeError> {
         self.input.release_all();
         self.machine.release_keys()?;
@@ -121,6 +134,7 @@ impl Session {
             let Some(event) = self.input.next_event() else {
                 break;
             };
+            self.menu_idle_input();
             match event {
                 doslet_input::GuestEvent::Key { key, pressed } => {
                     if let Err(error) = self.machine.key_event(key, pressed) {
@@ -226,6 +240,45 @@ impl Session {
             self.import_overlay(payload)
                 .map_err(RuntimeError::Storage)?;
             self.drive.acknowledge_all();
+        }
+        self.persistent = Some(Persistent {
+            namespace,
+            base,
+            fencing_token,
+            revision,
+            next_request: 1,
+            buffer: Vec::with_capacity(self.drive.snapshot_capacity() + 36),
+            pending: None,
+            emitted: false,
+            result: None,
+            attempts: 0,
+            unresolved: false,
+        });
+        Ok(())
+    }
+    /// Detach the host storage lease at a settled boundary so a portable state
+    /// snapshot (`save_state`) can be written on shutdown.
+    pub fn detach_persistent_store(&mut self) -> Result<(), RuntimeError> {
+        if self.storage_wait || self.pending_commit() {
+            return Err(RuntimeError::Storage(StorageError::Unavailable));
+        }
+        self.persistent = None;
+        Ok(())
+    }
+    /// Reattach a host storage lease to a session restored from a state snapshot,
+    /// keeping the snapshot's live file handles and overlay.
+    pub fn attach_resumed_persistent_store(
+        &mut self,
+        namespace: [u8; 32],
+        base: [u8; 32],
+        fencing_token: u64,
+        revision: u64,
+    ) -> Result<(), RuntimeError> {
+        if self.persistent.is_some() {
+            return Err(RuntimeError::InvalidLaunch);
+        }
+        if base != self.base_identity {
+            return Err(RuntimeError::Storage(StorageError::MissingBase));
         }
         self.persistent = Some(Persistent {
             namespace,
@@ -587,6 +640,7 @@ impl Session {
                     };
                     self.machine.bus.write_u8(address, self.staging[offset])?;
                 }
+                self.disk_read_bytes = self.disk_read_bytes.saturating_add((end - copied) as u64);
                 copied = end;
                 if copied < length {
                     self.continuation = Some(Continuation::Copy {
@@ -733,6 +787,22 @@ impl Session {
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
+    /// Start a fresh host attachment after restoring a portable snapshot.
+    pub fn renew_epoch(&mut self) -> Result<(), RuntimeError> {
+        if self.continuation.is_some() || self.storage_wait || self.persistent.is_some() {
+            return Err(RuntimeError::InvalidLaunch);
+        }
+        let epoch = new_epoch()?;
+        self.release_keys()?;
+        self.epoch = epoch;
+        self.input.reset(epoch);
+        if let Some(cd) = &mut self.cdrom
+            && let cdrom::Media::Remote(provider) = &mut cd.image
+        {
+            provider.source_mut().reset_epoch(epoch);
+        }
+        Ok(())
+    }
     pub fn set_epoch(&mut self, epoch: u64) -> Result<(), RuntimeError> {
         if self.status != SessionStatus::Ready || self.continuation.is_some() {
             return Err(RuntimeError::InvalidLaunch);
@@ -777,3 +847,7 @@ impl Session {
         Ok(())
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "storage_saved.rs"]
+mod saved_state;

@@ -4,6 +4,8 @@ extern crate alloc;
 use alloc::boxed::Box;
 use doslet_midi_synth::wire::{Decoder, REPLAY_CAPACITY, State, WireError};
 use doslet_mt32_gm::Translator;
+mod monitor;
+pub use monitor::Channel;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
     #[default]
@@ -12,6 +14,14 @@ pub enum Mode {
 }
 impl Mode {
     pub const ALL: [Self; 2] = [Self::Gm, Self::Mt32];
+    /// Receiver initialization on a new connection or a game restart.
+    /// Pause/resume preserves device state and must not use this reset.
+    pub const fn reset_message(self) -> &'static [u8] {
+        match self {
+            Self::Gm => &[0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7],
+            Self::Mt32 => &[0xF0, 0x41, 0x10, 0x16, 0x12, 0x7F, 0, 0, 1, 0, 0xF7],
+        }
+    }
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Gm => "gm",
@@ -99,7 +109,11 @@ impl Routing {
             self.raw = State::new();
             self.gm = State::new();
         }
-        self.raw.receive(message);
+        // A raw MT-32 ignores GM System On. Its own reset is handled below;
+        // the generic GM replay state must not clear MT-32 channels for it.
+        if self.mode != Mode::Mt32 || message[0] != 0xF0 {
+            self.raw.receive(message);
+        }
         if self.mode == Mode::Mt32 {
             if message.len() >= 11
                 && message[..8] == [0xF0, 0x41, 0x10, 0x16, 0x12, 0x7F, 0, 0]
@@ -131,7 +145,7 @@ impl Routing {
     pub fn replay<F: FnMut(&[u8])>(&self, output: Mode, emit: &mut F) {
         let mut bytes = [0u8; REPLAY_CAPACITY];
         if self.mode == Mode::Mt32 && output == Mode::Mt32 {
-            emit(&[0xF0, 0x41, 0x10, 0x16, 0x12, 0x7F, 0, 0, 1, 0, 0xF7]);
+            emit(Mode::Mt32.reset_message());
             self.translator.memory().replay(emit);
             let count = self.raw.write(&mut bytes);
             // Program/pan/volume/bend range are already in parameter memory;

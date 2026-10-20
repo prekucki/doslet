@@ -5,8 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [features]
-default = ["dynamic-core"]
+default = ["wasm-procedures"]
 dynamic-core = ["doslet-runtime/dynamic-core"]
+wasm-procedures = ["doslet-runtime/wasm-procedures", "doslet-aot/wasm", "dep:doslet-x86-wasm"]
 [dependencies]
 doslet-config.workspace = true
 doslet-input.workspace = true
@@ -20,24 +21,46 @@ doslet-mt32.workspace = true
 doslet-dos.workspace = true
 web-time = "1.1.0"
 doslet-x86.workspace = true
-iced = { version = "0.14.0", default-features = false, features = ["image-without-codecs", "crisp", "fira-sans"] }
+hqx = "0.1.1"
+iced = { version = "0.14.0", default-features = false, features = ["image-without-codecs", "svg", "crisp", "fira-sans"] }
+# iced exposes allocation tasks only with its codec-enabled `image` feature.
+iced_runtime = "0.14.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+doslet-runtime = { workspace = true, features = ["save-state"] }
+doslet-executable.workspace = true
+doslet-aot = { path = "../../crates/system/doslet-aot" }
+doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm", optional = true }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+flate2 = "1"
+doslet-debugger.workspace = true
+doslet-mcp.workspace = true
+serde_json = "1"
+sha2 = "0.10.9"
 clap = { version = "4", features = ["derive"] }
 gilrs = "0.11.2"
 ureq = "3"
+redb = "4.4.0"
 cpal = "0.15.3"
 midir = "0.11.1"
 iced = { version = "0.14.0", default-features = false, features = ["wgpu", "tokio", "x11", "wayland"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-iced = { version = "0.14.0", default-features = false, features = ["tiny-skia"] }
+iced = { version = "0.14.0", default-features = false, features = ["wgpu", "webgl", "tiny-skia", "web-colors"] }
 console_error_panic_hook = "0.1.7"
-web-sys = { version = "0.3.106", features = ["Blob", "File", "FileList", "HtmlInputElement", "HtmlElement", "Document", "Window", "Event", "EventTarget", "Node", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioScheduledSourceNode", "GainNode", "AudioParam", "console", "AudioContextOptions"] }
+web-sys = { version = "0.3.106", features = ["Blob", "File", "FileList", "HtmlInputElement", "HtmlElement", "HtmlCanvasElement", "Document", "Window", "Event", "EventTarget", "Node", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioScheduledSourceNode", "GainNode", "AudioParam", "console", "AudioContextOptions"] }
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 js-sys = "0.3.106"
 log = "0.4.34"
 [target.'cfg(target_os = "macos")'.dependencies]
 doslet-apple-midi = { path = "../../crates/runtime/doslet-apple-midi" }
+[target.'cfg(target_os = "linux")'.dependencies]
+doslet-pulse = { path = "../../crates/runtime/doslet-pulse" }
 [lints]
 workspace = true
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm" }
+serde_json = "1"
+base64 = "0.22"
+png = "0.18"
+tokio = { version = "1", features = ["sync"] }

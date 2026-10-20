@@ -34,12 +34,16 @@ pub struct IdleLoopStats {
     pub poll_failures: u64,
     pub skips: u64,
     pub skipped_steps: u64,
+    /// Guest time advanced by proven idle passes, independent of the analyzer.
+    pub skipped_nanos: u64,
+    /// The same idle time already included in execution-tier counters.
+    pub skipped_tier_nanos: [u64; 4],
     pub last_failure: &'static str,
 }
 
 /// Input-driver state visible to services but kept outside guest RAM.
 #[derive(Clone, Copy, PartialEq)]
-struct InputState {
+pub(super) struct InputState {
     mouse: [u16; 3],
     motion: (i16, i16),
     counts: [u16; 6],
@@ -56,14 +60,18 @@ struct Proof {
     cpu: CpuSnapshot,
     input: InputState,
     mark: IdleProofMark,
+    device_accesses: u64,
     steps: u32,
+    limit: u32,
     failure: Option<&'static str>,
+    tier_counts: [u64; 4],
 }
 
 struct Proven {
     cpu: CpuSnapshot,
     input: InputState,
     pass: u32,
+    tier_counts: [u64; 4],
     ram_writes: u64,
     device_accesses: u64,
 }
@@ -106,7 +114,7 @@ impl IdleLoops {
     /// A service that is not a pure query ends the running proof.
     pub(super) fn note_service(&mut self, vector: u8, ax: u16, dl: u8, motion: (i16, i16)) {
         // Reading zero relative motion and resetting it to zero changes nothing.
-        let pure = pure_service(vector, ax, dl) || (vector, ax, motion) == (0x33, 0x0B, (0, 0));
+        let pure = repeatable_service(vector, ax, dl, motion);
         if let Some(proof) = &mut self.proof
             && !pure
         {
@@ -136,9 +144,65 @@ fn pure_service(vector: u8, ax: u16, dl: u8) -> bool {
     }
 }
 
+/// State changes of these services are covered by CPU, RAM and input snapshots.
+pub(super) fn repeatable_service(vector: u8, ax: u16, dl: u8, motion: (i16, i16)) -> bool {
+    pure_service(vector, ax, dl) || (vector, ax, motion) == (0x33, 0x0B, (0, 0))
+}
+
 impl Session {
+    /// Bounded interpreter execution starting at a statically suggested wait.
+    /// A suggestion only starts the ordinary CPU/RAM recurrence proof: every
+    /// omitted pass must still be proven, and skips stop before hardware events.
+    /// Other execution policies remain selected by the caller. When they are
+    /// active, this operation simply takes the ordinary runtime path.
+    pub(super) fn idle_candidate_advance(&mut self, budget: u32, proof_steps: u32) -> u32 {
+        let budget = budget.min(65_536);
+        if budget == 0 {
+            return 0;
+        }
+        if self.idle.enabled
+            || self.analyzer.enabled
+            || self.observer.enabled
+            || self.menu_idle_enabled()
+            || self.adaptive_idle_enabled()
+            || self.continuation.is_some()
+            || self.storage_wait
+        {
+            return self.advance(budget);
+        }
+        // Keep the normal strategy's proof/backoff state intact. This temporary
+        // interpreter slice owns its proof; none survives generated execution.
+        let previous = core::mem::take(&mut self.idle);
+        self.idle.next_attempt = u64::MAX;
+        self.idle_start_bounded(false, false, proof_steps.clamp(1, PROOF_STEPS));
+        let completed = self.advance(budget);
+        self.idle_abandon();
+        let stats = self.idle.stats;
+        self.idle = previous;
+        let total = &mut self.idle.stats;
+        total.proofs = total.proofs.saturating_add(stats.proofs);
+        total.failures = total.failures.saturating_add(stats.failures);
+        total.head_failures = total.head_failures.saturating_add(stats.head_failures);
+        total.poll_failures = total.poll_failures.saturating_add(stats.poll_failures);
+        total.skips = total.skips.saturating_add(stats.skips);
+        total.skipped_steps = total.skipped_steps.saturating_add(stats.skipped_steps);
+        total.skipped_nanos = total.skipped_nanos.saturating_add(stats.skipped_nanos);
+        for (total, extra) in total
+            .skipped_tier_nanos
+            .iter_mut()
+            .zip(stats.skipped_tier_nanos)
+        {
+            *total = total.saturating_add(extra);
+        }
+        if stats.failures != 0 {
+            total.last_failure = stats.last_failure;
+        }
+        completed
+    }
+
     pub fn set_idle_loops(&mut self, enabled: bool) {
         if !enabled {
+            self.cancel_menu_idle();
             self.idle_abandon();
             self.idle.proven = None;
             self.idle.head = None;
@@ -146,11 +210,26 @@ impl Session {
         self.idle.enabled = enabled;
     }
 
+    /// A foreign engine must leave this boundary to ordinary execution: a proof
+    /// observes every step, and a known head or proven state is where the
+    /// next proof starts or proven passes are skipped.
+    pub(super) fn idle_needs_boundary(&self) -> bool {
+        let r = &self.machine.cpu.registers;
+        self.idle.enabled
+            && (self.idle.proof.is_some()
+                || self.idle.head == Some((r.cs, r.ip))
+                || self
+                    .idle
+                    .proven
+                    .as_ref()
+                    .is_some_and(|proven| self.machine.cpu.matches(&proven.cpu)))
+    }
+
     pub fn idle_loop_stats(&self) -> IdleLoopStats {
         self.idle.stats
     }
 
-    fn input_state(&self) -> InputState {
+    pub(super) fn input_state(&self) -> InputState {
         let mouse = &self.mouse;
         InputState {
             mouse: [mouse.x, mouse.y, mouse.buttons],
@@ -168,7 +247,7 @@ impl Session {
         }
     }
 
-    fn idle_abandon(&mut self) {
+    pub(super) fn idle_abandon(&mut self) {
         if let Some(proof) = self.idle.proof.take() {
             self.machine.end_idle_proof(proof.mark);
         }
@@ -206,7 +285,11 @@ impl Session {
         now: u64,
         budget: u32,
     ) -> Result<Option<u32>, RuntimeError> {
-        if !self.idle.enabled || self.continuation.is_some() || self.storage_wait {
+        if !self.idle.enabled
+            || self.continuation.is_some()
+            || self.storage_wait
+            || self.analyzer_recurrence_recording()
+        {
             self.idle_abandon();
             return Ok(None);
         }
@@ -218,8 +301,22 @@ impl Session {
                     && self.machine.device_accesses() == proven.device_accesses
                     && self.input_state() == proven.input
                 {
-                    let skipped = self.machine.skip_idle_passes(proven.pass, budget)?;
+                    let before = self.machine.time().as_nanos();
+                    let tiers_before = self.machine.execution_tier_stats().1;
+                    let skipped = self.machine.skip_idle_passes_counted(
+                        proven.pass,
+                        budget,
+                        proven.tier_counts,
+                    )?;
                     if skipped != 0 {
+                        let elapsed = self.machine.time().as_nanos() - before;
+                        self.idle.stats.skipped_nanos += elapsed;
+                        let tiers_after = self.machine.execution_tier_stats().1;
+                        for i in 0..4 {
+                            self.idle.stats.skipped_tier_nanos[i] +=
+                                tiers_after[i].saturating_sub(tiers_before[i]);
+                        }
+                        self.analyzer_proven_idle(elapsed);
                         if skipped >= USEFUL_SKIP {
                             self.idle.backoff = BACKOFF_MIN;
                         }
@@ -258,6 +355,7 @@ impl Session {
             Some("schedule")
         } else if self.machine.cpu.matches(&proof.cpu) {
             let proof = self.idle.proof.take().expect("running proof");
+            let devices_unchanged = self.machine.device_accesses() == proof.device_accesses;
             let unchanged = self.machine.end_idle_proof(proof.mark);
             if unchanged && self.input_state() == proof.input {
                 let r = &self.machine.cpu.registers;
@@ -266,6 +364,9 @@ impl Session {
                     cpu: proof.cpu,
                     input: proof.input,
                     pass: proof.steps,
+                    tier_counts: core::array::from_fn(|i| {
+                        self.machine.cpu.execution_counts()[i] - proof.tier_counts[i]
+                    }),
                     ram_writes: self.machine.ram_writes(),
                     device_accesses: self.machine.device_accesses(),
                 });
@@ -276,12 +377,19 @@ impl Session {
                 self.idle.next_attempt = now + self.idle.backoff;
                 None
             } else {
+                let reason = if !devices_unchanged {
+                    "device access"
+                } else if !unchanged {
+                    "RAM changed or write-log capacity"
+                } else {
+                    "input state changed"
+                };
                 // Keep the proof so the failure applies to its trigger; the
                 // write log has already ended and ending it again is a no-op.
                 self.idle.proof = Some(proof);
-                Some("changed")
+                Some(reason)
             }
-        } else if proof.steps >= PROOF_STEPS {
+        } else if proof.steps >= proof.limit {
             Some("length")
         } else {
             None
@@ -293,6 +401,10 @@ impl Session {
     }
 
     fn idle_start(&mut self, at_head: bool, from_poll: bool) {
+        self.idle_start_bounded(at_head, from_poll, PROOF_STEPS);
+    }
+
+    fn idle_start_bounded(&mut self, at_head: bool, from_poll: bool, limit: u32) {
         if self.machine.interrupt_pending() || self.machine.cpu.is_halted() {
             return;
         }
@@ -302,13 +414,19 @@ impl Session {
             cpu: self.machine.cpu.snapshot(),
             input: self.input_state(),
             mark: self.machine.begin_idle_proof(),
+            device_accesses: self.machine.device_accesses(),
             steps: 0,
+            limit,
             failure: None,
+            tier_counts: self.machine.cpu.execution_counts(),
         });
     }
 
     /// Hooks for `service`: classify the call and note empty input polls.
     pub(super) fn idle_service(&mut self, vector: u8, ax: u16) {
+        if (vector, ax, self.mouse.motion, self.mouse.buttons) == (0x33, 0x0B, (0, 0), 0) {
+            self.note_empty_motion_poll();
+        }
         let dl = self.machine.cpu.registers.get_byte(2);
         self.idle.note_service(vector, ax, dl, self.mouse.motion);
         let poll = matches!(
@@ -318,8 +436,12 @@ impl Session {
             || (vector, ax) == (0x33, 3)
             || (vector, ax, self.mouse.motion) == (0x33, 0x0B, (0, 0));
         if poll {
+            self.observer.query();
             let now = self.steps;
             self.idle.note_poll(now);
         }
     }
 }
+
+#[cfg(test)]
+mod candidate_tests;

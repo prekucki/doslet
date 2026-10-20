@@ -1,6 +1,6 @@
 //! Preloaded guest directory tree with stable file nodes and a sparse upper.
 //! Host acquisition remains in platform adapters; DOS names use ASCII folding.
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 mod overlay;
 pub mod search;
 
@@ -77,9 +77,25 @@ impl Name {
     }
 }
 
+// Empty files created by the guest must not allocate an Arc after setup.
+#[derive(Clone, Default)]
+struct FileBytes(Option<Arc<Vec<u8>>>);
+impl From<Vec<u8>> for FileBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self((!bytes.is_empty()).then(|| Arc::new(bytes)))
+    }
+}
+impl core::ops::Deref for FileBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.0.as_ref().map_or(&[], |bytes| bytes.as_slice())
+    }
+}
+
+#[derive(Clone)]
 struct File {
     name: Name,
-    bytes: Vec<u8>,
+    bytes: FileBytes,
     base_name: Name,
     deleted: bool,
     directory: bool,
@@ -91,6 +107,7 @@ struct Handle {
     mode: u8,
 }
 
+#[derive(Clone)]
 pub struct DirectoryTree {
     files: Vec<File>,
     handles: [Option<usize>; HANDLE_COUNT],
@@ -104,12 +121,74 @@ pub struct DirectoryTree {
     overlay: Option<overlay::Overlay>,
     new_file_limit: usize,
 }
+/// Read-only view of a file after applying the sparse writable upper layer.
+/// Intended for host-side export; reading does not mutate DOS file handles.
+pub struct VisibleFile<'a> {
+    tree: &'a DirectoryTree,
+    index: usize,
+}
+impl VisibleFile<'_> {
+    pub fn name(&self) -> &[u8] {
+        self.tree.files[self.index].name.as_bytes()
+    }
+    pub fn len(&self) -> u32 {
+        let original = self.tree.files[self.index].bytes.len() as u32;
+        self.tree
+            .overlay
+            .as_ref()
+            .map_or(original, |upper| upper.length(self.index, original))
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn read_into(&self, position: u32, output: &mut [u8]) {
+        let original = &self.tree.files[self.index].bytes;
+        let count = output
+            .len()
+            .min(self.len().saturating_sub(position) as usize);
+        let (within, beyond) = output.split_at_mut(count);
+        beyond.fill(0);
+        if let Some(upper) = &self.tree.overlay {
+            upper.read_into(self.index, position, original, within);
+        } else {
+            within.fill(0);
+            let count = within
+                .len()
+                .min(original.len().saturating_sub(position as usize));
+            if count != 0 {
+                within[..count]
+                    .copy_from_slice(&original[position as usize..position as usize + count]);
+            }
+        }
+    }
+}
 impl Default for DirectoryTree {
     fn default() -> Self {
         Self::new()
     }
 }
 impl DirectoryTree {
+    /// Files visible to DOS, including created and renamed files and their
+    /// effective contents. Deleted files and directory records are omitted.
+    pub fn visible_files(&self) -> impl Iterator<Item = VisibleFile<'_>> {
+        self.files.iter().enumerate().filter_map(|(index, file)| {
+            (!file.deleted && !file.directory).then_some(VisibleFile { tree: self, index })
+        })
+    }
+    /// ZIP mounting infers directories from file paths, so an empty guest
+    /// directory cannot currently be represented in a flattened archive.
+    pub fn has_empty_directories(&self) -> bool {
+        self.files.iter().any(|directory| {
+            !directory.deleted
+                && directory.directory
+                && !self.files.iter().any(|file| {
+                    !file.deleted
+                        && !file.directory
+                        && file.name.as_bytes().starts_with(directory.name.as_bytes())
+                        && file.name.as_bytes().get(directory.name.len) == Some(&b'\\')
+                })
+        })
+    }
     /// Mounted input plus the bounded writable overlay, in 512-byte clusters.
     /// Free space describes the emulated write budget, not the host filesystem.
     pub fn disk_space(&self) -> (u64, u64) {
@@ -186,7 +265,7 @@ impl DirectoryTree {
                 base_name: Name::ROOT,
                 deleted: false,
                 directory: false,
-                bytes: Vec::new(),
+                bytes: FileBytes::default(),
             });
             index
         };
@@ -231,7 +310,7 @@ impl DirectoryTree {
             base_name: name,
             deleted: false,
             directory: false,
-            bytes,
+            bytes: FileBytes::from(bytes),
         });
         Ok(())
     }
@@ -814,7 +893,7 @@ impl DirectoryTree {
             base_name: Name::ROOT,
             deleted: false,
             directory: true,
-            bytes: Vec::new(),
+            bytes: FileBytes::default(),
         });
         self.namespace_dirty = true;
         Ok(())
@@ -971,7 +1050,7 @@ impl DirectoryTree {
                     base_name: Name::ROOT,
                     deleted,
                     directory,
-                    bytes: Vec::new(),
+                    bytes: FileBytes::default(),
                 });
             } else {
                 self.files[index].name = name;
@@ -1201,3 +1280,7 @@ mod import_compatibility_tests {
         );
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "tree_saved.rs"]
+mod saved_state;

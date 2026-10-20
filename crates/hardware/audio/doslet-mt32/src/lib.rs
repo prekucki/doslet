@@ -30,6 +30,24 @@ impl core::fmt::Display for Error {
 }
 impl core::error::Error for Error {}
 
+/// Check the exact ROM pair supported by this backend without creating a synth.
+pub fn validate_roms(control: &[u8], pcm: &[u8]) -> Result<(), Error> {
+    // moont's ROM layout is fixed to CM-32L v1.02. Validate before its parser
+    // indexes ROM tables; equal-sized MT-32 or corrupt images are unsuitable.
+    const CONTROL: [u8; 20] = [
+        0xa4, 0x39, 0xfb, 0xb3, 0x90, 0xda, 0x38, 0xca, 0xda, 0x95, 0xa7, 0xcb, 0xb1, 0xd6, 0xca,
+        0x19, 0x9c, 0xd6, 0x6e, 0xf8,
+    ];
+    const PCM: [u8; 20] = [
+        0x28, 0x9c, 0xc2, 0x98, 0xad, 0x53, 0x2b, 0x70, 0x24, 0x61, 0xbf, 0xc7, 0x38, 0x00, 0x9d,
+        0x9e, 0xbe, 0x80, 0x25, 0xea,
+    ];
+    if Sha1::digest(control).as_slice() != CONTROL || Sha1::digest(pcm).as_slice() != PCM {
+        return Err(Error::UnsupportedRom);
+    }
+    Ok(())
+}
+
 enum Device {
     Mt32(cm32l::Device),
     Gm(cm32l::GmDevice),
@@ -75,19 +93,7 @@ impl Timeline {
         if !(22050..=192000).contains(&rate) {
             return Err(Error::Rate);
         }
-        // moont's ROM layout is fixed to CM-32L v1.02. Validate before its parser
-        // indexes ROM tables; equal-sized MT-32 or corrupt images are unsuitable.
-        const CONTROL: [u8; 20] = [
-            0xa4, 0x39, 0xfb, 0xb3, 0x90, 0xda, 0x38, 0xca, 0xda, 0x95, 0xa7, 0xcb, 0xb1, 0xd6,
-            0xca, 0x19, 0x9c, 0xd6, 0x6e, 0xf8,
-        ];
-        const PCM: [u8; 20] = [
-            0x28, 0x9c, 0xc2, 0x98, 0xad, 0x53, 0x2b, 0x70, 0x24, 0x61, 0xbf, 0xc7, 0x38, 0x00,
-            0x9d, 0x9e, 0xbe, 0x80, 0x25, 0xea,
-        ];
-        if Sha1::digest(control).as_slice() != CONTROL || Sha1::digest(pcm).as_slice() != PCM {
-            return Err(Error::UnsupportedRom);
-        }
+        validate_roms(control, pcm)?;
         let rom = cm32l::Rom::new(control, pcm).map_err(Error::Rom)?;
         Ok(Self {
             device: if gm {

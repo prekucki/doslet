@@ -37,6 +37,7 @@ fn remote_iso_suspends_without_guest_time_or_cpu_retry_and_rejects_duplicate() {
     assert_eq!(session.advance(10000), 0);
     assert_eq!(session.emulated_nanos(), time);
     assert_eq!(session.registers().ip, ip);
+    assert_eq!(session.disk_read_bytes(), 0);
     let request = session.next_host_request().unwrap();
     let HostRequest::Read {
         tag,
@@ -71,6 +72,7 @@ fn remote_iso_suspends_without_guest_time_or_cpu_retry_and_rejects_duplicate() {
     session.advance(1000);
     assert_eq!(session.status(), SessionStatus::Exited(0));
     assert_eq!(session.ram_view(0x10300..0x10304).unwrap(), b"data");
+    assert_eq!(session.disk_read_bytes(), 4);
 }
 fn save_program() -> Vec<u8> {
     let mut program = vec![0; 0x120];
@@ -88,6 +90,47 @@ fn save_session() -> Session {
         .unwrap()
         .with_drive(ReadOnlyDrive::new().with_write_overlay(16384))
 }
+#[cfg(feature = "save-state")]
+#[test]
+fn diagnostic_replay_uses_private_writes_and_does_not_inherit_the_live_store() {
+    let mut live = save_session();
+    let base = live.base_identity();
+    live.attach_persistent_store([1; 32], base, 77, 9, None)
+        .unwrap();
+    assert!(live.check_working_state().is_ok());
+    assert!(
+        live.save_state().is_err(),
+        "portable state policy stays unchanged"
+    );
+    let initial_files = live.export_overlay().unwrap();
+    let mut replay = live.capture_working_state().unwrap().restore().unwrap();
+    assert_eq!(replay.committed_revision(), None);
+    replay.start();
+    replay.advance(1000);
+    assert_eq!(replay.status(), SessionStatus::Exited(0));
+    assert!(!replay.storage_waiting());
+    assert!(!replay.pending_commit());
+    assert!(replay.next_host_request().is_none());
+    assert!(replay.dirty_overlay());
+    assert_ne!(replay.export_overlay().unwrap(), initial_files);
+    assert_eq!(live.export_overlay().unwrap(), initial_files);
+    assert_eq!(live.committed_revision(), Some(9));
+    assert!(!live.dirty_overlay());
+    assert_eq!(live.steps(), 0);
+    assert!(live.next_host_request().is_none());
+
+    // The live owner still makes a real commit request for the same guest write.
+    live.start();
+    live.advance(1000);
+    assert!(live.pending_commit());
+    assert!(live.check_working_state().is_err());
+    assert!(live.capture_working_state().is_err());
+    assert!(matches!(
+        live.next_host_request(),
+        Some(HostRequest::Commit { .. })
+    ));
+}
+
 #[test]
 fn persistent_create_and_close_await_atomic_ack_with_no_auto_resume() {
     let session = save_session();
@@ -247,6 +290,7 @@ fn large_local_read_stages_then_copies_in_bounded_windows_without_guest_time() {
             .all(|b| *b == 7)
     );
     assert_eq!(session.registers().get(Gpr16::Ax), 0x5000);
+    assert_eq!(session.disk_read_bytes(), 0x5000);
 }
 #[cfg(not(target_arch = "wasm32"))]
 #[test]

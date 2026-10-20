@@ -41,6 +41,8 @@ pub struct Opl3 {
     timers: [Timer; 2],
     started: bool,
     fraction: u64,
+    key_on_writes: u64,
+    peak: u16,
 }
 impl Default for Opl3 {
     fn default() -> Self {
@@ -50,12 +52,20 @@ impl Default for Opl3 {
             timers: core::array::from_fn(|_| Timer::default()),
             started: false,
             fraction: 0,
+            key_on_writes: 0,
+            peak: 0,
         }
     }
 }
 impl Opl3 {
     pub fn started(&self) -> bool {
         self.started
+    }
+    pub fn key_on_writes(&self) -> u64 {
+        self.key_on_writes
+    }
+    pub fn peak(&self) -> u16 {
+        self.peak
     }
     pub fn next_sample_nanos(&self) -> Option<u64> {
         self.started
@@ -84,6 +94,9 @@ impl Opl3 {
                 }
             }
             _ => {
+                if matches!(register, 0xB0..=0xB8 | 0x1B0..=0x1B8) && value & 0x20 != 0 {
+                    self.key_on_writes += 1;
+                }
                 self.started = true;
                 // The CPU/machine already orders writes on the guest timeline.
                 self.chip.write_register(register, value);
@@ -122,6 +135,10 @@ impl Opl3 {
             self.chip
                 .generate_resampled(&mut sample)
                 .expect("stereo buffer");
+            self.peak = self
+                .peak
+                .max(sample[0].unsigned_abs())
+                .max(sample[1].unsigned_abs());
             let time = end - self.fraction / u64::from(SAMPLE_RATE);
             emit(time, sample);
         }
@@ -130,3 +147,7 @@ impl Opl3 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

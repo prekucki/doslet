@@ -56,7 +56,7 @@ export class HostIo {
         throw new Error('Storage did not settle within the operation limit');
     }
     async prepare(metadata, reset = false) {
-        let media = null, namespace = null, opened = false;
+        let media = null, namespace = null, opened = false, emptyStore = false;
         try {
             if(metadata.iso) {
                 if(reset && this.media) media = this.media;
@@ -71,10 +71,11 @@ export class HostIo {
             if(metadata.store !== null) {
                 namespace = hex(await fingerprint(metadata.store));
                 const state = await this.storage({kind:'open',namespace,base:metadata.base});
+                emptyStore = !state.payload?.length;
                 opened = namespace !== this.namespace;
                 this.engine.candidate_store(Uint8Array.from(namespace.match(/../g),v=>parseInt(v,16)), BigInt(state.fence), BigInt(state.revision), state.payload);
             }
-            return {media,namespace,input:metadata.input,blob:reset?this.activeBlob:this.selectedBlob};
+            return {media,namespace,input:metadata.input,blob:reset?this.activeBlob:this.selectedBlob,emptyStore};
         } catch(error) {
             if(media && media!==this.media) media.close();
             if(opened) await this.storage({kind:'close',namespace});

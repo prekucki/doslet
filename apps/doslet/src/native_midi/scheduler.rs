@@ -56,6 +56,7 @@ struct State {
     last_nanos: Option<u64>,
     active: bool,
     silence: bool,
+    reset: Option<Message>,
     stop: bool,
     epoch: u64,
     error: Option<String>,
@@ -70,6 +71,7 @@ enum Action {
         epoch: u64,
     },
     Silence,
+    Reset(Message),
     Stop,
     Wait(Option<Duration>),
 }
@@ -82,6 +84,7 @@ impl State {
             last_nanos: None,
             active: false,
             silence: false,
+            reset: None,
             stop: false,
             epoch: 0,
             error: None,
@@ -127,6 +130,9 @@ impl State {
         }
         if self.stop {
             return Action::Stop;
+        }
+        if let Some(message) = self.reset.take() {
+            return Action::Reset(message);
         }
         if self.active
             && self.error.is_none()
@@ -215,9 +221,10 @@ impl Output {
         self.shared.state.lock().unwrap().clock = Some((guest, now));
         self.shared.wake.notify_one();
     }
-    pub fn clear(&self) {
+    pub fn reset(&self, message: &[u8]) {
         let mut state = self.shared.state.lock().unwrap();
         state.cancel();
+        state.reset = Some(Message::new(message));
         state.sent = 0;
         state.late = 0;
         state.max_late = Duration::ZERO;
@@ -282,6 +289,7 @@ fn run(mut sink: impl Sink, shared: Arc<Shared>) {
                 (sink.send(message.bytes()), Some((epoch, late)))
             }
             Action::Silence => (silence(&mut sink), None),
+            Action::Reset(message) => (sink.send(message.bytes()), None),
             Action::Stop => return,
             Action::Wait(_) => unreachable!(),
         };
@@ -312,6 +320,47 @@ fn run(mut sink: impl Sink, shared: Arc<Shared>) {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn reconnect_resets_a_paused_receiver_before_new_guest_messages() {
+        let (output, rx) = Output::mock();
+        let reset = doslet_midi_routing::Mode::Mt32.reset_message();
+        output.reset(reset);
+        // Reset is control traffic: it needs neither active playback nor a clock.
+        let mut messages = Vec::new();
+        loop {
+            let (_, message) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let initialized = message == reset;
+            messages.push(message);
+            if initialized {
+                break;
+            }
+        }
+        assert_eq!(messages.len(), 33);
+        assert!(
+            messages[..32]
+                .iter()
+                .all(|m| m[0] & 0xf0 == 0xb0 && matches!(m[1], 64 | 120))
+        );
+        output.set_active(true);
+        output.push(0, &[0xb1, 7, 100]).unwrap();
+        output.push(0, &[0x91, 60, 100]).unwrap();
+        output.start_clock(0, Instant::now());
+        loop {
+            let (_, message) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if message == [0xb1, 7, 100] {
+                break;
+            }
+            assert_eq!(message[0] & 0xf0, 0xb0);
+        }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap().1,
+            [0x91, 60, 100]
+        );
+        output.push(5_000_000_000, &[0x91, 61, 100]).unwrap();
+        drop(output); // Disconnect cancels the delayed old note and silences all voices.
+        assert!(rx.try_iter().all(|(_, m)| m[0] & 0xf0 == 0xb0));
+    }
 
     #[test]
     fn deadlines_preserve_guest_intervals_and_message_order() {

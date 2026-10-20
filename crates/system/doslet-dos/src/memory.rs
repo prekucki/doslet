@@ -17,11 +17,35 @@ pub struct MemoryFailure {
     pub available: u16,
 }
 
+/// DOS-owned blocks, excluding MCB headers and firmware reservations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryStats {
+    pub allocated_bytes: u64,
+    pub free_bytes: u64,
+    pub largest_free_bytes: u64,
+    pub allocated_blocks: u32,
+}
+
 pub struct MemoryArena {
     blocks: [Block; CAPACITY],
     len: usize,
 }
 impl MemoryArena {
+    /// Read fixed allocation metadata without scanning or copying guest RAM.
+    pub fn stats(&self) -> MemoryStats {
+        let mut stats = MemoryStats::default();
+        for block in &self.blocks[..self.len] {
+            let bytes = u64::from(block.paragraphs) * 16;
+            if block.owner == 0 {
+                stats.free_bytes += bytes;
+                stats.largest_free_bytes = stats.largest_free_bytes.max(bytes);
+            } else {
+                stats.allocated_bytes += bytes;
+                stats.allocated_blocks += 1;
+            }
+        }
+        stats
+    }
     /// Initial process block followed by free memory up to the exclusive end.
     pub fn new(psp: u16, process_end: u16, arena_end: u16) -> Self {
         assert!(psp != 0 && psp < process_end && process_end <= arena_end);
@@ -156,6 +180,22 @@ impl MemoryArena {
 mod tests {
     use super::*;
     #[test]
+    fn stats_follow_allocations_frees_and_mcb_overhead() {
+        let mut arena = MemoryArena::new(0x1000, 0x2000, 0xA000);
+        let initial = arena.stats();
+        assert_eq!(initial.allocated_bytes, 0x10000);
+        assert_eq!(initial.free_bytes, 0x7FFF0);
+        assert_eq!(initial.largest_free_bytes, initial.free_bytes);
+        assert_eq!(initial.allocated_blocks, 1);
+        let segment = arena.allocate(0x100, 0x1000).unwrap();
+        let allocated = arena.stats();
+        assert_eq!(allocated.allocated_bytes, initial.allocated_bytes + 4096);
+        assert_eq!(allocated.free_bytes, initial.free_bytes - 4096 - 16);
+        assert_eq!(allocated.allocated_blocks, 2);
+        arena.free(segment).unwrap();
+        assert_eq!(arena.stats(), initial);
+    }
+    #[test]
     fn hundreds_of_small_dos_buffers_fit_without_false_out_of_memory() {
         let mut arena = MemoryArena::new(0x1000, 0x2000, 0xA000);
         for _ in 0..233 {
@@ -201,3 +241,7 @@ mod tests {
         assert_eq!(arena.allocate(1, 0x1000).unwrap_err().code, 8);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "memory_saved.rs"]
+mod saved_state;

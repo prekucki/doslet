@@ -17,10 +17,19 @@ impl Default for Mixer {
         mixer.reset_volumes();
         mixer.registers[0x80] = 4; // IRQ7.
         mixer.registers[0x81] = 0x22; // DMA1/DMA5.
+        mixer.registers[0x83] = 0x0F; // DSP byte/word and MPU interrupt enables.
         mixer
     }
 }
 impl Mixer {
+    pub fn fm_levels(&self) -> [u8; 4] {
+        [
+            self.registers[0x30],
+            self.registers[0x31],
+            self.registers[0x34],
+            self.registers[0x35],
+        ]
+    }
     /// Apply the CT1745 master and FM levels independently to both channels.
     /// Each step below 31 attenuates by approximately 2 dB; zero mutes.
     pub fn fm_samples(&self, mut samples: [i16; 2]) -> [i16; 2] {
@@ -90,6 +99,9 @@ impl Mixer {
     pub fn set_interrupt_status(&mut self, value: u8) {
         self.registers[0x82] = value & 7;
     }
+    pub fn enabled_irq_sources(&self) -> u8 {
+        self.registers[0x83] & 7
+    }
     pub fn select(&mut self, index: u8) {
         self.index = index;
     }
@@ -97,7 +109,10 @@ impl Mixer {
         self.index
     }
     fn reset_volumes(&mut self) {
-        self.registers[0x30..=0x39].fill(0xD8);
+        // Start playback at unity like DOSBox, independently of the game's
+        // later DAC/FM fader writes. D8h on master silently adds -8 dB.
+        self.registers[0x30..=0x37].fill(0xF8);
+        self.registers[0x38..=0x39].fill(0xD8);
         self.registers[0x3A] = 0;
         self.registers[0x3B] = 0xC0;
         self.registers[0x3C] = 0x1F;
@@ -121,7 +136,7 @@ impl Mixer {
         }
         match self.index {
             0 => Ok(0),
-            0x30..=0x47 | 0x80..=0x82 => Ok(self.registers[usize::from(self.index)]),
+            0x30..=0x47 | 0x80..=0x83 => Ok(self.registers[usize::from(self.index)]),
             _ => Err(UnsupportedRegister(self.index)),
         }
     }
@@ -144,6 +159,7 @@ impl Mixer {
             0x44..=0x47 => 0xF0,
             0x80 => 15,
             0x81 => 0xEB,
+            0x83 => 0x0F,
             0x82 => return Ok(()), // Interrupt status is read-only; no source is active yet.
             _ => return Err(UnsupportedRegister(self.index)),
         };
@@ -155,8 +171,39 @@ impl Mixer {
 mod tests {
     use super::*;
     #[test]
+    fn wave_blaster_irq_enable_can_be_saved_disabled_and_restored() {
+        let mut mixer = Mixer::default();
+        mixer.select(0x83);
+        let original = mixer.read().unwrap();
+        assert_eq!(original, 0x0f);
+        mixer.write(0x0b).unwrap();
+        assert_eq!(mixer.read(), Ok(0x0b));
+        assert_eq!(mixer.enabled_irq_sources(), 3);
+        mixer.set_interrupt_status(7);
+        mixer.select(0x82);
+        assert_eq!(mixer.read(), Ok(7)); // Masking does not acknowledge pending IRQs.
+        mixer.select(0x83);
+        mixer.write(0).unwrap();
+        assert_eq!(mixer.enabled_irq_sources(), 0);
+        #[cfg(feature = "save-state")]
+        {
+            use doslet_state::State;
+            let saved = mixer.save();
+            assert_eq!(Mixer::load(saved.clone()).unwrap().enabled_irq_sources(), 0);
+            let mut legacy = saved;
+            legacy.irq_enable_initialized = false;
+            assert_eq!(Mixer::load(legacy).unwrap().enabled_irq_sources(), 7);
+        }
+        mixer.write(original).unwrap();
+        assert_eq!(mixer.enabled_irq_sources(), 7);
+        mixer.select(0xff);
+        assert!(mixer.read().is_err());
+    }
+
+    #[test]
     fn master_and_fm_levels_attenuate_each_channel_and_zero_mutes() {
         let mut mixer = Mixer::default();
+        assert_eq!(mixer.fm_samples([10000, -10000]), [10000, -10000]);
         for register in [0x30, 0x31, 0x34, 0x35] {
             mixer.select(register);
             mixer.write(0xF8).unwrap();
@@ -192,6 +239,7 @@ mod tests {
         assert_eq!(mixer.read(), Ok(0x38));
         mixer.select(0);
         mixer.write(0).unwrap();
+        assert_eq!(mixer.fm_samples([10000, -10000]), [10000, -10000]);
         mixer.select(0x80);
         assert_eq!(mixer.read(), Ok(4));
         mixer.select(0x81);
@@ -203,3 +251,7 @@ mod tests {
         assert_eq!(mixer.write(0), Err(UnsupportedRegister(0xFF)));
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

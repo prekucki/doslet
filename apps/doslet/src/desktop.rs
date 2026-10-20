@@ -1,5 +1,6 @@
 //! Desktop presentation owns snapshots; the emulation thread exclusively owns Session.
 use crate::app::Message;
+use crate::native_effects::Effects;
 use crate::presentation::{DisplayFrame, DisplaySizing};
 use doslet_midi_routing::Mode;
 use doslet_runtime::{RuntimeError, SessionStatus};
@@ -58,7 +59,27 @@ impl SessionSnapshot {
         self.dirty
     }
 }
+#[allow(dead_code)]
 pub struct Snapshot {
+    pub cpu_settings: crate::cpu_config::Settings,
+    pub cpu_profile: Option<crate::cpu_config::ProfileInfo>,
+    pub cpu_learning_available: bool,
+    pub disk_reads: (u64, u64),
+    pub video_mode_label: String,
+    pub audio_volume: u8,
+    pub audio_use: doslet_runtime::AudioUse,
+    pub memory_usage: doslet_runtime::session::MemoryUsage,
+    pub(crate) cpu_activity: Option<crate::cpu_meter::Activity>,
+    pub(crate) speed_tiers: Option<crate::native_speed_tiers::Stats>,
+    pub analysis: doslet_runtime::session::AnalyzerStats,
+    pub host_audio_underruns: Option<u64>,
+    pub synchronization: doslet_runtime::session::SynchronizationStats,
+    pub idle_observation: doslet_runtime::session::IdleObservation,
+    pub adaptive_idle_percent: u8,
+    pub learned_idle: bool,
+    pub menu_idle: (bool, u64, u64),
+    pub mcp: Option<std::net::SocketAddr>,
+    pub gdb: Option<(std::net::SocketAddr, bool)>,
     pub session: SessionSnapshot,
     pub workspace: crate::ui::Workspace,
     pub configurator: Option<crate::configurator::ConfiguratorState>,
@@ -67,9 +88,12 @@ pub struct Snapshot {
     pub notice: Option<String>,
     pub midi_choices: Vec<String>,
     pub midi_choice: String,
+    #[cfg(target_os = "linux")]
+    pub audio_mixer: crate::audio::Mixer,
     pub midi_mode: Mode,
     pub midi_output_mode: Mode,
     pub midi_activity: crate::midi_activity::MidiActivity,
+    pub midi_channels: [doslet_midi_routing::Channel; 16],
     pub spectrum: [f32; doslet_pcm::spectrum::BANDS],
     pub pointer_dimensions: (u16, u16),
     pub captured: bool,
@@ -94,7 +118,9 @@ mod tests {
         Worker::spawn_with(move || {
             assert_eq!(std::thread::current().name(), Some("doslet-emulation"));
             let mut engine = Box::new(crate::app::Doslet::new());
-            engine.session = doslet_runtime::Session::new(&[0x40, 0xEB, 0xFD]).unwrap();
+            engine.session = doslet_runtime::Session::new(&[0x40, 0xEB, 0xFD])
+                .unwrap()
+                .into();
             if running {
                 engine.session.start();
             }
@@ -148,6 +174,299 @@ mod tests {
             s.session.steps() == 0 && s.session.status() == SessionStatus::Ready
         });
         drop(worker); // Joins the owner and drops its resources on that thread.
+    }
+
+    #[test]
+    fn gdb_partial_packet_keeps_owner_responsive_and_paused() {
+        use std::io::Write;
+        let (mut worker, initial) = Worker::spawn_with(|| {
+            let mut engine = Box::new(crate::app::Doslet::new());
+            engine.session = doslet_runtime::Session::new(&[0x40, 0xEB, 0xFD])
+                .unwrap()
+                .into();
+            engine.session.start();
+            engine
+                .enable_gdb("127.0.0.1:0".parse().unwrap())
+                .map_err(|e| e.to_string())?;
+            Ok(engine)
+        })
+        .unwrap();
+        let address = initial.gdb.unwrap().0;
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client.write_all(b"$qSupported").unwrap();
+        let paused = wait_for(&worker, |s| s.session.status() == SessionStatus::Paused);
+        let steps = paused.snapshot.session.steps();
+        assert_eq!(paused.snapshot.gdb, Some((address, true)));
+        worker.send(Message::Step).unwrap();
+        let refused = wait_for(&worker, |s| {
+            s.notice
+                .as_ref()
+                .is_some_and(|n| n.contains("GDB controls"))
+        });
+        assert_eq!(refused.snapshot.session.steps(), steps);
+        worker.send(Message::GdbToggle).unwrap();
+        wait_for(&worker, |s| s.gdb.is_none() && s.session.steps() > steps);
+        let began = Instant::now();
+        drop(worker);
+        assert!(began.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    #[ignore = "requires GNU GDB and localhost TCP"]
+    fn local_gdb_desktop_owner_steps_patches_and_detaches() {
+        let (worker, initial) = Worker::spawn_with(|| {
+            let mut engine = Box::new(crate::app::Doslet::new());
+            engine.session = doslet_runtime::Session::new(&[0x40, 0xEB, 0xFD])
+                .unwrap()
+                .into();
+            engine
+                .enable_gdb("127.0.0.1:0".parse().unwrap())
+                .map_err(|e| e.to_string())?;
+            Ok(engine)
+        })
+        .unwrap();
+        let address = initial.gdb.unwrap().0;
+        let mut gdb = std::process::Command::new("gdb");
+        gdb.args(["-nx", "-nh", "--batch"]);
+        for command in [
+            "set confirm off".to_string(),
+            format!("target remote {address}"),
+            "set $eax = 0x1234".into(),
+            "stepi".into(),
+            "set {unsigned char}0x10100 = 0x48".into(),
+            "set $pc = 0x10100".into(),
+            "break *0x10101".into(),
+            "continue".into(),
+            "stepi".into(),
+            "monitor state".into(),
+            "detach".into(),
+        ] {
+            gdb.args(["-ex", &command]);
+        }
+        let output = gdb.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let final_state = wait_for(&worker, |s| {
+            s.session.steps() == 3 && s.gdb == Some((address, false))
+        });
+        assert_eq!(final_state.snapshot.session.status(), SessionStatus::Paused);
+        assert_eq!(
+            final_state
+                .snapshot
+                .session
+                .registers()
+                .get(doslet_x86::Gpr16::Ax),
+            0x1234
+        );
+    }
+
+    fn mcp_rpc(
+        address: std::net::SocketAddr,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let body =
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build();
+        let mut response = ureq::Agent::new_with_config(config)
+            .post(&format!("http://{address}/mcp"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .send(body.as_str())
+            .unwrap();
+        serde_json::from_str(&response.body_mut().read_to_string().unwrap()).unwrap()
+    }
+    fn mcp_tool(
+        address: std::net::SocketAddr,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let response = mcp_rpc(
+            address,
+            "tools/call",
+            serde_json::json!({"name":name,"arguments":arguments}),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        response["result"].clone()
+    }
+    fn mcp_screen(result: &serde_json::Value) -> (u32, u32, Vec<u8>) {
+        use base64::Engine;
+        assert_ne!(result["isError"], true, "{result}");
+        let content = result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "image")
+            .unwrap();
+        assert_eq!(content["mimeType"], "image/png");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(content["data"].as_str().unwrap())
+            .unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+            .read_info()
+            .unwrap();
+        let mut bytes = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut bytes).unwrap();
+        bytes.truncate(info.buffer_size());
+        (info.width, info.height, bytes)
+    }
+    #[test]
+    fn mcp_http_drives_guest_keyboard_mouse_and_reads_native_png() {
+        let (worker, initial) = Worker::spawn_with(|| {
+            assert_eq!(std::thread::current().name(), Some("doslet-emulation"));
+            let mut engine = Box::new(crate::app::Doslet::new());
+            // A local redistributable guest: mode 13h, poll mouse, read BIOS
+            // keys, paint the last ASCII code at pixel zero and retain it in SI.
+            let mut code = vec![
+                0xB8, 0x13, 0, 0xCD, 0x10, 0xB8, 0, 0xA0, 0x8E, 0xC0, 0x31, 0xC0, 0xCD, 0x33,
+            ];
+            let top = code.len();
+            code.extend([
+                0xB8, 3, 0, 0xCD, 0x33, 0x26, 0x88, 0x1E, 1, 0, 0xB4, 1, 0xCD, 0x16,
+            ]);
+            let idle = code.len();
+            code.extend([0x74, 0, 0xB4, 0, 0xCD, 0x16, 0x89, 0xC6, 0x26, 0xA2, 0, 0]);
+            let back = code.len();
+            code.extend([0xEB, 0]);
+            code[idle + 1] = (top as isize - idle as isize - 2) as i8 as u8;
+            code[back + 1] = (top as isize - back as isize - 2) as i8 as u8;
+            engine.session = doslet_runtime::Session::new(&code).unwrap().into();
+            engine.session.start();
+            engine
+                .enable_mcp("127.0.0.1:0".parse().unwrap())
+                .map_err(|e| e.to_string())?;
+            Ok(engine)
+        })
+        .unwrap();
+        let address = initial.mcp.unwrap();
+        let init = mcp_rpc(
+            address,
+            "initialize",
+            serde_json::json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"doslet-test","version":"1"}}),
+        );
+        assert_eq!(init["result"]["protocolVersion"], "2025-11-25", "{init}");
+        let tools = mcp_rpc(address, "tools/list", serde_json::json!({}));
+        assert!(
+            tools["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "screenshot")
+        );
+        wait_for(&worker, |s| {
+            s.display.dimensions().is_some_and(|s| s.width == 320.0)
+        });
+        let screen = mcp_tool(address, "screenshot", serde_json::json!({}));
+        let (w, h, before) = mcp_screen(&screen);
+        assert_eq!((w, h), (320, 200));
+        let moved = mcp_tool(address, "move_mouse", serde_json::json!({"x":319,"y":199}));
+        mcp_screen(&moved);
+        wait_for(&worker, |s| {
+            s.session.registers().get(doslet_x86::Gpr16::Cx) == 639
+                && s.session.registers().get(doslet_x86::Gpr16::Dx) == 199
+        });
+        let click = mcp_tool(
+            address,
+            "click",
+            serde_json::json!({"x":160,"y":100,"hold_ms":30}),
+        );
+        mcp_screen(&click);
+        let typed = mcp_tool(address, "type_text", serde_json::json!({"text":"Aa"}));
+        let (_, _, after) = mcp_screen(&typed);
+        wait_for(&worker, |s| {
+            s.session.registers().get(doslet_x86::Gpr16::Si) & 0xff == u16::from(b'a')
+        });
+        assert_ne!(&before[..4], &after[..4]);
+        let invalid = mcp_tool(address, "move_mouse", serde_json::json!({"x":320,"y":0}));
+        assert_eq!(invalid["isError"], true);
+        let paused = mcp_tool(address, "pause", serde_json::json!({}));
+        assert_eq!(paused["structuredContent"]["status"], "Paused");
+        let steps = paused["structuredContent"]["steps"].as_u64().unwrap();
+        let changed = mcp_tool(address, "set_cpu_mhz", serde_json::json!({"mhz":133}));
+        assert_eq!(changed["structuredContent"]["cpu_mhz"], 133);
+        assert_eq!(
+            changed["structuredContent"]["steps"].as_u64().unwrap(),
+            steps
+        );
+        assert_eq!(changed["structuredContent"]["status"], "Paused");
+        assert_eq!(
+            changed["structuredContent"]["emulated_nanos"],
+            paused["structuredContent"]["emulated_nanos"]
+        );
+        let blocked = mcp_tool(address, "key_press", serde_json::json!({"key":"Escape"}));
+        assert_eq!(blocked["isError"], true);
+        let still = mcp_tool(address, "status", serde_json::json!({}));
+        assert_eq!(still["structuredContent"]["steps"].as_u64().unwrap(), steps);
+        let resumed = mcp_tool(address, "resume", serde_json::json!({}));
+        assert_eq!(resumed["structuredContent"]["status"], "Running");
+        mcp_screen(&mcp_tool(
+            address,
+            "wait",
+            serde_json::json!({"milliseconds":20}),
+        ));
+        drop(worker);
+    }
+
+    #[test]
+    fn mcp_exit_acknowledges_and_requests_shutdown_even_when_paused() {
+        for running in [true, false] {
+            let (worker, initial) = Worker::spawn_with(move || {
+                let mut engine = Box::new(crate::app::Doslet::new());
+                engine.session = doslet_runtime::Session::new(&[0x40, 0xEB, 0xFD])
+                    .unwrap()
+                    .into();
+                engine.session.start();
+                if !running {
+                    engine.session.pause();
+                }
+                engine
+                    .enable_mcp("127.0.0.1:0".parse().unwrap())
+                    .map_err(|e| e.to_string())?;
+                Ok(engine)
+            })
+            .unwrap();
+            let address = initial.mcp.unwrap();
+            let tools = mcp_rpc(address, "tools/list", serde_json::json!({}));
+            assert!(
+                tools["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| {
+                        t["name"] == "exit" && t["annotations"]["destructiveHint"] == true
+                    })
+            );
+            let exiting = mcp_tool(address, "exit", serde_json::json!({}));
+            assert_ne!(exiting["isError"], true, "{exiting}");
+            assert_eq!(exiting["structuredContent"]["status"], "Exiting");
+            let packet = wait_for(&worker, |s| s.session.status() == SessionStatus::Paused);
+            use iced::futures::{StreamExt, executor::block_on};
+            let mut actions = iced_runtime::task::into_stream(packet.effects.into_task()).unwrap();
+            assert!(
+                block_on(async {
+                    while let Some(action) = actions.next().await {
+                        if matches!(action, iced_runtime::Action::Exit) {
+                            return true;
+                        }
+                    }
+                    false
+                }),
+                "shutdown must reach the UI"
+            );
+            let rejected = mcp_tool(address, "resume", serde_json::json!({}));
+            assert_eq!(rejected["isError"], true);
+            let began = Instant::now();
+            drop(worker);
+            assert!(began.elapsed() < Duration::from_secs(5));
+            assert!(std::net::TcpStream::connect(address).is_err());
+        }
     }
 
     #[test]
@@ -207,13 +526,13 @@ mod tests {
         let mailbox = Mailbox::default();
         mailbox.publish(Packet {
             snapshot: engine.snapshot(true),
-            effects: Task::none(),
+            effects: Effects::default(),
             sequence: 1,
         });
         engine.session.single_step();
         mailbox.publish(Packet {
             snapshot: engine.snapshot(false),
-            effects: Task::none(),
+            effects: Effects::default(),
             sequence: 2,
         });
         let latest = mailbox.take().unwrap();
@@ -228,11 +547,15 @@ mod tests {
         let (worker, mut state) = worker(false);
         let configurator = state.configurator.take().unwrap();
         let mut app = Doslet {
+            disk_activity: crate::disk_activity::Activity::default(),
             worker,
             state,
             configurator,
             display_sizing: DisplaySizing::default(),
             config_sequence: 0,
+            cpu_sequence: 0,
+            tier_meter: crate::speed_tier_meter::Meter::default(),
+            from_library: false,
         };
         let _ = app.update(Message::Config(crate::configurator::Edit::Name(
             "New name".into(),
@@ -241,11 +564,22 @@ mod tests {
         let mut old = crate::app::Doslet::new();
         app.worker.mailbox.publish(Packet {
             snapshot: old.snapshot(true),
-            effects: Task::none(),
+            effects: Effects::default(),
             sequence: 0,
         });
         let _ = app.update(Message::GamepadsReady);
         assert_eq!(app.configurator.draft.name, "New name");
+        let _ = app.update(Message::Cpu(crate::cpu_config::Edit::Grey(100)));
+        let _ = app.update(Message::Cpu(crate::cpu_config::Edit::Hot(500)));
+        assert_eq!(app.workspace.cpu.unwrap().grey, 100);
+        app.worker.mailbox.publish(Packet {
+            snapshot: old.snapshot(true),
+            effects: Effects::default(),
+            sequence: 0,
+        });
+        let _ = app.update(Message::GamepadsReady);
+        assert_eq!(app.workspace.cpu.unwrap().grey, 100);
+        assert_eq!(app.workspace.cpu.unwrap().hot, Some(500));
     }
 
     #[test]
@@ -303,7 +637,7 @@ mod tests {
 }
 struct Packet {
     snapshot: Snapshot,
-    effects: Task<Message>,
+    effects: Effects<Message>,
     sequence: u64,
 }
 struct Command {
@@ -316,7 +650,9 @@ impl Mailbox {
     fn publish(&self, mut packet: Packet) {
         let mut slot = self.0.lock().unwrap();
         if let Some(previous) = slot.take() {
-            packet.effects = Task::batch([previous.effects, packet.effects]);
+            let mut effects = previous.effects;
+            effects.append(packet.effects);
+            packet.effects = effects;
             if packet.snapshot.configurator.is_none() {
                 packet.snapshot.configurator = previous.snapshot.configurator;
             }
@@ -408,7 +744,7 @@ impl Worker {
                 if ready_tx.send(Ok(engine.snapshot(true))).is_err() {
                     return;
                 }
-                let mut effects = Task::none();
+                let mut effects = Effects::default();
                 let mut config_dirty = false;
                 let mut sequence = 0;
                 let mut last_publish = std::time::Instant::now();
@@ -416,7 +752,7 @@ impl Worker {
                     let overflow = overflowed.swap(false, Ordering::AcqRel);
                     if let Ok(command) = completion_receiver.try_recv() {
                         sequence = sequence.max(command.sequence);
-                        effects = Task::batch([effects, engine.update(command.message)]);
+                        effects.push(engine.update(command.message));
                         config_dirty = true;
                         refresh.store(true, Ordering::Release);
                     }
@@ -428,7 +764,7 @@ impl Worker {
                         };
                         if !matches!(command.message, Message::Tick) {
                             sequence = sequence.max(command.sequence);
-                            effects = Task::batch([effects, engine.update(command.message)]);
+                            effects.push(engine.update(command.message));
                             config_dirty = true;
                             refresh.store(true, Ordering::Release);
                         }
@@ -438,11 +774,11 @@ impl Worker {
                         let _ = engine
                             .session
                             .release_input_source(doslet_input::InputSourceId(1));
-                        effects = Task::batch([effects, engine.update(Message::FocusLost)]);
+                        effects.push(engine.update(Message::FocusLost));
                         engine.notice = Some(
                             "Input queue full; emulation paused and held input released.".into(),
                         );
-                        effects = Task::batch([effects, engine.update(Message::Tick)]);
+                        effects.push(engine.update(Message::Tick));
                         refresh.store(true, Ordering::Release);
                     }
                     // No iced timer drives execution. Each turn checks commands again.
@@ -452,7 +788,7 @@ impl Worker {
                         engine.presentation_revision,
                     );
                     let guest_before = engine.session.emulated_nanos();
-                    effects = Task::batch([effects, engine.worker_tick()]);
+                    effects.push(engine.worker_tick());
                     let progressed = engine.session.emulated_nanos() != guest_before;
                     let after = (
                         engine.session.status(),
@@ -467,7 +803,7 @@ impl Worker {
                         refresh.store(false, Ordering::Release);
                         output.publish(Packet {
                             snapshot: engine.snapshot(config_dirty),
-                            effects: std::mem::replace(&mut effects, Task::none()),
+                            effects: std::mem::take(&mut effects),
                             sequence,
                         });
                         config_dirty = false;
@@ -483,7 +819,7 @@ impl Worker {
                         }) => {}
                         Ok(command) => {
                             sequence = sequence.max(command.sequence);
-                            effects = Task::batch([effects, engine.update(command.message)]);
+                            effects.push(engine.update(command.message));
                             config_dirty = true;
                             refresh.store(true, Ordering::Release);
                         }
@@ -492,6 +828,7 @@ impl Worker {
                     }
                 }
                 engine.save_core_profile();
+                engine.save_autosave();
             })
             .map_err(|e| e.to_string())?;
         match ready_rx.recv().map_err(|e| e.to_string())? {
@@ -538,11 +875,16 @@ impl Worker {
 }
 
 pub struct Doslet {
+    pub(crate) disk_activity: crate::disk_activity::Activity,
     worker: Worker,
     pub state: Snapshot,
     pub configurator: crate::configurator::ConfiguratorState,
     pub display_sizing: DisplaySizing,
     config_sequence: u64,
+    cpu_sequence: u64,
+    pub(crate) tier_meter: crate::speed_tier_meter::Meter,
+    /// Started from the library, which the toolbar offers to return to.
+    pub from_library: bool,
 }
 impl std::ops::Deref for Doslet {
     type Target = Snapshot;
@@ -552,15 +894,35 @@ impl std::ops::Deref for Doslet {
 }
 impl Doslet {
     pub fn from_cli(cli: crate::cli::Cli) -> Result<Box<Self>, Box<dyn std::error::Error>> {
-        let (worker, mut state) = Worker::spawn(cli)?;
+        let (worker, state) = Worker::spawn(cli)?;
+        Ok(Self::from_worker(worker, state))
+    }
+    /// A frontend for an engine built by `boot` on its emulation thread.
+    #[cfg(test)]
+    pub(crate) fn with_engine(
+        boot: impl FnOnce() -> Result<Box<crate::app::Doslet>, String> + Send + 'static,
+    ) -> Box<Self> {
+        let (worker, state) = Worker::spawn_with(boot).unwrap();
+        Self::from_worker(worker, state)
+    }
+    fn from_worker(worker: Worker, mut state: Snapshot) -> Box<Self> {
         let configurator = state.configurator.take().unwrap();
-        Ok(Box::new(Self {
+        let mut display_sizing = DisplaySizing::default();
+        display_sizing.filter = configurator.active.output.video_filter.into();
+        Box::new(Self {
+            disk_activity: crate::disk_activity::Activity::new(
+                state.disk_reads.0,
+                state.disk_reads.1,
+            ),
             worker,
             state,
             configurator,
-            display_sizing: DisplaySizing::default(),
+            display_sizing,
             config_sequence: 0,
-        }))
+            cpu_sequence: 0,
+            tier_meter: crate::speed_tier_meter::Meter::default(),
+            from_library: false,
+        })
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
         if let Message::DisplaySizing(message) = message {
@@ -572,9 +934,15 @@ impl Doslet {
         if matches!(message, Message::Tick | Message::GamepadsReady) {
             self.worker.signal.clear();
             let effects = if let Some(mut packet) = self.worker.mailbox.take() {
+                if packet.sequence < self.cpu_sequence {
+                    packet.snapshot.workspace.cpu = self.state.workspace.cpu;
+                    packet.snapshot.workspace.cpu_profile_form =
+                        self.state.workspace.cpu_profile_form.clone();
+                }
                 if let Some(mut configurator) = packet.snapshot.configurator.take()
                     && packet.sequence >= self.config_sequence
                 {
+                    let previous_filter = self.configurator.active.output.video_filter;
                     // Preserve selection/caret across snapshots with unchanged text.
                     if configurator.profile_text == self.configurator.profile_text {
                         std::mem::swap(
@@ -583,9 +951,29 @@ impl Doslet {
                         );
                     }
                     self.configurator = configurator;
+                    if self.configurator.active.output.video_filter != previous_filter {
+                        self.display_sizing.filter =
+                            self.configurator.active.output.video_filter.into();
+                    }
                 }
                 self.state = packet.snapshot;
-                packet.effects
+                self.disk_activity.observe(
+                    self.state.disk_reads.0,
+                    self.state.disk_reads.1,
+                    web_time::Instant::now(),
+                );
+                self.tier_meter.sample(
+                    std::time::Instant::now(),
+                    self.state.speed_tiers,
+                    self.state.session.status == SessionStatus::Running
+                        && !self.state.gdb.is_some_and(|(_, connected)| connected),
+                );
+                Task::batch([
+                    packet.effects.into_task(),
+                    self.display_sizing
+                        .refresh(&self.state.display)
+                        .map(Message::DisplaySizing),
+                ])
             } else {
                 Task::none()
             };
@@ -600,6 +988,24 @@ impl Doslet {
         }
         // Editor cursor actions are presentation state; execution sees the same edits.
         let config = matches!(message, Message::Config(_));
+        let cpu = matches!(message, Message::Cpu(_) | Message::CpuProfile(_));
+        if let Message::CpuProfile(crate::cpu_config::ProfileEdit::Path(path)) = &message
+            && let Some(form) = &mut self.state.workspace.cpu_profile_form
+        {
+            form.path.clone_from(path);
+            form.error = None;
+        }
+        if let Message::Cpu(edit) = message {
+            if matches!(edit, crate::cpu_config::Edit::Revert) {
+                self.state.workspace.cpu = Some(self.state.cpu_settings);
+            } else if !matches!(edit, crate::cpu_config::Edit::Apply) {
+                self.state
+                    .workspace
+                    .cpu
+                    .get_or_insert(self.state.cpu_settings)
+                    .edit(edit);
+            }
+        }
         if let Message::Config(edit) = &message {
             self.configurator.edit(edit);
         }
@@ -612,6 +1018,9 @@ impl Doslet {
             Ok(sequence) => {
                 if config {
                     self.config_sequence = sequence;
+                }
+                if cpu {
+                    self.cpu_sequence = sequence;
                 }
             }
             Err(error) => {

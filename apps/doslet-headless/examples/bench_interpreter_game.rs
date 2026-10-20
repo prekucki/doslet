@@ -16,8 +16,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let path = args
         .first()
-        .ok_or("usage: bench_interpreter_game EXE STEPS [ISO|-] [reference|cached] [KEYS]")?;
+        .ok_or("usage: bench_interpreter_game EXE STEPS [ISO|-] [reference|cached] [KEYS] [BATCH] [all|no-idle|no-vga|none]")?;
     let steps: u64 = args.get(1).ok_or("missing STEPS")?.parse()?;
+    let batch: u32 = args.get(5).map_or(Ok(10_000), |s| s.parse())?;
+    if !(1..=10_000).contains(&batch) {
+        return Err("BATCH must be 1..10000".into());
+    }
     let settings = native_input::LaunchSettings {
         hardware: doslet_config::HardwareConfig {
             cpu_mhz: 50,
@@ -34,6 +38,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.get(3).is_some_and(|s| s == "reference") {
         session.set_decode_cache(false);
     }
+    let accelerations = args.get(6).map_or("all", String::as_str);
+    match accelerations {
+        "all" => {}
+        "no-idle" => session.set_idle_loops(false),
+        "no-vga" => session.set_vga_wait_acceleration(false),
+        "none" => {
+            session.set_idle_loops(false);
+            session.set_vga_wait_acceleration(false);
+        }
+        _ => return Err("accelerations must be all, no-idle, no-vga or none".into()),
+    }
     session.start();
     let mut keys = args.get(4).map_or("", String::as_str).bytes();
     let mut midi = [0; 4096];
@@ -41,7 +56,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut midi_hash = 0xcbf29ce484222325_u64;
     let start = Instant::now();
     while session.steps() < steps && session.status() == SessionStatus::Running {
-        session.advance((steps - session.steps()).min(10_000) as u32);
+        session.advance((steps - session.steps()).min(u64::from(batch)) as u32);
         loop {
             let count = session.drain_midi(&mut midi);
             for byte in &midi[..count] {
@@ -63,6 +78,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let elapsed = start.elapsed();
+    eprintln!(
+        "accelerations={accelerations} batch={batch} idle={:?}",
+        session.idle_loop_stats()
+    );
     eprintln!(
         "mode={:?} midi={:?} console={}",
         session.video_mode(),

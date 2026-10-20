@@ -35,23 +35,16 @@ pub struct Output {
     active: bool,
 }
 impl Ports {
+    pub fn selection_name(&self, selection: &str) -> Option<&str> {
+        port_index(&self.names, selection).map(|index| self.names[index].as_str())
+    }
     pub fn connect(self, selection: &str) -> Result<Output, String> {
-        let index = self
-            .names
-            .iter()
-            .position(|name| {
-                name == selection
-                    || name
-                        .split_once(": ")
-                        .is_some_and(|(_, raw)| raw == selection)
-            })
-            .or_else(|| {
-                selection
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|i| *i < self.ports.len())
-            })
-            .ok_or_else(|| format!("Unknown MIDI output {selection:?}; use --list-midi-outputs"))?;
+        let index = port_index(&self.names, selection)
+            .ok_or_else(|| if selection.eq_ignore_ascii_case("timidity") {
+                "TiMidity MIDI port unavailable; start its ALSA sequencer service and refresh outputs".into()
+            } else {
+                format!("Unknown MIDI output {selection:?}; use --list-midi-outputs")
+            })?;
         let name = self.names[index].clone();
         let connection = self
             .output
@@ -65,6 +58,29 @@ impl Ports {
         })
     }
 }
+
+fn port_index(names: &[String], selection: &str) -> Option<usize> {
+    names
+        .iter()
+        .position(|name| {
+            name == selection
+                || name
+                    .split_once(": ")
+                    .is_some_and(|(_, raw)| raw == selection)
+        })
+        .or_else(|| selection.parse::<usize>().ok().filter(|i| *i < names.len()))
+        .or_else(|| {
+            selection
+                .eq_ignore_ascii_case("timidity")
+                .then(|| {
+                    names
+                        .iter()
+                        .position(|name| name.to_ascii_lowercase().contains("timidity"))
+                })
+                .flatten()
+        })
+}
+
 impl Output {
     #[cfg(test)]
     pub(crate) fn mock() -> (Self, std::sync::mpsc::Receiver<(Instant, Vec<u8>)>) {
@@ -109,8 +125,9 @@ impl Output {
     pub fn start_clock(&self, nanos: u64, now: Instant) {
         self.scheduler.start_clock(nanos, now);
     }
-    pub fn clear(&mut self) -> Result<(), String> {
-        self.scheduler.clear();
+    /// A cable reconnect initializes the receiver even while playback is paused.
+    pub fn reset(&mut self, mode: doslet_midi_routing::Mode) -> Result<(), String> {
+        self.scheduler.reset(mode.reset_message());
         self.decoder = Decoder::new();
         self.scheduler.check()
     }
@@ -120,5 +137,24 @@ impl Output {
             "Host MIDI · {} · {sent} sent · {queued} queued · {late} late (>2 ms) · max {max_late:.1} ms",
             self.name
         )
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::port_index;
+    #[test]
+    fn timidity_alias_discovers_running_port_without_changing_explicit_selection() {
+        let ports = vec![
+            "0: External synth".into(),
+            "1: TiMidity port 0".into(),
+            "2: TiMidity port 1".into(),
+        ];
+        assert_eq!(port_index(&ports, "timidity"), Some(1));
+        assert_eq!(port_index(&ports, "TiMidity"), Some(1));
+        assert_eq!(port_index(&ports, "2"), Some(2));
+        assert_eq!(port_index(&ports, "TiMidity port 1"), Some(2));
+        assert_eq!(port_index(&ports, "0: External synth"), Some(0));
+        assert_eq!(port_index(&ports[..1], "timidity"), None);
     }
 }

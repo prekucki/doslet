@@ -4,6 +4,45 @@ use doslet_config::{HardwareConfig, KeyboardMode};
 use doslet_input::PhysicalKey;
 
 #[test]
+fn mixer_errors_identify_the_selected_register_and_wave_blaster_mask_is_routed() {
+    let mut machine = PcMachine::default();
+    machine.bus.write_port_u8(0x224, 0x83).unwrap();
+    let original = machine.bus.read_port_u8(0x225).unwrap();
+    machine.bus.write_port_u8(0x225, 0x0b).unwrap();
+    assert_eq!(machine.bus.read_port_u8(0x225), Ok(0x0b));
+    assert_eq!(machine.audio_status().irq_enabled_sources, 3);
+    machine.bus.write_port_u8(0x225, original).unwrap();
+    machine.bus.write_port_u8(0x224, 0x7f).unwrap();
+    let error = doslet_bus::BusError::UnsupportedPortRegister {
+        port: 0x225,
+        index: 0x7f,
+    };
+    assert_eq!(machine.bus.read_port_u8(0x225), Err(error));
+    assert_eq!(machine.bus.write_port_u8(0x225, 0), Err(error));
+}
+
+#[test]
+fn live_keyboard_mode_keeps_controller_configuration_and_pic_masks() {
+    let mut m = PcMachine::default();
+    m.bus.write_port_u8(0x21, 0x55).unwrap();
+    m.bus.write_port_u8(0x64, 0x60).unwrap();
+    m.bus.write_port_u8(0x60, 0x41).unwrap();
+    m.set_keyboard_mode(KeyboardMode::At).unwrap();
+    m.key_event(PhysicalKey(4), true).unwrap();
+    assert_eq!(m.bus.read_pending_keyboard(), Some(0x1e));
+    let time = m.time();
+    m.set_keyboard_mode(KeyboardMode::Bios).unwrap();
+    assert_eq!(m.bus.read_pending_keyboard(), Some(0x9e));
+    assert_eq!(m.bus.read_port_u8(0x21), Ok(0x55));
+    assert_eq!(m.time(), time);
+    m.set_keyboard_mode(KeyboardMode::At).unwrap();
+    m.bus.write_port_u8(0x64, 0x20).unwrap();
+    assert_eq!(m.bus.read_pending_keyboard(), Some(0x41));
+    m.key_event(PhysicalKey(4), true).unwrap();
+    assert_eq!(m.bus.read_pending_keyboard(), Some(0x1e));
+}
+
+#[test]
 fn native_ram_views_follow_each_configured_capacity_and_page_table() {
     for memory_mib in [4, 8, 16, 32] {
         let mut m = PcMachine::from_config(HardwareConfig {

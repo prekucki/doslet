@@ -41,3 +41,7 @@ mod tests {
         assert_eq!(g.read(1_124_010), 0xEC);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

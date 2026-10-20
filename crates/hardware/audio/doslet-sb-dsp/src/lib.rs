@@ -22,6 +22,8 @@ struct Playback {
     remaining: u32,
     auto_init: bool,
     paused: bool,
+    /// Previous block in this continuous transfer, if any, and its IRQ ACK.
+    previous_block_acknowledged: Option<bool>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SampleEvent {
@@ -36,6 +38,11 @@ pub struct Diagnostics {
     pub dma_requests: u64,
     pub last_dma_command: u8,
     pub dma_units: u64,
+    /// Completed service windows between consecutive auto-init DMA blocks.
+    pub block_irq_deadlines: u64,
+    /// Previous block's matching IRQ was not acknowledged by the next block.
+    /// This observes IRQ service only, not guest buffer refills or host audio.
+    pub block_irq_deadline_misses: u64,
 }
 #[derive(Debug)]
 pub struct Dsp {
@@ -127,6 +134,16 @@ impl Dsp {
     pub fn configured_format(&self) -> Option<Format> {
         self.configured_format
     }
+    /// Earliest output frame that can complete the current DMA block.
+    /// Assumes DMA supplies every requested unit; a stalled DMA can only delay it.
+    pub fn frames_until_block_irq(&self) -> Option<u32> {
+        let state = self.playback.filter(|s| !s.paused)?;
+        Some(
+            state
+                .remaining
+                .div_ceil(if state.format.stereo { 2 } else { 1 }),
+        )
+    }
     pub fn irq_status(&self) -> u8 {
         u8::from(self.irq8) | (u8::from(self.irq16) << 1)
     }
@@ -135,6 +152,12 @@ impl Dsp {
             self.irq16 = false;
         } else {
             self.irq8 = false;
+        }
+        if let Some(state) = &mut self.playback
+            && state.format.word == word
+            && let Some(acknowledged) = &mut state.previous_block_acknowledged
+        {
+            *acknowledged = true;
         }
     }
     /// Consume a single DMA unit. Stereo output waits for both channels; block
@@ -171,6 +194,10 @@ impl Dsp {
         state.remaining -= 1;
         let mut raised_irq = false;
         if state.remaining == 0 {
+            if let Some(acknowledged) = state.previous_block_acknowledged {
+                self.diagnostics.block_irq_deadlines += 1;
+                self.diagnostics.block_irq_deadline_misses += u64::from(!acknowledged);
+            }
             let irq = if format.word {
                 &mut self.irq16
             } else {
@@ -180,6 +207,7 @@ impl Dsp {
             *irq = true;
             if state.auto_init {
                 state.remaining = state.length;
+                state.previous_block_acknowledged = Some(false);
             } else {
                 self.playback = None;
                 self.left = None;
@@ -213,6 +241,7 @@ impl Dsp {
                             remaining: length,
                             auto_init: command & 4 != 0,
                             paused: false,
+                            previous_block_acknowledged: None,
                         });
                         self.left = None;
                         self.configured_format = self.playback.map(|state| state.format);
@@ -300,6 +329,88 @@ impl Dsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn next_dma_block_checks_the_matching_irq_ack_for_byte_word_and_stereo() {
+        for word in [false, true] {
+            for stereo in [false, true] {
+                let mut dsp = Dsp::default();
+                for byte in [
+                    if word { 0xb6 } else { 0xc6 },
+                    if stereo { 0x20 } else { 0 },
+                    3,
+                    0,
+                ] {
+                    dsp.write_command(byte).unwrap();
+                }
+                for _ in 0..4 {
+                    dsp.accept_sample(0).unwrap();
+                }
+                assert_eq!(dsp.diagnostics().block_irq_deadlines, 0);
+                for _ in 0..4 {
+                    dsp.accept_sample(0).unwrap();
+                }
+                assert_eq!(dsp.diagnostics().block_irq_deadlines, 1);
+                assert_eq!(dsp.diagnostics().block_irq_deadline_misses, 1);
+                dsp.acknowledge_irq(!word);
+                for _ in 0..4 {
+                    dsp.accept_sample(0).unwrap();
+                }
+                assert_eq!(dsp.diagnostics().block_irq_deadline_misses, 2);
+                dsp.acknowledge_irq(word);
+                for _ in 0..4 {
+                    dsp.accept_sample(0).unwrap();
+                }
+                assert_eq!(dsp.diagnostics().block_irq_deadlines, 3);
+                assert_eq!(dsp.diagnostics().block_irq_deadline_misses, 2);
+            }
+        }
+    }
+    #[test]
+    fn paused_replaced_and_single_cycle_transfers_do_not_invent_deadlines() {
+        let mut dsp = Dsp::default();
+        for byte in [0xb6, 0, 1, 0] {
+            dsp.write_command(byte).unwrap();
+        }
+        for _ in 0..3 {
+            dsp.accept_sample(0).unwrap();
+        }
+        dsp.write_command(0xd5).unwrap();
+        for _ in 0..10 {
+            assert_eq!(dsp.accept_sample(0), Err(DspError::NoTransfer));
+        }
+        assert_eq!(dsp.diagnostics().block_irq_deadlines, 0);
+        dsp.acknowledge_irq(true);
+        dsp.write_command(0xd6).unwrap();
+        dsp.accept_sample(0).unwrap();
+        assert_eq!(dsp.diagnostics().block_irq_deadlines, 1);
+        assert_eq!(dsp.diagnostics().block_irq_deadline_misses, 0);
+        // Disabling auto-init still finishes the block already in progress.
+        dsp.write_command(0xd9).unwrap();
+        for _ in 0..2 {
+            dsp.accept_sample(0).unwrap();
+        }
+        assert_eq!(dsp.diagnostics().block_irq_deadlines, 2);
+        assert_eq!(dsp.diagnostics().block_irq_deadline_misses, 1);
+        for _ in 0..2 {
+            for byte in [0xb0, 0, 0, 0] {
+                dsp.write_command(byte).unwrap();
+            }
+            dsp.accept_sample(0).unwrap();
+        }
+        assert_eq!(dsp.diagnostics().block_irq_deadlines, 2);
+        for byte in [0xb6, 0, 0, 0] {
+            dsp.write_command(byte).unwrap();
+        }
+        dsp.accept_sample(0).unwrap();
+        dsp.write_reset(1);
+        dsp.write_reset(0);
+        for byte in [0xb6, 0, 0, 0] {
+            dsp.write_command(byte).unwrap();
+        }
+        dsp.accept_sample(0).unwrap();
+        assert_eq!(dsp.diagnostics().block_irq_deadlines, 2);
+        assert_eq!(dsp.diagnostics().block_irq_deadline_misses, 1);
+    }
     #[test]
     fn guest_format_survives_single_cycle_completion_but_not_reset() {
         let mut dsp = Dsp::default();
@@ -391,6 +502,26 @@ mod tests {
         assert!(dsp.speaker_enabled());
     }
     #[test]
+    fn block_irq_horizon_counts_units_and_pause_without_consuming_audio() {
+        let mut dsp = Dsp::default();
+        assert_eq!(dsp.frames_until_block_irq(), None);
+        for byte in [0xb6, 0x30, 3, 0] {
+            dsp.write_command(byte).unwrap();
+        }
+        assert_eq!(dsp.frames_until_block_irq(), Some(2));
+        dsp.accept_sample(0).unwrap();
+        assert_eq!(dsp.frames_until_block_irq(), Some(2));
+        dsp.accept_sample(0).unwrap();
+        assert_eq!(dsp.frames_until_block_irq(), Some(1));
+        dsp.write_command(0xd5).unwrap();
+        assert_eq!(dsp.frames_until_block_irq(), None);
+        dsp.write_command(0xd6).unwrap();
+        assert_eq!(dsp.frames_until_block_irq(), Some(1));
+        dsp.accept_sample(0).unwrap();
+        dsp.accept_sample(0).unwrap();
+        assert_eq!(dsp.frames_until_block_irq(), Some(2));
+    }
+    #[test]
     fn stereo_auto_init_sample_units_irq_ack_and_pause_preserve_block_state() {
         let mut dsp = Dsp::default();
         for byte in [0xB6, 0x30, 3, 0] {
@@ -420,3 +551,7 @@ mod tests {
         assert_eq!(dsp.playback_format(), None);
     }
 }
+
+#[cfg(feature = "save-state")]
+#[path = "lib_saved.rs"]
+mod saved_state;

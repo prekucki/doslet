@@ -2,6 +2,7 @@ use doslet_dos::files::ReadOnlyDrive;
 use doslet_runtime::{Session, SessionStatus};
 
 include!("../../../../tests/fixtures/relocated_mz.rs");
+include!("../../../../tests/fixtures/midi.rs");
 
 #[test]
 fn dos_set_time_returns_status_and_get_time_observes_only_valid_changes() {
@@ -270,6 +271,35 @@ fn exec_overlay_runs_a_preloaded_mz_without_a_new_process() {
 }
 
 #[test]
+fn mz_environment_describes_configured_sound_blaster_and_keeps_program_trailer() {
+    for (sb16, mpu401, irq, dma8, dma16, expected) in [
+        (true, true, 7, 1, 5, Some("BLASTER=A220 I7 D1 H5 T6 P330")),
+        (true, false, 5, 3, 6, Some("BLASTER=A220 I5 D3 H6 T6")),
+        (false, true, 7, 1, 5, None),
+    ] {
+        let config = doslet_config::HardwareConfig {
+            sb16,
+            mpu401,
+            sb_irq: irq,
+            sb_dma8: dma8,
+            sb_dma16: dma16,
+            ..Default::default()
+        };
+        let session =
+            Session::from_mz_stub_named_configured(&relocated_mz(), b"C:\\SYNTH.EXE", config)
+                .unwrap();
+        let ram = session.ram_view(0x0f000..0x0f200).unwrap();
+        let end = ram.windows(2).position(|v| v == [0, 0]).unwrap();
+        let vars: Vec<_> = ram[..end].split(|b| *b == 0).collect();
+        assert_eq!(vars[0], b"PATH=C:\\");
+        assert_eq!(vars.get(1).copied(), expected.map(str::as_bytes));
+        assert_eq!(&ram[end + 2..end + 4], &[1, 0]);
+        assert_eq!(&ram[end + 4..end + 17], b"C:\\SYNTH.EXE\0");
+        assert_eq!(session.audio_use(), Default::default());
+    }
+}
+
+#[test]
 fn executing_an_extended_files_dos_stub_does_not_execute_its_le_image() {
     let original = relocated_mz();
     let mut file = [0; 240];
@@ -292,21 +322,52 @@ fn executing_an_extended_files_dos_stub_does_not_execute_its_le_image() {
 
 #[test]
 fn guest_uart_port_output_reaches_the_sessions_midi_queue() {
-    let program = [
+    let mut program = vec![
         0xBA, 0x31, 3, 0xB0, 0xFF, 0xEE, // Reset MPU.
         0xBA, 0x30, 3, 0xEC, // Consume reset acknowledgement.
         0xBA, 0x31, 3, 0xB0, 0x3F, 0xEE, // Enter UART mode.
-        0xBA, 0x30, 3, 0xEC, 0xB0, 0x90, 0xEE, 0xB0, 60, 0xEE, 0xB0, 100, 0xEE, 0xB8, 0, 0x4C,
-        0xCD, 0x21,
+        0xBA, 0x30, 3, 0xEC, // Consume UART acknowledgement.
     ];
+    for byte in [0x90, 60, 100] {
+        append_midi_byte(&mut program, byte);
+    }
+    program.extend_from_slice(&[0xB8, 0, 0x4C, 0xCD, 0x21]);
     let mut session = Session::new(&program).unwrap();
     session.start();
-    session.advance(100);
+    session.advance(10000);
     assert_eq!(session.status(), SessionStatus::Exited(0));
     let mut midi = [0; 16];
     assert_eq!(session.drain_midi(&mut midi), 3);
     assert_eq!(&midi[..3], &[0x90, 60, 100]);
     assert_eq!(session.drain_midi(&mut midi), 0);
+}
+
+#[test]
+fn guest_uart_busy_survives_frequent_drains_at_different_cpu_rates() {
+    let mut program = vec![0xBA, 0x31, 3, 0xB0, 0x3F, 0xEE];
+    for byte in 0..64 {
+        append_midi_byte(&mut program, byte);
+    }
+    program.extend_from_slice(&[0xB8, 0, 0x4C, 0xCD, 0x21]);
+    for mhz in [1, 33] {
+        let mut session = Session::new(&program).unwrap();
+        session.set_cpu_mhz(mhz).unwrap();
+        session.start();
+        let mut received = Vec::new();
+        let mut bytes = [0; 64];
+        for _ in 0..10000 {
+            session.advance(64);
+            let count = session.drain_midi(&mut bytes);
+            received.extend_from_slice(&bytes[..count]);
+            if session.status() != SessionStatus::Running {
+                break;
+            }
+        }
+        assert_eq!(session.status(), SessionStatus::Exited(0));
+        assert_eq!(received, (0..64).collect::<Vec<u8>>());
+        assert!(session.emulated_nanos() >= 63 * 320_000);
+        assert!(session.emulated_nanos() < 25_000_000);
+    }
 }
 
 #[test]

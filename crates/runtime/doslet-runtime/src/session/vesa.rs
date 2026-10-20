@@ -36,7 +36,7 @@ impl Session {
                 true
             }
             2 if bx & !0x8000 == 0x101 => {
-                self.machine.bus.vga.set_vbe_101h(bx & 0x8000 != 0);
+                self.machine.bus.set_video_vbe_101h(bx & 0x8000 != 0);
                 self.mouse_video_mode_changed();
                 true
             }

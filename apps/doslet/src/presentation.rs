@@ -2,6 +2,12 @@
 use doslet_runtime::Session;
 use iced::Size;
 use iced::widget::image::Handle;
+use iced_runtime::image::{self, Allocation, Error};
+
+mod filter;
+mod upload;
+pub use filter::DisplayFilter;
+pub use upload::PreparedFrame;
 
 // Logical pixels keep the UI usable independently of the monitor's DPI.
 #[cfg(not(target_arch = "wasm32"))]
@@ -9,13 +15,28 @@ pub const DEFAULT_WINDOW_SIZE: Size = Size::new(960.0, 640.0);
 #[cfg(not(target_arch = "wasm32"))]
 pub const MIN_WINDOW_SIZE: Size = Size::new(400.0, 160.0);
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DisplayFrame {
     pub image: Option<Handle>,
+    // Snapshots may skip the empty frame at reset. Preserve a stream identity
+    // so an upload from the previous session cannot be presented afterward.
+    generation: u64,
     #[cfg(not(target_arch = "wasm32"))]
     revision: Option<(usize, usize, u64)>,
 }
-#[cfg(not(target_arch = "wasm32"))]
+
+impl Default for DisplayFrame {
+    fn default() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+        Self {
+            image: None,
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            #[cfg(not(target_arch = "wasm32"))]
+            revision: None,
+        }
+    }
+}
 impl DisplayFrame {
     pub fn dimensions(&self) -> Option<Size> {
         match self.image.as_ref()? {
@@ -34,49 +55,135 @@ pub fn fit_size(available: Size, aspect_ratio: f32) -> Size {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub struct DisplaySizing {
-    pub actual_size: bool,
-    viewport: Size,
-    scale_factor: f32,
-    resize_passes: u8,
+/// Use whole physical pixels, even when the host uses fractional DPI scaling.
+/// Small viewports retain 1x and scroll instead of discarding guest pixels.
+pub fn pixel_perfect_size(available: Size, pixels: Size, scale_factor: f32) -> Size {
+    let zoom = (available.width * scale_factor / pixels.width)
+        .min(available.height * scale_factor / pixels.height)
+        .floor()
+        .max(1.0);
+    Size::new(
+        pixels.width * zoom / scale_factor,
+        pixels.height * zoom / scale_factor,
+    )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+pub struct DisplaySizing {
+    pub pixel_perfect: bool,
+    pub filter: DisplayFilter,
+    viewport: Size,
+    scale_factor: f32,
+    filtered: filter::FilterCache,
+    uploads: upload::UploadQueue,
+    #[cfg(target_arch = "wasm32")]
+    web_image: Option<PreparedFrame>,
+}
+
 impl Default for DisplaySizing {
     fn default() -> Self {
         Self {
-            actual_size: false,
+            pixel_perfect: false,
+            filter: DisplayFilter::default(),
             viewport: Size::ZERO,
             scale_factor: 1.0,
-            resize_passes: 0,
+            filtered: filter::FilterCache::default(),
+            uploads: upload::UploadQueue::default(),
+            #[cfg(target_arch = "wasm32")]
+            web_image: None,
         }
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
 pub enum SizingMessage {
-    ActualSize,
+    PixelPerfect,
     Fit,
+    Filter(DisplayFilter),
     Viewport(Size),
     ScaleFactor(f32),
-    WindowMetrics(iced::window::Id, Size, f32),
+    Uploaded(u64, Result<Allocation, Error>),
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl DisplaySizing {
-    pub fn image_size(&self, frame: &DisplayFrame) -> Option<Size> {
-        if !self.actual_size {
-            return None;
+    pub fn image_size(&self, available: Size, pixels: Size) -> Size {
+        if self.pixel_perfect {
+            pixel_perfect_size(available, pixels, self.scale_factor)
+        } else {
+            fit_size(available, 4.0 / 3.0)
         }
-        let pixels = frame.dimensions()?;
-        Some(Size::new(
-            pixels.width / self.scale_factor,
-            pixels.height / self.scale_factor,
-        ))
     }
 
+    pub fn image(&self) -> Option<&PreparedFrame> {
+        #[cfg(target_arch = "wasm32")]
+        return self.web_image.as_ref();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.uploads.frame()
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.uploads.error()
+    }
+
+    pub fn refresh(&mut self, frame: &DisplayFrame) -> iced::Task<SizingMessage> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.scale_factor =
+                web_sys::window().map_or(1.0, |window| window.device_pixel_ratio()) as f32;
+        }
+        let target = frame.dimensions().map(|pixels| {
+            let logical = self.image_size(self.viewport, pixels);
+            Size::new(
+                logical.width * self.scale_factor,
+                logical.height * self.scale_factor,
+            )
+        });
+        self.filtered
+            .refresh(frame.image.as_ref(), self.filter, target);
+        #[cfg(target_arch = "wasm32")]
+        {
+            // WGPU on WASM uploads raster textures when they are first drawn.
+            // Waiting for an explicit allocation before drawing deadlocks it.
+            self.web_image = frame.dimensions().and_then(|source_size| {
+                self.filtered
+                    .image()
+                    .or(frame.image.as_ref())
+                    .map(|image| PreparedFrame {
+                        image: image.clone(),
+                        generation: frame.generation,
+                        source_size,
+                        filter: self.filter,
+                    })
+            });
+            return iced::Task::none();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.uploads
+                .offer(frame.dimensions().and_then(|source_size| {
+                    self.filtered
+                        .image()
+                        .or(frame.image.as_ref())
+                        .map(|image| PreparedFrame {
+                            image: image.clone(),
+                            generation: frame.generation,
+                            source_size,
+                            filter: self.filter,
+                        })
+                }));
+            self.start_upload()
+        }
+    }
+
+    fn start_upload(&mut self) -> iced::Task<SizingMessage> {
+        match self.uploads.start() {
+            Some((id, handle)) => {
+                image::allocate(handle).map(move |result| SizingMessage::Uploaded(id, result))
+            }
+            None => iced::Task::none(),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn subscription() -> iced::Subscription<SizingMessage> {
         iced::window::events().filter_map(|(_, event)| match event {
             iced::window::Event::Rescaled(scale) => Some(SizingMessage::ScaleFactor(scale)),
@@ -89,72 +196,62 @@ impl DisplaySizing {
         message: SizingMessage,
         frame: &DisplayFrame,
     ) -> iced::Task<SizingMessage> {
-        use iced::{Task, window};
+        let mut task = iced::Task::none();
         match message {
-            SizingMessage::ActualSize => {
+            SizingMessage::PixelPerfect => {
+                self.uploads.retry();
                 if frame.dimensions().is_some() {
-                    self.actual_size = true;
-                    self.resize_passes = 4;
-                    return query_window_metrics();
+                    self.pixel_perfect = true;
+                    task = query_scale_factor();
                 }
             }
             SizingMessage::Fit => {
-                self.actual_size = false;
-                self.resize_passes = 0;
+                self.uploads.retry();
+                self.pixel_perfect = false;
+            }
+            SizingMessage::Filter(filter) => {
+                self.uploads.retry();
+                self.filter = filter;
             }
             SizingMessage::Viewport(size) => {
                 self.viewport = size;
-                // Narrowing can wrap the toolbar. Measure the resulting layout
-                // again before settling the height, only during a 1:1 request.
-                if self.resize_passes > 0 {
-                    return query_window_metrics();
+                task = query_scale_factor();
+            }
+            SizingMessage::ScaleFactor(scale) => {
+                if scale.is_finite() && scale > 0.0 {
+                    self.scale_factor = scale;
                 }
             }
-            SizingMessage::ScaleFactor(scale) => self.scale_factor = scale,
-            SizingMessage::WindowMetrics(id, size, scale) => {
-                self.scale_factor = scale;
-                // A pending window query must not undo a later click on Fit.
-                if self.actual_size
-                    && self.resize_passes > 0
-                    && self.viewport.width > 0.0
-                    && self.viewport.height > 0.0
-                    && let Some(pixels) = frame.dimensions()
+            SizingMessage::Uploaded(id, result) => {
+                let previous_error = self.uploads.error().map(str::to_owned);
+                self.uploads
+                    .finish(id, result.map_err(|error| error.to_string()));
+                if self.uploads.error() != previous_error.as_deref()
+                    && let Some(error) = self.uploads.error()
                 {
-                    let target = actual_window_size(size, self.viewport, pixels, scale);
-                    if (target.width - size.width).abs() < 1.0
-                        && (target.height - size.height).abs() < 1.0
-                    {
-                        self.resize_passes = 0;
-                        return Task::none();
-                    }
-                    self.resize_passes -= 1;
-                    return window::maximize(id, false).chain(window::resize(id, target));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    eprintln!("{error}");
+                    #[cfg(target_arch = "wasm32")]
+                    log::error!("{error}");
                 }
+                return self.start_upload();
             }
         }
-        Task::none()
+        iced::Task::batch([task, self.refresh(frame)])
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn query_window_metrics() -> iced::Task<SizingMessage> {
+fn query_scale_factor() -> iced::Task<SizingMessage> {
     use iced::window;
-    window::latest().and_then(|id| {
-        window::size(id).then(move |size| {
-            window::scale_factor(id).map(move |scale| SizingMessage::WindowMetrics(id, size, scale))
-        })
-    })
+    window::latest().and_then(|id| window::scale_factor(id).map(SizingMessage::ScaleFactor))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn actual_window_size(window: Size, viewport: Size, pixels: Size, scale: f32) -> Size {
-    // Window/widget dimensions are logical pixels; guest pixels must occupy
-    // physical display pixels. Measure the surrounding UI instead of encoding
-    // its padding, toolbar, sidebar and variable footer heights here.
-    Size::new(
-        (window.width - viewport.width + pixels.width / scale).max(MIN_WINDOW_SIZE.width),
-        (window.height - viewport.height + pixels.height / scale).max(MIN_WINDOW_SIZE.height),
-    )
+#[cfg(target_arch = "wasm32")]
+fn query_scale_factor() -> iced::Task<SizingMessage> {
+    iced::Task::done(SizingMessage::ScaleFactor(
+        web_sys::window().map_or(1.0, |window| window.device_pixel_ratio()) as f32,
+    ))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -196,53 +293,73 @@ mod tests {
     }
 
     #[test]
-    fn actual_size_preserves_raster_pixels_across_dpi_and_video_mode_changes() {
+    fn integer_zoom_adapts_to_viewport_dpi_and_video_mode() {
         let text = frame(720, 400);
         let mut sizing = DisplaySizing::default();
-        assert_eq!(sizing.image_size(&text), None);
-        let _ = sizing.update(SizingMessage::ActualSize, &text);
-        assert_eq!(sizing.image_size(&text), Some(Size::new(720.0, 400.0)));
+        let available = Size::new(960.0, 640.0);
+        let _ = sizing.update(SizingMessage::PixelPerfect, &text);
+        assert_eq!(
+            sizing.image_size(available, text.dimensions().unwrap()),
+            Size::new(720.0, 400.0)
+        );
         let _ = sizing.update(SizingMessage::ScaleFactor(1.5), &text);
-        let size = sizing.image_size(&text).unwrap();
-        assert_eq!(size.width * 1.5, 720.0);
-        assert_eq!(size.height * 1.5, 400.0);
+        let size = sizing.image_size(available, text.dimensions().unwrap());
+        assert_eq!(size.width * 1.5, 1440.0);
+        assert_eq!(size.height * 1.5, 800.0);
 
         let graphics = frame(640, 480);
-        let size = sizing.image_size(&graphics).unwrap();
-        assert_eq!(size.width * 1.5, 640.0);
-        assert_eq!(size.height * 1.5, 480.0);
+        let size = sizing.image_size(available, graphics.dimensions().unwrap());
+        assert_eq!(size.width * 1.5, 1280.0);
+        assert_eq!(size.height * 1.5, 960.0);
         let _ = sizing.update(SizingMessage::Fit, &graphics);
-        assert_eq!(sizing.image_size(&graphics), None);
+        // A late DPI response must not reselect integer scaling or resize a window.
+        let _ = sizing.update(SizingMessage::ScaleFactor(2.0), &graphics);
+        assert!(!sizing.pixel_perfect);
+        assert_eq!(
+            sizing.image_size(available, graphics.dimensions().unwrap()),
+            fit_size(available, 4.0 / 3.0)
+        );
         let fitted = fit_size(Size::new(720.0, 400.0), 4.0 / 3.0);
         assert!((fitted.width - 533.3333).abs() < 0.001);
         assert_eq!(fitted.height, 400.0);
     }
 
     #[test]
-    fn window_resize_keeps_measured_ui_space_and_accounts_for_hidpi() {
-        let window = Size::new(1120.0, 760.0);
-        let viewport = Size::new(736.0, 450.0);
-        let pixels = Size::new(720.0, 400.0);
+    fn mode_13h_keeps_square_pixels_and_small_windows_keep_one_times() {
+        let pixels = Size::new(320.0, 200.0);
         assert_eq!(
-            actual_window_size(window, viewport, pixels, 1.0),
-            Size::new(1104.0, 710.0)
+            pixel_perfect_size(Size::new(1000.0, 700.0), pixels, 1.0),
+            Size::new(960.0, 600.0)
         );
         assert_eq!(
-            actual_window_size(window, viewport, pixels, 2.0),
-            Size::new(744.0, 510.0)
+            pixel_perfect_size(Size::new(640.0, 480.0), pixels, 1.0),
+            Size::new(640.0, 400.0)
+        );
+        assert_eq!(
+            pixel_perfect_size(Size::new(200.0, 100.0), pixels, 1.0),
+            pixels
         );
     }
 
     #[test]
-    fn compact_window_remeasures_wrapped_controls_without_large_inner_margins() {
-        let pixels = Size::new(720.0, 400.0);
-        let first = actual_window_size(DEFAULT_WINDOW_SIZE, Size::new(960.0, 550.0), pixels, 2.0);
-        assert_eq!(first, Size::new(400.0, 290.0));
-        let wrapped = actual_window_size(first, Size::new(400.0, 170.0), pixels, 2.0);
-        assert_eq!(wrapped, Size::new(400.0, 320.0));
-        assert_eq!(
-            actual_window_size(wrapped, Size::new(400.0, 200.0), pixels, 2.0),
-            wrapped
-        );
+    fn fractional_dpi_uses_the_largest_whole_physical_zoom() {
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            for pixels in [
+                Size::new(320.0, 200.0),
+                Size::new(640.0, 480.0),
+                Size::new(720.0, 400.0),
+            ] {
+                let available = Size::new(1001.0, 751.0);
+                let size = pixel_perfect_size(available, pixels, scale);
+                let zoom = size.width * scale / pixels.width;
+                assert!((zoom - zoom.round()).abs() < 0.0001);
+                assert!((size.height * scale / pixels.height - zoom).abs() < 0.0001);
+                assert!(size.width <= available.width && size.height <= available.height);
+                assert!(
+                    pixels.width * (zoom + 1.0) > available.width * scale
+                        || pixels.height * (zoom + 1.0) > available.height * scale
+                );
+            }
+        }
     }
 }

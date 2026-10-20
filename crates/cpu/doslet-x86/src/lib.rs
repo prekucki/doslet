@@ -3,16 +3,22 @@
 #![no_std]
 extern crate alloc;
 
+pub use engines::interpreter::analysis;
+pub use engines::interpreter::translation;
 mod decode;
+mod execution_tiers;
+pub use execution_tiers::ExecutionLabel;
 pub mod engines;
 pub mod flags;
+#[cfg(feature = "procedure-calls")]
+pub mod procedure_calls;
 pub mod state;
 pub mod x87_decode;
 pub use engines::{DYNAMIC_PROFILE_MAX_BYTES, DynamicExitReason, DynamicExitRecord, DynamicStats};
 
 #[cfg(feature = "profiling")]
 pub use engines::interpreter::DecodeCacheStats;
-pub use engines::interpreter::{Cpu, CpuError, CpuSnapshot, StepOutcome};
+pub use engines::interpreter::{Cpu, CpuContext, CpuError, CpuSnapshot, Fault, StepOutcome};
 pub use state::{
     Access, ControlRegisters, DescriptorTable, Gpr16, Gpr32, Registers, SegmentCache,
     SegmentRegister,
