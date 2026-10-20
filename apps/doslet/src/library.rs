@@ -477,6 +477,7 @@ impl Filter {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum GlobalEdit {
+    Language(String),
     AudioEnabled(bool),
     AudioVolume(u8),
     AudioMixer(String),
@@ -495,6 +496,12 @@ pub enum GlobalEdit {
     Scaling(String),
     Aspect(String),
     DefaultPreset(String),
+    NewPresetName(String),
+    NewPresetMhz(u16),
+    NewPresetMode(CpuMode),
+    NewPresetMemory(u8),
+    AddPreset,
+    RemovePreset(String),
 }
 
 #[derive(Clone, Debug)]
@@ -509,6 +516,8 @@ pub enum GameEdit {
     GameMidi(String),
     Gameport(bool),
     Executable(String),
+    DriveCSource(String),
+    DriveDSource(String),
     NewActionName(String),
     NewActionExe(String),
     AddAction,
@@ -677,6 +686,10 @@ pub struct Library {
     pub selected_save_file: Option<usize>,
     pub new_action_name: String,
     pub new_action_exe: String,
+    pub new_preset_name: String,
+    pub new_preset_mhz: u16,
+    pub new_preset_mode: CpuMode,
+    pub new_preset_memory: u8,
 }
 impl Library {
     pub fn discover() -> Self {
@@ -698,6 +711,10 @@ impl Library {
             selected_save_file: None,
             new_action_name: String::new(),
             new_action_exe: String::new(),
+            new_preset_name: String::new(),
+            new_preset_mhz: 66,
+            new_preset_mode: CpuMode::Adaptive,
+            new_preset_memory: 16,
         }
     }
     pub fn refresh_autosaves(&mut self) {
@@ -744,6 +761,7 @@ impl Library {
     }
     fn edit_global(&mut self, edit: GlobalEdit) {
         match edit {
+            GlobalEdit::Language(v) => self.global.language = v,
             GlobalEdit::AudioEnabled(v) => self.global.audio_enabled = v,
             GlobalEdit::AudioVolume(v) => self.global.audio_volume = v.min(100),
             GlobalEdit::AudioMixer(v) => self.global.audio_mixer = v,
@@ -767,6 +785,61 @@ impl Library {
             GlobalEdit::Scaling(v) => self.global.scaling = v,
             GlobalEdit::Aspect(v) => self.global.aspect = v,
             GlobalEdit::DefaultPreset(v) => self.global.default_preset = v,
+            GlobalEdit::NewPresetName(v) => {
+                self.new_preset_name = v;
+                return;
+            }
+            GlobalEdit::NewPresetMhz(v) => {
+                self.new_preset_mhz = v.clamp(1, 1000);
+                return;
+            }
+            GlobalEdit::NewPresetMode(v) => {
+                self.new_preset_mode = v;
+                return;
+            }
+            GlobalEdit::NewPresetMemory(v) => {
+                self.new_preset_memory = v;
+                return;
+            }
+            GlobalEdit::AddPreset => {
+                let name = self.new_preset_name.trim().to_owned();
+                if name.is_empty() {
+                    self.notice = Some("Enter a preset name (e.g. Fast 486).".into());
+                    return;
+                }
+                let id: String = name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect();
+                let preset = HardwarePreset {
+                    id: id.clone(),
+                    name,
+                    cpu_mhz: self.new_preset_mhz,
+                    cpu_mode: self.new_preset_mode,
+                    memory_mib: self.new_preset_memory,
+                    x87: true,
+                    sb16: true,
+                    mpu401: true,
+                };
+                if let Some(existing) = self.global.presets.iter_mut().find(|p| p.id == id) {
+                    *existing = preset;
+                } else {
+                    self.global.presets.push(preset);
+                }
+                self.new_preset_name.clear();
+            }
+            GlobalEdit::RemovePreset(id) => {
+                self.global.presets.retain(|p| p.id != id);
+                if self.global.default_preset == id {
+                    self.global.default_preset = "486dx2-66".into();
+                }
+            }
         }
         if let Err(error) = self.global.save_to_disk() {
             self.notice = Some(format!("Cannot save global settings: {error}"));
@@ -812,6 +885,55 @@ impl Library {
             GameEdit::GameMidi(v) => game.spec.output.game_midi = v,
             GameEdit::Gameport(v) => game.spec.hardware.gameport = v,
             GameEdit::Executable(v) => game.spec.game.executable = v,
+            GameEdit::DriveCSource(v) => {
+                let kind = if v.to_ascii_lowercase().ends_with(".zip") {
+                    SourceKind::BrowserZip
+                } else {
+                    SourceKind::NativeDirectory
+                };
+                if let Some(mount) = game.spec.mounts.iter_mut().find(|m| m.letter == b'C') {
+                    if let Some(b) = game.spec.host.bindings.iter_mut().find(|b| b.id == mount.source) {
+                        b.location = v;
+                        b.kind = if kind == SourceKind::BrowserZip {
+                            doslet_config::BindingKind::BrowserZip
+                        } else {
+                            doslet_config::BindingKind::NativeDirectory
+                        };
+                    } else {
+                        mount.source = v;
+                    }
+                    mount.kind = kind;
+                } else {
+                    game.spec.mounts.push(doslet_config::MountSpec {
+                        letter: b'C',
+                        kind,
+                        source: v,
+                        policy: doslet_config::WritePolicy::Persistent,
+                        store: None,
+                    });
+                }
+            }
+            GameEdit::DriveDSource(v) => {
+                if v.trim().is_empty() {
+                    game.spec.mounts.retain(|m| m.letter != b'D');
+                } else if let Some(mount) = game.spec.mounts.iter_mut().find(|m| m.letter == b'D') {
+                    if let Some(b) = game.spec.host.bindings.iter_mut().find(|b| b.id == mount.source) {
+                        b.location = v;
+                        b.kind = doslet_config::BindingKind::LocalIso;
+                    } else {
+                        mount.source = v;
+                    }
+                    mount.kind = SourceKind::LocalIso;
+                } else {
+                    game.spec.mounts.push(doslet_config::MountSpec {
+                        letter: b'D',
+                        kind: SourceKind::LocalIso,
+                        source: v,
+                        policy: doslet_config::WritePolicy::ReadOnly,
+                        store: None,
+                    });
+                }
+            }
             GameEdit::NewActionName(v) => self.new_action_name = v,
             GameEdit::NewActionExe(v) => self.new_action_exe = v,
             GameEdit::AddAction => {
@@ -1108,6 +1230,10 @@ mod tests {
             selected_save_file: None,
             new_action_name: String::new(),
             new_action_exe: String::new(),
+            new_preset_name: String::new(),
+            new_preset_mhz: 66,
+            new_preset_mode: CpuMode::Adaptive,
+            new_preset_memory: 16,
         };
         assert!(!library.is_empty(), "no profiles in ./games");
         for game in &mut library.games {

@@ -321,6 +321,10 @@ impl Doslet {
         app.audio_backend = cli.audio_backend;
         app.audio_mixer = cli.audio_mixer;
         app.audio_deferred = !cli.no_audio;
+        if let Some(global) = &cli.global_settings {
+            app.audio_volume = global.audio_volume.min(100);
+            app.display_sizing.pixel_perfect = global.scaling.eq_ignore_ascii_case("pixel-perfect");
+        }
         app.gamepads = Some(crate::native_gamepad::NativeGamepads::new());
         app.midi_mode = cli.midi_mode.unwrap_or_default().into();
         app.midi_output_mode = cli.midi_output_mode.unwrap_or_default().into();

@@ -47,27 +47,36 @@ library of the launch profiles in the
 profile directory to your own profile folder keeps relative cover and drive
 paths working. Each version-2 profile becomes a card with its `[info]` cover,
 release year and genre:
-- **Sidebar.** Filters all games or one genre.
+- **Sidebar.** Filters all games, one genre, or opens **Settings** (`settings.toml`
+  for global host audio mixer, MIDI output, gamepad deadzone, display scaling,
+  interface language, and default/custom hardware presets).
 - **Search.** Matches titles, developers, publishers, genres and program names.
 - **Game page.** Clicking a card opens it, with the cover over a blurred
-  backdrop, tags, the description and a table of details. **Play**, or Enter
-  on that page, starts the game; Esc returns to the library.
+  backdrop, primary launch actions (**Play** / **Resume**, **Restart**, and
+  configured `[[game.actions]]` entrypoints such as **Setup**), and three tabs:
+  - **Overview** — description and game metadata.
+  - **Drive C: & State** — paused RAM snapshot status (`autosave.state.gz`), a
+    VFS Drive `C:` browser with **All files (VFS)** vs **Changes only** modes,
+    color-coded overlay status (`+ Created`, `~ Modified`, `→ Renamed`,
+    `− Deleted`, `Base`), inline hex/ASCII file preview, and **Reset C: changes**.
+  - **Configuration** — per-game hardware preset, CPU clock/mode, RAM, SB16,
+    MPU-401, Gameport, Drive `C:` / CD-ROM `D:` paths, and entrypoints.
 - **Placeholders.** Profiles without a cover get a colored card with the game's
   initials.
 
 **Play** prepares the game in the background, then shows it in the same window,
 exactly as `doslet --config PROFILE` would. Options given to the library, such
 as `--dpmi off` or `--no-audio`, apply to every game it starts.
-**‹ Library** in the game's toolbar returns to the list. So does leaving the
-game itself, for example quitting to DOS, once its last save is committed.
-Returning follows the same rules as Reset: a pending save finishes first, and
-unsaved changes in a temporary drive overlay must be exported or explicitly
-discarded in the machine settings. Closing the window still quits Doslet. A
-game that fails to start reports why above the library.
+**‹ Library** in the game's toolbar, or closing the window while a library game
+is running, commits pending disk writes and saves a paused RAM snapshot
+(`autosave.state.gz`) so **Resume** continues where you left off. Leaving the
+game by quitting to DOS returns to the library and removes `autosave.state.gz`
+while keeping persistent disk saves in `overlay.redb`.
 **Rescan profiles** reloads the directories. Profiles that fail to parse are
-skipped with a warning in the terminal. Without any profiles, or with `--demo`,
-Doslet opens the workspace and its color-bar demo as before. Describe a game
-with the `[info]` fields in [launch profiles](configuration.md#profiles).
+skipped with a warning in the terminal. When no profiles are installed yet, the
+library offers a button to launch the built-in test demo or open global settings.
+Describe a game with the `[info]` fields in
+[launch profiles](configuration.md#global-settings-hardware-presets-and-game-profiles).
 
 ### Launch a game
 

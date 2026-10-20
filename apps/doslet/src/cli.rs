@@ -205,6 +205,8 @@ pub struct Cli {
     pub launch: crate::native_input::LaunchSettings,
     #[arg(skip)]
     pub profile_name: Option<String>,
+    #[arg(skip)]
+    pub global_settings: Option<crate::global_settings::GlobalSettings>,
 }
 
 impl Cli {

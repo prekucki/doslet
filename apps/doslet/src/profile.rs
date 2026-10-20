@@ -293,6 +293,73 @@ impl Cli {
                     spec.game.patches.clear();
                     spec.game.startup_keys.clear();
                 }
+                if let Some(global) = &self.global_settings {
+                    let has_hw_field = |k: &str| {
+                        document
+                            .get("machine")
+                            .and_then(Item::as_table_like)
+                            .is_some_and(|t| t.contains_key(k))
+                            || document
+                                .get("hardware")
+                                .and_then(Item::as_table_like)
+                                .is_some_and(|t| t.contains_key(k))
+                    };
+                    let target_preset = match &spec.preset {
+                        Some(id) if doslet_config::HardwarePreset::find_builtin(id).is_none() => {
+                            global.find_preset(id)
+                        }
+                        None => global.find_preset(&global.default_preset),
+                        _ => None,
+                    };
+                    if let Some(preset) = target_preset {
+                        let mut base_hw = spec.hardware;
+                        let mut base_mode = spec.cpu_mode;
+                        preset.apply_to(&mut base_hw, &mut base_mode);
+                        if !has_hw_field("cpu_mhz") && !has_hw_field("clock_hz") {
+                            spec.hardware.cpu_mhz = base_hw.cpu_mhz;
+                        }
+                        if !has_hw_field("memory_mib") {
+                            spec.hardware.memory_mib = base_hw.memory_mib;
+                        }
+                        if !has_hw_field("x87") {
+                            spec.hardware.x87 = base_hw.x87;
+                        }
+                        if !has_hw_field("sb16") && document.get("sound").is_none() {
+                            spec.hardware.sb16 = base_hw.sb16;
+                        }
+                        if !has_hw_field("mpu401") && document.get("sound").is_none() {
+                            spec.hardware.mpu401 = base_hw.mpu401;
+                        }
+                        if !has_hw_field("cpu_mode") {
+                            spec.cpu_mode = base_mode;
+                        }
+                    }
+                    let out_table = document.get("output").and_then(Item::as_table_like);
+                    if out_table.and_then(|t| t.get("video_filter")).is_none() {
+                        spec.output.video_filter = global.video_filter;
+                    }
+                    if out_table.and_then(|t| t.get("game_midi")).is_none() {
+                        spec.output.game_midi = global.game_midi.clone();
+                    }
+                    if out_table.and_then(|t| t.get("host_midi")).is_none() {
+                        spec.output.host_midi = global.host_midi.clone();
+                    }
+                    let in_table = document.get("input").and_then(Item::as_table_like);
+                    if in_table.is_none() {
+                        spec.input = global.input.clone();
+                    }
+                    if !has_hw_field("keyboard")
+                        && in_table.and_then(|t| t.get("keyboard")).is_none()
+                    {
+                        spec.hardware.keyboard = global.keyboard;
+                    }
+                    let snd_table = document.get("sound").and_then(Item::as_table_like);
+                    if !has_hw_field("gameport")
+                        && snd_table.and_then(|t| t.get("gameport")).is_none()
+                    {
+                        spec.hardware.gameport |= global.gameport;
+                    }
+                }
                 if let Some(cpu_mode) = spec.cpu_mode {
                     match cpu_mode {
                         doslet_config::CpuMode::Adaptive => {
@@ -459,6 +526,35 @@ impl Cli {
             self.launch.cdrom = profile.cdrom;
             if self.game.is_none() && !is_v2 {
                 return Err("profile requires game.executable or --game".into());
+            }
+        } else if let Some(global) = &self.global_settings {
+            let mut spec = doslet_config::MachineSpec::default();
+            if let Some(preset) = global.find_preset(&global.default_preset) {
+                preset.apply_to(&mut spec.hardware, &mut spec.cpu_mode);
+            }
+            spec.output.video_filter = global.video_filter;
+            spec.output.game_midi = global.game_midi.clone();
+            spec.output.host_midi = global.host_midi.clone();
+            spec.input = global.input.clone();
+            spec.hardware.keyboard = global.keyboard;
+            spec.hardware.gameport |= global.gameport;
+            self.launch.hardware = spec.hardware;
+            self.launch.machine_spec = Some(spec);
+        }
+        if let Some(global) = &self.global_settings {
+            if self.midi_mode.is_none() {
+                self.midi_mode = Some(if global.game_midi.eq_ignore_ascii_case("mt32") {
+                    MidiMode::Mt32
+                } else {
+                    MidiMode::Gm
+                });
+            }
+            if self.midi_output_mode.is_none() {
+                self.midi_output_mode = Some(if global.host_midi.eq_ignore_ascii_case("mt32") {
+                    MidiMode::Mt32
+                } else {
+                    MidiMode::Gm
+                });
             }
         }
         if let Some(memory) = self.memory_mib {

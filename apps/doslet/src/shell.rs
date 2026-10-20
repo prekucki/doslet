@@ -78,6 +78,7 @@ impl Shell {
                 cli.mt32_rom_dir = g.mt32_rom_dir.as_ref().map(PathBuf::from);
             }
         }
+        cli.global_settings = Some(g.clone());
     }
 
     /// Prepare the machine off the window thread: loading media, audio and

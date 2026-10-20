@@ -86,7 +86,12 @@ pub fn view(library: &Library) -> Element<'_, Message> {
     .into()
 }
 
+fn tr(library: &Library) -> &'static crate::i18n::Strings {
+    crate::i18n::Locale::resolve(&library.global.language).strings()
+}
+
 fn sidebar(library: &Library) -> Element<'_, Message> {
+    let s = tr(library);
     let brand = row![
         svg(svg::Handle::from_memory(LOGO)).width(36).height(36),
         column![
@@ -97,12 +102,12 @@ fn sidebar(library: &Library) -> Element<'_, Message> {
     ]
     .spacing(12)
     .align_y(Alignment::Center);
-    let mut nav = column![section("LIBRARY")].spacing(4);
+    let mut nav = column![section(s.library_section)].spacing(4);
     let mut genres = false;
     for (label, filter) in filters(library) {
         if matches!(filter, Filter::Genre(_)) && !genres {
             genres = true;
-            nav = nav.push(space().height(14)).push(section("GENRES"));
+            nav = nav.push(space().height(14)).push(section(s.genres_section));
         }
         let count = library.games.iter().filter(|g| filter.admits(g)).count();
         nav = nav.push(nav_item(
@@ -114,7 +119,7 @@ fn sidebar(library: &Library) -> Element<'_, Message> {
     }
     let settings_selected = library.selected.is_none() && library.filter == Filter::Settings;
     let mut footer = column![
-        nav_item("Settings", None, settings_selected, Filter::Settings),
+        nav_item(s.global_settings, None, settings_selected, Filter::Settings),
         space().height(6),
         section("PROFILES"),
     ]
@@ -147,7 +152,7 @@ fn sidebar(library: &Library) -> Element<'_, Message> {
 
 /// Every library view: all games, then each genre.
 fn filters(library: &Library) -> Vec<(&str, Filter)> {
-    let mut filters = vec![("All games", Filter::All)];
+    let mut filters = vec![(tr(library).all_games, Filter::All)];
     filters.extend(
         library
             .genres()
@@ -234,8 +239,9 @@ fn secondary_button_style(_: &Theme, status: button::Status) -> button::Style {
 }
 
 fn library_page(library: &Library, width: f32, compact: bool) -> Element<'_, Message> {
+    let s = tr(library);
     let title = match &library.filter {
-        Filter::All | Filter::Settings => "All games".to_owned(),
+        Filter::All | Filter::Settings => s.all_games.to_owned(),
         Filter::Genre(genre) => genre.clone(),
     };
     let visible: Vec<_> = library.visible().collect();
@@ -257,7 +263,7 @@ fn library_page(library: &Library, width: f32, compact: bool) -> Element<'_, Mes
     let mut page = column![].spacing(22).padding([30.0, PAGE_PADDING]);
     if compact {
         let mut chip_items = filters(library);
-        chip_items.push(("Settings", Filter::Settings));
+        chip_items.push((s.global_settings, Filter::Settings));
         let chips = chip_items.into_iter().map(|(label, filter)| {
             let selected = library.filter == filter;
             button(text(label).size(13))
@@ -282,9 +288,9 @@ fn library_page(library: &Library, width: f32, compact: bool) -> Element<'_, Mes
     }
     let content: Element<'_, Message> = if visible.is_empty() {
         let mut empty_col = column![
-            text("No games here").size(20).font(semibold()),
+            text(s.no_games_here).size(20).font(semibold()),
             text(if library.search.trim().is_empty() {
-                "Add a game profile (.toml) to your profiles directory, or launch the built-in test demo."
+                s.no_games_hint
             } else {
                 "Try another search or choose All games."
             })
@@ -296,11 +302,11 @@ fn library_page(library: &Library, width: f32, compact: bool) -> Element<'_, Mes
         if library.search.trim().is_empty() {
             empty_col = empty_col.push(
                 row![
-                    button(text("Launch test demo").size(14).font(semibold()))
+                    button(text(s.launch_demo).size(14).font(semibold()))
                         .padding([10, 20])
                         .style(secondary_button_style)
                         .on_press(Message::LaunchDemo),
-                    button(text("Global Settings").size(14))
+                    button(text(s.global_settings_title).size(14))
                         .padding([10, 20])
                         .style(secondary_button_style)
                         .on_press(Message::Filter(Filter::Settings)),
@@ -682,8 +688,9 @@ fn game_details<'a>(
     } else {
         usable.min(720.0)
     };
+    let s = tr(library);
     let back = button(
-        row![text("‹").size(22), text("Library").size(14)]
+        row![text("‹").size(22), text(s.library_back).size(14)]
             .spacing(8)
             .align_y(Alignment::Center),
     )
@@ -733,7 +740,7 @@ fn game_details<'a>(
         .align_y(Alignment::Center);
     if game.has_autosave {
         actions_row = actions_row.push(
-            button(text("Restart").size(14).font(semibold()))
+            button(text(s.restart_game).size(14).font(semibold()))
                 .padding([12, 22])
                 .style(secondary_button_style)
                 .on_press_maybe(ready.then_some(Message::Restart(index))),
@@ -761,7 +768,7 @@ fn game_details<'a>(
 
     let tabs = row![
         button(
-            text("Overview")
+            text(s.tab_overview)
                 .size(13)
                 .font(if library.game_tab == GameTab::Overview { bold() } else { semibold() }),
         )
@@ -769,7 +776,7 @@ fn game_details<'a>(
         .style(chip_style(library.game_tab == GameTab::Overview))
         .on_press(Message::SelectTab(GameTab::Overview)),
         button(
-            text(format!("Drive C: & State{tab_badge}"))
+            text(format!("{}{tab_badge}", s.tab_vfs_state))
                 .size(13)
                 .font(if library.game_tab == GameTab::VfsAndState { bold() } else { semibold() }),
         )
@@ -777,7 +784,7 @@ fn game_details<'a>(
         .style(chip_style(library.game_tab == GameTab::VfsAndState))
         .on_press(Message::SelectTab(GameTab::VfsAndState)),
         button(
-            text("Configuration")
+            text(s.tab_configuration)
                 .size(13)
                 .font(if library.game_tab == GameTab::Configuration { bold() } else { semibold() }),
         )
@@ -839,13 +846,13 @@ fn game_details<'a>(
     }
     let body: Element<'_, Message> = if wide {
         row![
-            column![hero, facts(game)].spacing(24).width(art_width),
+            column![hero, facts(library, game)].spacing(24).width(art_width),
             info.width(Fill),
         ]
         .spacing(44)
         .into()
     } else {
-        column![hero, info, facts(game)].spacing(28).into()
+        column![hero, info, facts(library, game)].spacing(28).into()
     };
     scrollable(
         column![back, body]
@@ -871,6 +878,7 @@ fn vfs_and_state_card<'a>(
     index: usize,
     game: &'a Game,
 ) -> Element<'a, Message> {
+    let s = tr(library);
     let ram_section: Element<'a, Message> = match &game.autosave_info {
         Some(info) => {
             let mut details = format!(
@@ -894,7 +902,7 @@ fn vfs_and_state_card<'a>(
                     ]
                     .spacing(6)
                     .width(Fill),
-                    button(text("Discard paused state").size(12))
+                    button(text(s.discard_paused_state).size(12))
                         .padding([6, 12])
                         .style(secondary_button_style)
                         .on_press(Message::DiscardAutosave(index)),
@@ -927,14 +935,14 @@ fn vfs_and_state_card<'a>(
     let disk_section: Element<'a, Message> = match &game.store_summary {
         Some(summary) => {
             let mode_buttons = row![
-                button(text("All files (VFS)").size(11).font(semibold()))
+                button(text(s.vfs_all_files).size(11).font(semibold()))
                     .padding([5, 12])
                     .style(chip_style(library.vfs_mode == VfsViewMode::AllFiles))
                     .on_press(Message::SetVfsMode(VfsViewMode::AllFiles)),
                 button(
                     text(format!(
-                        "Changes only ({})",
-                        summary.changed_count
+                        "{} ({})",
+                        s.vfs_changes_only, summary.changed_count
                     ))
                     .size(11)
                     .font(semibold())
@@ -970,7 +978,7 @@ fn vfs_and_state_card<'a>(
                     .align_y(Alignment::Center)
                     .into()
                 } else {
-                    button(text("Reset C: changes").size(11))
+                    button(text(s.reset_c_changes).size(11))
                         .padding([5, 10])
                         .style(secondary_button_style)
                         .on_press(Message::RequestResetOverlay(true))
@@ -1336,9 +1344,23 @@ fn game_config_card<'a>(library: &'a Library, game: &'a Game) -> Element<'a, Mes
     .wrap()
     .vertical_spacing(8);
 
+    let s = tr(library);
+    let drive_c_source = game
+        .spec
+        .mounts
+        .iter()
+        .find(|m| m.letter == b'C')
+        .map_or("", |m| game.spec.binding(&m.source));
+    let drive_d_source = game
+        .spec
+        .mounts
+        .iter()
+        .find(|m| m.letter == b'D')
+        .map_or("", |m| game.spec.binding(&m.source));
+
     container(
         column![
-            text("Game Configuration").size(18).font(bold()),
+            text(s.game_configuration).size(18).font(bold()),
             column![
                 text("Hardware Preset").size(12).color(MUTED),
                 row(preset_buttons).spacing(8).wrap().vertical_spacing(8),
@@ -1388,6 +1410,29 @@ fn game_config_card<'a>(library: &'a Library, game: &'a Game) -> Element<'a, Mes
                 row(midi_buttons).spacing(8),
             ]
             .spacing(6),
+            row![
+                column![
+                    text("Drive C: Source (Folder or .zip)").size(12).color(MUTED),
+                    text_input("Path to folder or .zip", drive_c_source)
+                        .on_input(|v| Message::GameConfig(GameEdit::DriveCSource(v)))
+                        .padding([8, 12])
+                        .size(13)
+                        .width(260),
+                ]
+                .spacing(6),
+                column![
+                    text("CD-ROM Drive D: (.iso image)").size(12).color(MUTED),
+                    text_input("Optional .iso path", drive_d_source)
+                        .on_input(|v| Message::GameConfig(GameEdit::DriveDSource(v)))
+                        .padding([8, 12])
+                        .size(13)
+                        .width(260),
+                ]
+                .spacing(6),
+            ]
+            .spacing(16)
+            .wrap()
+            .vertical_spacing(10),
             column![
                 text("Main Executable").size(12).color(MUTED),
                 text_input("GAME.EXE", &game.spec.game.executable)
@@ -1404,7 +1449,7 @@ fn game_config_card<'a>(library: &'a Library, game: &'a Game) -> Element<'a, Mes
             ]
             .spacing(8),
             row![
-                button(text("Save to profile").size(14).font(bold()))
+                button(text(s.save_to_profile).size(14).font(bold()))
                     .padding([10, 22])
                     .style(play_style)
                     .on_press(Message::GameConfig(GameEdit::Save)),
@@ -1433,10 +1478,11 @@ fn game_config_card<'a>(library: &'a Library, game: &'a Game) -> Element<'a, Mes
 }
 
 fn settings_page(library: &Library, compact: bool) -> Element<'_, Message> {
+    let s = tr(library);
     let g = &library.global;
     let heading = column![
-        text("Global Settings").size(30).font(bold()),
-        text("Default host audio, MIDI, controller, display and hardware presets for all games")
+        text(s.global_settings_title).size(30).font(bold()),
+        text(s.global_settings_subtitle)
             .size(13)
             .color(MUTED),
     ]
@@ -1658,9 +1704,28 @@ fn settings_page(library: &Library, compact: bool) -> Element<'_, Message> {
                 .into()
         });
 
+    let lang_buttons = [
+        ("auto", "Auto (System)"),
+        ("en", "English"),
+        ("pl", "Polski"),
+    ]
+    .into_iter()
+    .map(|(id, label)| {
+        button(text(label).size(13))
+            .padding([7, 14])
+            .style(chip_style(g.language.eq_ignore_ascii_case(id)))
+            .on_press(Message::Global(GlobalEdit::Language(id.into())))
+            .into()
+    });
+
     let display_section = settings_card(
-        "Display",
+        "Display & Language",
         column![
+            column![
+                text("Interface Language").size(12).color(MUTED),
+                row(lang_buttons).spacing(8).wrap().vertical_spacing(8),
+            ]
+            .spacing(6),
             column![
                 text("Scaling Filter").size(12).color(MUTED),
                 row(filter_buttons).spacing(8).wrap().vertical_spacing(8),
@@ -1710,21 +1775,98 @@ fn settings_page(library: &Library, compact: bool) -> Element<'_, Message> {
         .into()
     });
 
+    let mut custom_list = column![].spacing(6);
+    for custom in &g.presets {
+        custom_list = custom_list.push(
+            row![
+                text(custom.name.clone()).size(13).font(semibold()).width(180),
+                text(format!(
+                    "{} MHz · {} · {} MiB RAM",
+                    custom.cpu_mhz,
+                    custom.cpu_mode.as_str(),
+                    custom.memory_mib
+                ))
+                .size(12)
+                .color(MUTED)
+                .width(Fill),
+                button(text("Remove").size(12))
+                    .padding([4, 10])
+                    .style(nav_style(false))
+                    .on_press(Message::Global(GlobalEdit::RemovePreset(custom.id.clone()))),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    let new_preset_modes = [
+        (CpuMode::Fixed, "Fixed"),
+        (CpuMode::Adaptive, "Adaptive"),
+        (CpuMode::SpeedTiers, "Speed Tiers"),
+    ]
+    .into_iter()
+    .map(|(m, label)| {
+        button(text(label).size(12))
+            .padding([5, 10])
+            .style(chip_style(library.new_preset_mode == m))
+            .on_press(Message::Global(GlobalEdit::NewPresetMode(m)))
+            .into()
+    });
+
+    let new_preset_mems = [4u8, 8, 16, 32, 64].into_iter().map(|mib| {
+        button(text(format!("{mib} MiB")).size(12))
+            .padding([5, 10])
+            .style(chip_style(library.new_preset_memory == mib))
+            .on_press(Message::Global(GlobalEdit::NewPresetMemory(mib)))
+            .into()
+    });
+
+    let add_preset_form = column![
+        text("Create Custom Hardware Preset").size(12).color(MUTED),
+        row![
+            text_input("Preset name (e.g. Fast 486)", &library.new_preset_name)
+                .on_input(|v| Message::Global(GlobalEdit::NewPresetName(v)))
+                .padding([8, 12])
+                .size(13)
+                .width(200),
+            text(format!("{} MHz", library.new_preset_mhz))
+                .size(12)
+                .color(FOREGROUND),
+            slider(1..=200, library.new_preset_mhz, |v| {
+                Message::Global(GlobalEdit::NewPresetMhz(v))
+            })
+            .width(150),
+            row(new_preset_modes).spacing(6),
+            row(new_preset_mems).spacing(6),
+            button(text("Add preset").size(12).font(semibold()))
+                .padding([7, 14])
+                .style(secondary_button_style)
+                .on_press(Message::Global(GlobalEdit::AddPreset)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .wrap()
+        .vertical_spacing(8),
+    ]
+    .spacing(6);
+
     let presets_section = settings_card(
-        "Default Hardware Preset",
+        "Default Hardware & Custom Presets",
         column![
             text("Used when a game profile does not specify its own preset or custom MHz.")
                 .size(13)
                 .color(MUTED),
             row(preset_buttons).spacing(10).wrap().vertical_spacing(10),
+            custom_list,
+            add_preset_form,
         ]
-        .spacing(12),
+        .spacing(14),
     );
 
     let mut page = column![].spacing(22).padding([30.0, PAGE_PADDING]);
     if compact {
         let mut chip_items = filters(library);
-        chip_items.push(("Settings", Filter::Settings));
+        chip_items.push((s.global_settings, Filter::Settings));
         let chips = chip_items.into_iter().map(|(label, filter)| {
             let selected = library.filter == filter;
             button(text(label).size(13))
@@ -1794,18 +1936,19 @@ fn tag(label: &str) -> Element<'_, Message> {
         .into()
 }
 
-fn facts(game: &Game) -> Element<'_, Message> {
+fn facts<'a>(library: &'a Library, game: &'a Game) -> Element<'a, Message> {
+    let s = tr(library);
     let list = |labels: &[String]| (!labels.is_empty()).then(|| labels.join(", "));
     let profile = game
         .profile
         .file_name()
         .map(|name| name.to_string_lossy().into_owned());
     let rows = [
-        ("Released", game.info.released.map(|year| year.to_string())),
-        ("Developer", list(&game.info.developers)),
-        ("Publisher", list(&game.info.publishers)),
-        ("Genre", list(&game.info.genres)),
-        ("Gameplay", list(&game.info.gameplay)),
+        (s.released, game.info.released.map(|year| year.to_string())),
+        (s.developer, list(&game.info.developers)),
+        (s.publisher, list(&game.info.publishers)),
+        (s.genre, list(&game.info.genres)),
+        (s.gameplay, list(&game.info.gameplay)),
         (
             "Program",
             Some(game.program.clone()).filter(|p| !p.is_empty()),
