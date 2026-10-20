@@ -7,5 +7,6 @@ pub mod loader;
 pub mod memory;
 pub mod mouse;
 pub mod mz;
+pub mod tables;
 pub use loader::{ComError, load_com};
 pub use mz::{MzError, ProcessMemory, load_mz, load_mz_stub, load_overlay};

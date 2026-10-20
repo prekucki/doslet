@@ -22,6 +22,7 @@ mod cooperative;
 pub use cooperative::{EventIdleSite, MenuIdleSite, MenuIdleStats};
 pub mod debug;
 pub mod dpmi;
+mod file_tables;
 mod idle;
 mod observation;
 mod synchronization;
@@ -321,6 +322,7 @@ impl Session {
         let process_end = machine.bus.read_u16(0x10002)?;
         let memory = MemoryArena::new(0x1000, process_end, 0xA000);
         memory.write_mcbs(&mut machine.bus)?;
+        doslet_dos::tables::install(&mut machine.bus, doslet_dos::loader::PSP_SEGMENT)?;
         let epoch = storage::new_epoch()?;
         Ok(Self {
             machine,
@@ -1180,6 +1182,9 @@ impl Session {
             (0x2F, _) if ax == 0x4300 => {
                 self.machine.cpu.registers.set_byte(0, 0); // No external XMS driver installed.
             }
+            (0x2F, _) if ax == 0x7A00 => {
+                self.machine.cpu.registers.set_byte(0, 0); // No IPX network driver installed.
+            }
             (0x15, 0x88) => {
                 let kilobytes = (self.machine.bus.ram_size() - 0x100000) / 1024;
                 self.machine
@@ -1236,12 +1241,9 @@ impl Session {
                     .set(Gpr16::Bx, bios::INDOS_OFFSET);
             }
             (0x21, 0x52) => {
-                // DOS 5 list-of-lists subset: first MCB is at returned ES:BX-2.
-                self.machine
-                    .bus
-                    .write_u16(0xF101E, self.memory.first_mcb())?;
-                self.machine.cpu.registers.es = 0xF100;
-                self.machine.cpu.registers.set(Gpr16::Bx, 0x20);
+                let (segment, offset) = self.list_of_lists()?;
+                self.machine.cpu.registers.es = segment;
+                self.machine.cpu.registers.set(Gpr16::Bx, offset);
             }
             (0x21, 0x0E) if self.machine.cpu.registers.get_byte(2) == 2 => {
                 // C: is the only mounted/default drive. AL is the drive count,
@@ -1442,19 +1444,31 @@ impl Session {
                 self.machine.cpu.registers.es = segment;
                 self.machine.cpu.registers.set(Gpr16::Bx, offset);
             }
+            // No swappable data area exists. DJGPP's stat() then derives
+            // inode numbers from names instead of the SDA's directory entry.
+            (0x21, 0x5D) if ax as u8 == 6 => self.dos_error(1)?,
+            (0x21, 0x44) if ax as u8 == 9 => {
+                // BL: 0 default, 3 C:. MSCDEX drives are network redirections.
+                let drive = self.machine.cpu.registers.get_byte(3);
+                let attributes = if drive == 0 || drive == 3 {
+                    Some(0)
+                } else {
+                    self.cdrom
+                        .as_ref()
+                        .filter(|cd| drive == cd.drive - b'A' + 1)
+                        .map(|_| 0x1000)
+                };
+                match attributes {
+                    Some(attributes) => {
+                        self.machine.cpu.registers.set(Gpr16::Dx, attributes);
+                        self.set_carry(false)?;
+                    }
+                    None => self.dos_error(15)?,
+                }
+            }
             (0x21, 0x44) if ax as u8 == 0 => {
                 let handle = self.machine.cpu.registers.get(Gpr16::Bx);
-                if handle <= 2 || self.file_is_open(handle) {
-                    let info = if handle <= 2 {
-                        0x80D3
-                    } else if self
-                        .backend_handle(handle)
-                        .is_ok_and(CdromImage::owns_handle)
-                    {
-                        u16::from(self.cdrom.as_ref().unwrap().drive - b'A')
-                    } else {
-                        2
-                    };
+                if let Some(info) = self.device_info(handle) {
                     self.machine.cpu.registers.set(Gpr16::Dx, info);
                     self.set_carry(false)?;
                 } else {
@@ -1480,6 +1494,47 @@ impl Session {
                     }
                     self.machine.cpu.registers.set(Gpr16::Ax, 0x0100);
                     self.set_carry(false)?;
+                }
+            }
+            // TRUENAME qualifies a path lexically; the file need not exist.
+            (0x21, 0x60) => {
+                let si = self.registers().get(Gpr16::Si);
+                let Some((name, length)) = self.read_path_at(si)? else {
+                    return Ok(());
+                };
+                let path = &name[..length];
+                // "X:\", the name and a NUL fill DOS's 128-byte buffer.
+                let mut canonical = [0; 128];
+                let result = match &self.cdrom {
+                    Some(cd) if cd.matches_path(path) => {
+                        // A CD-ROM drive has no current directory of its own.
+                        let mut rooted = [b'\\'; 128];
+                        rooted[1..length - 1].copy_from_slice(&path[2..]);
+                        let drive = cd.drive;
+                        self.drive
+                            .canonical(&rooted[..length - 1], &mut canonical[3..127])
+                            .map(|len| (drive, len))
+                    }
+                    _ => self
+                        .drive
+                        .canonical(path, &mut canonical[3..127])
+                        .map(|len| (b'C', len)),
+                };
+                match result {
+                    Ok((drive, len)) => {
+                        canonical[..3].copy_from_slice(&[drive, b':', b'\\']);
+                        let r = &self.machine.cpu.registers;
+                        let (es, di) = (r.es, r.get(Gpr16::Di));
+                        for (offset, byte) in canonical[..len + 4].iter().enumerate() {
+                            self.machine.bus.write_u8(
+                                linear_address(es, di.wrapping_add(offset as u16)),
+                                *byte,
+                            )?;
+                        }
+                        self.machine.cpu.registers.set(Gpr16::Ax, 0);
+                        self.set_carry(false)?;
+                    }
+                    Err(_) => self.dos_error(3)?,
                 }
             }
             (0x21, 0x3B) => {
@@ -1546,6 +1601,9 @@ impl Session {
                 };
                 match result {
                     Ok(value) => {
+                        if ax >> 8 == 0x3D {
+                            self.sync_handle(value, None)?;
+                        }
                         self.machine.cpu.registers.set(
                             if ax >> 8 == 0x43 {
                                 Gpr16::Cx
@@ -1579,6 +1637,7 @@ impl Session {
                                 return Ok(());
                             }
                         };
+                        self.sync_handle(handle, None)?;
                         self.machine.cpu.registers.set(Gpr16::Ax, handle);
                         self.begin_commit()?;
                         self.set_carry(false)?;
@@ -1588,11 +1647,14 @@ impl Session {
             }
             (0x21, 0x57) if ax as u8 == 0 => {
                 if self.file_is_open(self.registers().get(Gpr16::Bx)) {
-                    self.machine.cpu.registers.set(Gpr16::Cx, 0x6000); // Deterministic noon boot timestamp.
                     self.machine
                         .cpu
                         .registers
-                        .set(Gpr16::Dx, (46 << 9) | (10 << 5) | 14);
+                        .set(Gpr16::Cx, file_tables::FILE_TIME);
+                    self.machine
+                        .cpu
+                        .registers
+                        .set(Gpr16::Dx, file_tables::FILE_DATE);
                     self.set_carry(false)?;
                 } else {
                     self.dos_error(6)?;
@@ -1600,9 +1662,11 @@ impl Session {
             }
             (0x21, 0x3E) => {
                 let public = self.machine.cpu.registers.get(Gpr16::Bx);
+                let previous = self.handles.description_index(public);
                 let result = self.close_handle(public);
                 match result {
                     Ok(()) => {
+                        self.sync_handle(public, previous)?;
                         self.set_carry(false)?;
                         self.begin_commit()?;
                     }
@@ -1663,6 +1727,7 @@ impl Session {
                     };
                     match self.drive.write_buffer(handle, r.get(Gpr16::Cx)) {
                         Ok(_) => {
+                            self.sync_backend(handle)?;
                             if count == 0 {
                                 self.machine.cpu.registers.set(Gpr16::Ax, 0);
                                 self.set_carry(false)?;
@@ -1712,6 +1777,7 @@ impl Session {
                 };
                 match result {
                     Ok(position) => {
+                        self.sync_backend(handle)?;
                         self.machine.cpu.registers.set(Gpr16::Ax, position as u16);
                         self.machine
                             .cpu
@@ -1800,14 +1866,18 @@ impl Session {
             }
             (0x21, 0x45 | 0x46) => {
                 let source = self.registers().get(Gpr16::Bx);
+                let target = self.registers().get(Gpr16::Cx);
+                let previous = (ax >> 8 == 0x46)
+                    .then(|| self.handles.description_index(target))
+                    .flatten();
                 let result = if ax >> 8 == 0x45 {
                     self.handles.duplicate(source)
                 } else {
-                    let target = self.registers().get(Gpr16::Cx);
                     self.force_duplicate_handle(source, target).map(|()| target)
                 };
                 match result {
                     Ok(handle) => {
+                        self.sync_handle(handle, previous)?;
                         self.machine.cpu.registers.set(Gpr16::Ax, handle);
                         self.set_carry(false)?;
                         if ax >> 8 == 0x46 {
@@ -2070,8 +2140,11 @@ impl Session {
         self.set_carry(true)
     }
     fn read_path(&mut self) -> Result<Option<([u8; 128], usize)>, RuntimeError> {
-        let r = &self.machine.cpu.registers;
-        let (ds, dx) = (r.ds, r.get(Gpr16::Dx));
+        self.read_path_at(self.machine.cpu.registers.get(Gpr16::Dx))
+    }
+    /// The NUL-terminated path at DS:`dx`, or None after DOS error 3.
+    fn read_path_at(&mut self, dx: u16) -> Result<Option<([u8; 128], usize)>, RuntimeError> {
+        let ds = self.machine.cpu.registers.ds;
         let mut name = [0; 128];
         for (offset, byte) in name.iter_mut().enumerate() {
             *byte = self

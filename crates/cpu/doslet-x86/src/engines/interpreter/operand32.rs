@@ -706,6 +706,36 @@ impl Cpu {
         Ok(())
     }
 
+    /// BT, BTS, BTR or BTC (`operation` 4–7) of bit `bit`, modulo the
+    /// operand width. CF receives the bit; other flags stay unchanged.
+    fn bit_test<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand: decode::Operand,
+        dword: bool,
+        operation: u8,
+        bit: u32,
+    ) -> Result<(), CpuError> {
+        let value = if dword {
+            operand.read32(&self.registers, bus)?
+        } else {
+            u32::from(operand.read(&self.registers, bus, true)?)
+        };
+        let mask = 1 << (bit & if dword { 31 } else { 15 });
+        self.flags = (self.flags & !flags::CARRY) | u32::from(value & mask != 0);
+        let value = match operation {
+            5 => value | mask,
+            6 => value & !mask,
+            7 => value ^ mask,
+            _ => return Ok(()),
+        };
+        if dword {
+            operand.write32(&mut self.registers, bus, value)
+        } else {
+            operand.write(&mut self.registers, bus, true, value as u16)
+        }
+    }
+
     pub(super) fn extended_step<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -1137,27 +1167,34 @@ impl Cpu {
                 if operation < 4 {
                     return Err(context.operand(opcode, modrm));
                 }
-                let bit = decode::fetch(&mut self.registers, bus)? & if dword { 31 } else { 15 };
-                let value = if dword {
-                    operand.read32(&self.registers, bus)?
+                let bit = u32::from(decode::fetch(&mut self.registers, bus)?);
+                self.bit_test(bus, operand, dword, operation, bit)?;
+            }
+            // BT, BTS, BTR and BTC with the bit offset in a register. In
+            // memory the offset is signed and may select another word or
+            // dword than the addressed one.
+            0xA3 | 0xAB | 0xB3 | 0xBB => {
+                let modrm = decode::fetch(&mut self.registers, bus)?;
+                let mut operand = decode::operand(
+                    &mut self.registers,
+                    bus,
+                    modrm,
+                    context.segment_override,
+                    context.address_32,
+                )?;
+                let bit = if dword {
+                    self.registers.get32(Gpr32::decode(modrm >> 3)) as i32
                 } else {
-                    u32::from(operand.read(&self.registers, bus, true)?)
+                    i32::from(self.registers.get(Gpr16::decode(modrm >> 3)) as i16)
                 };
-                let mask = 1 << bit;
-                self.flags = (self.flags & !flags::CARRY) | u32::from(value & mask != 0);
-                let value = match operation {
-                    5 => value | mask,
-                    6 => value & !mask,
-                    7 => value ^ mask,
-                    _ => value,
-                };
-                if operation != 4 {
-                    if dword {
-                        operand.write32(&mut self.registers, bus, value)?;
-                    } else {
-                        operand.write(&mut self.registers, bus, true, value as u16)?;
+                if let decode::Operand::Memory { offset, .. } = &mut operand {
+                    let (shift, bytes) = if dword { (5, 4) } else { (4, 2) };
+                    *offset = offset.wrapping_add(((bit >> shift) * bytes) as u32);
+                    if !context.address_32 {
+                        *offset &= 0xFFFF;
                     }
                 }
+                self.bit_test(bus, operand, dword, 4 + ((opcode >> 3) & 3), bit as u32)?;
             }
             0xB6 | 0xB7 | 0xBE | 0xBF => {
                 let modrm = decode::fetch(&mut self.registers, bus)?;

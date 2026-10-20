@@ -233,6 +233,148 @@ fn a_guest_opens_reads_and_writes_a_mounted_file_to_stdout() {
 }
 
 #[test]
+fn ioctl_reports_c_as_local_and_rejects_absent_drives() {
+    let mut program = vec![0; 0x100];
+    let code = [
+        0xB3, 3, 0xB8, 9, 0x44, 0xCD, 0x21, 0x72, 0x12, // C: remote? JC -> fail.
+        0x89, 0x16, 0xA0, 1, // Store DX.
+        0xB3, 1, 0xB8, 9, 0x44, 0xCD, 0x21, 0x73, 5, // A:? JNC -> fail.
+        0xB8, 0, 0x4C, 0xCD, 0x21, 0xB8, 1, 0x4C, 0xCD, 0x21,
+    ];
+    program[..code.len()].copy_from_slice(&code);
+    program[0xA0..0xA2].copy_from_slice(&[0xFF, 0xFF]);
+    let mut session = Session::new(&program).unwrap();
+    session.start();
+    session.advance(100);
+    assert_eq!(session.status(), SessionStatus::Exited(0));
+    assert_eq!(session.ram_view(0x101A0..0x101A2).unwrap(), [0, 0]);
+}
+
+#[test]
+fn truename_qualifies_paths_that_need_not_exist() {
+    let mut program = vec![0; 0x100];
+    let code = [
+        0xBE, 0x80, 1, 0xBF, 0xA0, 1, 0xB4, 0x60, 0xCD, 0x21, // TRUENAME.
+        0x72, 5, // JC -> error exit.
+        0xB8, 0, 0x4C, 0xCD, 0x21, 0xB8, 1, 0x4C, 0xCD, 0x21,
+    ];
+    program[..code.len()].copy_from_slice(&code);
+    program[0x80..0x91].copy_from_slice(b"c:dir/../new.txt\0");
+    let mut session = Session::new(&program).unwrap();
+    session.start();
+    session.advance(100);
+    assert_eq!(session.status(), SessionStatus::Exited(0));
+    assert_eq!(
+        session.ram_view(0x101A0..0x101AF).unwrap(),
+        b"C:\\NEW.TXT\0\0\0\0\0"
+    );
+}
+
+fn ram_u16(session: &Session, address: u32) -> u16 {
+    let bytes = session
+        .ram_view(address as usize..address as usize + 2)
+        .unwrap();
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn ram_far(session: &Session, address: u32) -> u32 {
+    u32::from(ram_u16(session, address + 2)) * 16 + u32::from(ram_u16(session, address))
+}
+
+/// Resolve a handle the way DJGPP's fstat() does: the JFT through PSP:34h,
+/// then the SFT chain from List of Lists+4.
+fn sft_entry(session: &Session, lol: u32, handle: u16) -> Option<&[u8]> {
+    if handle >= ram_u16(session, 0x10032) {
+        return None;
+    }
+    let jft = ram_far(session, 0x10034) + u32::from(handle);
+    let mut index = u16::from(session.ram_view(jft as usize..jft as usize + 1).unwrap()[0]);
+    if index == 0xFF {
+        return None;
+    }
+    let mut block = ram_far(session, lol + 4);
+    while index >= ram_u16(session, block + 4) {
+        index -= ram_u16(session, block + 4);
+        if ram_u16(session, block) == 0xFFFF {
+            return None;
+        }
+        block = ram_far(session, block);
+    }
+    let entry = (block + 6 + u32::from(index) * 0x3B) as usize;
+    session.ram_view(entry..entry + 0x3B)
+}
+
+fn sft_session(code: &[u8]) -> Session {
+    let mut program = vec![0; 0x100];
+    program[..code.len()].copy_from_slice(code);
+    program[0x80..0x89].copy_from_slice(b"TEST.BIN\0");
+    let mut drive = ReadOnlyDrive::new();
+    drive
+        .mount(b"TEST.BIN", Vec::from(&b"hello world"[..]))
+        .unwrap();
+    let mut session = Session::new(&program).unwrap().with_drive(drive);
+    session.start();
+    session.advance(200);
+    assert_eq!(session.status(), SessionStatus::Running);
+    session
+}
+
+#[test]
+fn open_handles_are_visible_in_the_guests_jft_and_sft() {
+    let session = sft_session(&[
+        0xBA, 0x80, 1, 0xB8, 0, 0x3D, 0xCD, 0x21, // Open TEST.BIN as handle 5.
+        0x89, 0xC3, 0xB4, 0x45, 0xCD, 0x21, // Duplicate it as handle 6.
+        0xB9, 3, 0, 0xBA, 0x90, 1, 0xB4, 0x3F, 0xCD, 0x21, // Read 3 bytes.
+        0xB4, 0x52, 0xCD, 0x21, // List of Lists.
+        0xEB, 0xFE,
+    ]);
+    let r = session.registers();
+    let lol = u32::from(r.es) * 16 + u32::from(r.get(doslet_x86::Gpr16::Bx));
+    let entry = sft_entry(&session, lol, 5).unwrap();
+    assert_eq!(sft_entry(&session, lol, 6), Some(entry));
+    assert_eq!(entry[0..2], [2, 0]); // Two handles share the description.
+    assert_eq!(entry[5..7], [2, 0]); // A file on C:, as IOCTL 4400h reports.
+    assert_eq!(entry[0x11..0x15], 11u32.to_le_bytes());
+    assert_eq!(entry[0x15..0x19], 3u32.to_le_bytes());
+    assert_eq!(&entry[0x20..0x2B], b"TEST    BIN");
+    let con = sft_entry(&session, lol, 1).unwrap();
+    assert_eq!(con[0..2], [3, 0]);
+    assert_eq!(con[5..7], [0xD3, 0x80]);
+    assert_eq!(sft_entry(&session, lol, 7), None);
+    assert_eq!(ram_u16(&session, lol - 2), 0x0FFF); // First MCB.
+}
+
+#[test]
+fn closed_and_forced_duplicate_handles_update_the_guests_tables() {
+    let session = sft_session(&[
+        0xBA, 0x80, 1, 0xB8, 0, 0x3D, 0xCD, 0x21, // Open TEST.BIN as handle 5.
+        0x89, 0xC3, 0xB9, 7, 0, 0xB4, 0x46, 0xCD, 0x21, // Force handle 7 onto it.
+        0xB4, 0x3E, 0xCD, 0x21, // Close handle 5.
+        0xB8, 0, 0x3D, 0xCD, 0x21, // Reopen as handle 5, a new description.
+        0xBB, 7, 0, 0xB4, 0x3E, 0xCD, 0x21, // Close handle 7.
+        0xB4, 0x52, 0xCD, 0x21, // List of Lists.
+        0xEB, 0xFE,
+    ]);
+    let r = session.registers();
+    let lol = u32::from(r.es) * 16 + u32::from(r.get(doslet_x86::Gpr16::Bx));
+    assert_eq!(sft_entry(&session, lol, 7), None);
+    let entry = sft_entry(&session, lol, 5).unwrap();
+    assert_eq!(entry[0..2], [1, 0]);
+    assert_eq!(entry[0x15..0x19], [0; 4]);
+    // The first description's entry, freed with handle 7, follows CON.
+    let sft = ram_far(&session, lol + 4) as usize;
+    let freed = sft + 6 + 0x3B;
+    assert_eq!(session.ram_view(freed..freed + 0x3B).unwrap(), [0; 0x3B]);
+    assert_eq!(
+        entry.as_ptr(),
+        session
+            .ram_view(freed + 0x3B..freed + 0x3C)
+            .unwrap()
+            .as_ptr()
+    );
+}
+
+#[test]
 fn memory_service_results_survive_iret_and_mcb_sizes_are_visible() {
     let program = [
         0xBC, 0xFE, 0x0F, // Move stack into the retained process block.
@@ -407,12 +549,12 @@ fn mscdex_installation_probe_reports_no_cdrom_drives() {
 #[test]
 fn absent_extender_services_return_their_probe_status_without_running_null_vectors() {
     let program = [
-        0xB8, 0x87, 0x16, 0xCD, 0x2F, 0xB8, 0, 0x43, 0xCD, 0x2F, 0xB8, 0, 0xDE, 0xCD, 0x67, 0xB8,
-        0xDE, 0xBF, 0xCD, 0x15, 0xB8, 0, 0x4C, 0xCD, 0x21,
+        0xB8, 0x87, 0x16, 0xCD, 0x2F, 0xB8, 0, 0x43, 0xCD, 0x2F, 0xB8, 0, 0x7A, 0xCD, 0x2F, 0xB8,
+        0, 0xDE, 0xCD, 0x67, 0xB8, 0xDE, 0xBF, 0xCD, 0x15, 0xB8, 0, 0x4C, 0xCD, 0x21,
     ];
     let mut session = Session::new(&program).unwrap();
     session.start();
-    for expected in [1, 0x4300, 0x8400, 0x86DE] {
+    for expected in [1, 0x4300, 0x7A00, 0x8400, 0x86DE] {
         session.advance(3);
         assert_eq!(session.registers().get(doslet_x86::Gpr16::Ax), expected);
         assert_eq!(session.status(), SessionStatus::Running);

@@ -205,7 +205,9 @@ The [implementation audit](compatibility/x87-audit.md) records exact counts,
 remaining limits and reproducible native-reference commands. These checks do
 not establish game compatibility.
 Dword ENTER builds bounded nested stack frames and BSF/BSR support both operand
-widths, including their defined zero flag.
+widths, including their defined zero flag. BT/BTS/BTR/BTC take an immediate or a
+register bit offset. With a memory operand, a register offset is signed and may
+select another word or dword than the addressed one.
 
 CPU segment translation produces an unmasked linear address; machine A20 wiring
 controls address bit 20. The default PC has 16 MiB of RAM, with A20 initially
@@ -547,8 +549,25 @@ leave partial writes; file/layout validation errors precede all guest writes.
 
 Stub sessions supply an ASCII environment and program path at segment 0F00h.
 DOS memory allocate/free/resize services use 64 fixed records, with guest-visible
-MCBs, splitting/coalescing and explicit exhaustion. The list-of-lists subset
-exposes only the first-MCB pointer; a complete DOS kernel data layout is pending.
+MCBs, splitting/coalescing and explicit exhaustion.
+
+DOS kernel tables sit at segment 0080h, below the first MCB, for programs that
+read DOS memory directly. DJGPP's `fstat()` is one; Quake needs it. INT 21h/52h
+returns a DOS 5 List of Lists subset: the first MCB, the SFT chain, the CON
+device header, the 512-byte sector size, the block device count, LASTDRIVE
+and the NUL device header, which links to CON. The DPB chain, CDS, disk buffers,
+the FCB table and the CLOCK$ pointer are absent: their pointers are null or
+FFFF:FFFF. One SFT block in the DOS 4.0–6.x layout (3Bh-byte entries) has CON at
+index 0, shared by handles 0–2, and then one entry per open description. The
+runtime rewrites the PSP's JFT slot and the SFT entry after every open,
+duplicate, close, read, write and seek. Entries carry the handle count, open
+mode, attributes, the device information word that IOCTL 4400h returns, the
+deterministic time/date, size, position, owner PSP and the 8.3 name. Cluster and
+directory-slot fields are synthetic but unique per file. Handles 3 and 4 (AUX
+and PRN) are not open. Because files are numbered up to 100, PSP:32h/34h
+describe a 101-entry JFT at 0080:0070, as after INT 21h/67h. The PSP's own 20
+entries at 18h are kept equal for older readers. States saved before these
+tables existed restore without them.
 The runtime still owns one process; EXEC/AL=00, child-process restoration and
 handle inheritance remain unsupported.
 
@@ -632,7 +651,18 @@ The session remains running; `Session::timeslice_yielded()` reports this stop
 until the next `advance` call. Native and Worker schedulers return to their
 event loop before executing another batch. This service does not sleep,
 advance hardware time beyond executed steps, or wait for an interrupt. Guest
-INT 2Fh vector replacements retain ownership of their handler.
+INT 2Fh vector replacements retain ownership of their handler. INT 2Fh/7A00h
+reports no IPX driver (AL=00h).
+
+Further DOS services for DJGPP programs:
+
+- INT 21h/60h (TRUENAME) qualifies a path lexically, without requiring the file:
+  `c:dir/../x` becomes `C:\X`. Wildcards, other drives and names over the
+  128-byte buffer return error 3.
+- IOCTL 4409h reports C: as local (DX=0000h) and an MSCDEX drive as remote
+  (bit 12). Other drives return error 0Fh.
+- 5D06h has no swappable data area to return and fails with error 1.
+  DJGPP's `stat()` then derives inode numbers from names.
 The runtime accepts one immutable ISO 9660 image through `Session::with_cdrom_image`
 or one bounded positional provider through `Session::with_cdrom_source`,
 and implements MSCDEX INT 2Fh services 1500h, 1502h–1508h, 150Ah–150Eh
@@ -662,7 +692,10 @@ Only arrival at an unchanged installed IRET shim invokes the host service.
 An installed IRQ0 shim updates BDA ticks/daily rollover and decrements the BIOS
 floppy-motor timeout (also used by CIV for delays), invokes the current
 INT 1Ch user hook and sends PIC EOI through guest instructions while preserving
-AX. Modified shims execute as guest code. INT 1Ah/AH=02h reads hours, minutes,
+AX. IRQs 2–15, apart from IRQ 12, whose vector holds the mouse driver's wrapper,
+start at default handlers in guest code. These send EOI (also to the slave PIC
+for IRQs 8–15) and return, as a BIOS's do. An unclaimed IRQ therefore never
+runs vector 0000:0000. Modified shims execute as guest code. INT 1Ah/AH=02h reads hours, minutes,
 seconds and the daylight-saving flag from the installed CMOS registers, returning
 CF set while its update-in-progress bit is set. The initial clock uses BCD and
 24-hour format; RTC ticking and format conversion remain pending.

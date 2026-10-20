@@ -231,6 +231,9 @@ impl Session {
         if real && ip == 0x1C && self.machine.bus.read_u8(bios::SHIM_BASE + ip)? == 0xCF {
             return self.dpmi_timer_tick();
         }
+        if real && let Some((vector, iret)) = bios::interrupt_handler(&mut self.machine.bus, ip)? {
+            return self.dpmi_hardware_interrupt(vector, iret);
+        }
         let known = if real {
             callback || matches!(ip, ENTRY | RM_RETURN | RAW_PM | SAVE_RM)
         } else {
@@ -433,17 +436,59 @@ impl Session {
         Ok(())
     }
 
-    fn dpmi_timer_tick(&mut self) -> Result<(), RuntimeError> {
-        let h = self.dpmi.as_ref().unwrap();
-        if !h.stats.entered || h.frames[..h.depth].iter().flatten().any(|f| f.timer) {
-            return Ok(());
-        }
-        let at = IDT + 0x1C * 8;
+    /// Whether the client replaced the host's gate for `vector` (0205h).
+    fn dpmi_handler_installed(&mut self, vector: u8) -> Result<bool, RuntimeError> {
+        let at = IDT + u32::from(vector) * 8;
         let low = self.machine.bus.read_u32(at)?;
         let high = self.machine.bus.read_u32(at + 4)?;
-        if low == (u32::from(CODE) << 16) | (PM_BASE + 0x1C * 8) && high & 0xFFFF0000 == 0 {
+        Ok(
+            low != (u32::from(CODE) << 16) | (PM_BASE + u32::from(vector) * 8)
+                || high & 0xFFFF0000 != 0,
+        )
+    }
+
+    /// Whether a real-mode interrupt may run a protected-mode handler now:
+    /// the client entered and no such handler already runs.
+    fn dpmi_handler_idle(&self) -> bool {
+        let h = self.dpmi.as_ref().unwrap();
+        h.stats.entered && !h.frames[..h.depth].iter().flatten().any(|f| f.timer)
+    }
+
+    fn dpmi_timer_tick(&mut self) -> Result<(), RuntimeError> {
+        if !self.dpmi_handler_idle() || !self.dpmi_handler_installed(0x1C)? {
             return Ok(());
         }
+        self.dpmi_run_handler(0x1C)
+    }
+
+    /// DPMI hosts route a hardware interrupt arriving in real mode to the
+    /// client's protected-mode handler. Doslet does so when the interrupt
+    /// reaches its BIOS handler, then returns through that handler's final
+    /// IRET, skipping its own work. Reflections of client interrupts, 0300h
+    /// calls and chains to the default handler return to the host, so they
+    /// stay in real mode.
+    fn dpmi_hardware_interrupt(&mut self, vector: u8, iret: u16) -> Result<(), RuntimeError> {
+        if !self.dpmi_handler_idle() || !self.dpmi_handler_installed(vector)? {
+            return Ok(());
+        }
+        let r = self.registers();
+        let (ss, sp) = (r.ss, r.get(Gpr16::Sp));
+        if self.machine.bus.read_u16(linear_address(ss, sp))? == RM_RETURN as u16
+            && self
+                .machine
+                .bus
+                .read_u16(linear_address(ss, sp.wrapping_add(2)))?
+                == bios::SHIM_SEGMENT
+        {
+            return Ok(());
+        }
+        self.machine.cpu.registers.ip = u32::from(iret);
+        self.dpmi_run_handler(vector)
+    }
+
+    /// Call the client's protected-mode handler for `vector` on a host stack;
+    /// its IRET reaches `TIMER_RETURN`, which resumes the real-mode context.
+    fn dpmi_run_handler(&mut self, vector: u8) -> Result<(), RuntimeError> {
         let h = self.dpmi.as_mut().unwrap();
         if h.depth == h.frames.len() {
             return Err(dpmi_error(0x8012));
@@ -477,7 +522,7 @@ impl Session {
         }
         self.machine.cpu.registers.set32(Gpr32::Esp, sp);
         self.machine.cpu.registers.ip = TIMER_RETURN;
-        self.machine.cpu.interrupt(&mut self.machine.bus, 0x1C)?;
+        self.machine.cpu.interrupt(&mut self.machine.bus, vector)?;
         Ok(())
     }
 

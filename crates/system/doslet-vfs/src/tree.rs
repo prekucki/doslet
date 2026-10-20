@@ -398,6 +398,16 @@ impl DirectoryTree {
         Ok(())
     }
     /// No drive prefix, leading separator or NUL, as in INT 21h/AH=47h.
+    /// INT 21h/60h: the qualified upper-case form of a C: path, which need
+    /// not exist, without its drive: `DIR\FILE`, or empty for the root.
+    pub fn canonical(&self, path: &[u8], output: &mut [u8]) -> Result<usize, u16> {
+        let name = Name::relative(path, self.current)?;
+        output
+            .get_mut(..name.len)
+            .ok_or(3u16)?
+            .copy_from_slice(name.as_bytes());
+        Ok(name.len)
+    }
     pub fn current_directory(&self) -> &[u8] {
         self.current.as_bytes()
     }
@@ -598,6 +608,37 @@ impl DirectoryTree {
         handle.position = position as u32;
         Ok(handle.position)
     }
+    /// What DOS keeps in a system file table entry for an open handle.
+    pub fn handle_info(&self, handle: u16) -> Result<HandleInfo, u16> {
+        let index = self.handles[Self::slot(handle)?].ok_or(6u16)?;
+        let handle = self.descriptions[index].as_ref().ok_or(6u16)?;
+        let file = &self.files[handle.file];
+        let path = file.name.as_bytes();
+        let name = path
+            .iter()
+            .rposition(|byte| *byte == b'\\')
+            .map_or(path, |i| &path[i + 1..]);
+        Ok(HandleInfo {
+            file: handle.file,
+            short_name: search::short_name(name).unwrap_or([b' '; 11]),
+            length: self
+                .overlay
+                .as_ref()
+                .map_or(file.bytes.len() as u32, |overlay| {
+                    overlay.length(handle.file, file.bytes.len() as u32)
+                }),
+            position: handle.position,
+        })
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandleInfo {
+    /// Stable index of the file within the tree.
+    pub file: usize,
+    /// FCB-style 8.3 name, blank when the name has no 8.3 form.
+    pub short_name: [u8; 11],
+    pub length: u32,
+    pub position: u32,
 }
 /// Borrowed merged view of base bytes and sparse overlay extents, without copying.
 pub struct ReadView<'a> {
@@ -714,6 +755,16 @@ mod tests {
         drive.change_directory(b"C:\\DIR").unwrap();
         drive.change_directory(b"sub").unwrap();
         assert_eq!(drive.current_directory(), b"DIR\\SUB");
+        let mut name = [0; 16];
+        let len = drive.canonical(b"c:../x/./new.txt", &mut name).unwrap();
+        assert_eq!(&name[..len], b"DIR\\X\\NEW.TXT");
+        assert_eq!(drive.canonical(b"/", &mut name), Ok(0));
+        assert_eq!(drive.canonical(b"D:\\X", &mut name), Err(15));
+        assert_eq!(drive.canonical(b"*.TXT", &mut name), Err(3));
+        assert_eq!(
+            drive.canonical(b"\\LONGER\\THAN.BUF", &mut name[..14]),
+            Err(3)
+        );
         assert_eq!(drive.file(b"c:test.dat"), Ok(&b"inside"[..]));
         assert_eq!(drive.file(b"\\TEST.DAT"), Ok(&b"root"[..]));
         assert_eq!(drive.change_directory(b"TEST.DAT"), Err(3));
@@ -740,6 +791,15 @@ mod tests {
         assert_eq!(drive.seek(handle, 0, -1), Err(1));
         assert_eq!(drive.seek(handle, 0, 100), Ok(100));
         assert_eq!(drive.read(handle, 1), Ok(&b""[..]));
+        assert_eq!(
+            drive.handle_info(handle),
+            Ok(HandleInfo {
+                file: 0,
+                short_name: *b"TEST    DAT",
+                length: 6,
+                position: 100,
+            })
+        );
         assert_eq!(drive.open(b"DIR/TEST.DAT", 2), Err(5));
         assert_eq!(drive.open(b"../DIR/TEST.DAT", 0), Err(3));
         assert_eq!(drive.open(b"D:\\DIR\\TEST.DAT", 0), Err(15));
