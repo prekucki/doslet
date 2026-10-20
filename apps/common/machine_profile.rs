@@ -200,18 +200,25 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
     fields(
         t,
         &[
-            "version", "name", "machine", "sound", "input", "output", "game", "info", "drives",
-            "bindings",
+            "version", "name", "preset", "machine", "sound", "input", "output", "game", "info",
+            "drives", "bindings",
         ],
         "",
     )?;
     if t.get("version").and_then(Item::as_integer) != Some(2) {
         return Err("version must be the integer 2".into());
     }
+    let preset = string(t, "preset")?.filter(|s| !s.trim().is_empty());
     let mut spec = MachineSpec {
         name: string(t, "name")?.unwrap_or_default(),
+        preset: preset.clone(),
         ..Default::default()
     };
+    if let Some(preset_id) = &preset
+        && let Some(builtin) = HardwarePreset::find_builtin(preset_id)
+    {
+        builtin.apply_to(&mut spec.hardware, &mut spec.cpu_mode);
+    }
     if let Some(m) = section(t, "machine")? {
         fields(
             m,
@@ -222,6 +229,7 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
                 "timing",
                 "clock_hz",
                 "cpu_mhz",
+                "cpu_mode",
                 "memory_mib",
                 "x87",
                 "video",
@@ -248,6 +256,9 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
         }
         if let Some(v) = cpu_mhz(m)? {
             spec.hardware.cpu_mhz = v;
+        }
+        if let Some(v) = string(m, "cpu_mode")? {
+            spec.cpu_mode = Some(v.parse::<CpuMode>()?);
         }
         if let Some(v) = number(m, "memory_mib")? {
             spec.hardware.memory_mib = v;
@@ -379,6 +390,7 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
                 "working_directory",
                 "patches",
                 "startup_keys",
+                "actions",
             ],
             "game.",
         )?;
@@ -399,6 +411,56 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
                         .ok_or("game.arguments must contain only strings")?
                         .into(),
                 );
+            }
+        }
+        if let Some(actions) = g.get("actions") {
+            for action in actions
+                .as_array_of_tables()
+                .ok_or("game.actions must use [[game.actions]]")?
+                .iter()
+            {
+                fields(
+                    action,
+                    &["id", "name", "executable", "arguments"],
+                    "game.actions.",
+                )?;
+                let executable = required(action, "executable")?;
+                let name = string(action, "name")?
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| executable.clone());
+                let id = string(action, "id")?
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        name.chars()
+                            .map(|c| {
+                                if c.is_ascii_alphanumeric() {
+                                    c.to_ascii_lowercase()
+                                } else {
+                                    '-'
+                                }
+                            })
+                            .collect()
+                    });
+                let mut arguments = Vec::new();
+                if let Some(args) = action.get("arguments") {
+                    for arg in args
+                        .as_array()
+                        .ok_or("game.actions.arguments must be an array")?
+                        .iter()
+                    {
+                        arguments.push(
+                            arg.as_str()
+                                .ok_or("game.actions.arguments must contain only strings")?
+                                .into(),
+                        );
+                    }
+                }
+                spec.game.actions.push(GameAction {
+                    id,
+                    name,
+                    executable,
+                    arguments,
+                });
             }
         }
     }
@@ -606,6 +668,9 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
     let mut d = DocumentMut::new();
     d["version"] = value(2);
     d["name"] = value(&spec.name);
+    if let Some(preset) = &spec.preset {
+        d["preset"] = value(preset);
+    }
     for (k, v) in [
         ("platform", "pc-at"),
         ("cpu", "i386"),
@@ -616,6 +681,9 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
         d["machine"][k] = value(v);
     }
     d["machine"]["cpu_mhz"] = value(i64::from(spec.hardware.cpu_mhz));
+    if let Some(cpu_mode) = spec.cpu_mode {
+        d["machine"]["cpu_mode"] = value(cpu_mode.as_str());
+    }
     d["machine"]["vram_kib"] = value(512);
     d["machine"]["memory_mib"] = value(i64::from(spec.hardware.memory_mib));
     d["machine"]["x87"] = value(spec.hardware.x87);
@@ -676,6 +744,20 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
     }
     if !spec.game.startup_keys.is_empty() {
         d["game"]["startup_keys"] = value(&spec.game.startup_keys);
+    }
+    if !spec.game.actions.is_empty() {
+        let mut actions = ArrayOfTables::new();
+        for action in &spec.game.actions {
+            let mut t = Table::new();
+            t["id"] = value(&action.id);
+            t["name"] = value(&action.name);
+            t["executable"] = value(&action.executable);
+            if !action.arguments.is_empty() {
+                t["arguments"] = value(action.arguments.iter().map(String::as_str).collect::<Array>());
+            }
+            actions.push(t);
+        }
+        d["game"]["actions"] = Item::ArrayOfTables(actions);
     }
     let info = &spec.info;
     if let Some(cover) = &info.cover {

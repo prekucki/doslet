@@ -8,8 +8,14 @@ mod cpu_meter;
 mod desktop;
 mod disk_activity;
 #[cfg(not(target_arch = "wasm32"))]
+#[path = "../../common/global_settings.rs"]
+mod global_settings;
+#[cfg(not(target_arch = "wasm32"))]
 #[path = "../../common/host_dirs.rs"]
 mod host_dirs;
+#[allow(dead_code)]
+#[path = "../../common/i18n.rs"]
+mod i18n;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_computer;
 #[cfg(not(target_arch = "wasm32"))]
@@ -107,14 +113,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    // Without a game, browse launch profiles; Play starts one in this window.
+    // Without a game, always open the game library (including when empty).
     if cli.opens_library() {
         let library = library::Library::discover();
-        if !library.is_empty() {
-            let forwarded = std::env::args_os().skip(1).collect();
-            shell::run(shell::Shell::new(library, forwarded))?;
-            return Ok(());
-        }
+        let forwarded = std::env::args_os().skip(1).collect();
+        shell::run(shell::Shell::new(library, forwarded))?;
+        return Ok(());
     }
     let app = desktop::Doslet::from_cli(cli)?;
     // Transfer the presentation proxy once; the worker retains machine ownership.

@@ -57,6 +57,7 @@ impl Default for Settings {
         }
     }
 }
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub enum Edit {
     Mode(Mode),
@@ -71,6 +72,7 @@ pub enum Edit {
     Revert,
 }
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum ProfileEdit {
     New,
@@ -87,6 +89,7 @@ pub struct ProfileForm {
     pub error: Option<String>,
 }
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ProfileInfo {
     pub path: Option<String>,

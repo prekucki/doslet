@@ -7,6 +7,9 @@ mod archive;
 #[path = "../../common/host_dirs.rs"]
 mod host_dirs;
 #[allow(dead_code)]
+#[path = "../../common/i18n.rs"]
+mod i18n;
+#[allow(dead_code)]
 #[path = "../../common/machine_profile.rs"]
 mod machine_profile;
 #[allow(dead_code)]
@@ -732,27 +735,41 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
     }
     let title = escape(&spec.name);
     let info = &spec.info;
+    let strings = i18n::EN;
     let details: String = [
-        ("Wydanie", info.released.map(|year| year.to_string())),
         (
-            "Wydawca",
+            "released",
+            strings.released,
+            info.released.map(|year| year.to_string()),
+        ),
+        (
+            "publisher",
+            strings.publisher,
             (!info.publishers.is_empty()).then(|| info.publishers.join(", ")),
         ),
         (
-            "Producent",
+            "developer",
+            strings.developer,
             (!info.developers.is_empty()).then(|| info.developers.join(", ")),
         ),
         (
-            "Gatunek",
+            "genre",
+            strings.genre,
             (!info.genres.is_empty()).then(|| info.genres.join(", ")),
         ),
         (
-            "Rozgrywka",
+            "gameplay",
+            strings.gameplay,
             (!info.gameplay.is_empty()).then(|| info.gameplay.join(", ")),
         ),
     ]
     .into_iter()
-    .filter_map(|(label, value)| Some(format!("<dt>{label}</dt><dd>{}</dd>", escape(&value?))))
+    .filter_map(|(key, label, value)| {
+        Some(format!(
+            r#"<dt data-i18n="{key}">{label}</dt><dd>{}</dd>"#,
+            escape(&value?)
+        ))
+    })
     .collect();
     let details = if details.is_empty() {
         details
@@ -787,7 +804,8 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
         format!(r#"<img id="doslet-bundle-art" src="{src}" alt="">"#)
     });
     let overlay = format!(
-        r#"<style>#doslet-bundle-cover{{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;overflow:hidden;background:#111215;color:#ebedf0;font:16px system-ui}}#doslet-bundle-backdrop{{position:absolute;inset:-48px;background:center/cover no-repeat;filter:blur(28px) brightness(.35);transform:scale(1.08)}}#doslet-bundle-card{{position:relative;box-sizing:border-box;max-width:min(100vw,820px);padding:2rem 1rem;text-align:center}}#doslet-bundle-art{{display:block;width:100%;max-height:60vh;object-fit:contain;margin:0 auto 1.5rem;border-radius:12px;box-shadow:0 18px 60px #000a}}#doslet-bundle-card h1{{margin:0 0 1rem;text-shadow:0 2px 12px #000}}#doslet-bundle-info{{display:grid;grid-template-columns:auto auto;justify-content:center;gap:.25rem 1rem;margin:0 0 1.5rem;font-size:.9rem;text-align:left}}#doslet-bundle-info dt{{color:#9aa1ab}}#doslet-bundle-info dd{{margin:0}}#doslet-bundle-about{{max-width:620px;margin:0 auto 1.5rem;color:#c3c8cf;font-size:.95rem;line-height:1.55;text-align:left}}#doslet-bundle-about p{{margin:0 0 .75rem}}#doslet-bundle-launch{{font:700 1.05rem/1 system-ui;letter-spacing:.02em;padding:.9rem 2.4rem;border:0;border-radius:999px;background:linear-gradient(#f7c860,#e3892b);color:#1b1206;cursor:pointer;box-shadow:0 10px 30px #0009,inset 0 1px #fff6;transition:filter .15s,transform .15s}}#doslet-bundle-launch:hover:not(:disabled){{filter:brightness(1.08);transform:translateY(-1px)}}#doslet-bundle-launch:active:not(:disabled){{transform:translateY(1px)}}#doslet-bundle-launch:focus-visible{{outline:3px solid #f7c860;outline-offset:4px}}#doslet-bundle-launch:disabled{{background:#2e3138;color:#8b929c;cursor:default;box-shadow:none}}#doslet-bundle-status{{margin:1rem 0 0;color:#c3c8cf;font-size:.9rem;text-shadow:0 1px 6px #000}}</style><div id="doslet-bundle-cover">{backdrop}<div id="doslet-bundle-card">{image}<h1>{title}</h1>{details}{about}<button id="doslet-bundle-launch" disabled>Uruchom grę</button><p id="doslet-bundle-status">Ładowanie emulatora…</p></div></div><script type="module" src="browser/bundle-launch.js"></script>"#
+        r#"<style>#doslet-bundle-cover{{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;overflow:hidden;background:#111215;color:#ebedf0;font:16px system-ui}}#doslet-bundle-backdrop{{position:absolute;inset:-48px;background:center/cover no-repeat;filter:blur(28px) brightness(.35);transform:scale(1.08)}}#doslet-bundle-card{{position:relative;box-sizing:border-box;max-width:min(100vw,820px);padding:2rem 1rem;text-align:center}}#doslet-bundle-art{{display:block;width:100%;max-height:60vh;object-fit:contain;margin:0 auto 1.5rem;border-radius:12px;box-shadow:0 18px 60px #000a}}#doslet-bundle-card h1{{margin:0 0 1rem;text-shadow:0 2px 12px #000}}#doslet-bundle-info{{display:grid;grid-template-columns:auto auto;justify-content:center;gap:.25rem 1rem;margin:0 0 1.5rem;font-size:.9rem;text-align:left}}#doslet-bundle-info dt{{color:#9aa1ab}}#doslet-bundle-info dd{{margin:0}}#doslet-bundle-about{{max-width:620px;margin:0 auto 1.5rem;color:#c3c8cf;font-size:.95rem;line-height:1.55;text-align:left}}#doslet-bundle-about p{{margin:0 0 .75rem}}#doslet-bundle-launch{{font:700 1.05rem/1 system-ui;letter-spacing:.02em;padding:.9rem 2.4rem;border:0;border-radius:999px;background:linear-gradient(#f7c860,#e3892b);color:#1b1206;cursor:pointer;box-shadow:0 10px 30px #0009,inset 0 1px #fff6;transition:filter .15s,transform .15s}}#doslet-bundle-launch:hover:not(:disabled){{filter:brightness(1.08);transform:translateY(-1px)}}#doslet-bundle-launch:active:not(:disabled){{transform:translateY(1px)}}#doslet-bundle-launch:focus-visible{{outline:3px solid #f7c860;outline-offset:4px}}#doslet-bundle-launch:disabled{{background:#2e3138;color:#8b929c;cursor:default;box-shadow:none}}#doslet-bundle-status{{margin:1rem 0 0;color:#c3c8cf;font-size:.9rem;text-shadow:0 1px 6px #000}}</style><div id="doslet-bundle-cover">{backdrop}<div id="doslet-bundle-card">{image}<h1>{title}</h1>{details}{about}<button id="doslet-bundle-launch" disabled>{}</button><p id="doslet-bundle-status">{}</p></div></div><script type="module" src="browser/bundle-launch.js"></script>"#,
+        strings.play_game, strings.loading_emulator,
     );
     // Name the page after the game and describe it for tabs and shared links.
     let heading = match info.released {
@@ -810,9 +828,9 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
     let description = if let Some(first) = paragraphs.first() {
         first.clone()
     } else if summary.is_empty() {
-        format!("{heading} — gra DOS uruchamiana w przeglądarce.")
+        format!("{heading} — {}", strings.browser_dos_game_suffix)
     } else {
-        format!("{heading}: {summary}. Gra DOS uruchamiana w przeglądarce.")
+        format!("{heading}: {summary}. {}", strings.browser_dos_game_suffix)
     };
     let mut head = format!(
         r#"<title>{} · Doslet</title><meta name="description" content="{}"><meta property="og:type" content="website"><meta property="og:title" content="{}"><meta property="og:description" content="{}">"#,
@@ -1274,7 +1292,7 @@ mod tests {
         assert_eq!(fs::read(site.join("bundle/cover.png")).unwrap(), png);
         let index = fs::read_to_string(site.join("index.html")).unwrap();
         assert!(index.contains(r#"<img id="doslet-bundle-art" src="bundle/cover.png""#));
-        assert!(index.contains("<dt>Wydanie</dt><dd>1994</dd>"));
+        assert!(index.contains(r#"<dt data-i18n="released">Released</dt><dd>1994</dd>"#));
         assert!(index.contains("<title>&lt;Test&gt; (1994) · Doslet</title>"));
         assert!(index.contains(r#"<meta property="og:image" content="bundle/cover.png">"#));
         assert_eq!(index.matches("<title>").count(), 1);

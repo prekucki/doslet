@@ -256,6 +256,45 @@ impl Session {
         });
         Ok(())
     }
+    /// Detach the host storage lease at a settled boundary so a portable state
+    /// snapshot (`save_state`) can be written on shutdown.
+    pub fn detach_persistent_store(&mut self) -> Result<(), RuntimeError> {
+        if self.storage_wait || self.pending_commit() {
+            return Err(RuntimeError::Storage(StorageError::Unavailable));
+        }
+        self.persistent = None;
+        Ok(())
+    }
+    /// Reattach a host storage lease to a session restored from a state snapshot,
+    /// keeping the snapshot's live file handles and overlay.
+    pub fn attach_resumed_persistent_store(
+        &mut self,
+        namespace: [u8; 32],
+        base: [u8; 32],
+        fencing_token: u64,
+        revision: u64,
+    ) -> Result<(), RuntimeError> {
+        if self.persistent.is_some() {
+            return Err(RuntimeError::InvalidLaunch);
+        }
+        if base != self.base_identity {
+            return Err(RuntimeError::Storage(StorageError::MissingBase));
+        }
+        self.persistent = Some(Persistent {
+            namespace,
+            base,
+            fencing_token,
+            revision,
+            next_request: 1,
+            buffer: Vec::with_capacity(self.drive.snapshot_capacity() + 36),
+            pending: None,
+            emitted: false,
+            result: None,
+            attempts: 0,
+            unresolved: false,
+        });
+        Ok(())
+    }
     pub fn export_overlay(&mut self) -> Result<Vec<u8>, StorageError> {
         let mut body = Vec::with_capacity(self.drive.snapshot_capacity());
         self.drive

@@ -168,6 +168,122 @@ impl core::str::FromStr for VideoFilter {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CpuMode {
+    #[default]
+    Fixed,
+    Adaptive,
+    SpeedTiers,
+}
+impl CpuMode {
+    pub const ALL: [Self; 3] = [Self::Fixed, Self::Adaptive, Self::SpeedTiers];
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Adaptive => "adaptive",
+            Self::SpeedTiers => "speed-tiers",
+        }
+    }
+}
+impl core::fmt::Display for CpuMode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Fixed => "Fixed clock",
+            Self::Adaptive => "Adaptive",
+            Self::SpeedTiers => "Speed tiers",
+        })
+    }
+}
+impl core::str::FromStr for CpuMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fixed" => Ok(Self::Fixed),
+            "adaptive" => Ok(Self::Adaptive),
+            "speed-tiers" => Ok(Self::SpeedTiers),
+            _ => Err("machine.cpu_mode must be fixed, adaptive, or speed-tiers"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HardwarePreset {
+    pub id: String,
+    pub name: String,
+    pub cpu_mhz: u16,
+    pub cpu_mode: CpuMode,
+    pub memory_mib: u8,
+    pub x87: bool,
+    pub sb16: bool,
+    pub mpu401: bool,
+}
+impl HardwarePreset {
+    pub fn builtins() -> Vec<Self> {
+        alloc::vec![
+            Self {
+                id: "386sx-16".into(),
+                name: "386SX · 16 MHz".into(),
+                cpu_mhz: 16,
+                cpu_mode: CpuMode::Fixed,
+                memory_mib: 4,
+                x87: true,
+                sb16: true,
+                mpu401: false,
+            },
+            Self {
+                id: "386dx-33".into(),
+                name: "386DX · 33 MHz".into(),
+                cpu_mhz: 33,
+                cpu_mode: CpuMode::Fixed,
+                memory_mib: 8,
+                x87: true,
+                sb16: true,
+                mpu401: true,
+            },
+            Self {
+                id: "486dx2-66".into(),
+                name: "486DX2 · 66 MHz".into(),
+                cpu_mhz: 66,
+                cpu_mode: CpuMode::Adaptive,
+                memory_mib: 16,
+                x87: true,
+                sb16: true,
+                mpu401: true,
+            },
+            Self {
+                id: "pentium-133".into(),
+                name: "Pentium · 133 MHz".into(),
+                cpu_mhz: 133,
+                cpu_mode: CpuMode::SpeedTiers,
+                memory_mib: 32,
+                x87: true,
+                sb16: true,
+                mpu401: true,
+            },
+        ]
+    }
+    pub fn find_builtin(id: &str) -> Option<Self> {
+        Self::builtins().into_iter().find(|p| p.id == id)
+    }
+    pub fn apply_to(&self, hardware: &mut HardwareConfig, cpu_mode: &mut Option<CpuMode>) {
+        hardware.cpu_mhz = self.cpu_mhz;
+        hardware.memory_mib = self.memory_mib;
+        hardware.x87 = self.x87;
+        hardware.sb16 = self.sb16;
+        hardware.mpu401 = self.mpu401;
+        *cpu_mode = Some(self.cpu_mode);
+    }
+}
+
+/// An additional entry point for a game profile, such as `SETUP.EXE` or `SETSOUND.EXE`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GameAction {
+    pub id: String,
+    pub name: String,
+    pub executable: String,
+    pub arguments: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GameSpec {
     pub executable: String,
@@ -177,6 +293,8 @@ pub struct GameSpec {
     pub working_directory: String,
     /// ASCII characters queued in the BIOS keyboard buffer at the first wait.
     pub startup_keys: String,
+    /// Secondary entry points (e.g. `SETUP.EXE`, `SETSOUND.EXE`) sharing the game's save store.
+    pub actions: Vec<GameAction>,
 }
 impl Default for GameSpec {
     fn default() -> Self {
@@ -186,6 +304,7 @@ impl Default for GameSpec {
             arguments: Vec::new(),
             working_directory: "C:\\".into(),
             startup_keys: String::new(),
+            actions: Vec::new(),
         }
     }
 }
@@ -296,6 +415,10 @@ pub struct GameInfo {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MachineSpec {
     pub name: String,
+    /// Optional hardware preset identifier (e.g. `"386sx-16"`, `"486dx2-66"`, or a user preset).
+    pub preset: Option<String>,
+    /// Optional CPU pacing mode (`Fixed`, `Adaptive`, or `SpeedTiers`).
+    pub cpu_mode: Option<CpuMode>,
     pub hardware: HardwareConfig,
     pub mounts: Vec<MountSpec>,
     pub host: HostBindingManifest,
@@ -542,6 +665,40 @@ impl MachineSpec {
                 "game.patches",
                 "must contain at most 32 nonempty paths",
             ));
+        }
+        if self.game.actions.len() > 16 {
+            return Err(ConfigError::new(
+                "game.actions",
+                "supports at most 16 entry points",
+            ));
+        }
+        for (index, action) in self.game.actions.iter().enumerate() {
+            if action.id.trim().is_empty()
+                || action.name.trim().is_empty()
+                || action.executable.trim().is_empty()
+            {
+                return Err(ConfigError::new(
+                    "game.actions",
+                    "each action requires a nonempty id, name and executable",
+                ));
+            }
+            if self.game.actions[..index]
+                .iter()
+                .any(|other| other.id == action.id)
+            {
+                return Err(ConfigError::new(
+                    "game.actions",
+                    "action ids must be unique",
+                ));
+            }
+            for arg in &action.arguments {
+                if !arg.is_ascii() || arg.bytes().any(|b| b < 32 || b == 127 || b == b'"') {
+                    return Err(ConfigError::new(
+                        "game.actions.arguments",
+                        "must be printable ASCII without double quotes",
+                    ));
+                }
+            }
         }
         let directory = &self.game.working_directory;
         if !directory.is_ascii()

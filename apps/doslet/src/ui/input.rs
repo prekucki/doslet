@@ -36,7 +36,7 @@ pub(super) fn indicator() -> Element<'static, Message> {
             .padding([6, 8])
             .style(ghost)
             .on_press(Message::Ui(Action::Open(Panel::Input))),
-        container(text("Mouse & keyboard").size(12))
+        container(text("Mouse, keyboard & joystick").size(12))
             .padding([6, 10])
             .style(panel),
         tooltip::Position::Top,
@@ -114,9 +114,17 @@ pub(super) fn dialog(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         .color(MUTED),
     ]
     .spacing(14);
+    let joystick = column![
+        section_title("Joystick"),
+        toggler(config.hardware.gameport)
+            .label("Emulate PC gameport (port 201h)")
+            .text_size(13)
+            .on_toggle_maybe(ready.then_some(|v| Message::Config(Edit::Gameport(v)))),
+    ]
+    .spacing(10);
     let header = row![
         icon(),
-        text("Mouse & keyboard").size(20).font(semibold()),
+        text("Input").size(20).font(semibold()),
         space::horizontal(),
         button(text("Close").size(13))
             .padding([8, 12])
@@ -140,7 +148,12 @@ pub(super) fn dialog(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     if let Some(notice) = &app.notice {
         footer = footer.push(text(notice).size(12).color(super::DANGER));
     }
-    let mut cards = column![card_content(mouse.into()), card_content(keyboard.into())].spacing(14);
+    let mut cards = column![
+        card_content(mouse.into()),
+        card_content(keyboard.into()),
+        card_content(joystick.into()),
+    ]
+    .spacing(14);
     if mode != MouseMode::NoCapture {
         cards = cards.push(
             text(if cfg!(target_arch = "wasm32") {
@@ -171,7 +184,7 @@ pub(super) fn dialog(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     .padding(if narrow { 16 } else { 22 })
     .max_width(580)
     .width(Fill)
-    .height((size.height - 32.0).clamp(160.0, if narrow { 550.0 } else { 500.0 }))
+    .height((size.height - 32.0).clamp(160.0, if narrow { 580.0 } else { 540.0 }))
     .style(panel)
     .into()
 }

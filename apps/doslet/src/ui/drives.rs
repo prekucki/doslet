@@ -3,11 +3,13 @@ use super::{
     ACCENT, Action, Doslet, EDGE, Icon, MUTED, Message, Panel, ghost, panel, primary, secondary,
 };
 use crate::configurator::Edit;
-use doslet_config::{SourceKind, WritePolicy};
+use doslet_config::SourceKind;
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, rule, scrollable, space, svg, text,
-    text_input, tooltip,
+    button, checkbox, column, container, row, rule, scrollable, space, svg, text, text_input,
+    tooltip,
 };
+#[cfg(target_arch = "wasm32")]
+use iced::widget::pick_list;
 use iced::{Border, Element, Fill};
 
 pub(super) fn indicator(app: &Doslet) -> Element<'_, Message> {
@@ -184,25 +186,16 @@ pub(super) fn dialog(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     .padding(if narrow { 16 } else { 22 })
     .width(Fill)
     .max_width(620)
-    .height(
-        (size.height - 32.0).clamp(
-            160.0,
-            if narrow {
-                620.0
-            } else if config
-                .draft
-                .mounts
-                .iter()
-                .any(|m| m.policy == WritePolicy::Persistent)
-            {
-                if cd.is_some() { 600.0 } else { 480.0 }
-            } else if cd.is_some() {
-                550.0
-            } else {
-                430.0
-            },
-        ),
-    )
+    .height((size.height - 32.0).clamp(
+        160.0,
+        if narrow {
+            540.0
+        } else if cd.is_some() {
+            480.0
+        } else {
+            370.0
+        },
+    ))
     .style(panel)
     .into()
 }
@@ -278,52 +271,7 @@ fn system_drive(app: &Doslet, narrow: bool) -> Element<'_, Message> {
             ));
         }
     }
-    let policy = c.map_or("Temporary changes", |m| match m.policy {
-        WritePolicy::ReadOnly => "Read only",
-        WritePolicy::Temporary => "Temporary changes",
-        WritePolicy::Persistent => "Persistent changes",
-        WritePolicy::LegacyWriteback => "Legacy direct writeback",
-    });
-    let policies: &[&str] = if cfg!(target_arch = "wasm32") {
-        &["Read only", "Temporary changes", "Persistent changes"]
-    } else {
-        &[
-            "Read only",
-            "Temporary changes",
-            "Persistent changes",
-            "Legacy direct writeback",
-        ]
-    };
-    body = body.push(setting(
-        "Writes",
-        pick_list(policies, Some(policy), |v| {
-            Message::Config(Edit::Policy(v.into()))
-        })
-        .padding([7, 10])
-        .text_size(13)
-        .width(Fill)
-        .into(),
-        narrow,
-    ));
-    if c.is_some_and(|m| m.policy == WritePolicy::Persistent) {
-        body = body.push(setting(
-            "Save store",
-            text_input(
-                if cfg!(target_arch = "wasm32") {
-                    "Save location"
-                } else {
-                    "Name or folder path"
-                },
-                c.and_then(|m| m.store.as_deref())
-                    .map_or("", |id| s.binding(id)),
-            )
-            .on_input(|v| Message::Config(Edit::Store(v)))
-            .padding([7, 10])
-            .size(13)
-            .into(),
-            narrow,
-        ));
-    }
+    body = body.push(text(app.storage_label()).size(12).color(MUTED));
     card_content(body.into())
 }
 

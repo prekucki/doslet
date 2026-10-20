@@ -65,8 +65,16 @@ impl HostDirs {
     pub fn profiles(&self) -> PathBuf {
         self.config.join("profiles")
     }
+    #[allow(dead_code)]
+    pub fn settings_file(&self) -> PathBuf {
+        self.config.join("settings.toml")
+    }
     pub fn saves(&self) -> PathBuf {
         self.data.join("saves")
+    }
+    #[allow(dead_code)]
+    pub fn autosave_file(&self, store_name: &str) -> PathBuf {
+        self.saves().join(store_name).join("autosave.state.gz")
     }
     pub fn save_exports(&self) -> PathBuf {
         self.data.join("exports")
