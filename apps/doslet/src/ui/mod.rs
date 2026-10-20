@@ -291,39 +291,6 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     };
     shell = shell.push(container(bottom).padding([5, 16]).width(Fill));
     let shell: Element<'_, Message> = shell.into();
-    if app.configurator.open {
-        // Keep the tabs in one place as sections change; only the sheet's
-        // lower edge moves to accommodate its content.
-        let top = ((size.height - 620.0) / 2.0).max(if narrow { 96.0 } else { 64.0 });
-        let settings = container(
-            app.configurator
-                .view(app.session.dirty_overlay())
-                .map(Message::Config),
-        )
-        .max_width(800)
-        .width(Fill)
-        .height((size.height - top - 16.0).clamp(
-            1.0,
-            app.configurator.preferred_height() + if size.width < 620.0 { 70.0 } else { 0.0 },
-        ))
-        .style(panel);
-        return stack![
-            shell,
-            opaque(
-                container(settings)
-                    .center_x(Fill)
-                    .height(Fill)
-                    .padding(iced::Padding {
-                        top,
-                        right: 8.0,
-                        bottom: 16.0,
-                        left: 8.0
-                    })
-                    .style(backdrop)
-            )
-        ]
-        .into();
-    }
     if let Some(kind) = app.workspace.panel {
         let (title, content) = match kind {
             Panel::Cpu => return modal(shell, cpu::dialog(app, size), narrow),
@@ -383,13 +350,14 @@ fn modal<'a>(
 ) -> Element<'a, Message> {
     stack![
         base,
-        opaque(
-            container(dialog)
+        iced::widget::mouse_area(
+            container(opaque(dialog))
                 .center_x(Fill)
                 .center_y(Fill)
                 .padding(if narrow { 8 } else { 16 })
                 .style(backdrop)
         )
+        .on_press(Message::Ui(Action::Close))
     ]
     .into()
 }
@@ -511,13 +479,10 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
     }
     let mut body = column![
         text(&app.name).size(15),
-        row![
-            small_button(
-                "Settings…",
-                Message::Config(crate::configurator::Edit::Toggle),
-            ),
-            small_button("Audio…", Message::Ui(Action::Open(Panel::Audio))),
-        ]
+        row![small_button(
+            "Audio…",
+            Message::Ui(Action::Open(Panel::Audio))
+        ),]
         .spacing(8),
         text(app.storage_label()).size(13).color(MUTED),
         text(format!("{} instructions", app.session.steps()))
@@ -565,9 +530,6 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
                         text(format!("IRQ {:.1}%", tiers.percent(3))).color(MUTED),
                     ]
                     .spacing(12),
-                    text("Share of guest time since activation · frozen experimental profile")
-                        .size(11)
-                        .color(MUTED),
                     small_button(
                         if tiers.enabled {
                             "Use normal CPU"
@@ -609,17 +571,6 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
             .spacing(8),
         );
         body = body.push(
-            row![
-                text("CPU MHz · live").size(12),
-                pick_list(
-                    &[8u16, 16, 25, 33, 50, 66, 100, 132, 133, 200, 266, 500, 1000][..],
-                    Some(app.configurator.active.hardware.cpu_mhz),
-                    Message::CpuMhz,
-                ),
-            ]
-            .spacing(8),
-        );
-        body = body.push(
             text(format!(
                 "Core: {} MHz · emulation lag {:.1} ms",
                 app.configurator.active.hardware.cpu_mhz,
@@ -628,184 +579,6 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
             .size(12)
             .color(MUTED),
         );
-        body = body.push(
-            column![
-                small_button(
-                    if app.menu_idle.0 && !app.learned_idle {
-                        "Disable Heroes adaptive idle"
-                    } else {
-                        "Try Heroes adaptive idle"
-                    },
-                    Message::HeroesMenuIdleToggle
-                ),
-                text(format!(
-                    "Experimental · {:.1} ms CPU idle · wait {:.0} µs",
-                    app.menu_idle.1 as f64 / 1e6,
-                    app.menu_idle.2 as f64 / 1e3
-                ))
-                .size(12)
-                .color(MUTED),
-            ]
-            .spacing(8),
-        );
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let o = app.idle_observation;
-        body = body.push(
-            text(format!(
-                "Cooperative idle · {}% of recent guest time",
-                app.adaptive_idle_percent
-            ))
-            .size(12)
-            .color(MUTED),
-        );
-        body = body.push(
-            column![
-                small_button(
-                    if app.learned_idle {
-                        "Disable learned idle"
-                    } else {
-                        "Enable learned idle"
-                    },
-                    Message::AdaptiveIdleToggle
-                ),
-                text("Experimental · budgets empty input polls and countdown guards · waits up to 250 µs")
-                    .size(12)
-                    .color(MUTED),
-            ]
-            .spacing(8),
-        );
-        body = body.push(column![
-            small_button(if o.enabled { "Stop idle observation" } else { "Observe idle loops" },
-                Message::IdleObservationToggle),
-            text(if !o.enabled { "Observer off".to_owned() } else { format!(
-                "Observer · {}\n{} samples · {} at {:04X}:{:08X}\n{} input queries · {} RAM writes · {} device accesses\nDiagnostic only — no automatic sleep.",
-                o.reason, o.samples, o.repeated, o.cs, o.ip, o.queries, o.writes, o.device_accesses,
-            ) }).size(12).color(MUTED),
-        ].spacing(8));
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    if app.idle_observation.enabled {
-        let s = app.synchronization;
-        if app.learned_idle {
-            body = body.push(
-                text(format!(
-                    "Empty-poll waits {} · observed CPU work {:.1} µs\nLearned guards · {} arrivals · last check {:08X}: {}",
-                    s.poll_waits, s.poll_cpu_peak_nanos as f64 / 1000.0,
-                    s.learned_hits,
-                    s.learned_checked_ip,
-                    if s.learned_reason.is_empty() {
-                        "searching for guard"
-                    } else {
-                        s.learned_reason
-                    }
-                ))
-                .size(12)
-                .color(MUTED),
-            );
-        }
-        let slack = s.provisional_slack_nanos.map_or_else(
-            || "collecting fresh recurrence samples".to_owned(),
-            |ns| {
-                format!(
-                    "{:.3} ms (~{} nominal steps)",
-                    ns as f64 / 1e6,
-                    s.provisional_slack_steps.unwrap_or(0)
-                )
-            },
-        );
-        let horizon = s.horizon_nanos.map_or_else(
-            || "unknown".to_owned(),
-            |ns| format!("{:.3} ms · {}", ns as f64 / 1e6, s.horizon_source),
-        );
-        body = body.push(text(format!(
-            "Provisional budget · {slack}\nNext known service: {horizon}\nObserved recurrence peak {:.3} ms · {} samples · reserve {:.3} ms\nRecurrence is not measured useful work. Only VGA mask 08h has a linked transition; other wake sources are unproven. No automatic sleep.",
-            s.recurrence_peak_nanos as f64 / 1e6, s.recurrence_samples,
-            s.reserve_nanos as f64 / 1e6,
-        )).size(12).color(MUTED));
-        body = body.push(text(format!(
-            "Synchronization · {} traced steps · {} conditions\n{:04X}:{:08X} · {} {:08X} · {} byte(s)\nValue {:X}, compare/mask {:X} · taken {} / fallthrough {}\nValue changes between tests: {} · across traced steps: {}\nLast change: RAM {:08X}, step {:04X}:{:08X} · IRQ pending {} · device access {}\nChange source unproven; tracing does not authorize sleep.",
-            s.traced_steps, s.conditions, s.cs, s.ip, if s.port { "port" } else { "RAM" },
-            s.operand, s.width, s.value, s.comparison, s.taken, s.fallthrough,
-            s.value_changes, s.observed_changes, s.change_operand, s.change_cs, s.change_ip,
-            s.change_with_irq, s.change_with_device_access,
-        )).size(12).color(MUTED));
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    if app.analysis.enabled {
-        let a = app.analysis;
-        let guest_audio = if a.audio_irq_deadlines == 0 {
-            "Guest DMA IRQ service: no complete observation".to_owned()
-        } else {
-            format!(
-                "Guest DMA IRQ service: {} missed / {} observed block deadlines",
-                a.audio_irq_deadline_misses, a.audio_irq_deadlines
-            )
-        };
-        body = body.push(
-            text(format!(
-                "Host PCM missing frames: {:?}\n{guest_audio}",
-                app.host_audio_underruns,
-            ))
-            .size(12)
-            .color(MUTED),
-        );
-        body=body.push(text(format!("Synchronization analyzer · {}\n{} nodes · {} backedges · {} traced steps · {} gaps\nCPU {} MHz effective / {} MHz ceiling\n{}",a.graph_reason,a.graph_nodes,a.backedges,a.observed_steps,a.gaps,a.effective_mhz,a.configured_mhz,a.reason)).size(12).color(MUTED));
-        for c in a.candidates.into_iter().filter(|c| c.width != 0) {
-            let work_label = if c.boundary_accounting {
-                "work upper bound"
-            } else {
-                "traced work"
-            };
-            let source = if c.port {
-                format!("VGA retrace · port {:04X}", c.operand)
-            } else {
-                format!(
-                    "RAM {:08X} · writer {:?} · IRQ {:?} · {} partial writes",
-                    c.operand, c.writer_pc, c.writer_irq, c.partial_writes
-                )
-            };
-            body=body.push(text(format!("{:08X} · {} · {}\n{} complete episodes · {} {:.3} ms / confirmed wait {:.3} ms · max {:.3} ms\n{} · predicted {:?} MHz",c.head,c.state,c.reason,c.episodes,work_label,c.work_nanos as f64/1e6,c.wait_nanos as f64/1e6,c.work_max_nanos as f64/1e6,source,c.predicted_mhz)).size(12).color(MUTED));
-            if c.reference_period_nanos != 0 {
-                let mean = c.cadence_mean_nanos.map_or_else(
-                    || "collecting".to_owned(),
-                    |nanos| format!("{:.3} ms", nanos as f64 / 1e6),
-                );
-                body = body.push(
-                    text(format!(
-                        "Reference period {:.3} ms · current mean {mean} · cadence floor {} MHz",
-                        c.reference_period_nanos as f64 / 1e6,
-                        c.cadence_floor_mhz,
-                    ))
-                    .size(12)
-                    .color(MUTED),
-                );
-            }
-        }
-        for g in a.guards.into_iter().filter(|g| g.head != 0) {
-            body = body.push(text(format!(
-                "Returning guard {:08X} · RAM {:08X}\nCaller {:08X} · {} observed backedges\n{} IRQ decrements · writer {:?} · IRQ {:?}\n{}",
-                g.head, g.operand, g.caller, g.caller_backedges, g.observed_decrements, g.writer_pc, g.writer_irq, g.reason,
-            )).size(12).color(MUTED));
-        }
-        if a.caller.head != 0 {
-            let c = a.caller;
-            body = body.push(text(format!(
-                "Caller trace {:08X} · {}/{} complete iterations · {} exhausted\nLast {} steps / {:.3} ms · {} service gaps · {} dropped effects\n{}",
-                c.caller, c.complete, c.attempts, c.exhausted, c.last_steps,
-                c.last_nanos as f64 / 1e6, c.service_gaps, c.dropped_effects, c.reason,
-            )).size(12).color(MUTED));
-        }
-        if a.recurrence.head != 0 {
-            let r = a.recurrence;
-            let kind = if r.backedge { "backedge" } else { "caller" };
-            body = body.push(text(format!(
-                "Recurring {kind} {:08X} · {}/{} unchanged intervals\nMeasured wait {:.3} ms · {} rejected · {} cancelled\n{} abandoned probes · {}",
-                r.caller, r.unchanged, r.intervals, r.measured_wait_nanos as f64 / 1e6, r.rejected, r.cancelled,
-                r.probe_rejections, r.last_probe_rejection_reason,
-            )).size(12).color(MUTED));
-        }
     }
     if let Some(fault) = app.session.fault() {
         body = body.push(text(fault.to_string()).size(13).color(DANGER));

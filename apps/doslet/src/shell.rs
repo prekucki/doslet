@@ -6,7 +6,7 @@ use doslet_runtime::SessionStatus;
 use iced::{Element, Subscription, Task, Theme};
 use std::{
     ffi::OsString,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -53,19 +53,67 @@ impl Shell {
         }
     }
 
+    fn apply_global_to_cli(&self, cli: &mut crate::cli::Cli) {
+        let g = &self.library.global;
+        let has_flag = |flag: &str| {
+            self.forwarded
+                .iter()
+                .any(|arg| arg.to_string_lossy().starts_with(flag))
+        };
+        if !g.audio_enabled && !has_flag("--no-audio") {
+            cli.no_audio = true;
+        }
+        if !has_flag("--audio-mixer") {
+            cli.audio_mixer = if g.audio_mixer.eq_ignore_ascii_case("system") {
+                crate::audio::Mixer::System
+            } else {
+                crate::audio::Mixer::Application
+            };
+        }
+        if !cli.no_audio {
+            if cli.midi_output.is_none() && !g.midi_output.is_empty() {
+                cli.midi_output = Some(g.midi_output.clone());
+            }
+            if cli.mt32_rom_dir.is_none() {
+                cli.mt32_rom_dir = g.mt32_rom_dir.as_ref().map(PathBuf::from);
+            }
+        }
+    }
+
     /// Prepare the machine off the window thread: loading media, audio and
     /// AOT code can take a moment, during which the library keeps drawing.
-    fn start(&mut self, index: usize) -> Task<Message> {
+    fn start(
+        &mut self,
+        index: usize,
+        action: Option<String>,
+        resume_autosave: bool,
+    ) -> Task<Message> {
         if self.game.is_some() || self.library.starting.is_some() {
             return Task::none();
         }
         let Some(game) = self.library.games.get(index) else {
             return Task::none();
         };
-        let arguments = std::iter::once(OsString::from("doslet"))
+        let mut arguments: Vec<OsString> = std::iter::once(OsString::from("doslet"))
             .chain(self.forwarded.iter().cloned())
-            .chain([OsString::from("--config"), game.profile.clone().into()]);
-        let cli = match <crate::cli::Cli as clap::Parser>::try_parse_from(arguments) {
+            .chain([OsString::from("--config"), game.profile.clone().into()])
+            .collect();
+        if let Some(action_id) = &action {
+            // Running a secondary entrypoint (e.g. SETUP.EXE) may modify game
+            // configuration files in the persistent overlay, so clear any stale
+            // memory snapshot before launching the utility.
+            let _ = std::fs::remove_file(&game.autosave);
+            arguments.push(OsString::from("--action"));
+            arguments.push(OsString::from(action_id));
+        } else {
+            arguments.push(OsString::from("--autosave-path"));
+            arguments.push(game.autosave.clone().into());
+            if resume_autosave && game.autosave.is_file() {
+                arguments.push(OsString::from("--load-state"));
+                arguments.push(game.autosave.clone().into());
+            }
+        }
+        let mut cli = match <crate::cli::Cli as clap::Parser>::try_parse_from(arguments) {
             Ok(cli) => cli,
             Err(error) => {
                 let name = game.name.clone();
@@ -74,8 +122,32 @@ impl Shell {
                 return Task::none();
             }
         };
+        self.apply_global_to_cli(&mut cli);
         self.library.starting = Some(index);
         self.library.notice = None;
+        self.spawn_cli(cli)
+    }
+
+    fn start_demo(&mut self) -> Task<Message> {
+        if self.game.is_some() || self.library.starting.is_some() {
+            return Task::none();
+        }
+        let arguments = std::iter::once(OsString::from("doslet"))
+            .chain(self.forwarded.iter().cloned())
+            .chain([OsString::from("--demo")]);
+        let mut cli = match <crate::cli::Cli as clap::Parser>::try_parse_from(arguments) {
+            Ok(cli) => cli,
+            Err(error) => {
+                self.library.notice = Some(format!("Cannot start demo: {error}"));
+                return Task::none();
+            }
+        };
+        self.apply_global_to_cli(&mut cli);
+        self.library.notice = None;
+        self.spawn_cli(cli)
+    }
+
+    fn spawn_cli(&mut self, cli: crate::cli::Cli) -> Task<Message> {
         Task::perform(
             async move {
                 let (sender, receiver) = iced::futures::channel::oneshot::channel();
@@ -98,7 +170,18 @@ impl Shell {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Library(library::Message::Launch(index)) => self.start(index),
+            Message::Library(library::Message::Launch(index)) => self.start(index, None, true),
+            Message::Library(library::Message::Restart(index)) => {
+                if let Some(game) = self.library.games.get(index) {
+                    let _ = std::fs::remove_file(&game.autosave);
+                }
+                self.library.refresh_autosaves();
+                self.start(index, None, false)
+            }
+            Message::Library(library::Message::LaunchAction(index, action_id)) => {
+                self.start(index, Some(action_id), false)
+            }
+            Message::Library(library::Message::LaunchDemo) => self.start_demo(),
             Message::Library(message) => self.library.update(message).map(Message::Library),
             Message::Started(result) => {
                 let index = self.library.starting.take();
@@ -121,9 +204,11 @@ impl Shell {
                 }
                 Task::none()
             }
-            // Dropping the frontend stops and joins its emulation thread.
+            // Dropping the frontend stops and joins its emulation thread
+            // (which writes autosave.state.gz if the guest is still active).
             Message::Game(app::Message::LibraryReady) => {
                 self.game = None;
+                self.library.refresh_autosaves();
                 Task::none()
             }
             Message::Game(message) => {
@@ -132,8 +217,7 @@ impl Shell {
                 };
                 let task = game.update(message).map(Message::Game);
                 // A program that ends returns to the library like the toolbar
-                // button, once its last save is committed. A refusal there
-                // (unsaved temporary changes) leaves it on screen with the reason.
+                // button, once its last save is committed.
                 let session = &game.session;
                 let exited = matches!(session.status(), SessionStatus::Exited(_));
                 let settled = !session.pending_commit() && !session.storage_waiting();

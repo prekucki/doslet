@@ -275,6 +275,45 @@ impl Cli {
             let is_v2 = document.get("version").and_then(Item::as_integer) == Some(2);
             let profile = if is_v2 {
                 let mut spec = crate::machine_profile::parse_machine_profile(&text)?;
+                if let Some(action_id) = &self.action {
+                    let action = spec
+                        .game
+                        .actions
+                        .iter()
+                        .find(|a| a.id == *action_id)
+                        .ok_or_else(|| format!("unknown game action: {action_id}"))?
+                        .clone();
+                    if !spec.name.is_empty() {
+                        spec.name = format!("{} · {}", spec.name, action.name);
+                    } else {
+                        spec.name = action.name;
+                    }
+                    spec.game.executable = action.executable;
+                    spec.game.arguments = action.arguments;
+                    spec.game.patches.clear();
+                    spec.game.startup_keys.clear();
+                }
+                if let Some(cpu_mode) = spec.cpu_mode {
+                    match cpu_mode {
+                        doslet_config::CpuMode::Adaptive => {
+                            if !self.adaptive_idle
+                                && !self.experimental_heroes_menu_idle
+                                && !self.experimental_heroes_timer_waits
+                                && self.speed_tier_profile.is_none()
+                            {
+                                self.adaptive_cpu = true;
+                                self.no_speed_tiers = true;
+                            }
+                        }
+                        doslet_config::CpuMode::Fixed => {
+                            self.adaptive_cpu = false;
+                            self.no_speed_tiers = true;
+                        }
+                        doslet_config::CpuMode::SpeedTiers => {
+                            self.adaptive_cpu = false;
+                        }
+                    }
+                }
                 for path in &mut spec.game.patches {
                     *path = std::path::absolute(base.join(&*path))?
                         .to_string_lossy()
@@ -339,6 +378,7 @@ impl Cli {
                     }
                     if let Some(store) = &mut mount.store
                         && !spec.host.bindings.iter().any(|b| b.id == *store)
+                        && Path::new(&*store).components().count() > 1
                     {
                         *store = base.join(&*store).to_string_lossy().into_owned();
                     }
@@ -629,6 +669,20 @@ impl Cli {
                 DriveMode::Overlay => doslet_config::WritePolicy::Temporary,
                 DriveMode::Rw => doslet_config::WritePolicy::LegacyWriteback,
             };
+        }
+        if (self.autosave_path.is_some() || self.action.is_some())
+            && explicit_drive_mode.is_none()
+            && let Some(config) = &self.config
+            && let Some(stem) = config
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty())
+            && let Some(c) = spec.mounts.iter_mut().find(|m| m.letter == b'C')
+            && c.policy == doslet_config::WritePolicy::Temporary
+            && c.store.is_none()
+        {
+            c.policy = doslet_config::WritePolicy::Persistent;
+            c.store = Some(stem);
         }
         if let Some(mount) = crate::native_zip::mount(&spec) {
             if self.launch.persist || mount.policy == doslet_config::WritePolicy::LegacyWriteback {

@@ -11,6 +11,7 @@ __pycache__/
 /mise.local.toml
 
 # Local tool credentials and account-linked design exports
+/.claude/
 /.codex/
 /design/stitch/
 

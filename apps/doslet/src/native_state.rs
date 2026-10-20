@@ -1,6 +1,28 @@
 //! Native file adapter only; embedded media stay local to the restored Session.
 use doslet_runtime::{Session, SessionStatus};
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::{self, File},
+    io::{Read, Write},
+    path::Path,
+};
+
+pub fn save(path: &Path, session: &mut Session) -> Result<(), Box<dyn std::error::Error>> {
+    session.detach_persistent_store()?;
+    let bytes = session.save_state()?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let file = File::create(&tmp)?;
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        encoder.write_all(&bytes)?;
+        let file = encoder.finish()?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
 
 pub fn load(
     path: &Path,

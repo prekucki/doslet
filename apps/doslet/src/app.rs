@@ -33,7 +33,7 @@ struct PreparedMachine {
 }
 pub(crate) struct MachinePreparation {
     old_storage: Option<crate::native_storage::NativeStorage>,
-    result: Result<(PreparedMachine, crate::native_storage::NativeStorage), String>,
+    result: Result<(Box<PreparedMachine>, crate::native_storage::NativeStorage), String>,
 }
 impl core::fmt::Debug for MachinePreparation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -49,6 +49,7 @@ pub struct Doslet {
     cpu_meter: crate::cpu_meter::Meter,
     speed_tiers: Option<crate::native_speed_tiers::Controller>,
     restore_state: Option<std::path::PathBuf>,
+    pub(crate) autosave_path: Option<std::path::PathBuf>,
     host_mouse_buttons: u8,
     agent_mouse_buttons: u8,
     host_modifiers: u8,
@@ -118,6 +119,7 @@ pub struct Doslet {
     #[cfg(not(target_arch = "wasm32"))]
     audio: Option<crate::audio::Output>,
 }
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum Message {
     CpuProfile(crate::cpu_config::ProfileEdit),
@@ -171,6 +173,7 @@ pub enum Message {
     StartArchive,
 }
 impl Doslet {
+    #[inline(never)]
     pub fn new() -> Self {
         Self {
             session: Session::demo().into(),
@@ -180,6 +183,7 @@ impl Doslet {
             cpu_meter: crate::cpu_meter::Meter::default(),
             speed_tiers: None,
             restore_state: None,
+            autosave_path: None,
             host_mouse_buttons: 0,
             agent_mouse_buttons: 0,
             host_modifiers: 0,
@@ -249,15 +253,78 @@ impl Doslet {
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn boxed_new() -> Box<Self> {
+        Box::new(Self::new())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn init_demo_session(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.session = Session::demo_configured(self.launch.hardware)?.into();
+        self.session.set_dynamic_core(!self.launch.no_dynamic_core);
+        if let Some(path) = &self.launch.core_profile {
+            crate::native_input::load_core_profile(&mut self.session, path);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn init_snapshot_session(
+        &mut self,
+        path: std::path::PathBuf,
+        game: Option<std::path::PathBuf>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(game) = game {
+            // Mount resources before resolving the snapshot's logical references.
+            let persist = self.launch.persist;
+            self.launch.persist = false;
+            let mut media_settings = self.launch.clone();
+            media_settings.wasm_procedures = None;
+            media_settings.interpret_procedures = false;
+            self.session =
+                crate::native_zip::load_game_with_settings(&game, &media_settings)?.into();
+            self.source = Some(game);
+            self.launch.persist = persist;
+        }
+        self.install_snapshot(path)?;
+        if self.autosave_path.is_some() {
+            self.storage = Some(crate::native_storage::NativeStorage::prepare_resumed_mut(
+                &mut self.session,
+                &self.launch,
+            )?);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn init_game_session(
+        &mut self,
+        path: std::path::PathBuf,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = crate::native_zip::load_game_with_settings(&path, &self.launch)
+            .map_err(|error| format!("Cannot load {}: {error}", path.display()))?;
+        self.storage = Some(crate::native_storage::NativeStorage::prepare_mut(
+            &mut session,
+            &self.launch,
+        )?);
+        self.name = path.file_name().unwrap().to_string_lossy().into_owned();
+        self.source = Some(path);
+        session.start();
+        self.session = session.into();
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
     pub fn from_cli(cli: crate::cli::Cli) -> Result<Box<Self>, Box<dyn std::error::Error>> {
         let cli = cli.resolve()?;
-        let mut app = Box::new(Self::new());
+        let mut app = Self::boxed_new();
         app.audio_backend = cli.audio_backend;
         app.audio_mixer = cli.audio_mixer;
         app.audio_deferred = !cli.no_audio;
         app.gamepads = Some(crate::native_gamepad::NativeGamepads::new());
         app.midi_mode = cli.midi_mode.unwrap_or_default().into();
         app.midi_output_mode = cli.midi_output_mode.unwrap_or_default().into();
+        app.autosave_path = cli.autosave_path.clone();
         app.launch = cli.launch;
         let automatic_tiers = if cli.speed_tier_profile.is_none()
             && !cli.no_speed_tiers
@@ -306,38 +373,14 @@ impl Doslet {
         app.display_sizing.filter = machine_spec.output.video_filter.into();
         app.configurator.set_active(machine_spec);
         if cli.game.is_none() && cli.load_state.is_none() {
-            app.session = Session::demo_configured(app.launch.hardware)?.into();
-            app.session.set_dynamic_core(!app.launch.no_dynamic_core);
-            if let Some(path) = &app.launch.core_profile {
-                crate::native_input::load_core_profile(&mut app.session, path);
-            }
+            app.init_demo_session()?;
         }
         app.routing.set_mode(app.midi_mode);
         if cli.game.is_some() || cli.load_state.is_some() {
             if let Some(path) = cli.load_state {
-                if let Some(game) = cli.game {
-                    // Mount resources before resolving the snapshot's logical references.
-                    app.launch.persist = false;
-                    let mut media_settings = app.launch.clone();
-                    media_settings.wasm_procedures = None;
-                    media_settings.interpret_procedures = false;
-                    app.session =
-                        crate::native_zip::load_game_with_settings(&game, &media_settings)?.into();
-                    app.source = Some(game);
-                }
-                app.install_snapshot(path)?;
+                app.init_snapshot_session(path, cli.game)?;
             } else {
-                let path = cli.game.unwrap();
-                let mut session = crate::native_zip::load_game_with_settings(&path, &app.launch)
-                    .map_err(|error| format!("Cannot load {}: {error}", path.display()))?;
-                app.storage = Some(crate::native_storage::NativeStorage::prepare_mut(
-                    &mut session,
-                    &app.launch,
-                )?);
-                app.name = path.file_name().unwrap().to_string_lossy().into_owned();
-                app.source = Some(path);
-                session.start();
-                app.session = session.into();
+                app.init_game_session(cli.game.unwrap())?;
             }
             if let Some(name) = cli.profile_name {
                 app.name = name;
@@ -1163,12 +1206,14 @@ impl Doslet {
             }
             Message::CloseRequested(id) => {
                 self.save_core_profile();
+                self.save_autosave();
                 return iced::window::close(id);
             }
             Message::ExitRequested => {
                 self.session.pause();
                 self.presentation_revision = self.presentation_revision.wrapping_add(1);
                 self.save_core_profile();
+                self.save_autosave();
                 return iced::exit();
             }
             Message::ReturnToLibrary => return self.return_to_library(),
@@ -1452,12 +1497,12 @@ impl Doslet {
                     storage.import(&mut session, &path)?;
                 }
                 Ok((
-                    PreparedMachine {
+                    Box::new(PreparedMachine {
                         session,
                         source: path,
                         launch: settings,
                         spec,
-                    },
+                    }),
                     storage,
                 ))
             }))
@@ -1481,7 +1526,8 @@ impl Doslet {
             Ok(prepared) => {
                 self.storage = prepared.old_storage;
                 match prepared.result {
-                    Ok((mut candidate, storage)) => {
+                    Ok((candidate, storage)) => {
+                        let mut candidate = *candidate;
                         let Some(output) = self.pending_output.take() else {
                             self.configurator.message =
                                 Some("Prepared host output unavailable.".into());
@@ -1624,6 +1670,7 @@ impl Doslet {
             self.logged_notice.clone_from(&self.notice);
         }
     }
+    #[inline(never)]
     fn reset(&mut self) {
         self.save_core_profile();
         self.notice = None;
@@ -1657,59 +1704,17 @@ impl Doslet {
             return;
         }
         #[cfg(test)]
-        if let Some((archive, program)) = &self.active_archive {
-            match archive.load(program) {
-                Ok(mut session) => {
-                    session.start();
-                    self.seed_pad(&mut session);
-                    let _ = session.release_keys();
-                    self.session = session.into();
-                    self.name = program.rsplit('/').next().unwrap().into();
-                    self.clear_presentation();
-                }
-                Err(error) => self.notice = Some(error),
-            }
+        if self.active_archive.is_some() {
+            self.reset_active_archive();
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             // A snapshot selects the initial position, not the reset recipe.
             // Prefer restarting the configured executable when one is available.
-            if let Some(path) = &self.source {
-                match crate::native_zip::load_game_with_settings(path, &self.launch) {
-                    Ok(mut session) => {
-                        match if let Some(storage) = &mut self.storage {
-                            storage.prepare_replacement_mut(&mut session, &self.launch)
-                        } else {
-                            crate::native_storage::NativeStorage::prepare_mut(
-                                &mut session,
-                                &self.launch,
-                            )
-                        } {
-                            Ok(storage) => {
-                                session.start();
-                                self.session = session.into();
-                                self.storage = Some(storage);
-                                self.restore_state = None;
-                                self.name = if self.configurator.active.name.is_empty() {
-                                    path.file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .into_owned()
-                                } else {
-                                    self.configurator.active.name.clone()
-                                };
-                            }
-                            Err(error) => {
-                                self.notice = Some(format!("Cannot reload saves: {error}"));
-                                return;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        self.notice = Some(format!("Cannot reload game: {error}"));
-                        return;
-                    }
+            if self.source.is_some() {
+                if !self.reset_source_game() {
+                    return;
                 }
             } else if let Some(path) = self.restore_state.clone() {
                 if let Err(error) = self.install_snapshot(path) {
@@ -1717,18 +1722,7 @@ impl Doslet {
                     return;
                 }
             } else {
-                self.session = Session::demo_configured(self.launch.hardware)
-                    .expect("validated demo hardware")
-                    .into();
-                self.session.set_dynamic_core(!self.launch.no_dynamic_core);
-                self.session
-                    .set_synchronization_analysis(self.launch.analyze_synchronization);
-                if self.launch.adaptive_cpu {
-                    self.session.set_adaptive_cpu(true);
-                }
-                if let Some(path) = &self.launch.core_profile {
-                    crate::native_input::load_core_profile(&mut self.session, path);
-                }
+                self.reset_demo_session();
             }
         }
         if let Some(generation) = self.pad_generation {
@@ -1743,6 +1737,79 @@ impl Doslet {
         let _ = self.session.release_keys();
         self.clear_presentation();
     }
+    #[cfg(test)]
+    #[inline(never)]
+    fn reset_active_archive(&mut self) {
+        if let Some((archive, program)) = &self.active_archive {
+            match archive.load(program) {
+                Ok(mut session) => {
+                    session.start();
+                    self.seed_pad(&mut session);
+                    let _ = session.release_keys();
+                    self.session = session.into();
+                    self.name = program.rsplit('/').next().unwrap().into();
+                    self.clear_presentation();
+                }
+                Err(error) => self.notice = Some(error),
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn reset_source_game(&mut self) -> bool {
+        let Some(path) = &self.source else {
+            return true;
+        };
+        match crate::native_zip::load_game_with_settings(path, &self.launch) {
+            Ok(mut session) => {
+                match if let Some(storage) = &mut self.storage {
+                    storage.prepare_replacement_mut(&mut session, &self.launch)
+                } else {
+                    crate::native_storage::NativeStorage::prepare_mut(&mut session, &self.launch)
+                } {
+                    Ok(storage) => {
+                        session.start();
+                        self.session = session.into();
+                        self.storage = Some(storage);
+                        self.restore_state = None;
+                        self.name = if self.configurator.active.name.is_empty() {
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned()
+                        } else {
+                            self.configurator.active.name.clone()
+                        };
+                        true
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!("Cannot reload saves: {error}"));
+                        false
+                    }
+                }
+            }
+            Err(error) => {
+                self.notice = Some(format!("Cannot reload game: {error}"));
+                false
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn reset_demo_session(&mut self) {
+        self.session = Session::demo_configured(self.launch.hardware)
+            .expect("validated demo hardware")
+            .into();
+        self.session.set_dynamic_core(!self.launch.no_dynamic_core);
+        self.session
+            .set_synchronization_analysis(self.launch.analyze_synchronization);
+        if self.launch.adaptive_cpu {
+            self.session.set_adaptive_cpu(true);
+        }
+        if let Some(path) = &self.launch.core_profile {
+            crate::native_input::load_core_profile(&mut self.session, path);
+        }
+    }
     /// Leaving drops the machine, so it needs Reset's guarantees: committed
     /// saves and no silently discarded temporary changes.
     fn return_to_library(&mut self) -> Task<Message> {
@@ -1756,7 +1823,8 @@ impl Doslet {
             self.notice = Some("Saving; return to the library after the commit finishes.".into());
             return Task::none();
         }
-        if self.session.dirty_overlay()
+        if self.autosave_path.is_none()
+            && self.session.dirty_overlay()
             && !self.launch.persist
             && !self.configurator.discard_changes
         {
@@ -1770,12 +1838,41 @@ impl Doslet {
         self.session.pause();
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
         self.save_core_profile();
+        self.save_autosave();
         Task::batch([self.release_mouse(), Task::done(Message::LibraryReady)])
     }
     pub(crate) fn save_core_profile(&self) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = &self.launch.core_profile {
             crate::native_input::save_core_profile(&self.session, path);
+        }
+    }
+    pub(crate) fn save_autosave(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = self.autosave_path.take() {
+            if let Some(storage) = &mut self.storage {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while (self.session.storage_waiting() || self.session.pending_commit())
+                    && Instant::now() < deadline
+                {
+                    let _ = storage.service(&mut self.session);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            if matches!(
+                self.session.status(),
+                SessionStatus::Exited(_) | SessionStatus::Faulted | SessionStatus::Halted
+            ) {
+                let _ = std::fs::remove_file(&path);
+                return;
+            }
+            self.session.pause();
+            if let Err(error) = crate::native_state::save(&path, &mut self.session) {
+                eprintln!(
+                    "[WARN doslet] Cannot save suspended state {}: {error}",
+                    path.display()
+                );
+            }
         }
     }
     fn clear_presentation(&mut self) {
@@ -3559,7 +3656,7 @@ enabled = false
     }
     #[test]
     fn failed_candidate_restores_running_session_and_reset_recipe() {
-        let mut app = Doslet::new();
+        let mut app = Box::new(Doslet::new());
         app.session.start();
         app.session.advance(25);
         let steps = app.session.steps();
@@ -3590,7 +3687,7 @@ enabled = false
     }
     #[test]
     fn prepared_hardware_becomes_the_active_session_and_reset_recipe() {
-        let mut app = Doslet::new();
+        let mut app = Box::new(Doslet::new());
         let mut spec = doslet_config::MachineSpec::default();
         spec.hardware.memory_mib = 4;
         spec.hardware.sb16 = false;

@@ -59,6 +59,7 @@ impl SessionSnapshot {
         self.dirty
     }
 }
+#[allow(dead_code)]
 pub struct Snapshot {
     pub cpu_settings: crate::cpu_config::Settings,
     pub cpu_profile: Option<crate::cpu_config::ProfileInfo>,
@@ -827,6 +828,7 @@ impl Worker {
                     }
                 }
                 engine.save_core_profile();
+                engine.save_autosave();
             })
             .map_err(|e| e.to_string())?;
         match ready_rx.recv().map_err(|e| e.to_string())? {

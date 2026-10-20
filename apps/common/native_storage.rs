@@ -589,7 +589,14 @@ impl NativeStorage {
         session: &mut Session,
         settings: &crate::native_input::LaunchSettings,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::prepare_inner(session, settings, None)
+        Self::prepare_inner(session, settings, None, false)
+    }
+    #[allow(dead_code)]
+    pub fn prepare_resumed_mut(
+        session: &mut Session,
+        settings: &crate::native_input::LaunchSettings,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::prepare_inner(session, settings, None, true)
     }
     #[allow(dead_code)]
     pub fn prepare_replacement(
@@ -608,12 +615,13 @@ impl NativeStorage {
         if self.in_flight != 0 || self.deferred.is_some() {
             return Err("storage operations must settle before replacing the session".into());
         }
-        Self::prepare_inner(session, settings, self.store.as_ref())
+        Self::prepare_inner(session, settings, self.store.as_ref(), false)
     }
     fn prepare_inner(
         session: &mut Session,
         settings: &crate::native_input::LaunchSettings,
         reuse: Option<&Arc<Mutex<NativeStore>>>,
+        resumed_snapshot: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let mut source = None;
         let mut store = None;
@@ -665,13 +673,22 @@ impl NativeStorage {
                 {
                     let current = selected.lock().map_err(|_| "save store worker failed")?;
                     let (revision, payload) = current.committed().map_err(store_error)?;
-                    session.attach_persistent_store(
-                        namespace,
-                        base,
-                        current.fence,
-                        revision,
-                        payload.as_deref(),
-                    )?;
+                    if resumed_snapshot {
+                        session.attach_resumed_persistent_store(
+                            namespace,
+                            base,
+                            current.fence,
+                            revision,
+                        )?;
+                    } else {
+                        session.attach_persistent_store(
+                            namespace,
+                            base,
+                            current.fence,
+                            revision,
+                            payload.as_deref(),
+                        )?;
+                    }
                 }
                 store = Some(selected);
             }

@@ -1,4 +1,5 @@
 //! Shared machine editor. The draft never mutates an executing machine.
+#![allow(dead_code)]
 use doslet_config::{KeyboardMode, MachineSpec, MountSpec, SourceKind, WritePolicy};
 use iced::{
     Element, Fill,

@@ -193,6 +193,14 @@ pub struct Cli {
     #[arg(long)]
     pub list_midi_outputs: bool,
 
+    /// Launch a named secondary action from `[game.actions]` (e.g. `setup`)
+    #[arg(long, hide = true)]
+    pub action: Option<String>,
+
+    /// Path to save/restore automatic suspend state for library launches
+    #[arg(long, hide = true)]
+    pub autosave_path: Option<PathBuf>,
+
     #[arg(skip)]
     pub launch: crate::native_input::LaunchSettings,
     #[arg(skip)]
