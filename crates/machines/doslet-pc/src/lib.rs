@@ -193,6 +193,9 @@ impl PcMachine {
 }
 impl PcMachine {
     /// Optional instruction-boundary scheduling hints; ordinary execution has none.
+    pub fn batch_yield_ips(&self) -> Option<[u32; 2]> {
+        self.batch_yield_ip
+    }
     pub fn set_batch_yield_ips(&mut self, ips: Option<[u32; 2]>) {
         self.batch_yield_ip = ips;
     }

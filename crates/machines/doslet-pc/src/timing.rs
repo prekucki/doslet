@@ -305,14 +305,35 @@ impl PcMachine {
         self.timing
             .steps_to_event_nanos(&self.bus, budget, deadline)
     }
+    pub(crate) fn idle_pass_steps_to_event(&self, pass: u32, budget: u32, counts: [u64; 4]) -> u32 {
+        if let Some(tiers) = &self.timing.tiers
+            && self.cpu.execution_labels_enabled()
+        {
+            let event_nanos = self.timing.next_event_nanos(&self.bus, u64::MAX);
+            if event_nanos == 0 {
+                return 0;
+            }
+            let mut per_pass = counts;
+            per_pass[2] += u64::from(pass).saturating_sub(per_pass.iter().sum());
+            let pass_cost: u128 = per_pass
+                .into_iter()
+                .zip(tiers.costs)
+                .map(|(n, cost)| u128::from(n) * u128::from(cost))
+                .sum();
+            let max_passes = (u128::from(event_nanos) * u128::from(tiers.denominator))
+                .saturating_sub(1 + u128::from(tiers.fraction))
+                .checked_div(pass_cost)
+                .unwrap_or(u128::from(budget / pass));
+            let passes = (budget / pass).min(max_passes.min(u128::from(u32::MAX)) as u32);
+            passes * pass
+        } else {
+            let event = self.steps_to_event_nanos(u32::MAX, u64::MAX);
+            budget.min(event.saturating_sub(1)) / pass * pass
+        }
+    }
 }
 impl Timing {
-    pub(crate) fn steps_to_event_nanos(
-        &self,
-        bus: &crate::PcBus,
-        budget: u32,
-        deadline: u64,
-    ) -> u32 {
+    pub(crate) fn next_event_nanos(&self, bus: &crate::PcBus, deadline: u64) -> u64 {
         // Bound hardware-only work to one millisecond of guest time even when
         // no wake source is programmed. This is independent of host refresh.
         let mut nanos = deadline.min(1_000_000);
@@ -331,21 +352,24 @@ impl Timing {
                 (1_000_000_000 - self.pcm_fraction).div_ceil(u64::from(bus.dsp.sample_rate()));
             nanos = nanos.min(deadline);
         }
+        if bus.hardware_config().sb16
+            && let Some(deadline) = bus.opl.next_sample_nanos()
+        {
+            nanos = nanos.min(deadline);
+        }
+        nanos
+    }
+    pub(crate) fn steps_to_event_nanos(
+        &self,
+        bus: &crate::PcBus,
+        budget: u32,
+        deadline: u64,
+    ) -> u32 {
+        let nanos = self.next_event_nanos(bus, deadline);
         let steps = if let Some(tiers) = &self.tiers {
             nanos.saturating_mul(tiers.slowest) / 4000
         } else {
             self.cpu.steps_until_nanos(nanos)
-        };
-        let steps = if bus.hardware_config().sb16 {
-            bus.opl.next_sample_nanos().map_or(steps, |deadline| {
-                steps.min(if let Some(tiers) = &self.tiers {
-                    deadline.saturating_mul(tiers.slowest) / 4000
-                } else {
-                    self.cpu.steps_until_nanos(deadline)
-                })
-            })
-        } else {
-            steps
         };
         budget.min(steps.max(1) as u32)
     }

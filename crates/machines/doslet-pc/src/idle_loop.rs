@@ -57,8 +57,7 @@ impl PcMachine {
         if pass == 0 || self.cpu.is_halted() || self.interrupt_pending() {
             return Ok(0);
         }
-        let event = self.steps_to_event_nanos(u32::MAX, u64::MAX);
-        let steps = budget.min(event.saturating_sub(1)) / pass * pass;
+        let steps = self.idle_pass_steps_to_event(pass, budget, counts);
         if steps == 0 {
             return Ok(0);
         }
