@@ -90,6 +90,38 @@ pub fn set_text_mode<B: MemoryBus>(bus: &mut B, preserve: bool) -> Result<(), Bu
     Ok(())
 }
 
+/// Selected CGA 320x200 4-color (04h/05h) or 640x200 2-color (06h) BIOS state at B800h.
+pub fn set_cga_mode<B: MemoryBus>(bus: &mut B, mode: u8, preserve: bool) -> Result<(), BusError> {
+    if !preserve {
+        for address in (0xB8000..0xBC000).step_by(2) {
+            bus.write_u16(address, 0)?;
+        }
+    }
+    bus.write_u8(0x449, mode)?;
+    bus.write_u16(0x44A, if mode == 6 { 80 } else { 40 })?;
+    bus.write_u16(0x44C, 0x4000)?;
+    bus.write_u16(0x44E, 0)?;
+    for address in (0x450..0x460).step_by(2) {
+        bus.write_u16(address, 0)?;
+    }
+    bus.write_u16(0x460, 0x0607)?;
+    bus.write_u8(0x462, 0)?;
+    bus.write_u16(0x463, 0x3D4)?;
+    bus.write_u8(
+        0x465,
+        match mode {
+            5 => 0x2E,
+            6 => 0x1E,
+            _ => 0x2A,
+        },
+    )?;
+    bus.write_u8(0x466, if mode == 6 { 0x3F } else { 0x30 })?;
+    bus.write_u8(0x484, 24)?;
+    bus.write_u16(0x485, 8)?;
+    bus.write_u8(0x487, 0x60 | if preserve { 0x80 } else { 0 })?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceSelector {
     Timer,
@@ -100,6 +132,7 @@ pub enum ServiceSelector {
     Clock,
     Terminate,
     Dos,
+    TerminateStayResident,
     Mscdex,
     Mouse,
     Ems,
@@ -115,6 +148,7 @@ impl ServiceSelector {
             Self::Clock => 0x1A,
             Self::Terminate => 0x20,
             Self::Dos => 0x21,
+            Self::TerminateStayResident => 0x27,
             Self::Mscdex => 0x2F,
             Self::Mouse => 0x33,
             Self::Ems => 0x67,
@@ -126,7 +160,7 @@ struct ServiceDefinition {
     offset: u16,
     signature: &'static [u8],
 }
-const SERVICES: [ServiceDefinition; 11] = [
+const SERVICES: [ServiceDefinition; 12] = [
     ServiceDefinition {
         selector: ServiceSelector::Timer,
         offset: IRQ0_OFFSET,
@@ -165,6 +199,11 @@ const SERVICES: [ServiceDefinition; 11] = [
     ServiceDefinition {
         selector: ServiceSelector::Dos,
         offset: 0x21,
+        signature: &[0xCF],
+    },
+    ServiceDefinition {
+        selector: ServiceSelector::TerminateStayResident,
+        offset: 0x27,
         signature: &[0xCF],
     },
     ServiceDefinition {

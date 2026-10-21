@@ -163,6 +163,8 @@ impl Routes {
             }
         }
         this.fallback(0x3CD, Endpoint::Probe);
+        this.fallback(0x3D8, Endpoint::Probe);
+        this.fallback(0x3D9, Endpoint::Probe);
         // Pro Audio Spectrum audio-filter register. Some AdLib drivers clear
         // it before probing OPL; this machine has no PAS card to receive it.
         this.fallback(0xB8A, Endpoint::Probe);

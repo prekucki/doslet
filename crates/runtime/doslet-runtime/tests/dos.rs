@@ -134,7 +134,7 @@ fn bios_cursor_positions_are_independent_per_page_and_queries_return_shape() {
 
 #[test]
 fn unavailable_legacy_video_modes_still_fault_explicitly() {
-    let mut session = Session::new(&[0xB8, 4, 0, 0xCD, 0x10]).unwrap();
+    let mut session = Session::new(&[0xB8, 8, 0, 0xCD, 0x10]).unwrap();
     session.start();
     session.advance(20);
     assert_eq!(session.status(), SessionStatus::Faulted);

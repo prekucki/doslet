@@ -665,7 +665,15 @@ impl PortBus for PcBus {
         self.touch_audio(endpoint);
         match endpoint {
             Endpoint::Absent => return Err(BusError::UnmappedPort(port)),
-            Endpoint::Probe => {}
+            Endpoint::Probe => match port {
+                0x3D8 => {
+                    let _ = self.ram.write(0x465, value);
+                }
+                0x3D9 => {
+                    let _ = self.ram.write(0x466, value);
+                }
+                _ => {}
+            },
             Endpoint::AweProbe => self.awe_writes += 1,
             Endpoint::SystemControl => {
                 self.pit.set_gate(2, value & 1 != 0).unwrap();

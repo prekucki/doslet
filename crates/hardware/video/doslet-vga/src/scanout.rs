@@ -52,6 +52,15 @@ impl IndexedFrame<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameSizeError;
 
+/// Borrowed 16-KiB B8000h CGA buffer (even rows at 0..8000, odd rows at 0x2000..0x3F40).
+pub struct CgaFrame<'a> {
+    pub bytes: &'a [u8],
+    pub palette: [[u8; 4]; 4],
+    pub high_res: bool,
+    pub revision: u64,
+    pub cursor: Option<(i32, i32, &'a [u16; 32])>,
+}
+
 /// Borrowed text cells; glyph expansion writes directly into host storage.
 pub struct TextFrame<'a> {
     pub cells: &'a [u8],
@@ -63,6 +72,7 @@ pub struct TextFrame<'a> {
 }
 pub enum PresentationFrame<'a> {
     Indexed(IndexedFrame<'a>),
+    Cga(CgaFrame<'a>),
     Text(TextFrame<'a>),
     Cursor {
         frame: IndexedFrame<'a>,
@@ -75,27 +85,67 @@ impl PresentationFrame<'_> {
     pub fn width(&self) -> usize {
         match self {
             Self::Indexed(f) | Self::Cursor { frame: f, .. } => f.width,
+            Self::Cga(f) => {
+                if f.high_res {
+                    640
+                } else {
+                    320
+                }
+            }
             Self::Text(_) => 720,
         }
     }
     pub fn height(&self) -> usize {
         match self {
             Self::Indexed(f) | Self::Cursor { frame: f, .. } => f.height,
+            Self::Cga(_) => 200,
             Self::Text(_) => 400,
         }
     }
     pub fn revision(&self) -> u64 {
         match self {
             Self::Indexed(f) | Self::Cursor { frame: f, .. } => f.revision,
+            Self::Cga(f) => f.revision,
             Self::Text(f) => f.revision,
         }
     }
     pub fn write_rgba(&self, output: &mut [u8]) -> Result<(), FrameSizeError> {
-        if output.len() != self.width() * self.height() * 4 {
+        let width = self.width();
+        let height = self.height();
+        if output.len() != width * height * 4 {
             return Err(FrameSizeError);
         }
         match self {
             Self::Indexed(f) => f.write_rgba(output),
+            Self::Cga(f) => {
+                let mut out_pixels = output.as_chunks_mut::<4>().0.iter_mut();
+                for y in 0..200 {
+                    let row_start = (y & 1) * 0x2000 + (y / 2) * 80;
+                    if f.high_res {
+                        for &byte in &f.bytes[row_start..row_start + 80] {
+                            for shift in (0..8).rev() {
+                                let color = usize::from((byte >> shift) & 1);
+                                if let Some(rgba) = out_pixels.next() {
+                                    *rgba = f.palette[color];
+                                }
+                            }
+                        }
+                    } else {
+                        for &byte in &f.bytes[row_start..row_start + 80] {
+                            for shift in [6, 4, 2, 0] {
+                                let color = usize::from((byte >> shift) & 3);
+                                if let Some(rgba) = out_pixels.next() {
+                                    *rgba = f.palette[color];
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((x, y, masks)) = f.cursor {
+                    overlay_cursor(output, width, height, x, y, masks);
+                }
+                Ok(())
+            }
             Self::Cursor {
                 frame: f,
                 x,
@@ -103,25 +153,7 @@ impl PresentationFrame<'_> {
                 masks,
             } => {
                 f.write_rgba(output)?;
-                for row in 0..16 {
-                    for column in 0..16 {
-                        let (px, py) = (*x + column, *y + row);
-                        if px < 0 || py < 0 || px >= f.width as i32 || py >= f.height as i32 {
-                            continue;
-                        }
-                        let keep = masks[row as usize] & (0x8000 >> column) != 0;
-                        let invert = masks[row as usize + 16] & (0x8000 >> column) != 0;
-                        let index = (py as usize * f.width + px as usize) * 4;
-                        for channel in &mut output[index..index + 3] {
-                            if !keep {
-                                *channel = 0;
-                            }
-                            if invert {
-                                *channel = !*channel;
-                            }
-                        }
-                    }
-                }
+                overlay_cursor(output, f.width, f.height, *x, *y, masks);
                 Ok(())
             }
             Self::Text(f) => {
@@ -156,6 +188,35 @@ impl PresentationFrame<'_> {
                     }
                 }
                 Ok(())
+            }
+        }
+    }
+}
+
+fn overlay_cursor(
+    output: &mut [u8],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    masks: &[u16; 32],
+) {
+    for row in 0..16 {
+        for column in 0..16 {
+            let (px, py) = (x + column, y + row);
+            if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                continue;
+            }
+            let keep = masks[row as usize] & (0x8000 >> column) != 0;
+            let invert = masks[row as usize + 16] & (0x8000 >> column) != 0;
+            let index = (py as usize * width + px as usize) * 4;
+            for channel in &mut output[index..index + 3] {
+                if !keep {
+                    *channel = 0;
+                }
+                if invert {
+                    *channel = !*channel;
+                }
             }
         }
     }

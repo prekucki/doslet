@@ -6,10 +6,19 @@ use doslet_bus::PortBus;
 pub struct VideoModeLabel {
     mode: doslet_vga::VideoMode,
     dimensions: Option<(usize, usize)>,
+    cga_mode: Option<u8>,
 }
 impl VideoModeLabel {
-    pub(super) fn new(mode: doslet_vga::VideoMode, dimensions: Option<(usize, usize)>) -> Self {
-        Self { mode, dimensions }
+    pub(super) fn new(
+        mode: doslet_vga::VideoMode,
+        dimensions: Option<(usize, usize)>,
+        cga_mode: Option<u8>,
+    ) -> Self {
+        Self {
+            mode,
+            dimensions,
+            cga_mode,
+        }
     }
 }
 impl fmt::Display for VideoModeLabel {
@@ -21,6 +30,10 @@ impl fmt::Display for VideoModeLabel {
                 "VGA"
             };
             write!(f, "{width}×{height}×8 {adapter}")
+        } else if self.cga_mode == Some(6) {
+            f.write_str("640×200×1 CGA")
+        } else if self.cga_mode.is_some() {
+            f.write_str("320×200×2 CGA")
         } else {
             f.write_str("80×25 VGA text")
         }
@@ -127,6 +140,51 @@ impl Session {
             }
             return Ok(());
         }
+        let bda_mode = self.machine.bus.read_u8(0x449)? & 0x7F;
+        if self.video_mode() == doslet_vga::VideoMode::Text3 && matches!(bda_mode, 4..=6) {
+            let cols = if bda_mode == 6 { 80 } else { 40 };
+            match ax >> 8 {
+                6 | 7 => {
+                    let (top, left) = ((cx >> 8).min(24), (cx & 255).min(cols - 1));
+                    let (bottom, right) = ((dx >> 8).min(24), (dx & 255).min(cols - 1));
+                    if top <= bottom && left <= right {
+                        for char_row in top..=bottom {
+                            for sub_row in 0..8u16 {
+                                let y = char_row * 8 + sub_row;
+                                let row_base =
+                                    0xB8000 + u32::from(y & 1) * 0x2000 + u32::from(y / 2) * 80;
+                                for col in left..=right {
+                                    if bda_mode == 6 {
+                                        self.machine.bus.write_u8(row_base + u32::from(col), 0)?;
+                                    } else {
+                                        self.machine
+                                            .bus
+                                            .write_u16(row_base + u32::from(col) * 2, 0)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                9 | 10 => {
+                    let cursor = self.machine.bus.read_u16(0x450)?;
+                    let cols_u32 = u32::from(cols);
+                    let start = u32::from(cursor >> 8) * cols_u32 + u32::from(cursor & 255);
+                    let color = u16::from(bx as u8 & if bda_mode == 6 { 1 } else { 3 });
+                    let xor = bx as u8 & 0x80 != 0;
+                    for cell in start..(start + u32::from(cx)).min(cols_u32 * 25) {
+                        self.cga_draw_char(bda_mode, cell, ax as u8, color, xor)?;
+                    }
+                    return Ok(());
+                }
+                14 => {
+                    self.teletype_cga(ax as u8, bx as u8)?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         if self.video_mode() != doslet_vga::VideoMode::Text3 || page >= 8 {
             return Err(RuntimeError::UnsupportedService { vector: 0x10, ax });
         }
@@ -225,6 +283,95 @@ impl Session {
         self.machine
             .bus
             .write_u16(cursor_address, (row << 8) | col)?;
+        Ok(())
+    }
+
+    fn cga_draw_char(
+        &mut self,
+        mode: u8,
+        cell: u32,
+        ch: u8,
+        color: u16,
+        xor: bool,
+    ) -> Result<(), RuntimeError> {
+        let cols = if mode == 6 { 80 } else { 40 };
+        let cell_row = cell / cols;
+        let cell_col = cell % cols;
+        for row in 0..8u32 {
+            let bits = doslet_vga::font::FONT_8[usize::from(ch) * 8 + row as usize];
+            let y = cell_row * 8 + row;
+            if mode == 6 {
+                let addr = 0xB8000 + (y & 1) * 0x2000 + (y / 2) * 80 + cell_col;
+                let byte = if color != 0 { bits } else { 0 };
+                if xor {
+                    let old = self.machine.bus.read_u8(addr)?;
+                    self.machine.bus.write_u8(addr, old ^ byte)?;
+                } else {
+                    self.machine.bus.write_u8(addr, byte)?;
+                }
+            } else {
+                let mut packed = 0u16;
+                for col in 0..8u32 {
+                    let pixel = if bits & (0x80 >> col) != 0 { color } else { 0 };
+                    packed = (packed << 2) | pixel;
+                }
+                let addr = 0xB8000 + (y & 1) * 0x2000 + (y / 2) * 80 + cell_col * 2;
+                let bytes = packed.to_be_bytes();
+                if xor {
+                    let old0 = self.machine.bus.read_u8(addr)?;
+                    let old1 = self.machine.bus.read_u8(addr + 1)?;
+                    self.machine.bus.write_u8(addr, old0 ^ bytes[0])?;
+                    self.machine.bus.write_u8(addr + 1, old1 ^ bytes[1])?;
+                } else {
+                    self.machine.bus.write_u8(addr, bytes[0])?;
+                    self.machine.bus.write_u8(addr + 1, bytes[1])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn teletype_cga(&mut self, byte: u8, attr: u8) -> Result<(), RuntimeError> {
+        let mode = self.machine.bus.read_u8(0x449)? & 0x7F;
+        let cols = if mode == 6 { 80 } else { 40 };
+        let cursor = self.machine.bus.read_u16(0x450)?;
+        let (mut row, mut col) = (cursor >> 8, cursor & 255);
+        match byte {
+            7 => {}
+            8 => col = col.saturating_sub(1),
+            13 => col = 0,
+            10 => row += 1,
+            _ => {
+                let cell = u32::from(row) * u32::from(cols) + u32::from(col);
+                let mask = if mode == 6 { 1 } else { 3 };
+                let color = u16::from(if attr & mask != 0 { attr & mask } else { mask });
+                self.cga_draw_char(mode, cell, byte, color, attr & 0x80 != 0)?;
+                col += 1;
+                if col >= cols {
+                    col = 0;
+                    row += 1;
+                }
+            }
+        }
+        if row >= 25 {
+            for y in 0..192u32 {
+                let src_y = y + 8;
+                let dst = 0xB8000 + (y & 1) * 0x2000 + (y / 2) * 80;
+                let src = 0xB8000 + (src_y & 1) * 0x2000 + (src_y / 2) * 80;
+                for offset in (0..80u32).step_by(2) {
+                    let word = self.machine.bus.read_u16(src + offset)?;
+                    self.machine.bus.write_u16(dst + offset, word)?;
+                }
+            }
+            for y in 192..200u32 {
+                let dst = 0xB8000 + (y & 1) * 0x2000 + (y / 2) * 80;
+                for offset in (0..80u32).step_by(2) {
+                    self.machine.bus.write_u16(dst + offset, 0)?;
+                }
+            }
+            row = 24;
+        }
+        self.machine.bus.write_u16(0x450, (row << 8) | col)?;
         Ok(())
     }
 }

@@ -194,6 +194,15 @@ impl Session {
         self.drive
             .change_directory(working_directory)
             .map_err(RuntimeError::InvalidWorkingDirectory)?;
+        if let Ok(sound_com) = self.drive.file(b"SOUND.COM")
+            && sound_com.windows(12).any(|w| w == b"Sound driver")
+            && self.ram_view(0x02000..0x02002) != Some(&[0xCD, 0x20])
+            && self.ram_view(0x10100..0x10100 + sound_com.len().min(4096))
+                != Some(&sound_com[..sound_com.len().min(4096)])
+        {
+            let sound_com = sound_com.to_vec();
+            self.install_resident_com(&sound_com, b" b3000")?;
+        }
         let base = u32::from(doslet_dos::loader::PSP_SEGMENT) * 16;
         self.machine
             .bus
@@ -211,6 +220,83 @@ impl Session {
                     }),
             )?;
         }
+        Ok(())
+    }
+    /// Run a small resident COM driver (such as AdLib `SOUND.COM`) in low memory
+    /// below the environment block (`0200h..0EF0h`) before starting the main program.
+    pub fn install_resident_com(
+        &mut self,
+        program: &[u8],
+        command_tail: &[u8],
+    ) -> Result<(), RuntimeError> {
+        const TSR_SEGMENT: u16 = 0x0200;
+        const TSR_END_SEGMENT: u16 = 0x0EF0;
+        const TSR_SP: u16 = (TSR_END_SEGMENT - TSR_SEGMENT) * 16 - 2;
+        if self.status != SessionStatus::Ready
+            || program.is_empty()
+            || program.len() > usize::from(TSR_SP) - 0x100
+            || command_tail.len() > 126
+        {
+            return Err(RuntimeError::InvalidLaunch);
+        }
+        let saved_context = self.machine.cpu.context();
+        let saved_dta = self.dta;
+        let base = u32::from(TSR_SEGMENT) * 16;
+        for offset in 0..256 {
+            self.machine.bus.write_u8(base + offset, 0)?;
+        }
+        self.machine.bus.write_u8(base, 0xCD)?;
+        self.machine.bus.write_u8(base + 1, 0x20)?;
+        self.machine.bus.write_u16(base + 2, TSR_END_SEGMENT)?;
+        self.machine
+            .bus
+            .write_u8(base + 0x80, command_tail.len() as u8)?;
+        for offset in 0..127 {
+            self.machine.bus.write_u8(
+                base + 0x81 + offset as u32,
+                command_tail
+                    .get(offset)
+                    .copied()
+                    .unwrap_or(if offset == command_tail.len() { 0x0D } else { 0 }),
+            )?;
+        }
+        for (offset, byte) in program.iter().enumerate() {
+            self.machine
+                .bus
+                .write_u8(base + 0x100 + offset as u32, *byte)?;
+        }
+        self.machine.bus.write_u16(base + u32::from(TSR_SP), 0)?;
+        let mut registers = Registers::default();
+        registers.cs = TSR_SEGMENT;
+        registers.ds = TSR_SEGMENT;
+        registers.es = TSR_SEGMENT;
+        registers.ss = TSR_SEGMENT;
+        registers.ip = 0x100;
+        registers.set(Gpr16::Sp, TSR_SP);
+        self.machine.cpu.registers = registers;
+        self.status = SessionStatus::Running;
+        let mut remaining = 500_000u32;
+        while remaining != 0 && self.status == SessionStatus::Running {
+            let step = self.advance(remaining.min(4096));
+            if step == 0 {
+                break;
+            }
+            remaining = remaining.saturating_sub(step);
+        }
+        if let Some(fault) = self.fault.take() {
+            self.status = SessionStatus::Faulted;
+            return Err(fault);
+        }
+        if self.status != SessionStatus::Exited(0) {
+            return Err(RuntimeError::InvalidLaunch);
+        }
+        self.machine.cpu.restore_context(&saved_context);
+        self.dta = saved_dta;
+        self.console.clear();
+        self.console_truncated = false;
+        bios::set_text_mode(&mut self.machine.bus, false)?;
+        self.steps = 0;
+        self.status = SessionStatus::Ready;
         Ok(())
     }
     pub fn new(program: &[u8]) -> Result<Self, RuntimeError> {
@@ -592,7 +678,14 @@ impl Session {
     /// Returns small values; formatting is left to the frontend boundary.
     pub fn video_mode_label(&self) -> VideoModeLabel {
         let dimensions = self.frame().map(|frame| (frame.width, frame.height));
-        VideoModeLabel::new(self.video_mode(), dimensions)
+        let cga_mode = if dimensions.is_none() {
+            self.ram_view(0x449..0x44A)
+                .map(|m| m[0] & 0x7F)
+                .filter(|m| matches!(m, 4..=6))
+        } else {
+            None
+        };
+        VideoModeLabel::new(self.video_mode(), dimensions, cga_mode)
     }
     pub fn video_memory_configuration(&self) -> (u8, u8, u8, u16, u8, u8) {
         self.machine.bus.vga.memory_configuration()
@@ -630,7 +723,11 @@ impl Session {
         }
         self.console.push(byte);
         if self.video_mode() == doslet_vga::VideoMode::Text3 {
-            self.teletype(byte)?;
+            if matches!(self.machine.bus.read_u8(0x449)? & 0x7F, 4..=6) {
+                self.teletype_cga(byte, 7)?;
+            } else {
+                self.teletype(byte)?;
+            }
         }
         Ok(())
     }
@@ -638,7 +735,7 @@ impl Session {
         self.machine.bus.video_frame()
     }
     pub fn presentation_frame(&self) -> doslet_vga::scanout::PresentationFrame<'_> {
-        use doslet_vga::scanout::{PresentationFrame, TextFrame};
+        use doslet_vga::scanout::{CgaFrame, PresentationFrame, TextFrame};
         if let Some(mut frame) = self.frame() {
             frame.revision = frame.revision.wrapping_add(self.mouse.revision);
             if self.mouse.visible >= 0 {
@@ -655,6 +752,45 @@ impl Session {
             return PresentationFrame::Indexed(frame);
         }
         let bda = self.ram_view(0x400..0x488).expect("BIOS data RAM");
+        let mode = bda[0x49] & 0x7F;
+        if matches!(mode, 4..=6) {
+            let cga_pal = bda[0x66];
+            let bg = usize::from(cga_pal & 0x0F);
+            let intense = if cga_pal & 0x10 != 0 { 8 } else { 0 };
+            let high_res = mode == 6;
+            let indices = if high_res {
+                [0, bg, 0, 0]
+            } else if mode == 5 {
+                [bg, 3 + intense, 4 + intense, 7 + intense]
+            } else if cga_pal & 0x20 != 0 {
+                [bg, 3 + intense, 5 + intense, 7 + intense]
+            } else {
+                [bg, 2 + intense, 4 + intense, 6 + intense]
+            };
+            let vga_pal = self.machine.bus.vga.palette();
+            let width = if high_res { 640 } else { 320 };
+            let cursor = (self.mouse.visible >= 0).then(|| {
+                let dimensions = self.pointer_dimensions();
+                (
+                    i32::from(self.mouse.x) * width / i32::from(dimensions.0)
+                        - i32::from(self.mouse.hotspot.0),
+                    i32::from(self.mouse.y) * 200 / i32::from(dimensions.1)
+                        - i32::from(self.mouse.hotspot.1),
+                    &self.mouse.masks,
+                )
+            });
+            return PresentationFrame::Cga(CgaFrame {
+                bytes: self.ram_view(0xB8000..0xBC000).expect("CGA graphics RAM"),
+                palette: indices.map(|i| vga_pal[i]),
+                high_res,
+                revision: self
+                    .machine
+                    .bus
+                    .text_revision()
+                    .wrapping_add(self.mouse.revision),
+                cursor,
+            });
+        }
         let page = usize::from(bda[0x62].min(7));
         let position = u16::from_le_bytes([bda[0x50 + page * 2], bda[0x51 + page * 2]]);
         let blink = (self.emulated_nanos() / 250_000_000) & 1 == 0;
@@ -1121,11 +1257,29 @@ impl Session {
                 self.machine.cpu.registers.set_byte(0, 0x1A);
                 self.machine.cpu.registers.set(Gpr16::Bx, 8); // VGA with analog color display.
             }
+            (0x10, 0x0B) => {
+                let bx = self.machine.cpu.registers.get(Gpr16::Bx);
+                let bh = (bx >> 8) as u8;
+                let bl = bx as u8;
+                let current = self.machine.bus.read_u8(0x466)?;
+                let next = match bh {
+                    0 => (current & 0x20) | (bl & 0x1F),
+                    1 => (current & !0x20) | ((bl & 1) << 5),
+                    _ => return Err(RuntimeError::UnsupportedService { vector, ax }),
+                };
+                self.machine.bus.write_u8(0x466, next)?;
+            }
             (0x10, 0x0F) => {
                 let (mode, columns) = match self.machine.bus.vga.mode() {
                     doslet_vga::VideoMode::Mode13 => (0x13, 40),
                     doslet_vga::VideoMode::Text3 => {
-                        (3 | u16::from(self.machine.bus.read_u8(0x487)? & 0x80), 80)
+                        let raw = self.machine.bus.read_u8(0x449)? & 0x7F;
+                        let (m, cols) = match raw {
+                            4 | 5 => (u16::from(raw), 40),
+                            6 => (6, 80),
+                            _ => (3, 80),
+                        };
+                        (m | u16::from(self.machine.bus.read_u8(0x487)? & 0x80), cols)
                     }
                     doslet_vga::VideoMode::Vbe101 => (1, 80), // Low byte of the VBE mode.
                 };
@@ -1225,19 +1379,24 @@ impl Session {
                 self.machine.cpu.registers.set_byte(4, 0x86);
                 self.set_carry(true)?;
             }
-            (0x10, 0) if ax as u8 & 0x7F == 3 => {
+            (0x10, 0) if matches!(ax as u8 & 0x7F, 2 | 3) => {
                 self.machine.bus.vga.set_mode_3h();
                 self.mouse_video_mode_changed();
                 bios::set_text_mode(&mut self.machine.bus, ax as u8 & 0x80 != 0)?;
+            }
+            (0x10, 0) if matches!(ax as u8 & 0x7F, 4..=6) => {
+                self.machine.bus.vga.set_mode_3h();
+                self.mouse_video_mode_changed();
+                bios::set_cga_mode(&mut self.machine.bus, ax as u8 & 0x7F, ax as u8 & 0x80 != 0)?;
             }
             (0x10, 0) if ax as u8 == 0x13 => {
                 self.machine.bus.set_video_mode_13h();
                 self.mouse_video_mode_changed();
             }
-            (0x20, _) => {
+            (0x20 | 0x27, _) => {
                 self.finish_exit(0)?;
             }
-            (0x21, 0x4C) => {
+            (0x21, 0x31 | 0x4C) => {
                 self.finish_exit(ax as u8)?;
             }
             (0x21, 0x30) => {
@@ -2436,6 +2595,41 @@ mod tests {
         let frame = session.frame().unwrap();
         assert!(frame.pixels[..2560].contains(&12));
         assert_eq!(session.machine.bus.read_u16(0x450).unwrap(), 0);
+    }
+    #[test]
+    fn cga_mode_4_and_resident_com_tsr_work_with_opcode_82h() {
+        let tsr = [
+            0xB8, 0x65, 0x25, // MOV AX,2565h
+            0xBA, 0x10, 0x01, // MOV DX,0110h
+            0xCD, 0x21, // INT 21h
+            0xBA, 0x20, 0x01, // MOV DX,0120h
+            0xCD, 0x27, // INT 27h
+            0x90, 0x90, 0x90, // padding to 0110h
+            0x82, 0xC0, 0x04, // ADD AL,4 via opcode 82h alias
+            0xCF, // IRET
+        ];
+        let main = [
+            0xB8, 0x00, 0x00, // MOV AX,0
+            0xCD, 0x65, // INT 65h -> AL = 4
+            0xCD, 0x10, // INT 10h AX=0004 (CGA 320x200x4)
+            0xB4, 0x0B, 0xBB, 0x00, 0x01, 0xCD, 0x10, // INT 10h AH=0Bh BH=1 BL=0 (green/red/brown palette)
+            0xB8, 0x41, 0x0E, 0xBB, 0x02, 0x00, 0xCD, 0x10, // INT 10h AH=0Eh 'A' color 2
+            0xB4, 0x0F, 0xCD, 0x10, // INT 10h AH=0Fh -> AX = 2804h
+            0x89, 0xC1, // MOV CX,AX
+            0xB8, 0x00, 0x4C, 0xCD, 0x21,
+        ];
+        let mut session = Session::new(&main).unwrap();
+        session.install_resident_com(&tsr, b" b3000").unwrap();
+        session.start();
+        session.advance(500);
+        assert_eq!(session.status(), SessionStatus::Exited(0));
+        assert_eq!(session.registers().get(Gpr16::Cx), 0x2804);
+        assert_eq!(alloc::format!("{}", session.video_mode_label()), "320×200×2 CGA");
+        let frame = session.presentation_frame();
+        assert_eq!((frame.width(), frame.height()), (320, 200));
+        let mut rgba = vec![0u8; 320 * 200 * 4];
+        frame.write_rgba(&mut rgba).unwrap();
+        assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[..3] != [0, 0, 0]));
     }
     #[test]
     fn bios_rtc_time_reads_cmos_and_reports_updates_through_returned_carry() {

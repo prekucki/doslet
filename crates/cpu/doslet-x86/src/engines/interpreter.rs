@@ -988,7 +988,7 @@ impl Cpu {
                     target.write(&mut self.registers, bus, word, value)?;
                 }
             }
-            0x80 | 0x81 | 0x83 | 0x84 | 0x85 | 0x86 | 0x87 => {
+            0x80..=0x87 => {
                 let modrm = decode::fetch(&mut self.registers, bus)?;
                 let target = decode::operand(
                     &mut self.registers,
@@ -1000,7 +1000,7 @@ impl Cpu {
                 let word = opcode & 1 != 0;
                 let source = decode::Operand::Register((modrm >> 3) & 7);
                 let right = match opcode {
-                    0x80 => u16::from(decode::fetch(&mut self.registers, bus)?),
+                    0x80 | 0x82 => u16::from(decode::fetch(&mut self.registers, bus)?),
                     0x81 => decode::fetch_word(&mut self.registers, bus)?,
                     0x83 => decode::fetch(&mut self.registers, bus)? as i8 as i16 as u16,
                     _ => source.read(&self.registers, bus, word)?,

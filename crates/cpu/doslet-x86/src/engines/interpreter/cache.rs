@@ -2374,7 +2374,12 @@ impl Instruction {
     /// Prefixes as in the reference step; operand size does not affect the
     /// batched forms. Repeat prefixes are left to the reference path.
     fn decode_x87(bytes: &[u8], code32: bool) -> Option<Self> {
-        let mut r = Reader { bytes, position: 0 };
+        let mut r = Reader {
+            bytes,
+            position: 0,
+            disp32_offset: u8::MAX,
+            imm32_offset: u8::MAX,
+        };
         let mut address32 = code32;
         let mut segment = None;
         let opcode = loop {
@@ -2409,6 +2414,8 @@ impl Instruction {
             dword: false,
             width: 1,
             branch32: code32,
+            disp32_offset: r.disp32_offset,
+            imm32_offset: r.imm32_offset,
             operation: Operation::X87 { x87, target },
         })
     }
@@ -2475,7 +2482,7 @@ impl Instruction {
         let mut branch32 = operand32;
         let mut read_length = None;
         let operation = match opcode {
-            0x88..=0x8B | 0x8D | 0xC6 | 0xC7 | 0x80 | 0x81 | 0x83 | 0x84..=0x87 => {
+            0x80..=0x8B | 0x8D | 0xC6 | 0xC7 => {
                 let modrm = r.byte()?;
                 let target = r.target(modrm, address32, segment)?;
                 let register = (modrm >> 3) & 7;
@@ -2498,12 +2505,12 @@ impl Instruction {
                         })?),
                     },
                     0x86 | 0x87 => Operation::Exchange { target, register },
-                    0x80 | 0x81 | 0x83 | 0x84 | 0x85 => {
+                    0x80..=0x85 => {
                         if operand32 && matches!(opcode, 0x81 | 0x83) {
                             read_length = Some(r.position as u8);
                         }
                         let source = match opcode {
-                            0x80 | 0x81 => Value::Immediate(r.immediate_data(if dword {
+                            0x80..=0x82 => Value::Immediate(r.immediate_data(if dword {
                                 if operand32 { 4 } else { 2 }
                             } else {
                                 1
