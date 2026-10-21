@@ -4,6 +4,7 @@ mod binary;
 mod environment;
 mod exponential;
 mod extended;
+mod fast;
 mod finite;
 mod logarithm;
 mod operations;
@@ -80,6 +81,16 @@ impl X87 {
     }
     pub fn load_control(&mut self, value: u16) {
         self.control = value;
+    }
+    /// Whether ST(index) is tagged empty; indices wrap like the stack.
+    pub fn is_empty(&self, index: u8) -> bool {
+        let slot = (((self.status >> 11) + u16::from(index)) & 7) as usize;
+        (self.tags >> (slot * 2)) & 3 == 3
+    }
+    /// Restore a status word read before an operation that a caller declines
+    /// to complete. Other state must not have changed in between.
+    pub fn restore_status(&mut self, status: u16) {
+        self.status = status;
     }
     pub fn clear_exceptions(&mut self) {
         self.status &= !0x80FF;
@@ -606,6 +617,49 @@ impl X87 {
             },
             pop,
         )
+    }
+    /// ST(0) = ST(0) op ST(index), with `operation` as in `arithmetic_memory`:
+    /// `arithmetic_register` for 0, 1, 4 and 5, `divide` for 6 and 7.
+    pub fn arithmetic_top(&mut self, index: u8, operation: u8) -> Result<(), ArithmeticError> {
+        match operation {
+            6 | 7 => self.divide(index, operation == 7),
+            _ => self.arithmetic_register(index, operation),
+        }
+    }
+    /// ST(index) = ST(index) op ST(0), optionally popping: `add_register` and
+    /// `add_pop` for 0, `arithmetic_destination` and `arithmetic_pop` for 1,
+    /// 4 and 5, `divide_destination` and `divide_pop` for 6 and 7.
+    pub fn arithmetic_into(
+        &mut self,
+        index: u8,
+        operation: u8,
+        pop: bool,
+    ) -> Result<(), ArithmeticError> {
+        match (operation, pop) {
+            (0, false) => self.add_register(index),
+            (0, true) => self.add_pop(index),
+            (6 | 7, false) => self.divide_destination(index, operation == 7),
+            (6 | 7, true) => self.divide_pop(index, operation == 7),
+            (1 | 4 | 5, _) => {
+                self.arithmetic_destination(index, operation == 1, operation == 5, pop)
+            }
+            _ => Err(ArithmeticError::Unsupported),
+        }
+    }
+    /// Exact equality, including NaN payloads, signed zeros, the diagnostic
+    /// binary64 views and retained data of empty registers.
+    pub fn bitwise_eq(&self, other: &Self) -> bool {
+        self.control == other.control
+            && self.status == other.status
+            && self.tags == other.tags
+            && self
+                .values
+                .iter()
+                .zip(&other.values)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+            && self.finite == other.finite
+            && self.encodings == other.encodings
+            && self.pointers == other.pointers
     }
     /// FCOMP with a binary32/64 memory operand.
     pub fn compare_memory_pop(&mut self, rhs: f64) -> Result<(), ArithmeticError> {

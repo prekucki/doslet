@@ -94,6 +94,8 @@ mod presentation;
 mod procedure_cache;
 #[cfg(not(target_arch = "wasm32"))]
 mod profile;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod quake_x87;
 #[cfg(not(target_arch = "wasm32"))]
 mod shell;
 mod ui;

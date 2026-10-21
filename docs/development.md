@@ -1097,6 +1097,18 @@ final ordinary RAM and all physical VRAM. This headless check does not measure U
 browser throughput. Guest-PC sampling counts guest activity; it does not locate
 host CPU time by emulator function.
 
+Interpreter slices also batch the common x87 forms, with exact binary64 fast
+paths for basic arithmetic, loads and stores. `Session::set_x87_batching(false)`
+keeps x87 instructions on the byte-fetching handler and
+`Session::set_x87_fast_paths(false)` keeps the reference arithmetic in batches;
+both are runtime comparison switches, not saved state. The opt-in local Quake
+tests compare a demo replay's full state and audio with the reference handler
+and measure each variant; see the [x87 performance report](compatibility/x87-performance.md):
+
+```sh
+cargo test -p doslet --release --locked --bin doslet quake_x87 -- --ignored --nocapture --test-threads 1
+```
+
 Decode-cache profiling distinguishes CS context transitions and discarded entries
 from page-write, mapping, bus-owner and access invalidations. These counters count
 rejected entries, not writes to guest code. Collisions count lookups at occupied

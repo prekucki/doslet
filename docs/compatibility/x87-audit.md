@@ -25,6 +25,10 @@ nonfinite numerical domains remain incomplete.
 Doslet uses portable `no_std` arithmetic with retained 64-bit significands,
 independent fixed-width integer kernels and fixed local arrays. Runtime code
 has no new dependencies, unsafe blocks, host math calls or allocations.
+The batched fast paths additionally use host binary64 addition, subtraction,
+multiplication and division, only on targets where each rounds once, and only
+where error-free transformations prove the reference's result (see the
+[performance report](x87-performance.md#exactness)). No library math is used.
 Native assembly is confined to the standalone reference generator; it is not
 linked to any emulator or WASM target.
 
@@ -92,6 +96,9 @@ adversarial/high-precision testing before a universal accuracy claim.
 | Trig/atan/log1p | 2088 captures, 1944 compared | Sampled results within four adjacent extended values; huge-angle hardware comparisons excluded |
 | Real80 transfers | Raw special/extreme encoding matrix | Exact bytes, tags and status, including signaling NaNs and pseudo-denormals |
 | CPU environment integration | Synthetic size-override and bus-fault cases | Widths, pointer recording, reset/mask ordering and preservation on incomplete reads/writes |
+| Binary64 fast paths | 163,840,000 randomized and about 505,000 directed state comparisons | Bit-identical results, retained data, encodings, tags, status and pointers against the reference methods for all PC/RC/mask combinations |
+| Batched forms | 600 random protected/real-mode programs, batched with and without fast paths | Registers, flags, complete FPU state, RAM and errors match the reference handler; declined failing forms have no effect |
+| Game replay | Local Quake v1.06 demo, 400 million steps from a saved state | Full portable state and drained PCM/MIDI equal at eight checkpoints with and without batching and fast paths |
 | Game execution | Bounded real HEROES.EXE headless run, mounted local CD, 100 million steps | Still Running in VBE101 with no reported CPU error; no interactive gameplay acceptance |
 
 The bounded game command used the read-only local installation:

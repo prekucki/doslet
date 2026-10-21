@@ -794,6 +794,8 @@ impl PortBus for PcBus {
 #[cfg(test)]
 mod cache_tests;
 #[cfg(test)]
+mod x87_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

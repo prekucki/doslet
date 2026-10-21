@@ -12,6 +12,9 @@ use doslet_bus::{CodeCheck, CpuBus};
 #[path = "prepared.rs"]
 mod prepared;
 use prepared::Prepared;
+#[path = "x87_batch.rs"]
+mod x87_batch;
+use x87_batch::X87;
 
 const CAPACITY: usize = 4096;
 const NO_REGISTER: u8 = 8;
@@ -208,6 +211,10 @@ pub(super) struct Cache {
     /// Execute window of `context`; None leaves its faults to the interpreter.
     window: Option<SegmentWindow>,
     pub enabled: bool,
+    /// Decode common 387 forms into batch blocks; off keeps the reference.
+    pub(super) x87: bool,
+    /// Batched x87 forms use the exact binary64 fast paths of `doslet-x87`.
+    pub(super) x87_fast: bool,
     pub(super) profile: Option<crate::execution_tiers::ExecutionProfile>,
     #[cfg(feature = "profiling")]
     pub stats: DecodeCacheStats,
@@ -240,6 +247,8 @@ impl Default for Cache {
             code32: false,
             window: None,
             enabled: true,
+            x87: true,
+            x87_fast: true,
             profile: None,
             #[cfg(feature = "profiling")]
             stats: DecodeCacheStats::default(),
@@ -761,7 +770,9 @@ impl Cache {
             if offset != 0 && entries.get(entry_position) == Some(&current) {
                 break;
             }
-            let Some(instruction) = Instruction::decode_mode(&bytes[offset..], self.code32) else {
+            let Some(instruction) =
+                Instruction::decode_block(&bytes[offset..], self.code32, self.x87)
+            else {
                 break;
             };
             let end = offset + usize::from(instruction.length);
@@ -1102,6 +1113,12 @@ enum Operation {
         target: Target,
         operation: u8,
         bit: u8,
+    },
+    /// A batched 387 form (block decoding only); `target` is its memory
+    /// operand, or an unused register for register forms.
+    X87 {
+        x87: X87,
+        target: Target,
     },
     /// A remembered decoder rejection; never executed from the cache.
     Unsupported,
@@ -2090,6 +2107,9 @@ impl Cpu {
                 }
                 return self.delegate_batched(bus, i);
             }
+            Operation::X87 { x87, target } => {
+                return self.x87_batched(bus, windows, x87, target, next);
+            }
             Operation::Input | Operation::Output | Operation::Unsupported => return false,
         }
         self.registers.ip = next;
@@ -2337,6 +2357,60 @@ impl Instruction {
     ))]
     fn decode(bytes: &[u8]) -> Option<Self> {
         Self::decode_mode(bytes, true)
+    }
+
+    /// Block decoding additionally accepts the batched 387 subset. Other
+    /// decoder users keep rejecting x87 bytes, as before that subset existed.
+    fn decode_block(bytes: &[u8], code32: bool, x87: bool) -> Option<Self> {
+        Self::decode_mode(bytes, code32).or_else(|| {
+            if x87 {
+                Self::decode_x87(bytes, code32)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Prefixes as in the reference step; operand size does not affect the
+    /// batched forms. Repeat prefixes are left to the reference path.
+    fn decode_x87(bytes: &[u8], code32: bool) -> Option<Self> {
+        let mut r = Reader { bytes, position: 0 };
+        let mut address32 = code32;
+        let mut segment = None;
+        let opcode = loop {
+            match r.byte()? {
+                0x66 => {}
+                0x67 => address32 = !code32,
+                byte @ (0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) => {
+                    segment = Some(match byte {
+                        0x26 => SegmentRegister::Es,
+                        0x2E => SegmentRegister::Cs,
+                        0x36 => SegmentRegister::Ss,
+                        0x64 => SegmentRegister::Fs,
+                        0x65 => SegmentRegister::Gs,
+                        _ => SegmentRegister::Ds,
+                    })
+                }
+                byte => break byte,
+            }
+        };
+        if !(0xD8..=0xDF).contains(&opcode) {
+            return None;
+        }
+        let modrm = r.byte()?;
+        let x87 = X87::decode(opcode, modrm)?;
+        let target = r.target(modrm, address32, segment)?;
+        if r.position > 15 {
+            return None;
+        }
+        Some(Self {
+            length: r.position as u8,
+            read_length: r.position as u8,
+            dword: false,
+            width: 1,
+            branch32: code32,
+            operation: Operation::X87 { x87, target },
+        })
     }
 
     fn decode_mode(bytes: &[u8], code32: bool) -> Option<Self> {
@@ -3253,6 +3327,7 @@ impl Cpu {
                 }
             }
             Operation::Unsupported => unreachable!("lookups return None for rejections"),
+            Operation::X87 { .. } => unreachable!("x87 forms are decoded only into blocks"),
         }
         Ok(StepOutcome::Continue)
     }

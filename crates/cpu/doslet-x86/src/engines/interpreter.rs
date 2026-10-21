@@ -530,6 +530,20 @@ impl Cpu {
             self.set_dynamic_core(false);
         }
     }
+    /// Batch the common 387 forms (on by default). Off keeps every x87
+    /// instruction on the byte-fetching reference handler, for comparison.
+    pub fn set_x87_batching(&mut self, enabled: bool) {
+        self.decode_cache.clear();
+        self.decode_cache.x87 = enabled;
+    }
+    pub fn x87_batching(&self) -> bool {
+        self.decode_cache.x87
+    }
+    /// Batched x87 arithmetic, loads and stores use `doslet-x87`'s exact
+    /// binary64 fast paths (on by default); off calls the reference methods.
+    pub fn set_x87_fast_paths(&mut self, enabled: bool) {
+        self.decode_cache.x87_fast = enabled;
+    }
     #[cfg(feature = "profiling")]
     pub fn decode_cache_stats(&self) -> DecodeCacheStats {
         self.decode_cache.stats

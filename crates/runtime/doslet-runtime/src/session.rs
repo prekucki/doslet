@@ -484,6 +484,14 @@ impl Session {
     pub fn set_decode_cache(&mut self, enabled: bool) {
         self.machine.cpu.set_decode_cache(enabled);
     }
+    /// Reference comparisons can keep x87 instructions out of batches.
+    pub fn set_x87_batching(&mut self, enabled: bool) {
+        self.machine.cpu.set_x87_batching(enabled);
+    }
+    /// Reference comparisons can disable the exact binary64 x87 fast paths.
+    pub fn set_x87_fast_paths(&mut self, enabled: bool) {
+        self.machine.cpu.set_x87_fast_paths(enabled);
+    }
     pub fn set_dynamic_core(&mut self, enabled: bool) {
         self.machine.cpu.set_dynamic_core(enabled);
     }
