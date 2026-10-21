@@ -360,6 +360,7 @@ impl Doslet {
         };
         app.launch.preload_local_media = cli.learn_speed_tiers
             || cli.load_state.is_some()
+            || cli.autosave_path.is_some()
             || automatic_tiers.as_ref().is_some_and(|t| t.stats.learning);
         let mut machine_spec = app.launch.machine_spec.clone().unwrap_or_default();
         machine_spec.hardware = app.launch.hardware;
@@ -1854,6 +1855,14 @@ impl Doslet {
     pub(crate) fn save_autosave(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = self.autosave_path.take() {
+            if matches!(
+                self.session.status(),
+                SessionStatus::Exited(_) | SessionStatus::Faulted | SessionStatus::Halted
+            ) {
+                let _ = std::fs::remove_file(&path);
+                return;
+            }
+            self.session.pause();
             if let Some(storage) = &mut self.storage {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while (self.session.storage_waiting() || self.session.pending_commit())
@@ -1863,14 +1872,6 @@ impl Doslet {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
-            if matches!(
-                self.session.status(),
-                SessionStatus::Exited(_) | SessionStatus::Faulted | SessionStatus::Halted
-            ) {
-                let _ = std::fs::remove_file(&path);
-                return;
-            }
-            self.session.pause();
             if let Err(error) = crate::native_state::save(&path, &mut self.session) {
                 eprintln!(
                     "[WARN doslet] Cannot save suspended state {}: {error}",
@@ -3429,6 +3430,61 @@ enabled = false
             assert_eq!(app.session.status(), SessionStatus::Exited(7));
             assert_eq!(app.session.console(), b"Relocated MZ");
         }
+    }
+
+    include!("../../../tests/fixtures/iso9660.rs");
+
+    #[test]
+    fn autosave_with_cdrom_iso_preloads_local_media_and_resumes_snapshot() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let fixture = crate::profile::tests::Fixture::new(
+                    r#"
+version = 2
+name = "CD-ROM Game"
+[game]
+executable = "../TINY.EXE"
+[[drives]]
+letter = "C"
+source = ".."
+kind = "directory"
+[[drives]]
+letter = "D"
+source = "../disc.gog"
+kind = "iso"
+[output]
+audio = false
+"#,
+                );
+                std::fs::write(fixture.root.join("disc.gog"), test_iso()).unwrap();
+                let autosave = fixture.root.join("autosave.state.gz");
+                let mut app = Doslet::from_cli(fixture.cli(&[
+                    "--autosave-path",
+                    autosave.to_str().unwrap(),
+                ]))
+                .unwrap();
+                assert!(app.launch.preload_local_media);
+                app.session.advance(2);
+                assert_eq!(app.session.status(), SessionStatus::Running);
+                app.save_autosave();
+                drop(app);
+                assert!(autosave.is_file(), "expected autosave.state.gz to be created");
+
+                let mut resumed = Doslet::from_cli(fixture.cli(&[
+                    "--load-state",
+                    autosave.to_str().unwrap(),
+                    "--autosave-path",
+                    autosave.to_str().unwrap(),
+                ]))
+                .unwrap();
+                assert_eq!(resumed.session.status(), SessionStatus::Running);
+                resumed.session.advance(100);
+                assert_eq!(resumed.session.status(), SessionStatus::Exited(7));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
