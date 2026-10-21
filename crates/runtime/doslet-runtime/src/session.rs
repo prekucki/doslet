@@ -1009,6 +1009,11 @@ impl Session {
             observation.service_writes_unobserved = changed;
             observation.service_device_accesses_unobserved = device_accesses;
             result
+        } else if let Some(head_ip) = self.idle_yield_ip() {
+            self.machine.set_batch_yield_ip(Some(head_ip));
+            let result = self.machine.step_with_idle_budget(budget);
+            self.machine.set_batch_yield_ip(None);
+            result?
         } else {
             self.machine.step_with_idle_budget(budget)?
         };

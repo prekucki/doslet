@@ -127,3 +127,76 @@ fn suggested_work_loop_cannot_skip_changed_ram_and_remains_bounded() {
     assert_eq!(hinted.debug_advance_wait_candidate(0, 0), 0);
     assert_eq!(hinted.steps(), before);
 }
+
+#[test]
+fn far_call_tick_wait_skips_across_timer_irqs_opl3_and_tiered_batches() {
+    // Models Civilization's map wait: a poll followed by non-idle work, then a
+    // multi-tick wait loop calling a FAR tick reader while OPL3 sample timing
+    // and speed tiers are active and the host advances in 256-step batches.
+    let program = [
+        0xb8, 0x40, 0x00, // 0100: mov ax, 40h
+        0x8e, 0xc0, // 0103: mov es, ax
+        0xba, 0x88, 0x03, // 0105: mov dx, 388h
+        0xb0, 0x01, // 0108: mov al, 1
+        0xee, // 010a: out dx, al
+        0x42, // 010b: inc dx
+        0xb0, 0x20, // 010c: mov al, 20h
+        0xee, // 010e: out dx, al (activate OPL3 sample events)
+        0xbf, 0x02, 0x00, // 010f: mov di, 2
+        // 0112: outer:
+        0xb4, 0x01, // 0112: mov ah, 1
+        0xcd, 0x16, // 0114: int 16h (poll before non-idle work)
+        0xb9, 0x40, 0x00, // 0116: mov cx, 64
+        // 0119: work:
+        0xff, 0x06, 0x00, 0x02, // 0119: inc word [0200h]
+        0x49, // 011d: dec cx
+        0x75, 0xf9, // 011e: jnz work
+        0x9a, 0x40, 0x01, 0x00, 0x10, // 0120: call far 1000h:0140h
+        0x05, 0x02, 0x00, // 0125: add ax, 2
+        0x89, 0xc6, // 0128: mov si, ax
+        // 012a: wait_loop:
+        0x9a, 0x40, 0x01, 0x00, 0x10, // 012a: call far 1000h:0140h
+        0x39, 0xf0, // 012f: cmp ax, si
+        0x72, 0xf7, // 0131: jb wait_loop
+        0x4f, // 0133: dec di
+        0x75, 0xdc, // 0134: jnz outer
+        0xb8, 0x00, 0x4c, // 0136: mov ax, 4c00h
+        0xcd, 0x21, // 0139: int 21h
+        0x90, 0x90, 0x90, 0x90, 0x90, // 013b..0140: padding
+        // 0140: read_tick_far:
+        0x26, 0xa1, 0x6c, 0x00, // 0140: mov ax, es:[006ch]
+        0xcb, // 0144: retf
+    ];
+    let mut skipped = Session::new(&program).unwrap();
+    skipped
+        .machine
+        .set_execution_tiers(Some(alloc::vec![]), [Some(33), Some(1), Some(16)])
+        .unwrap();
+    skipped.set_idle_loops(true);
+    skipped.start();
+
+    let mut reference = Session::new(&program).unwrap();
+    reference
+        .machine
+        .set_execution_tiers(Some(alloc::vec![]), [Some(33), Some(1), Some(16)])
+        .unwrap();
+    reference.set_idle_loops(false);
+    reference.start();
+
+    while skipped.status() == SessionStatus::Running {
+        let step = skipped.advance(256);
+        assert_eq!(reference.advance(step), step);
+    }
+    assert_eq!(skipped.status(), SessionStatus::Exited(0));
+    equivalent(&skipped, &reference);
+    let stats = skipped.idle_loop_stats();
+    assert_eq!(stats.head_failures, 0, "{stats:?}");
+    assert_eq!(
+        stats.skipped_tier_nanos[2], stats.skipped_nanos,
+        "{stats:?}"
+    );
+    assert!(
+        stats.proofs >= 4 && stats.skipped_steps > 780_000,
+        "expected multi-tick skips across OPL3 and timer IRQs, got {stats:?}"
+    );
+}
