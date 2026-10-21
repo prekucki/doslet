@@ -727,13 +727,33 @@ fn a_faulting_pop_leaves_the_stack_pointer_unchanged() {
 }
 
 #[test]
-fn faults_without_a_handler_or_inside_one_still_stop_the_session() {
+fn unhandled_divide_errors_take_interrupt_0_and_other_faults_still_stop() {
+    // Without any handler, the reflected interrupt reaches DOS's abort.
     let mut s = faulting_client(&[], &DIVIDE);
     run_until_loop(&mut s);
-    assert_eq!(s.status(), SessionStatus::Faulted);
+    assert_eq!(s.status(), SessionStatus::Exited(0));
+    assert!(s.console().ends_with(b"Divide overflow\r\n"));
     assert!(!s.machine.cpu.precise_faults_enabled());
-    // A handler that faults itself is not entered again.
+    // A 0203h handler that faults itself is not entered again; the nested
+    // divide error takes the interrupt path too.
     let mut s = faulting_client(&[(0, 0x20005)], &DIVIDE);
+    run_until_loop(&mut s);
+    assert_eq!(s.status(), SessionStatus::Exited(0));
+    // A 0205h handler receives it as an interrupt and resumes after DIV.
+    let mut s = faulting_client(&[], &DIVIDE);
+    let code = s.registers().cs;
+    // ADD DWORD [ESP],2; IRETD.
+    for (i, byte) in [0x83, 0x04, 0x24, 2, 0xCF].into_iter().enumerate() {
+        s.machine.bus.write_u8(0x21200 + i as u32, byte).unwrap();
+    }
+    s.dpmi_gate(0, code, 0x21200).unwrap();
+    run_until_loop(&mut s);
+    assert_eq!(s.status(), SessionStatus::Running, "{:?}", s.fault());
+    assert_eq!(s.registers().ip, 0x20008);
+    assert_eq!(s.dpmi.as_ref().unwrap().depth, 0);
+    // Other faults without a handler still stop the session.
+    let client = [0x66, 0xB8, 0x34, 0x12, 0x8E, 0xD8, 0x90, 0x90, 0xEB, 0xFE];
+    let mut s = faulting_client(&[], &client);
     run_until_loop(&mut s);
     assert_eq!(s.status(), SessionStatus::Faulted);
 }

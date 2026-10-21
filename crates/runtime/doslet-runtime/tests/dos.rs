@@ -233,6 +233,189 @@ fn a_guest_opens_reads_and_writes_a_mounted_file_to_stdout() {
 }
 
 #[test]
+fn divide_errors_reach_dos_or_the_programs_int_0_handler() {
+    // XOR CX,CX; MOV AX,1; DIV CX.
+    let divide = [
+        0x31, 0xC9, 0xB8, 1, 0, 0xF7, 0xF1, 0xB8, 1, 0x4C, 0xCD, 0x21,
+    ];
+    let mut session = Session::new(&divide).unwrap();
+    session.start();
+    session.advance(100);
+    assert_eq!(session.status(), SessionStatus::Exited(0));
+    assert_eq!(session.console(), b"Divide overflow\r\n");
+
+    // A Turbo Pascal-style handler reports runtime error 200 itself.
+    let mut program = vec![
+        0x31, 0xC0, 0x8E, 0xC0, // XOR AX,AX; MOV ES,AX.
+        0x26, 0xC7, 0x06, 0, 0, 0x20, 0x01, // MOV ES:[0],0120h.
+        0x26, 0x8C, 0x0E, 2, 0, // MOV ES:[2],CS.
+    ];
+    program.extend_from_slice(&divide);
+    program.resize(0x20, 0x90);
+    program.extend_from_slice(&[0xB8, 0xC8, 0x4C, 0xCD, 0x21]); // Exit with code 200.
+    let mut session = Session::new(&program).unwrap();
+    session.start();
+    session.advance(100);
+    assert_eq!(session.status(), SessionStatus::Exited(200));
+    assert_eq!(session.console(), b"");
+
+    // The BIOS's dummy handlers return from vectors 1-7.
+    let mut session = Session::new(&[0xCC, 0xCD, 0x04, 0xB8, 5, 0x4C, 0xCD, 0x21]).unwrap();
+    session.start();
+    session.advance(100);
+    assert_eq!(
+        session.status(),
+        SessionStatus::Exited(5),
+        "{:?}",
+        session.fault()
+    );
+}
+
+/// A parent COM at offset 0: data at 180h-1F7h, EXEC parameters at 1A0h
+/// (inherited environment, tail at 1C0h).
+fn parent_program(code: &[u8], child: &[u8]) -> Vec<u8> {
+    let mut program = vec![0; 0xF8];
+    program[..code.len()].copy_from_slice(code);
+    program[0x80..0x89].copy_from_slice(b"TEST.TXT\0");
+    program[0x90..0x90 + child.len()].copy_from_slice(child);
+    program[0xA0..0xAE]
+        .copy_from_slice(&[0, 0, 0xC0, 1, 0, 0x10, 0x5C, 0, 0, 0x10, 0x6C, 0, 0, 0x10]);
+    program[0xC0..0xC5].copy_from_slice(&[3, b' ', b'h', b'i', 0x0D]);
+    program
+}
+
+/// The parent opens TEST.TXT, runs CHILD.COM, keeps its exit code twice
+/// and the largest free block before and after, then prints what is left.
+fn exec_session() -> Session {
+    let parent = parent_program(
+        &[
+            0xB4, 0x48, 0xBB, 0xFF, 0xFF, 0xCD, 0x21, // Largest free block,
+            0x89, 0x1E, 0xF4, 1, // stored at 1F4h.
+            0xBA, 0x80, 1, 0xB8, 0, 0x3D, 0xCD, 0x21, // Open TEST.TXT as handle 5.
+            0xBA, 0x90, 1, 0xBB, 0xA0, 1, 0xB8, 0, 0x4B, 0xCD, 0x21, // EXEC CHILD.COM.
+            0x72, 0x3A, // JC -> exit 99.
+            0xB4, 0x4D, 0xCD, 0x21, 0xA3, 0xF0, 1, // Child's code at 1F0h,
+            0xB4, 0x4D, 0xCD, 0x21, 0xA3, 0xF2, 1, // read only once.
+            0xB4, 0x48, 0xBB, 0xFF, 0xFF, 0xCD, 0x21, 0x89, 0x1E, 0xF6, 1, // Free again.
+            0xBB, 5, 0, 0xB9, 2, 0, 0xBA, 0xE0, 1, 0xB4, 0x3F, 0xCD, 0x21, // Read 2.
+            0xBB, 1, 0, 0xB9, 2, 0, 0xBA, 0xE0, 1, 0xB4, 0x40, 0xCD, 0x21, // Print them.
+            0xB8, 0, 0x4C, 0xCD, 0x21, 0x90, 0x90, // Exit 0.
+            0xB8, 0x63, 0x4C, 0xCD, 0x21, // Exit 99.
+        ],
+        b"CHILD.COM\0",
+    );
+    let child = [
+        0xBB, 5, 0, 0xB9, 2, 0, 0xBA, 0x40, 1, 0xB4, 0x3F, 0xCD, 0x21, // Read 2 inherited.
+        0xBB, 1, 0, 0xB9, 2, 0, 0xBA, 0x40, 1, 0xB4, 0x40, 0xCD, 0x21, // Print them.
+        0xBB, 1, 0, 0xB9, 2, 0, 0xBA, 0x82, 0, 0xB4, 0x40, 0xCD, 0x21, // Print the tail.
+        0xBB, 5, 0, 0xB4, 0x3E, 0xCD, 0x21, // Close the inherited handle.
+        0xB8, 7, 0x4C, 0xCD, 0x21, // Exit 7.
+    ];
+    let mut drive = ReadOnlyDrive::new();
+    drive.mount(b"TEST.TXT", b"hello".to_vec()).unwrap();
+    drive.mount(b"CHILD.COM", child.to_vec()).unwrap();
+    let mut session = Session::new(&parent).unwrap().with_drive(drive);
+    session.start();
+    session
+}
+
+#[test]
+fn exec_runs_a_child_with_inherited_handles_and_returns_its_code() {
+    let mut session = exec_session();
+    session.advance(500);
+    assert_eq!(
+        session.status(),
+        SessionStatus::Exited(0),
+        "{:?}",
+        session.fault()
+    );
+    // The child read from the shared position; the parent continued it.
+    assert_eq!(session.console(), b"hehill");
+    assert_eq!(ram_u16(&session, 0x101F0), 7);
+    assert_eq!(ram_u16(&session, 0x101F2), 0);
+    assert_eq!(ram_u16(&session, 0x101F4), ram_u16(&session, 0x101F6));
+}
+
+#[cfg(feature = "save-state")]
+#[test]
+fn states_saved_while_a_child_runs_resume_both_processes() {
+    let mut original = exec_session();
+    // Stop inside the child, past its first DOS call.
+    let mut calls = 0;
+    for _ in 0..200 {
+        original.advance(1);
+        let cs = original.registers().cs;
+        calls += usize::from(cs == 0xF000);
+        if calls > 2 && cs != 0x1000 && cs != 0xF000 {
+            break;
+        }
+    }
+    assert!(!matches!(original.registers().cs, 0x1000 | 0xF000));
+    let state = original.save_state().unwrap();
+    let mut restored = Session::load_state_with_media(&state, &exec_session()).unwrap();
+    restored.start();
+    for session in [&mut original, &mut restored] {
+        session.advance(500);
+        assert_eq!(
+            session.status(),
+            SessionStatus::Exited(0),
+            "{:?}",
+            session.fault()
+        );
+        assert_eq!(session.console(), b"hehill");
+        assert_eq!(ram_u16(session, 0x101F0), 7);
+    }
+    assert_eq!(
+        original.save_state().unwrap(),
+        restored.save_state().unwrap()
+    );
+}
+
+#[test]
+fn successive_children_enter_and_leave_the_dpmi_host() {
+    let parent = parent_program(
+        &[
+            0xBA, 0x90, 1, 0xBB, 0xA0, 1, 0xB8, 0, 0x4B, 0xCD, 0x21, // EXEC DPMI.COM.
+            0x72, 0x21, // JC -> exit 99.
+            0xB4, 0x4D, 0xCD, 0x21, 0xA3, 0xF0, 1, // First code at 1F0h.
+            0xBA, 0x90, 1, 0xBB, 0xA0, 1, 0xB8, 0, 0x4B, 0xCD, 0x21, // Again.
+            0x72, 0x0D, // JC -> exit 99.
+            0xB4, 0x4D, 0xCD, 0x21, 0xA3, 0xF2, 1, // Second code at 1F2h.
+            0xB8, 0, 0x4C, 0xCD, 0x21, 0x90, // Exit 0.
+            0xB8, 0x63, 0x4C, 0xCD, 0x21, // Exit 99.
+        ],
+        b"DPMI.COM\0",
+    );
+    // A 16-bit client: shrink to 64 KiB, enter, and exit from protected mode.
+    let client = [
+        0x0E, 0x07, 0xBB, 0, 0x10, 0xB4, 0x4A, 0xCD, 0x21, // Shrink the block.
+        0xB8, 0x87, 0x16, 0xCD, 0x2F, 0x85, 0xC0, 0x75, 0x22, // Detect the host.
+        0x89, 0x3E, 0x80, 1, 0x8C, 0x06, 0x82, 1, // Keep its entry.
+        0x89, 0xF3, 0xB4, 0x48, 0xCD, 0x21, 0x72, 0x12, // Its private data.
+        0x8E, 0xC0, 0x31, 0xC0, 0xFF, 0x1E, 0x80, 1, 0x72, 0x08, // Enter, 16-bit.
+        0xB8, 0x2A, 0x4C, 0xCD, 0x21, 0x90, 0x90, 0x90, // Exit 42 in protected mode.
+        0xB8, 0x63, 0x4C, 0xCD, 0x21, // Exit 99.
+    ];
+    let mut drive = ReadOnlyDrive::new();
+    drive.mount(b"DPMI.COM", client.to_vec()).unwrap();
+    let mut session = Session::new(&parent).unwrap().with_drive(drive);
+    session
+        .enable_dpmi(doslet_runtime::session::dpmi::Mode::Direct)
+        .unwrap();
+    session.start();
+    session.advance(2000);
+    assert_eq!(
+        session.status(),
+        SessionStatus::Exited(0),
+        "{:?}",
+        session.fault()
+    );
+    assert_eq!(ram_u16(&session, 0x101F0), 42);
+    assert_eq!(ram_u16(&session, 0x101F2), 42);
+    assert_eq!(session.dpmi_stats().unwrap().calls, 0);
+}
+
+#[test]
 fn ioctl_reports_c_as_local_and_rejects_absent_drives() {
     let mut program = vec![0; 0x100];
     let code = [

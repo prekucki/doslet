@@ -400,13 +400,60 @@ impl DirectoryTree {
     /// No drive prefix, leading separator or NUL, as in INT 21h/AH=47h.
     /// INT 21h/60h: the qualified upper-case form of a C: path, which need
     /// not exist, without its drive: `DIR\FILE`, or empty for the root.
+    /// Wildcards may appear only in the last component. As in DOS, `*` fills
+    /// the rest of its 8.3 field with `?`: `*.PAK` becomes `????????.PAK`.
     pub fn canonical(&self, path: &[u8], output: &mut [u8]) -> Result<usize, u16> {
-        let name = Name::relative(path, self.current)?;
-        output
-            .get_mut(..name.len)
-            .ok_or(3u16)?
-            .copy_from_slice(name.as_bytes());
-        Ok(name.len)
+        let split = path
+            .iter()
+            .rposition(|byte| matches!(byte, b'/' | b'\\' | b':'))
+            .map_or(0, |i| i + 1);
+        let last = &path[split..];
+        if !last.iter().any(|byte| matches!(byte, b'*' | b'?')) {
+            let name = Name::relative(path, self.current)?;
+            output
+                .get_mut(..name.len)
+                .ok_or(3u16)?
+                .copy_from_slice(name.as_bytes());
+            return Ok(name.len);
+        }
+        let directory = Name::relative(&path[..split], self.current)?;
+        let mut mask = [0; 12];
+        let dot = last.iter().position(|byte| *byte == b'.');
+        let (base, extension) = dot.map_or((last, &b""[..]), |i| (&last[..i], &last[i + 1..]));
+        let mut len = 0;
+        for (field, width) in [(base, 8), (extension, 3)] {
+            if width == 3 && dot.is_none() {
+                break;
+            }
+            if width == 3 {
+                mask[len] = b'.';
+                len += 1;
+            }
+            let start = len;
+            for &byte in field {
+                if byte == b'*' {
+                    while len - start < width {
+                        mask[len] = b'?';
+                        len += 1;
+                    }
+                    break;
+                }
+                if len - start == width || byte == b'.' || !byte.is_ascii_graphic() {
+                    return Err(3);
+                }
+                mask[len] = byte.to_ascii_uppercase();
+                len += 1;
+            }
+        }
+        let separator = usize::from(directory.len != 0);
+        let total = directory.len + separator + len;
+        let target = output.get_mut(..total).ok_or(3u16)?;
+        target[..directory.len].copy_from_slice(directory.as_bytes());
+        if separator != 0 {
+            target[directory.len] = b'\\';
+        }
+        target[directory.len + separator..].copy_from_slice(&mask[..len]);
+        Ok(total)
     }
     pub fn current_directory(&self) -> &[u8] {
         self.current.as_bytes()
@@ -760,7 +807,20 @@ mod tests {
         assert_eq!(&name[..len], b"DIR\\X\\NEW.TXT");
         assert_eq!(drive.canonical(b"/", &mut name), Ok(0));
         assert_eq!(drive.canonical(b"D:\\X", &mut name), Err(15));
-        assert_eq!(drive.canonical(b"*.TXT", &mut name), Err(3));
+        let mut wide = [0; 32];
+        for (mask, expected) in [
+            (&b"*.TXT"[..], &b"DIR\\SUB\\????????.TXT"[..]),
+            (b"*", b"DIR\\SUB\\????????"),
+            (b"*.*", b"DIR\\SUB\\????????.???"),
+            (b"c:\\a*.p?k", b"A???????.P?K"),
+            (b"../ab?d*", b"DIR\\AB?D????"),
+        ] {
+            let len = drive.canonical(mask, &mut wide).unwrap();
+            assert_eq!(&wide[..len], expected);
+        }
+        assert_eq!(drive.canonical(b"x*/y", &mut wide), Err(3));
+        assert_eq!(drive.canonical(b"abcdefghi*", &mut wide), Err(3));
+        assert_eq!(drive.canonical(b"*.TXT", &mut name), Err(3)); // 20 bytes.
         assert_eq!(
             drive.canonical(b"\\LONGER\\THAN.BUF", &mut name[..14]),
             Err(3)

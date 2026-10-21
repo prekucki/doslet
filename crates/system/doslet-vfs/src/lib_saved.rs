@@ -84,21 +84,55 @@ pub struct VfsHandleTableDescriptionsItem {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+pub struct VfsHandleTableParent {
+    #[prost(message, repeated, tag = "1")]
+    handles: Vec<VfsHandleTableHandlesItem>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
 pub struct VfsHandleTable {
     #[prost(message, repeated, tag = "1")]
     handles: Vec<VfsHandleTableHandlesItem>,
     #[prost(message, repeated, tag = "2")]
     descriptions: Vec<VfsHandleTableDescriptionsItem>,
+    /// Waiting parents' handles; absent in states without child processes.
+    #[prost(message, repeated, tag = "3")]
+    parents: Vec<VfsHandleTableParent>,
+}
+
+fn save_handles(handles: &[Option<u8>; HANDLE_COUNT]) -> Vec<VfsHandleTableHandlesItem> {
+    handles
+        .iter()
+        .map(|v| VfsHandleTableHandlesItem {
+            value: v.map(u32::from),
+        })
+        .collect()
+}
+
+fn load_handles(
+    items: Vec<VfsHandleTableHandlesItem>,
+) -> Result<[Option<u8>; HANDLE_COUNT], InvalidState> {
+    doslet_state::narrow(
+        items
+            .into_iter()
+            .map(|v| {
+                v.value
+                    .map(|v| doslet_state::narrow(v, "VfsHandleTable.handles"))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        "VfsHandleTable.handles length",
+    )
 }
 impl State for HandleTable {
     type Wire = VfsHandleTable;
     fn save(&self) -> Self::Wire {
         Self::Wire {
-            handles: self
-                .handles
+            handles: save_handles(&self.handles),
+            parents: self.parents[..self.depth]
                 .iter()
-                .map(|v| VfsHandleTableHandlesItem {
-                    value: (v).as_ref().map(|v| u32::from(*(v))),
+                .map(|handles| VfsHandleTableParent {
+                    handles: save_handles(handles),
                 })
                 .collect(),
             descriptions: self
@@ -111,20 +145,18 @@ impl State for HandleTable {
         }
     }
     fn load(w: Self::Wire) -> Result<Self, InvalidState> {
+        if w.parents.len() > MAX_PROCESS_DEPTH {
+            return Err(InvalidState("VfsHandleTable.parents length"));
+        }
+        let depth = w.parents.len();
+        let mut parents = [[None; HANDLE_COUNT]; MAX_PROCESS_DEPTH];
+        for (slot, parent) in parents.iter_mut().zip(w.parents) {
+            *slot = load_handles(parent.handles)?;
+        }
         let value = Self {
-            handles: doslet_state::narrow(
-                w.handles
-                    .into_iter()
-                    .map(|v| -> Result<_, InvalidState> {
-                        v.value
-                            .map(|v| -> Result<_, InvalidState> {
-                                doslet_state::narrow(v, "VfsHandleTable.handles")
-                            })
-                            .transpose()
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-                "VfsHandleTable.handles length",
-            )?,
+            handles: load_handles(w.handles)?,
+            parents,
+            depth,
             descriptions: doslet_state::narrow(
                 w.descriptions
                     .into_iter()
@@ -137,9 +169,14 @@ impl State for HandleTable {
                 "VfsHandleTable.descriptions length",
             )?,
         };
-        if !(value.handles.iter().flatten().all(|&i| {
-            usize::from(i) < HANDLE_COUNT && value.descriptions[usize::from(i)].is_some()
-        })) {
+        if !(core::iter::once(&value.handles)
+            .chain(&value.parents[..value.depth])
+            .flatten()
+            .flatten()
+            .all(|&i| {
+                usize::from(i) < HANDLE_COUNT && value.descriptions[usize::from(i)].is_some()
+            }))
+        {
             return Err(InvalidState("VfsHandleTable invariants"));
         }
         Ok(value)

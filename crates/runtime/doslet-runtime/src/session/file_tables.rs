@@ -2,7 +2,6 @@
 //! after every open, duplicate, close, read, write and seek. The layout is in
 //! `doslet_dos::tables`.
 use super::*;
-use doslet_dos::loader::PSP_SEGMENT;
 use doslet_dos::tables::{self, SftEntry};
 
 /// Every file reports one deterministic noon timestamp, through 57h and the SFT.
@@ -44,7 +43,7 @@ impl Session {
         let index = self.handles.description_index(handle);
         tables::set_handle(
             &mut self.machine.bus,
-            PSP_SEGMENT,
+            self.psp,
             handle,
             index.map(|index| tables::FIRST_FILE + index),
         )?;
@@ -71,6 +70,13 @@ impl Session {
         }
         Ok(())
     }
+    /// Every SFT entry, after a child's handles came or went.
+    pub(super) fn sync_descriptions(&mut self) -> Result<(), BusError> {
+        for index in 0..doslet_vfs::HANDLE_COUNT {
+            self.sync_description(index)?;
+        }
+        Ok(())
+    }
     fn sync_description(&mut self, index: usize) -> Result<(), BusError> {
         let entry = self.sft_entry(index).unwrap_or_default();
         tables::write_entry(&mut self.machine.bus, tables::FIRST_FILE + index, &entry)
@@ -85,7 +91,7 @@ impl Session {
             device_info: self.file_device_info(file),
             time: FILE_TIME,
             date: FILE_DATE,
-            owner: PSP_SEGMENT,
+            owner: self.psp,
             ..SftEntry::default()
         };
         if CdromImage::owns_handle(backend) {

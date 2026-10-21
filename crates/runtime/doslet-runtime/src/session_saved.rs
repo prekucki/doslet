@@ -158,6 +158,33 @@ pub struct RuntimeSession {
     /// The runtime DPMI host's own records; its tables live in RAM.
     #[prost(message, optional, tag = "35")]
     dpmi: Option<<dpmi::Host as State>::Wire>,
+    /// Running and waiting DOS processes; absent before EXEC existed.
+    #[prost(message, optional, tag = "36")]
+    processes: Option<RuntimeSessionProcesses>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RuntimeSessionParent {
+    #[prost(uint32, tag = "1")]
+    psp: u32,
+    #[prost(uint32, tag = "2")]
+    dta_segment: u32,
+    #[prost(uint32, tag = "3")]
+    dta_offset: u32,
+    #[prost(message, optional, tag = "4")]
+    context: Option<<doslet_x86::CpuContext as State>::Wire>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RuntimeSessionProcesses {
+    #[prost(uint32, tag = "1")]
+    psp: u32,
+    #[prost(uint32, tag = "2")]
+    return_code: u32,
+    #[prost(uint32, tag = "3")]
+    dpmi_client_psp: u32,
+    #[prost(message, repeated, tag = "4")]
+    parents: Vec<RuntimeSessionParent>,
 }
 impl Session {
     pub(super) fn save_wire_referenced(&self) -> RuntimeSession {
@@ -174,6 +201,22 @@ impl Session {
             patches: self.patches.clone(),
             patches_applied: self.patches_applied as u32,
             dpmi: self.dpmi.as_deref().map(State::save),
+            processes: Some(RuntimeSessionProcesses {
+                psp: u32::from(self.psp),
+                return_code: u32::from(self.return_code),
+                dpmi_client_psp: u32::from(self.dpmi_client_psp),
+                parents: self
+                    .parents
+                    .iter()
+                    .flatten()
+                    .map(|parent| RuntimeSessionParent {
+                        psp: u32::from(parent.psp),
+                        dta_segment: u32::from(parent.dta.0),
+                        dta_offset: u32::from(parent.dta.1),
+                        context: Some(parent.context.save()),
+                    })
+                    .collect(),
+            }),
             console: self.console.to_vec(),
             console_truncated: self.console_truncated,
             extended_key: self.extended_key.as_ref().map(|v| u32::from(*(v))),
@@ -217,7 +260,44 @@ impl Session {
         w: RuntimeSession,
         media: Option<&super::saved::StateResources>,
     ) -> Result<Self, InvalidState> {
+        let root = doslet_dos::loader::PSP_SEGMENT;
+        let processes = w.processes.unwrap_or(RuntimeSessionProcesses {
+            psp: u32::from(root),
+            return_code: 0,
+            // Earlier states had one process, the only possible client.
+            dpmi_client_psp: if w.dpmi.is_some() { u32::from(root) } else { 0 },
+            parents: Vec::new(),
+        });
+        if processes.parents.len() > doslet_vfs::MAX_PROCESS_DEPTH {
+            return Err(InvalidState("RuntimeSession.processes.parents length"));
+        }
+        let mut parents = process::no_parents();
+        for (slot, parent) in parents.iter_mut().zip(processes.parents) {
+            *slot = Some(process::Parent {
+                psp: doslet_state::narrow(parent.psp, "RuntimeSession.processes.parents.psp")?,
+                dta: (
+                    doslet_state::narrow(parent.dta_segment, "RuntimeSession.processes.dta")?,
+                    doslet_state::narrow(parent.dta_offset, "RuntimeSession.processes.dta")?,
+                ),
+                context: doslet_x86::CpuContext::load(doslet_state::required(
+                    parent.context,
+                    "RuntimeSession.processes.parents.context",
+                )?)?,
+            });
+        }
         let value = Self {
+            psp: doslet_state::narrow(processes.psp, "RuntimeSession.processes.psp")?,
+            parents,
+            return_code: doslet_state::narrow(
+                processes.return_code,
+                "RuntimeSession.processes.return_code",
+            )?,
+            dpmi_client_psp: doslet_state::narrow(
+                processes.dpmi_client_psp,
+                "RuntimeSession.processes.dpmi_client_psp",
+            )?,
+            // Set and consumed within one step, never at a batch boundary.
+            parent_resumed: false,
             machine: alloc::boxed::Box::new(<PcMachine as State>::load(doslet_state::required(
                 w.machine,
                 "RuntimeSession.machine",
@@ -346,6 +426,11 @@ impl Session {
             .is_some_and(|host| !host.fits(value.machine.bus.ram_size() as u32))
         {
             return Err(InvalidState("DPMI memory exceeds installed RAM"));
+        }
+        if value.parents.iter().flatten().count() != value.handles.depth() {
+            return Err(InvalidState(
+                "RuntimeSession processes and handle depth differ",
+            ));
         }
         let mut value = value;
         let precise = value.dpmi.as_ref().is_some_and(|h| h.handles_exceptions());

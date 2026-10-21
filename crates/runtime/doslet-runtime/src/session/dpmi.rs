@@ -120,21 +120,7 @@ impl Session {
         if self.status != SessionStatus::Ready || self.dpmi.is_some() {
             return Err(RuntimeError::InvalidLaunch);
         }
-        let end = self.machine.bus.ram_size() as u32;
-        self.dpmi = Some(Box::new(Host {
-            mode,
-            stats: Stats::default(),
-            used: [false; DESCRIPTORS],
-            dos_segments: [0; DESCRIPTORS],
-            exceptions: [(0, 0); 32],
-            memory: memory::Memory::new(POOL, end),
-            frames: core::array::from_fn(|_| None),
-            depth: 0,
-            private_segment: 0,
-            bits32: false,
-            callbacks: [None; 32],
-            direct_return_pending: false,
-        }));
+        self.dpmi = Some(Box::new(self.new_dpmi_host(mode)));
         for offset in [
             ENTRY,
             RM_RETURN,
@@ -155,6 +141,34 @@ impl Session {
             self.dpmi_marker(CB_BASE + i * 8)?;
         }
         Ok(())
+    }
+
+    fn new_dpmi_host(&self, mode: Mode) -> Host {
+        Host {
+            mode,
+            stats: Stats::default(),
+            used: [false; DESCRIPTORS],
+            dos_segments: [0; DESCRIPTORS],
+            exceptions: [(0, 0); 32],
+            memory: memory::Memory::new(POOL, self.machine.bus.ram_size() as u32),
+            frames: core::array::from_fn(|_| None),
+            depth: 0,
+            private_segment: 0,
+            bits32: false,
+            callbacks: [None; 32],
+            direct_return_pending: false,
+        }
+    }
+
+    /// The DPMI client's process terminated. The host forgets its
+    /// descriptors, memory, callbacks and handlers, so that a later program
+    /// can enter; its DOS memory went with the process.
+    pub(super) fn dpmi_reset(&mut self) {
+        if let Some(mode) = self.dpmi.as_ref().map(|h| h.mode) {
+            self.dpmi = Some(Box::new(self.new_dpmi_host(mode)));
+        }
+        self.dpmi_client_psp = 0;
+        self.machine.cpu.set_precise_faults(false);
     }
 
     /// The installed host, if any. Loaders place protected-mode code by it.
@@ -299,7 +313,10 @@ impl Session {
             if vector == 0x31 {
                 self.dpmi_int31()
             } else if vector == 0x21 && self.registers().get_byte(4) == 0x4C {
-                self.status = SessionStatus::Exited(self.registers().get_byte(0));
+                // A child client returns to its waiting parent.
+                let depth = self.handles.depth();
+                self.finish_exit(self.registers().get_byte(0))?;
+                self.parent_resumed = self.handles.depth() < depth;
                 Ok(())
             } else {
                 self.dpmi_reflect(vector, None, None, false)
@@ -576,7 +593,7 @@ impl Session {
             (cs_sel, ret_cs, 0x9A, 0, 0xFFFF),
             (ds_sel, ds, 0x92, if bits32 { 0x40 } else { 0 }, 0xFFFF),
             (ss_sel, ss, 0x92, if bits32 { 0x40 } else { 0 }, 0xFFFF),
-            (psp_sel, 0x1000, 0x92, 0, 0xFF),
+            (psp_sel, self.psp, 0x92, 0, 0xFF),
         ] {
             self.dpmi_descriptor_at(
                 LDT + u32::from(sel & !7),
@@ -586,10 +603,11 @@ impl Session {
                 flags,
             )?;
         }
-        let environment = self.machine.bus.read_u16(0x1002C)?;
+        let psp = u32::from(self.psp) * 16;
+        let environment = self.machine.bus.read_u16(psp + 0x2C)?;
         if environment != 0 {
             let env_sel = self.dpmi_real_alias(environment)?;
-            self.machine.bus.write_u16(0x1002C, env_sel)?;
+            self.machine.bus.write_u16(psp + 0x2C, env_sel)?;
         }
         self.machine.cpu.set_protected_mode(true);
         self.machine.cpu.set_current_privilege_level(3);
@@ -615,6 +633,7 @@ impl Session {
         h.bits32 = bits32;
         h.private_segment = private;
         h.stats.entered = true;
+        self.dpmi_client_psp = self.psp;
         Ok(())
     }
 
@@ -940,7 +959,7 @@ impl Session {
                     Ok(s) => s,
                     Err(e) => return Ok(Some(e)),
                 };
-                let segment = match self.memory.allocate(bx, 0x1000) {
+                let segment = match self.memory.allocate(bx, self.psp) {
                     Ok(s) => s,
                     Err(e) => {
                         self.dpmi.as_mut().unwrap().used[usize::from(sel >> 3)] = false;
