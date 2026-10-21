@@ -14,7 +14,8 @@ const RET: usize = CALL + 2;
 const BRANCH: usize = RET + 1;
 const SHIFT: usize = BRANCH + 2 * 17;
 const EXTEND: usize = SHIFT + 8 * 4;
-const GROUPS: usize = EXTEND + 8;
+const X87: usize = EXTEND + 8;
+const GROUPS: usize = X87 + x87_batch::KINDS;
 
 /// One memory expression at most; register-only forms leave its fields unused.
 #[derive(Clone, Copy)]
@@ -214,6 +215,11 @@ impl Prepared {
                 memory(source);
                 EXTEND + usize::from(word) * 4 + usize::from(signed) * 2 + usize::from(mem)
             }
+            Operation::X87 { x87, target } => {
+                p.immediate = x87.pack();
+                memory(target);
+                X87 + usize::from(x87.kind())
+            }
             _ => return p,
         };
         let width = match i.width {
@@ -363,6 +369,23 @@ impl<B: CpuBus> Handlers<B> {
         extend!(false, true);
         extend!(true, false);
         extend!(true, true);
+        // Only the byte-width entries are selected; register forms ignore
+        // the address size and share one instance.
+        macro_rules! x87 {
+            ($($kind:expr),*) => { $(
+                let at = 1 + (X87 + $kind) * VARIANTS;
+                table[at] = x87::<B, false, $kind>;
+                table[at + 1] = if $kind < x87_batch::MEMORY_KINDS {
+                    x87::<B, true, $kind>
+                } else {
+                    x87::<B, false, $kind>
+                };
+            )* };
+        }
+        x87!(
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33
+        );
         table
     };
 }
@@ -672,4 +695,20 @@ fn move_extend<
     let value = extend_result(value, WORD, SIGNED);
     cpu.store(bus, Place::Register(p.destination), W, value);
     p.finish(cpu)
+}
+
+fn x87<B: CpuBus, const A: bool, const KIND: u8>(
+    cpu: &mut Cpu,
+    bus: &mut B,
+    windows: &mut Windows,
+    _: SegmentWindow,
+    p: Prepared,
+) -> bool {
+    let next = cpu.registers.ip.wrapping_add(u32::from(p.length()));
+    cpu.x87_execute(bus, windows, X87::unpack::<KIND>(p.immediate), next, |r| {
+        Some((
+            SegmentRegister::ALL[usize::from(p.segment)],
+            p.offset::<A>(r),
+        ))
+    })
 }

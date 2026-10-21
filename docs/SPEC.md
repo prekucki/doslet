@@ -204,6 +204,26 @@ uses a 192-bit pi/2 constant rather than the physical x87 approximation.
 The [implementation audit](compatibility/x87-audit.md) records exact counts,
 remaining limits and reproducible native-reference commands. These checks do
 not establish game compatibility.
+
+Interpreter slices also execute the common 387 forms: real32/64/80 and integer
+loads and stores, memory and register arithmetic and comparisons, FXCH,
+FLD/FST/FSTP ST(i), FFREE, FLDCW, FNSTCW, FNSTSW, FCHS, FABS, FTST, FXAM, the
+constants, FSQRT, FRNDINT, FINCSTP/FDECSTP, FNOP, FNCLEX and FNINIT. Each form
+performs the reference handler's `doslet-x87` operations, memory accesses and
+pointer updates. It runs only when the reference cannot fail: available,
+unblocked FPU, nonempty operands and push slot, batch memory and, for numeric
+forms, all exceptions masked and PC other than 01. Otherwise it changes
+nothing and the reference step executes it. Transcendental, environment and
+BCD forms, WAIT and repeat-prefixed x87 bytes stay with the reference handler.
+Batched arithmetic, loads, integer loads, ST(i) loads and real32/64 stores use
+exact binary64 fast paths. For PC=24/53, every RC and finite zero/normal
+operands with at most 53 significant bits and exponents within ±448, host
+binary64 operations with TwoSum/Dekker error-free transformations select the
+reference's rounding, C1 and PE; other cases call the reference methods.
+Values, retained data, encodings, tags and status stay bit-identical.
+`Session::set_x87_batching` and `Session::set_x87_fast_paths` (both on by
+default and not saved in states) select the reference handler or the reference
+arithmetic for comparisons. See the [x87 performance report](compatibility/x87-performance.md).
 Dword ENTER builds bounded nested stack frames and BSF/BSR support both operand
 widths, including their defined zero flag. BT/BTS/BTR/BTC take an immediate or a
 register bit offset. With a memory operand, a register offset is signed and may
@@ -461,7 +481,8 @@ prepares 16-byte block operands and a dense code selecting a const-generic
 handler for the concrete bus. MOV and ALU/CMP/TEST register/immediate/memory
 forms, register/memory INC/DEC, LEA, register PUSH/POP, relative near CALL/JMP/Jcc,
 RET, shifts/rotates by immediate/CL and decoded MOVZX/MOVSX forms specialize
-width and 16/32-bit effective addressing at compile time. Shared arithmetic,
+width and 16/32-bit effective addressing at compile time. Each batched x87
+form kind has its own handler, specialized for its address size. Shared arithmetic,
 shift and extension helpers preserve cached execution semantics. Rare forms
 use a separate setup-allocated decoded array and the existing batch validator.
 Native slices use the same representation, with native eligibility recorded

@@ -619,6 +619,12 @@ for the concrete bus, without trait-object bus calls. Native eligibility is
 computed by the existing predicate during preparation; native decoders still
 reject word operands and non-32-bit branches.
 
+Batched x87 forms are prepared too: one handler per form kind, with the
+ModR/M, ST index, pointer-tracking bit and operation payload in the immediate
+and the memory expression in the ordinary operand fields. Each handler inlines
+the shared x87 executor, so its precondition and operand checks fold for that
+form. A form that the executor declines ends the slice before any effect.
+
 Rare forms retain `try_batched` and decoded `Instruction` in a separate fixed
 cold array, indexed by block slot and position. Only those steps copy the full
 IR. Both arrays are allocated at CPU setup. On x86-64, a hot block occupies
@@ -648,7 +654,13 @@ Raw real80 transfers and context images preserve guest encodings; binary64 is a
 diagnostic/output view. Shared arithmetic rules handle memory/register specials.
 Root, remainder, logarithm, exponential and trigonometric kernels have bounded
 loops and fixed local arrays, without a host math dependency or execution
-allocation. FPREM partial reductions return C2 to the guest; trig range failures
+allocation. Separate `fast_*` methods serve batched loads, stores and basic
+arithmetic: on targets whose binary64 operations round once (x86-64, AArch64,
+WASM, x86 with SSE2) they use host addition, subtraction, multiplication and
+division plus error-free transformations where the result is provably the
+reference's, and call the reference method elsewhere. They write the same
+three register views (diagnostic binary64, retained finite data, raw encoding),
+so saved states do not depend on which path ran. FPREM partial reductions return C2 to the guest; trig range failures
 also preserve the guest operand and set C2. FNSTENV/FNSAVE side effects occur
 after the CPU adapter completes memory writes.
 The [coverage map](compatibility/x87.md) separates opcode support from numerical
