@@ -175,19 +175,19 @@ fn far_call_tick_wait_skips_across_timer_irqs_opl3_and_tiered_batches() {
     skipped.set_idle_loops(true);
     skipped.start();
 
-    let mut reference = Session::new(&program).unwrap();
+    let mut reference = reference(&skipped, &program);
     reference
         .machine
         .set_execution_tiers(Some(alloc::vec![]), [Some(33), Some(1), Some(16)])
         .unwrap();
     reference.set_idle_loops(false);
-    reference.start();
 
     while skipped.status() == SessionStatus::Running {
         let step = skipped.advance(256);
         assert_eq!(reference.advance(step), step);
     }
     assert_eq!(skipped.status(), SessionStatus::Exited(0));
+    reference.set_idle_loops(true);
     equivalent(&skipped, &reference);
     let stats = skipped.idle_loop_stats();
     assert_eq!(stats.head_failures, 0, "{stats:?}");
