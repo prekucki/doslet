@@ -115,9 +115,11 @@ impl Doslet {
             } else {
                 Mode::Fixed
             },
+            // A workspace build can unify the runtime's dynamic core into an
+            // app without its compiler thread; that core never compiles.
             core: if self.aot_installed() {
                 Core::Aot
-            } else if self.session.dynamic_core_enabled() {
+            } else if crate::cpu_config::JIT_AVAILABLE && self.session.dynamic_core_enabled() {
                 Core::Jit
             } else {
                 Core::Interpreter

@@ -181,6 +181,9 @@ fn far_call_tick_wait_skips_across_timer_irqs_opl3_and_tiered_batches() {
         .set_execution_tiers(Some(alloc::vec![]), [Some(33), Some(1), Some(16)])
         .unwrap();
     reference.set_idle_loops(false);
+    // Portable states record each session's host-attachment epoch.
+    reference.epoch = skipped.epoch;
+    reference.input.reset(skipped.epoch);
     reference.start();
 
     while skipped.status() == SessionStatus::Running {
@@ -188,6 +191,8 @@ fn far_call_tick_wait_skips_across_timer_irqs_opl3_and_tiered_batches() {
         assert_eq!(reference.advance(step), step);
     }
     assert_eq!(skipped.status(), SessionStatus::Exited(0));
+    // The state envelope records the host's idle-loop setting too.
+    skipped.set_idle_loops(false);
     equivalent(&skipped, &reference);
     let stats = skipped.idle_loop_stats();
     assert_eq!(stats.head_failures, 0, "{stats:?}");

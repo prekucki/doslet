@@ -58,10 +58,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Install native audio build dependencies
+      - name: Install native build dependencies
+        # ALSA for cpal and midir; libudev for gilrs gamepad discovery.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev pkg-config
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config
 
       - name: Check native code
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
