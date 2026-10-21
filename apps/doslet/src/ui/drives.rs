@@ -4,12 +4,12 @@ use super::{
 };
 use crate::configurator::Edit;
 use doslet_config::SourceKind;
+#[cfg(target_arch = "wasm32")]
+use iced::widget::pick_list;
 use iced::widget::{
     button, checkbox, column, container, row, rule, scrollable, space, svg, text, text_input,
     tooltip,
 };
-#[cfg(target_arch = "wasm32")]
-use iced::widget::pick_list;
 use iced::{Border, Element, Fill};
 
 pub(super) fn indicator(app: &Doslet) -> Element<'_, Message> {

@@ -5,7 +5,7 @@ use super::{
 use crate::static_program::memory;
 use alloc::vec::Vec;
 use wasm_encoder::{
-    BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+    BlockType, BranchHint, CodeSection, EntityType, ExportKind, ExportSection, FunctionSection,
     ImportSection, Instruction as W, MemArg, MemoryType, Module, Section, TypeSection, ValType,
 };
 
@@ -59,8 +59,45 @@ const RESULT: u32 = 16;
 const CARRY: u32 = 17;
 pub(super) const WIDE: u32 = 18;
 
+pub(super) struct Function {
+    inner: wasm_encoder::Function,
+    branch_hints: Vec<BranchHint>,
+}
+impl Function {
+    pub(super) fn new<L>(locals: L) -> Self
+    where
+        L: IntoIterator<Item = (u32, ValType)>,
+        L::IntoIter: ExactSizeIterator,
+    {
+        Self {
+            inner: wasm_encoder::Function::new(locals),
+            branch_hints: Vec::new(),
+        }
+    }
+    pub(super) fn byte_len(&self) -> usize {
+        self.inner.byte_len()
+    }
+    pub(super) fn wasm(&self) -> &wasm_encoder::Function {
+        &self.inner
+    }
+    pub(super) fn branch_hints(&self) -> &[BranchHint] {
+        &self.branch_hints
+    }
+    pub(super) fn instruction(&mut self, instruction: &W<'_>) {
+        self.inner.instruction(instruction);
+    }
+}
+
 fn ins(f: &mut Function, op: W<'_>) {
-    f.instruction(&op);
+    f.inner.instruction(&op);
+}
+fn ins_hinted(f: &mut Function, likely: bool, op: W<'_>) {
+    debug_assert!(matches!(op, W::If(_) | W::BrIf(_)));
+    f.branch_hints.push(BranchHint {
+        branch_func_offset: f.inner.byte_len() as u32,
+        branch_hint_value: u32::from(likely),
+    });
+    f.inner.instruction(&op);
 }
 fn c(f: &mut Function, value: u32) {
     ins(f, W::I32Const(value as i32));
@@ -143,6 +180,7 @@ fn source(f: &mut Function, s: Source) {
     match s {
         Source::Register(r) => read_register(f, r),
         Source::Immediate(v) => c(f, v),
+        Source::VirtualRegister(local) => get(f, local),
     }
 }
 
@@ -263,14 +301,18 @@ fn wide_multiply(f: &mut Function, width: Width, signed: bool) {
 // Leave the offset on the stack; segment translation belongs only to accesses.
 // Keep this sequence shared with memory preflight, preserving its bytecode.
 fn effective_address(f: &mut Function, address: super::memory::MemoryAddress) {
-    c(f, address.displacement);
+    if address.scale & memory::VIRTUAL_DISPLACEMENT != 0 {
+        get(f, address.displacement);
+    } else {
+        c(f, address.displacement);
+    }
     if let Some(base) = address.base {
         read_register(f, base);
         ins(f, W::I32Add);
     }
     if let Some(index) = address.index {
         read_register(f, index);
-        c(f, u32::from(address.scale));
+        c(f, u32::from(address.scale & !memory::VIRTUAL_DISPLACEMENT));
         ins(f, W::I32Mul);
         ins(f, W::I32Add);
     }
@@ -1185,7 +1227,7 @@ pub(super) fn module(checked: &Checked<'_>) -> Result<(Vec<u8>, usize), CompileE
     c(&mut run, checked.options.service_interval_regions);
     ins(&mut run, W::ReturnCall(function_index(checked, DISPATCH)));
     ins(&mut run, W::End);
-    code.function(&run);
+    code.function(run.wasm());
     let mut dispatch = Function::new([(2, ValType::I32)]);
     // An exhausted initial/refilled budget never starts a new region. A HOT
     // loop with a positive budget remains bounded by the structural callback.
@@ -1214,11 +1256,11 @@ pub(super) fn module(checked: &Checked<'_>) -> Result<(Vec<u8>, usize), CompileE
     ins(&mut dispatch, W::Unreachable);
     ins(&mut dispatch, W::End);
     let mut dispatcher_bytes = dispatch.byte_len();
-    code.function(&dispatch);
+    code.function(dispatch.wasm());
     let mut fallback = Function::new([]);
     callback(&mut fallback, checked, abi::REASON_FALLBACK);
     ins(&mut fallback, W::End);
-    code.function(&fallback);
+    code.function(fallback.wasm());
     for &index in &checked.by_id {
         let f = region(checked, &checked.program.regions[index])?;
         if code
@@ -1229,10 +1271,10 @@ pub(super) fn module(checked: &Checked<'_>) -> Result<(Vec<u8>, usize), CompileE
         {
             return Err(CompileError::OutputTooLarge);
         }
-        code.function(&f);
+        code.function(f.wasm());
     }
     if checked.options.inline_admission {
-        code.function(&inline_admission_emit::helper());
+        code.function(inline_admission_emit::helper().wasm());
     }
     if dispatch_helpers != 0 {
         for entries in checked.by_address.chunks(DISPATCH_CHUNK_ENTRIES) {
@@ -1250,11 +1292,9 @@ pub(super) fn module(checked: &Checked<'_>) -> Result<(Vec<u8>, usize), CompileE
                 return Err(CompileError::OutputTooLarge);
             }
             dispatcher_bytes += helper.byte_len();
-            code.function(&helper);
+            code.function(helper.wasm());
         }
     }
-    // The upper bound covers section lengths, counts, names and each function
-    // type index. Reserve once before appending with wasm-encoder's interface.
     let capacity = code
         .byte_len()
         .saturating_add((checked.by_id.len() + dispatch_helpers) * 5)

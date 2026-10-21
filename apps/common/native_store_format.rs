@@ -321,11 +321,16 @@ pub fn inspect_dov1(revision: u64, payload: &[u8]) -> Result<StoreSummary, Stora
         cursor += used_bytes;
         for _ in 0..patches_count {
             let file = usize::try_from(read_u64(cursor)?).map_err(|_| StorageError::Corrupt)?;
-            let position = u32::try_from(read_u64(cursor + 8)?).map_err(|_| StorageError::Corrupt)?;
-            let offset = usize::try_from(read_u64(cursor + 16)?).map_err(|_| StorageError::Corrupt)?;
+            let position =
+                u32::try_from(read_u64(cursor + 8)?).map_err(|_| StorageError::Corrupt)?;
+            let offset =
+                usize::try_from(read_u64(cursor + 16)?).map_err(|_| StorageError::Corrupt)?;
             let len = usize::try_from(read_u64(cursor + 24)?).map_err(|_| StorageError::Corrupt)?;
             cursor += 32;
-            if offset.checked_add(len).is_none_or(|end| end > data_bytes.len()) {
+            if offset
+                .checked_add(len)
+                .is_none_or(|end| end > data_bytes.len())
+            {
                 return Err(StorageError::Corrupt);
             }
             patches.push((file, position, offset, len));
@@ -341,8 +346,11 @@ pub fn inspect_dov1(revision: u64, payload: &[u8]) -> Result<StoreSummary, Stora
         let mut files = Vec::new();
         for (idx, (base_name, name, deleted, directory)) in raw_files.into_iter().enumerate() {
             let length_entry = lengths.iter().find(|&&(f, _, _)| f == idx);
-            let mut file_patches: Vec<_> =
-                patches.iter().copied().filter(|&(f, _, _, _)| f == idx).collect();
+            let mut file_patches: Vec<_> = patches
+                .iter()
+                .copied()
+                .filter(|&(f, _, _, _)| f == idx)
+                .collect();
             file_patches.sort_by_key(|&(_, pos, _, _)| pos);
 
             let kind = if deleted {
@@ -368,14 +376,12 @@ pub fn inspect_dov1(revision: u64, payload: &[u8]) -> Result<StoreSummary, Stora
                 OverlayFileKind::Unchanged
             };
 
-            let size = length_entry
-                .map(|&(_, len, _)| len)
-                .or_else(|| {
-                    file_patches
-                        .iter()
-                        .map(|&(_, pos, _, len)| pos.saturating_add(len as u32))
-                        .max()
-                });
+            let size = length_entry.map(|&(_, len, _)| len).or_else(|| {
+                file_patches
+                    .iter()
+                    .map(|&(_, pos, _, len)| pos.saturating_add(len as u32))
+                    .max()
+            });
 
             let preview = if matches!(kind, OverlayFileKind::Created | OverlayFileKind::Modified) {
                 file_patches.first().map(|&(_, pos, offset, len)| {
@@ -529,7 +535,13 @@ mod format_tests {
         assert_eq!(summary.files[0].path, "SOUND.CFG");
         assert_eq!(summary.files[0].kind, OverlayFileKind::Modified);
         assert_eq!(summary.files[0].size, Some(17));
-        assert!(summary.files[0].preview.as_deref().unwrap().contains("IRQ=7"));
+        assert!(
+            summary.files[0]
+                .preview
+                .as_deref()
+                .unwrap()
+                .contains("IRQ=7")
+        );
 
         assert_eq!(summary.files[1].path, "OLD.TMP");
         assert_eq!(summary.files[1].kind, OverlayFileKind::Deleted);
@@ -537,6 +549,12 @@ mod format_tests {
         assert_eq!(summary.files[2].path, "SAVE0.GM1");
         assert_eq!(summary.files[2].kind, OverlayFileKind::Created);
         assert_eq!(summary.files[2].size, Some(8));
-        assert!(summary.files[2].preview.as_deref().unwrap().contains("48 4D 4D 31"));
+        assert!(
+            summary.files[2]
+                .preview
+                .as_deref()
+                .unwrap()
+                .contains("48 4D 4D 31")
+        );
     }
 }

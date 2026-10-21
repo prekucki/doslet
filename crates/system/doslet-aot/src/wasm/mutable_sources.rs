@@ -7,7 +7,9 @@
 //! existing source-byte and runtime guards.
 
 use super::{Budget, DosFlatBindingPlan, InstructionNode, LoweringError, StaticCfg, decode_node};
+use crate::{DefaultBitness, ObjectAddress, cfg::InstructionFlow};
 use alloc::vec::Vec;
+use doslet_executable::LeFixupSourceType;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -121,6 +123,332 @@ fn absolute_mov_write(instruction: &Instruction) -> Option<LinearInterval> {
     // Keep the exclusive end widened, including stores at the final u32 byte.
     // No wrapping low-address write or dynamic segment base is guessed here.
     LinearInterval::new(u64::from(displacement), width as u64)
+}
+
+#[derive(Debug, Default)]
+pub(super) struct VirtualRegisters {
+    writes: CodeWrites,
+    code_writers: Vec<bool>,
+}
+
+impl VirtualRegisters {
+    pub(super) fn is_code_writer(&self, node_index: usize) -> bool {
+        self.code_writers.get(node_index).copied().unwrap_or(false)
+    }
+
+    pub(super) fn intersects_slot(&self, linear: u32) -> bool {
+        let Some(source) = LinearInterval::new(u64::from(linear), 4) else {
+            return false;
+        };
+        let first = self
+            .writes
+            .intervals
+            .partition_point(|interval| interval.end <= source.start);
+        self.writes
+            .intervals
+            .get(first)
+            .is_some_and(|interval| interval.start < source.end)
+    }
+}
+
+pub(super) fn discover_virtual_registers(
+    graph: &StaticCfg<'_>,
+    binding: &DosFlatBindingPlan<'_>,
+    budget: &mut Budget,
+) -> Result<VirtualRegisters, LoweringError> {
+    if !core::ptr::eq(graph.image(), binding.image()) {
+        return Err(LoweringError::DifferentImage);
+    }
+    if !graph.matches_binding(binding) {
+        return Err(LoweringError::DifferentBinding);
+    }
+    if graph.binding().is_none() || graph.nodes().is_empty() {
+        return Ok(VirtualRegisters::default());
+    }
+
+    let mut node_intervals = Vec::new();
+    budget.reserve(&mut node_intervals, graph.nodes().len())?;
+    for node in graph.nodes() {
+        if node.bitness != DefaultBitness::Bits32 {
+            continue;
+        }
+        if let Some(object) = binding.object_binding(node.address.object_number)
+            && let Some(start) = object.linear_base.checked_add(node.address.offset)
+            && let Some(interval) = LinearInterval::new(u64::from(start), u64::from(node.byte_len))
+        {
+            node_intervals.push(interval);
+        }
+    }
+    merge_intervals(&mut node_intervals);
+    let overlaps_code = |candidate: LinearInterval| -> bool {
+        let first = node_intervals.partition_point(|interval| interval.end <= candidate.start);
+        node_intervals
+            .get(first)
+            .is_some_and(|interval| interval.start < candidate.end)
+    };
+
+    let interior_reloc_target = |rel: &crate::Relocation<'_>| -> Option<LinearInterval> {
+        if rel.kind != LeFixupSourceType::Offset32 {
+            return None;
+        }
+        let offset = rel.target.offset?;
+        let target_addr = ObjectAddress {
+            object_number: rel.target.object_number,
+            offset,
+        };
+        let pos = graph
+            .nodes()
+            .partition_point(|node| node.address <= target_addr);
+        let node = pos.checked_sub(1).and_then(|i| graph.nodes().get(i))?;
+        if node.bitness != DefaultBitness::Bits32
+            || node.address.object_number != target_addr.object_number
+            || target_addr.offset <= node.address.offset
+            || u64::from(target_addr.offset)
+                >= u64::from(node.address.offset) + u64::from(node.byte_len)
+        {
+            return None;
+        }
+        let object = binding.object_binding(target_addr.object_number)?;
+        let linear = object.linear_base.checked_add(target_addr.offset)?;
+        LinearInterval::new(u64::from(linear), 4)
+    };
+
+    let reloc_count = graph
+        .image()
+        .relocations()
+        .filter(|rel| interior_reloc_target(rel).is_some())
+        .count();
+
+    let mut code_writers = Vec::new();
+    budget.reserve(&mut code_writers, graph.nodes().len())?;
+    code_writers.resize(graph.nodes().len(), false);
+
+    let mut intervals = Vec::new();
+    budget.reserve(
+        &mut intervals,
+        graph
+            .nodes()
+            .len()
+            .checked_add(reloc_count)
+            .ok_or(LoweringError::OwnedByteLimit)?,
+    )?;
+
+    for rel in graph.image().relocations() {
+        if let Some(interval) = interior_reloc_target(&rel) {
+            intervals.push(interval);
+        }
+    }
+
+    let mut reg_const = [None::<u32>; 8];
+    for (index, node) in graph.nodes().iter().enumerate() {
+        if index == 0 || !sequential_predecessor(&graph.nodes()[index - 1], node) {
+            reg_const = [None; 8];
+        }
+        if node.bitness != DefaultBitness::Bits32 {
+            reg_const = [None; 8];
+            continue;
+        }
+        let instruction = decode_node(node, graph, binding)?;
+        if let Some(interval) = candidate_code_store(&instruction, &reg_const)
+            && overlaps_code(interval)
+        {
+            code_writers[index] = true;
+            intervals.push(interval);
+        }
+        update_reg_const(&instruction, node.flow, &mut reg_const);
+    }
+
+    merge_intervals(&mut intervals);
+    Ok(VirtualRegisters {
+        writes: CodeWrites { intervals },
+        code_writers,
+    })
+}
+
+fn merge_intervals(intervals: &mut Vec<LinearInterval>) {
+    intervals.sort_unstable();
+    let mut merged = 0;
+    for index in 0..intervals.len() {
+        let interval = intervals[index];
+        if merged != 0 && interval.start <= intervals[merged - 1].end {
+            intervals[merged - 1].end = intervals[merged - 1].end.max(interval.end);
+        } else {
+            intervals[merged] = interval;
+            merged += 1;
+        }
+    }
+    intervals.truncate(merged);
+}
+
+fn sequential_predecessor(prev: &InstructionNode, curr: &InstructionNode) -> bool {
+    prev.address.object_number == curr.address.object_number
+        && prev.address.offset.checked_add(u32::from(prev.byte_len)) == Some(curr.address.offset)
+        && matches!(
+            prev.flow,
+            InstructionFlow::Next | InstructionFlow::ConditionalBranch
+        )
+}
+
+fn gpr32_exact(reg: Register) -> Option<usize> {
+    Some(match reg {
+        Register::EAX => 0,
+        Register::ECX => 1,
+        Register::EDX => 2,
+        Register::EBX => 3,
+        Register::ESP => 4,
+        Register::EBP => 5,
+        Register::ESI => 6,
+        Register::EDI => 7,
+        _ => return None,
+    })
+}
+
+fn gpr_family(reg: Register) -> Option<usize> {
+    Some(match reg {
+        Register::EAX | Register::AX | Register::AL | Register::AH => 0,
+        Register::ECX | Register::CX | Register::CL | Register::CH => 1,
+        Register::EDX | Register::DX | Register::DL | Register::DH => 2,
+        Register::EBX | Register::BX | Register::BL | Register::BH => 3,
+        Register::ESP | Register::SP => 4,
+        Register::EBP | Register::BP => 5,
+        Register::ESI | Register::SI => 6,
+        Register::EDI | Register::DI => 7,
+        _ => return None,
+    })
+}
+
+fn candidate_code_store(
+    instruction: &Instruction,
+    reg_const: &[Option<u32>; 8],
+) -> Option<LinearInterval> {
+    if instruction.op0_kind() != OpKind::Memory
+        || instruction.memory_index() != Register::None
+        || !matches!(
+            instruction.mnemonic(),
+            Mnemonic::Mov
+                | Mnemonic::Add
+                | Mnemonic::Adc
+                | Mnemonic::Sub
+                | Mnemonic::Sbb
+                | Mnemonic::And
+                | Mnemonic::Or
+                | Mnemonic::Xor
+                | Mnemonic::Inc
+                | Mnemonic::Dec
+                | Mnemonic::Neg
+                | Mnemonic::Not
+        )
+    {
+        return None;
+    }
+    let width = instruction.memory_size().size();
+    if !matches!(width, 1 | 2 | 4) {
+        return None;
+    }
+    let address = if instruction.memory_base() == Register::None {
+        u32::try_from(instruction.memory_displacement64()).ok()?
+    } else {
+        let base = reg_const[gpr32_exact(instruction.memory_base())?]?;
+        base.wrapping_add(instruction.memory_displacement32())
+    };
+    LinearInterval::new(u64::from(address), width as u64)
+}
+
+fn update_reg_const(
+    instruction: &Instruction,
+    flow: InstructionFlow,
+    reg_const: &mut [Option<u32>; 8],
+) {
+    if !matches!(
+        flow,
+        InstructionFlow::Next | InstructionFlow::ConditionalBranch
+    ) {
+        *reg_const = [None; 8];
+        return;
+    }
+    match instruction.mnemonic() {
+        Mnemonic::Mov if instruction.op0_kind() == OpKind::Register => {
+            if let Some(dst) = gpr32_exact(instruction.op0_register()) {
+                reg_const[dst] = match instruction.op1_kind() {
+                    OpKind::Immediate32 => Some(instruction.immediate32()),
+                    OpKind::Register => {
+                        gpr32_exact(instruction.op1_register()).and_then(|src| reg_const[src])
+                    }
+                    _ => None,
+                };
+            } else if let Some(dst) = gpr_family(instruction.op0_register()) {
+                reg_const[dst] = None;
+            }
+        }
+        Mnemonic::Lea
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op1_kind() == OpKind::Memory =>
+        {
+            if let Some(dst) = gpr32_exact(instruction.op0_register()) {
+                reg_const[dst] = if instruction.memory_index() != Register::None {
+                    None
+                } else if instruction.memory_base() == Register::None {
+                    u32::try_from(instruction.memory_displacement64()).ok()
+                } else {
+                    gpr32_exact(instruction.memory_base())
+                        .and_then(|base| reg_const[base])
+                        .map(|base| base.wrapping_add(instruction.memory_displacement32()))
+                };
+            } else if let Some(dst) = gpr_family(instruction.op0_register()) {
+                reg_const[dst] = None;
+            }
+        }
+        Mnemonic::Add | Mnemonic::Sub if instruction.op0_kind() == OpKind::Register => {
+            if let Some(dst) = gpr32_exact(instruction.op0_register()) {
+                if matches!(
+                    instruction.op1_kind(),
+                    OpKind::Immediate8to32 | OpKind::Immediate32
+                ) {
+                    let imm = instruction.immediate(1) as u32;
+                    reg_const[dst] = reg_const[dst].map(|v| {
+                        if instruction.mnemonic() == Mnemonic::Add {
+                            v.wrapping_add(imm)
+                        } else {
+                            v.wrapping_sub(imm)
+                        }
+                    });
+                } else {
+                    reg_const[dst] = None;
+                }
+            } else if let Some(dst) = gpr_family(instruction.op0_register()) {
+                reg_const[dst] = None;
+            }
+        }
+        Mnemonic::Inc | Mnemonic::Dec if instruction.op0_kind() == OpKind::Register => {
+            if let Some(dst) = gpr32_exact(instruction.op0_register()) {
+                reg_const[dst] = reg_const[dst].map(|v| {
+                    if instruction.mnemonic() == Mnemonic::Inc {
+                        v.wrapping_add(1)
+                    } else {
+                        v.wrapping_sub(1)
+                    }
+                });
+            } else if let Some(dst) = gpr_family(instruction.op0_register()) {
+                reg_const[dst] = None;
+            }
+        }
+        Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Push | Mnemonic::Nop => {}
+        _ => {
+            if instruction.op0_kind() == OpKind::Memory {
+                return;
+            }
+            if let Some(dst) = gpr_family(instruction.op0_register()) {
+                reg_const[dst] = None;
+                if instruction.mnemonic() == Mnemonic::Xchg
+                    && let Some(other) = gpr_family(instruction.op1_register())
+                {
+                    reg_const[other] = None;
+                }
+            } else if instruction.op_count() != 0 {
+                *reg_const = [None; 8];
+            }
+        }
+    }
 }
 
 #[cfg(test)]

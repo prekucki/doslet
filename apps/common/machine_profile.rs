@@ -753,7 +753,13 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
             t["name"] = value(&action.name);
             t["executable"] = value(&action.executable);
             if !action.arguments.is_empty() {
-                t["arguments"] = value(action.arguments.iter().map(String::as_str).collect::<Array>());
+                t["arguments"] = value(
+                    action
+                        .arguments
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Array>(),
+                );
             }
             actions.push(t);
         }

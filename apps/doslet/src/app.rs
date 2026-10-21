@@ -3459,17 +3459,18 @@ audio = false
                 );
                 std::fs::write(fixture.root.join("disc.gog"), test_iso()).unwrap();
                 let autosave = fixture.root.join("autosave.state.gz");
-                let mut app = Doslet::from_cli(fixture.cli(&[
-                    "--autosave-path",
-                    autosave.to_str().unwrap(),
-                ]))
-                .unwrap();
+                let mut app =
+                    Doslet::from_cli(fixture.cli(&["--autosave-path", autosave.to_str().unwrap()]))
+                        .unwrap();
                 assert!(app.launch.preload_local_media);
                 app.session.advance(2);
                 assert_eq!(app.session.status(), SessionStatus::Running);
                 app.save_autosave();
                 drop(app);
-                assert!(autosave.is_file(), "expected autosave.state.gz to be created");
+                assert!(
+                    autosave.is_file(),
+                    "expected autosave.state.gz to be created"
+                );
 
                 let mut resumed = Doslet::from_cli(fixture.cli(&[
                     "--load-state",

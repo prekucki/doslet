@@ -126,6 +126,7 @@ fn encoding(op: Operation, code32: bool) -> Vec<u8> {
                 (0xaf, register_code(target), None)
             }
             Source::Immediate(v) => (0x69, register_code(target), Some(v)),
+            Source::VirtualRegister(_) => unreachable!("test source"),
         },
         Operation::ExtendMemory { target, signed, .. } => {
             out.push(0x0f);
@@ -625,6 +626,7 @@ fn memory_left_cmp_test_matches_reference_for_all_register_aliases_and_immediate
             let widths = match source {
                 Source::Register(r) => vec![r.width()],
                 Source::Immediate(_) => vec![Width::Byte, Width::Word, Width::Dword],
+                Source::VirtualRegister(_) => unreachable!("test source"),
             };
             for width in widths {
                 differential(

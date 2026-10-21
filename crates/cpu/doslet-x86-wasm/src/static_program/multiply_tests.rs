@@ -237,6 +237,7 @@ fn signed_multiply_captures_arbitrary_register_and_immediate_sources_before_alia
                         let value = match source {
                             Source::Register(r) => initial.gpr[r.index() as usize] & mask,
                             Source::Immediate(v) => v,
+                            Source::VirtualRegister(_) => unreachable!("test source"),
                         };
                         if target.width() == Width::Word {
                             i64::from(value as i16)

@@ -517,3 +517,80 @@ fn bounded_planner_declines_complex_candidate_without_poisoning_other_roots() {
     assert_eq!(compiled.procedure_ids().len(), 2);
     Module::new(&Engine::default(), compiled.wasm()).unwrap();
 }
+
+#[test]
+fn self_modifying_column_prologue_splits_into_virtual_register_loop_root() {
+    // 00: A3 07 00 01 00       MOV [0x10007], EAX      (patches disp32 of MOV AL,[EBX+disp32])
+    // 05: 8A 83 00 20 00 00    MOV AL, [EBX + 0x2000]  (loop header at +5, disp32 at +7..+11)
+    // 0B: 81 C7 04 00 00 00    ADD EDI, 4              (imm32 at +13..+17)
+    // 11: 88 07                MOV [EDI], AL
+    // 13: 49                   DEC ECX
+    // 14: 75 EF                JNZ +5
+    // 16: C3                   RET
+    // 17: 89 1D 0D 00 01 00    MOV [0x1000D], EBX      (patches imm32 of ADD EDI,imm32)
+    // 1D: C3                   RET
+    let code = [
+        0xa3, 0x07, 0x00, 0x01, 0x00, // 0..5
+        0x8a, 0x83, 0x00, 0x20, 0x00, 0x00, // 5..11
+        0x81, 0xc7, 0x04, 0x00, 0x00, 0x00, // 11..17
+        0x88, 0x07, // 17..19
+        0x49, // 19..20
+        0x75, 0xef, // 20..22
+        0xc3, // 22..23
+        0x89, 0x1d, 0x0d, 0x00, 0x01, 0x00, // 23..29
+        0xc3, // 29..30
+    ];
+    let image = image(&code, DefaultBitness::Bits32);
+    let binding = binding(&image, 0x10000);
+    let graph = StaticCfg::analyze_bound(&binding, &[at(0), at(23)], CfgLimits::default()).unwrap();
+    let prepared = PreparedMemoryProcedures::from_bound_graph_with_computations(
+        &graph,
+        &binding,
+        MemoryProcedureLimits {
+            max_work_per_call: Some(64),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(prepared.entries().contains(&at(5)));
+    let func = prepared
+        .program()
+        .functions
+        .iter()
+        .find(|f| f.entry.offset == 0x10005)
+        .unwrap();
+    let has_vreg_disp = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|inst| {
+            matches!(
+                inst.operation,
+                Operation::LoadMemory {
+                    address,
+                    ..
+                } if address.scale & memory::VIRTUAL_DISPLACEMENT != 0
+                    && address.displacement == 0x10007
+            )
+        });
+    let has_vreg_imm = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|inst| {
+            matches!(
+                inst.operation,
+                Operation::Alu {
+                    source: Source::VirtualRegister(0x1000d),
+                    ..
+                }
+            )
+        });
+    assert!(has_vreg_disp);
+    assert!(has_vreg_imm);
+    let compiled = prepared
+        .program()
+        .compile_with_computation_kernels(&ProcedureCompileOptions::default(), 64)
+        .unwrap();
+    Module::new(&Engine::default(), compiled.wasm()).unwrap();
+}

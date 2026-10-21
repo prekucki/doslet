@@ -271,6 +271,9 @@ pub enum Source {
     Register(Register),
     /// Must fit the destination width. Sign extension belongs to the lowering.
     Immediate(u32),
+    /// Guest linear address (`>= 0x500`) of a 4-byte immediate slot in ordinary
+    /// RAM, loaded once in a procedure prologue.
+    VirtualRegister(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -801,6 +804,9 @@ impl<'a> Checked<'a> {
             }
             for op in &r.operations {
                 validate_operation(op, r.id, options.direct_memory)?;
+                if operation_uses_virtual_register(*op) {
+                    return Err(CompileError::InvalidMemoryOperation(r.id));
+                }
                 if operation_accesses_memory(*op) {
                     if r.operations.len() != 1
                         || !matches!(
@@ -854,6 +860,37 @@ fn operation_accesses_memory(op: Operation) -> bool {
             | Operation::Push { .. }
             | Operation::Pop { .. }
     )
+}
+
+fn operation_uses_virtual_register(op: Operation) -> bool {
+    let vreg_source = |s: Source| matches!(s, Source::VirtualRegister(_));
+    let vreg_addr = |a: memory::MemoryAddress| a.scale & memory::VIRTUAL_DISPLACEMENT != 0;
+    match op {
+        Operation::Move { source, .. }
+        | Operation::Alu { source, .. }
+        | Operation::WideMultiply { source, .. }
+        | Operation::Push { source, .. } => vreg_source(source),
+        Operation::SignedMultiply { left, right, .. } => vreg_source(left) || vreg_source(right),
+        Operation::Lea { address, .. }
+        | Operation::LoadMemory { address, .. }
+        | Operation::ExtendMemory { address, .. }
+        | Operation::WideMultiplyMemory { address, .. }
+        | Operation::AluMemory { address, .. }
+        | Operation::UnaryMemory { address, .. } => vreg_addr(address),
+        Operation::SignedMultiplyMemory {
+            address, source, ..
+        }
+        | Operation::StoreMemory {
+            address, source, ..
+        }
+        | Operation::CompareMemory {
+            address, source, ..
+        }
+        | Operation::AluMemoryStore {
+            address, source, ..
+        } => vreg_addr(address) || vreg_source(source),
+        _ => false,
+    }
 }
 
 /// Shared operand/address validation; execution-boundary policy belongs to each compiler.
@@ -933,15 +970,23 @@ fn validate_operation(
     | Operation::CompareMemory { address, .. }
     | Operation::AluMemoryStore { address, .. }
     | Operation::UnaryMemory { address, .. } = *op
-        && (!matches!(address.scale, 1 | 2 | 4 | 8)
-            || (address.address16 && address.scale != 1)
+    {
+        let scale = address.scale & !memory::VIRTUAL_DISPLACEMENT;
+        let virtual_disp = address.scale & memory::VIRTUAL_DISPLACEMENT != 0;
+        if virtual_disp && !direct_memory {
+            return Err(CompileError::DirectMemoryDisabled(id));
+        }
+        if !matches!(scale, 1 | 2 | 4 | 8)
+            || (address.address16 && (scale != 1 || virtual_disp))
+            || (virtual_disp && !(0x500..=u32::MAX - 3).contains(&address.displacement))
             || address
                 .base
                 .into_iter()
                 .chain(address.index)
-                .any(|register| register.width() != Width::Dword))
-    {
-        return Err(CompileError::InvalidMemoryAddress(id));
+                .any(|register| register.width() != Width::Dword)
+        {
+            return Err(CompileError::InvalidMemoryAddress(id));
+        }
     }
     let pairs = match *op {
         Operation::SignedMultiply {
@@ -971,6 +1016,17 @@ fn validate_operation(
             }
             Source::Immediate(v) if v & !width.mask() != 0 => {
                 return Err(CompileError::ImmediateOutOfRange(id));
+            }
+            Source::VirtualRegister(linear) => {
+                if !direct_memory {
+                    return Err(CompileError::DirectMemoryDisabled(id));
+                }
+                if width != Width::Dword {
+                    return Err(CompileError::WidthMismatch(id));
+                }
+                if !(0x500..=u32::MAX - 3).contains(&linear) {
+                    return Err(CompileError::ImmediateOutOfRange(id));
+                }
             }
             _ => {}
         }

@@ -169,6 +169,7 @@ struct PreparedBinding {
 struct SourceInstruction {
     address: u32,
     length: u8,
+    prefix_length: u8,
     flow: doslet_x86::translation::NearFlow,
 }
 
@@ -240,8 +241,11 @@ impl PreparedBinding {
         let instructions = self.instructions.as_ref()?;
         let mut common = None;
         for instruction in instructions {
-            let tier =
-                cpu.execution_tier_for_instruction_at(bus, instruction.address, instruction.length);
+            let tier = cpu.execution_tier_for_instruction_at(
+                bus,
+                instruction.address,
+                instruction.prefix_length,
+            );
             if common.is_some_and(|previous| previous != tier) {
                 return None;
             }
@@ -277,8 +281,11 @@ impl PreparedBinding {
         let expected = kernel.actual_work(count)?;
         let mut counts = [0u64; 4];
         for (site, instruction) in self.instructions.as_ref()?.iter().enumerate() {
-            let tier =
-                cpu.execution_tier_for_instruction_at(bus, instruction.address, instruction.length);
+            let tier = cpu.execution_tier_for_instruction_at(
+                bus,
+                instruction.address,
+                instruction.prefix_length,
+            );
             counts[usize::from(tier)] += u64::from(kernel.canonical_repetitions(count, site)?);
         }
         (counts.iter().sum::<u64>() == u64::from(expected)).then_some(TierProof::Complete(counts))
@@ -323,25 +330,74 @@ pub(crate) struct Plan {
 
 fn source_instructions(binding: &Binding) -> Option<Vec<SourceInstruction>> {
     let mut instructions = Vec::new();
-    for part in &binding.code {
-        let mut cursor = 0usize;
+    let mut skip_in_next = 0usize;
+    for (part_index, part) in binding.code.iter().enumerate() {
+        if skip_in_next > part.expected.len() {
+            return None;
+        }
+        let mut cursor = skip_in_next;
+        skip_in_next = 0;
         while cursor < part.expected.len() {
             if instructions.len() >= MAX_SOURCE_PARTS {
                 return None;
             }
-            let length =
-                doslet_x86::translation::instruction_length(&part.expected[cursor..], true)?;
-            if length == 0 || cursor + usize::from(length) > part.expected.len() {
+            let remaining = &part.expected[cursor..];
+            if let Some(length) = doslet_x86::translation::instruction_length(remaining, true)
+                && length != 0
+                && usize::from(length) <= remaining.len()
+            {
+                instructions.try_reserve(1).ok()?;
+                instructions.push(SourceInstruction {
+                    address: part.linear.checked_add(cursor as u32)?,
+                    length,
+                    prefix_length: length,
+                    flow: doslet_x86::translation::near_flow(remaining, true)?,
+                });
+                cursor += usize::from(length);
+                continue;
+            }
+            // Reconstruct an instruction whose 4-byte displacement/immediate
+            // virtual-register slot was excluded from the immutable source part.
+            let prefix_len = remaining.len();
+            if prefix_len == 0 || prefix_len + 4 > 15 {
                 return None;
+            }
+            let gap_start = part.linear.checked_add(part.expected.len() as u32)?;
+            let after_gap = gap_start.checked_add(4)?;
+            let mut window = [0u8; 15];
+            window[..prefix_len].copy_from_slice(remaining);
+            if let Some(next_part) = binding.code.get(part_index + 1)
+                && next_part.linear == after_gap
+            {
+                let copy_len = next_part.expected.len().min(15 - (prefix_len + 4));
+                window[prefix_len + 4..prefix_len + 4 + copy_len]
+                    .copy_from_slice(&next_part.expected[..copy_len]);
+            }
+            let length = doslet_x86::translation::instruction_length(&window, true)?;
+            if usize::from(length) < prefix_len + 4 {
+                return None;
+            }
+            let suffix_needed = usize::from(length) - (prefix_len + 4);
+            if suffix_needed != 0 {
+                let next_part = binding.code.get(part_index + 1)?;
+                if next_part.linear == after_gap && next_part.expected.len() >= suffix_needed {
+                    skip_in_next = suffix_needed;
+                } else if suffix_needed != 4 {
+                    return None;
+                }
             }
             instructions.try_reserve(1).ok()?;
             instructions.push(SourceInstruction {
                 address: part.linear.checked_add(cursor as u32)?,
                 length,
-                flow: doslet_x86::translation::near_flow(&part.expected[cursor..], true)?,
+                prefix_length: prefix_len as u8,
+                flow: doslet_x86::translation::near_flow(&window[..usize::from(length)], true)?,
             });
-            cursor += usize::from(length);
+            cursor = part.expected.len();
         }
+    }
+    if skip_in_next != 0 {
+        return None;
     }
     Some(instructions)
 }
@@ -777,6 +833,21 @@ impl PcMachine {
                         check: None,
                     });
                     start = chunk_end;
+                }
+            }
+            if let Some(instructions) = &instructions {
+                for insn in instructions {
+                    if insn.prefix_length < insn.length {
+                        let end = (insn.address as usize).saturating_add(usize::from(insn.length));
+                        if end <= self.bus.ram_size() {
+                            let first = insn.address as usize / PAGE_BYTES;
+                            let last = (end - 1) / PAGE_BYTES;
+                            source_pages[first..=last].fill(1);
+                            if let Some(owner) = &mut owner {
+                                owner.protect_source(insn.address, u32::from(insn.length))?;
+                            }
+                        }
+                    }
                 }
             }
             entry_ips.push(binding.entry_ip);

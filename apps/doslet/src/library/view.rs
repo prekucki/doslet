@@ -554,7 +554,12 @@ fn art(game: &Game, radius: f32, initials_size: f32) -> Element<'_, Message> {
     .into()
 }
 
-fn play_button(index: usize, state: Launch, large: bool, resume: bool) -> Element<'static, Message> {
+fn play_button(
+    index: usize,
+    state: Launch,
+    large: bool,
+    resume: bool,
+) -> Element<'static, Message> {
     let ready = state == Launch::Ready;
     let size = if large { 20 } else { 15 };
     let icon = svg(svg::Handle::from_memory(PLAY))
@@ -751,14 +756,14 @@ fn game_details<'a>(
             button(text(&action.name).size(14).font(semibold()))
                 .padding([12, 20])
                 .style(secondary_button_style)
-                .on_press_maybe(
-                    ready.then(|| Message::LaunchAction(index, action.id.clone())),
-                ),
+                .on_press_maybe(ready.then(|| Message::LaunchAction(index, action.id.clone()))),
         );
     }
     actions_row = actions_row.push(status);
 
-    let tab_badge = if let Some(summary) = &game.store_summary && summary.changed_count > 0 {
+    let tab_badge = if let Some(summary) = &game.store_summary
+        && summary.changed_count > 0
+    {
         format!(" ({})", summary.changed_count)
     } else if game.has_autosave {
         " (Paused)".to_owned()
@@ -770,7 +775,11 @@ fn game_details<'a>(
         button(
             text(s.tab_overview)
                 .size(13)
-                .font(if library.game_tab == GameTab::Overview { bold() } else { semibold() }),
+                .font(if library.game_tab == GameTab::Overview {
+                    bold()
+                } else {
+                    semibold()
+                }),
         )
         .padding([7, 16])
         .style(chip_style(library.game_tab == GameTab::Overview))
@@ -778,16 +787,22 @@ fn game_details<'a>(
         button(
             text(format!("{}{tab_badge}", s.tab_vfs_state))
                 .size(13)
-                .font(if library.game_tab == GameTab::VfsAndState { bold() } else { semibold() }),
+                .font(if library.game_tab == GameTab::VfsAndState {
+                    bold()
+                } else {
+                    semibold()
+                }),
         )
         .padding([7, 16])
         .style(chip_style(library.game_tab == GameTab::VfsAndState))
         .on_press(Message::SelectTab(GameTab::VfsAndState)),
-        button(
-            text(s.tab_configuration)
-                .size(13)
-                .font(if library.game_tab == GameTab::Configuration { bold() } else { semibold() }),
-        )
+        button(text(s.tab_configuration).size(13).font(
+            if library.game_tab == GameTab::Configuration {
+                bold()
+            } else {
+                semibold()
+            }
+        ),)
         .padding([7, 16])
         .style(chip_style(library.game_tab == GameTab::Configuration))
         .on_press(Message::SelectTab(GameTab::Configuration)),
@@ -846,7 +861,9 @@ fn game_details<'a>(
     }
     let body: Element<'_, Message> = if wide {
         row![
-            column![hero, facts(library, game)].spacing(24).width(art_width),
+            column![hero, facts(library, game)]
+                .spacing(24)
+                .width(art_width),
             info.width(Fill),
         ]
         .spacing(44)
@@ -881,12 +898,12 @@ fn vfs_and_state_card<'a>(
     let s = tr(library);
     let ram_section: Element<'a, Message> = match &game.autosave_info {
         Some(info) => {
-            let mut details = format!(
-                "{} compressed",
-                format_bytes(info.compressed_bytes)
-            );
+            let mut details = format!("{} compressed", format_bytes(info.compressed_bytes));
             if let Some(raw) = info.uncompressed_bytes {
-                details.push_str(&format!(" · {} machine snapshot", format_bytes(u64::from(raw))));
+                details.push_str(&format!(
+                    " · {} machine snapshot",
+                    format_bytes(u64::from(raw))
+                ));
             }
             details.push_str(&format!(" · saved {}", info.age_label));
             container(
@@ -998,7 +1015,10 @@ fn vfs_and_state_card<'a>(
 
             let header = row![
                 badge(format!("Disk Overlay · rev {}", summary.revision), ACTIVE),
-                text(current_path).size(12).font(Font::MONOSPACE).color(FOREGROUND),
+                text(current_path)
+                    .size(12)
+                    .font(Font::MONOSPACE)
+                    .color(FOREGROUND),
                 space::horizontal(),
                 mode_buttons,
                 reset_button,
@@ -1011,12 +1031,13 @@ fn vfs_and_state_card<'a>(
             let mut file_rows = column![].spacing(6);
 
             if library.vfs_mode == VfsViewMode::ChangesOnly {
-                let changed_entries: Vec<(usize, &crate::native_store_format::OverlayFileEntry)> = summary
-                    .files
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.kind.is_changed())
-                    .collect();
+                let changed_entries: Vec<(usize, &crate::native_store_format::OverlayFileEntry)> =
+                    summary
+                        .files
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.kind.is_changed())
+                        .collect();
 
                 if changed_entries.is_empty() {
                     file_rows = file_rows.push(
@@ -1044,8 +1065,15 @@ fn vfs_and_state_card<'a>(
                     };
                     let up_btn = button(
                         row![
-                            text("Folder").size(11).font(semibold()).color(MUTED).width(70),
-                            text(".. (Up to parent folder)").size(12).font(Font::MONOSPACE).color(ACCENT),
+                            text("Folder")
+                                .size(11)
+                                .font(semibold())
+                                .color(MUTED)
+                                .width(70),
+                            text(".. (Up to parent folder)")
+                                .size(12)
+                                .font(Font::MONOSPACE)
+                                .color(ACCENT),
                         ]
                         .spacing(10)
                         .align_y(Alignment::Center),
@@ -1057,8 +1085,10 @@ fn vfs_and_state_card<'a>(
                     file_rows = file_rows.push(up_btn);
                 }
 
-                let mut subdirs: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
-                let mut direct_files: Vec<(usize, &crate::native_store_format::OverlayFileEntry)> = Vec::new();
+                let mut subdirs: std::collections::BTreeMap<String, bool> =
+                    std::collections::BTreeMap::new();
+                let mut direct_files: Vec<(usize, &crate::native_store_format::OverlayFileEntry)> =
+                    Vec::new();
 
                 for (idx, entry) in summary.files.iter().enumerate() {
                     let rel = if dir_prefix.is_empty() {
@@ -1093,8 +1123,16 @@ fn vfs_and_state_card<'a>(
                     };
                     let dir_btn = button(
                         row![
-                            text("Folder").size(11).font(semibold()).color(MUTED).width(70),
-                            text(format!("{subdir}\\")).size(12).font(Font::MONOSPACE).color(FOREGROUND).width(Fill),
+                            text("Folder")
+                                .size(11)
+                                .font(semibold())
+                                .color(MUTED)
+                                .width(70),
+                            text(format!("{subdir}\\"))
+                                .size(12)
+                                .font(Font::MONOSPACE)
+                                .color(FOREGROUND)
+                                .width(Fill),
                             folder_status,
                             text("Open ▾").size(11).color(MUTED),
                         ]
@@ -1116,7 +1154,10 @@ fn vfs_and_state_card<'a>(
             column![header, file_rows].spacing(10).into()
         }
         None => row![
-            text("Disk Overlay (C:):").size(12).font(semibold()).color(MUTED),
+            text("Disk Overlay (C:):")
+                .size(12)
+                .font(semibold())
+                .color(MUTED),
             text(format!(
                 "Clean base image — changes from gameplay or Setup will be saved to {}.",
                 display_path(&game.store_dir)
@@ -1169,7 +1210,12 @@ fn vfs_file_row<'a>(
     let file_display_name = if show_full_path {
         format!("C:\\{}", entry.path)
     } else {
-        entry.path.rsplit('\\').next().unwrap_or(&entry.path).to_string()
+        entry
+            .path
+            .rsplit('\\')
+            .next()
+            .unwrap_or(&entry.path)
+            .to_string()
     };
     let mut path_label = file_display_name;
     if entry.kind == OverlayFileKind::Renamed
@@ -1180,11 +1226,7 @@ fn vfs_file_row<'a>(
     let size_label = entry
         .size
         .map_or_else(String::new, |s| format_bytes(u64::from(s)));
-    let inspect_hint = if selected {
-        "Hide ▴"
-    } else {
-        "Inspect ▾"
-    };
+    let inspect_hint = if selected { "Hide ▴" } else { "Inspect ▾" };
     let item_row = button(
         row![
             container(
@@ -1297,16 +1339,17 @@ fn game_config_card<'a>(library: &'a Library, game: &'a Game) -> Element<'a, Mes
             .into()
     });
 
-    let midi_buttons = [("gm", "General MIDI"), ("mt32", "MT-32")]
-        .into_iter()
-        .map(|(id, label)| {
-            let selected = game.spec.output.game_midi.eq_ignore_ascii_case(id);
-            button(text(label).size(12))
-                .padding([6, 12])
-                .style(chip_style(selected))
-                .on_press(Message::GameConfig(GameEdit::GameMidi(id.into())))
-                .into()
-        });
+    let midi_buttons =
+        [("gm", "General MIDI"), ("mt32", "MT-32")]
+            .into_iter()
+            .map(|(id, label)| {
+                let selected = game.spec.output.game_midi.eq_ignore_ascii_case(id);
+                button(text(label).size(12))
+                    .padding([6, 12])
+                    .style(chip_style(selected))
+                    .on_press(Message::GameConfig(GameEdit::GameMidi(id.into())))
+                    .into()
+            });
 
     let mut actions_col = column![].spacing(6);
     for (idx, action) in game.spec.game.actions.iter().enumerate() {
@@ -1412,7 +1455,9 @@ fn game_config_card<'a>(library: &'a Library, game: &'a Game) -> Element<'a, Mes
             .spacing(6),
             row![
                 column![
-                    text("Drive C: Source (Folder or .zip)").size(12).color(MUTED),
+                    text("Drive C: Source (Folder or .zip)")
+                        .size(12)
+                        .color(MUTED),
                     text_input("Path to folder or .zip", drive_c_source)
                         .on_input(|v| Message::GameConfig(GameEdit::DriveCSource(v)))
                         .padding([8, 12])
@@ -1443,7 +1488,9 @@ fn game_config_card<'a>(library: &'a Library, game: &'a Game) -> Element<'a, Mes
             ]
             .spacing(6),
             column![
-                text("Additional Entrypoints (Setup, Editors)").size(12).color(MUTED),
+                text("Additional Entrypoints (Setup, Editors)")
+                    .size(12)
+                    .color(MUTED),
                 actions_col,
                 add_action_row,
             ]
@@ -1482,9 +1529,7 @@ fn settings_page(library: &Library, compact: bool) -> Element<'_, Message> {
     let g = &library.global;
     let heading = column![
         text(s.global_settings_title).size(30).font(bold()),
-        text(s.global_settings_subtitle)
-            .size(13)
-            .color(MUTED),
+        text(s.global_settings_subtitle).size(13).color(MUTED),
     ]
     .spacing(2);
 
@@ -1779,7 +1824,10 @@ fn settings_page(library: &Library, compact: bool) -> Element<'_, Message> {
     for custom in &g.presets {
         custom_list = custom_list.push(
             row![
-                text(custom.name.clone()).size(13).font(semibold()).width(180),
+                text(custom.name.clone())
+                    .size(13)
+                    .font(semibold())
+                    .width(180),
                 text(format!(
                     "{} MHz · {} · {} MiB RAM",
                     custom.cpu_mhz,
@@ -1904,21 +1952,19 @@ fn settings_card<'a>(
     title: &'a str,
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    container(
-        column![text(title).size(17).font(bold()), content.into()].spacing(14),
-    )
-    .width(Fill)
-    .padding([20, 24])
-    .style(|_| container::Style {
-        background: Some(fade(SIDEBAR, 0.85).into()),
-        border: Border {
-            color: EDGE,
-            width: 1.0,
-            radius: 14.0.into(),
-        },
-        ..Default::default()
-    })
-    .into()
+    container(column![text(title).size(17).font(bold()), content.into()].spacing(14))
+        .width(Fill)
+        .padding([20, 24])
+        .style(|_| container::Style {
+            background: Some(fade(SIDEBAR, 0.85).into()),
+            border: Border {
+                color: EDGE,
+                width: 1.0,
+                radius: 14.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 fn tag(label: &str) -> Element<'_, Message> {

@@ -47,6 +47,9 @@ pub const DEVICE_ROTATE: u32 = 340;
 pub const DEVICE_BIT_MASK: u32 = 344;
 pub const DEVICE_WRITES: u32 = 352;
 pub const DEVICE_CHANGES: u32 = 360;
+/// Marks [`MemoryAddress::displacement`] as the 32-bit guest linear address of
+/// a 4-byte displacement slot in ordinary RAM, loaded once at procedure entry.
+pub const VIRTUAL_DISPLACEMENT: u8 = 0x80;
 
 /// The order matches x86 ES, CS, SS, DS, FS, GS, without borrowing CPU state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

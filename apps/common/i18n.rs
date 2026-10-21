@@ -27,7 +27,10 @@ impl Locale {
 
     pub fn from_tag(tag: &str) -> Option<Self> {
         let trimmed = tag.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("c") || trimmed.eq_ignore_ascii_case("posix") {
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("c")
+            || trimmed.eq_ignore_ascii_case("posix")
+        {
             return None;
         }
         let primary = trimmed

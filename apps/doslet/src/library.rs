@@ -73,7 +73,9 @@ fn inspect_autosave(path: &Path) -> Option<AutosaveInfo> {
             },
         );
     let uncompressed_bytes = if compressed_bytes >= 18
-        && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gz"))
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gz"))
     {
         use std::io::{Seek, SeekFrom};
         File::open(path).ok().and_then(|mut file| {
@@ -254,7 +256,10 @@ fn read_base_preview(
             let mut zip = zip::ZipArchive::new(file).ok()?;
             let exe_norm = executable.replace('\\', "/").to_ascii_uppercase();
             let prefix = exe_norm.rfind('/').map_or("", |idx| &exe_norm[..=idx]);
-            let wanted = format!("{prefix}{}", dos_path.replace('\\', "/").to_ascii_uppercase());
+            let wanted = format!(
+                "{prefix}{}",
+                dos_path.replace('\\', "/").to_ascii_uppercase()
+            );
             for i in 0..zip.len() {
                 let entry = zip.by_index(i).ok()?;
                 if entry.is_dir() {
@@ -892,7 +897,13 @@ impl Library {
                     SourceKind::NativeDirectory
                 };
                 if let Some(mount) = game.spec.mounts.iter_mut().find(|m| m.letter == b'C') {
-                    if let Some(b) = game.spec.host.bindings.iter_mut().find(|b| b.id == mount.source) {
+                    if let Some(b) = game
+                        .spec
+                        .host
+                        .bindings
+                        .iter_mut()
+                        .find(|b| b.id == mount.source)
+                    {
                         b.location = v;
                         b.kind = if kind == SourceKind::BrowserZip {
                             doslet_config::BindingKind::BrowserZip
@@ -917,7 +928,13 @@ impl Library {
                 if v.trim().is_empty() {
                     game.spec.mounts.retain(|m| m.letter != b'D');
                 } else if let Some(mount) = game.spec.mounts.iter_mut().find(|m| m.letter == b'D') {
-                    if let Some(b) = game.spec.host.bindings.iter_mut().find(|b| b.id == mount.source) {
+                    if let Some(b) = game
+                        .spec
+                        .host
+                        .bindings
+                        .iter_mut()
+                        .find(|b| b.id == mount.source)
+                    {
                         b.location = v;
                         b.kind = doslet_config::BindingKind::LocalIso;
                     } else {
@@ -981,7 +998,8 @@ impl Library {
                         self.notice = Some(format!("Saved configuration for {}.", game.name));
                     }
                     Err(error) => {
-                        self.notice = Some(format!("Cannot save {}: {error}", game.profile.display()));
+                        self.notice =
+                            Some(format!("Cannot save {}: {error}", game.profile.display()));
                     }
                 }
             }
@@ -1076,9 +1094,8 @@ impl Library {
                         game.store_dir.join(crate::native_store_format::STORE_FILE),
                     );
                     game.refresh_state();
-                    self.notice = Some(
-                        "Reset persistent disk overlay to the clean base image.".into(),
-                    );
+                    self.notice =
+                        Some("Reset persistent disk overlay to the clean base image.".into());
                 }
             }
             // The shell owns the window and starts games itself.

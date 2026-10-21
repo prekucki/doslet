@@ -511,7 +511,7 @@ fn procedure_module_has_only_direct_calls_and_no_memory_table_import_or_guest_di
         }
         assert!(payload.is_empty());
     }
-    assert_eq!(sections, [1, 3, 7, 10]);
+    assert_eq!(sections, [1, 3, 7, 0, 10]);
     assert_eq!(calls, [1, 1, 2, 0, 1, 2]);
     assert_eq!(work_constants, 3); // One per exported boundary, none per call.
 }

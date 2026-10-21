@@ -1051,3 +1051,121 @@ fn execution_allocates_nothing_and_preserves_saturating_work_contract() {
     assert_eq!(runner.frame().status, frame.status | abi::COUNTER_OVERFLOW);
     assert_eq!(runner.frame().remaining_budget, frame.remaining_budget);
 }
+
+#[test]
+fn emits_compilation_hints_and_valid_branch_hints_before_code_section() {
+    fn read_leb_u32(bytes: &[u8], cursor: &mut usize) -> u32 {
+        let mut result = 0u32;
+        let mut shift = 0u32;
+        loop {
+            let byte = bytes[*cursor];
+            *cursor += 1;
+            result |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return result;
+            }
+            shift += 7;
+        }
+    }
+
+    let empty = ProcedureProgram::default()
+        .compile(&ProcedureCompileOptions::default())
+        .unwrap();
+    let mut cursor = 8;
+    while cursor < empty.wasm().len() {
+        let id = empty.wasm()[cursor];
+        cursor += 1;
+        let len = read_leb_u32(empty.wasm(), &mut cursor) as usize;
+        assert_ne!(id, 0, "empty module should not emit custom hint sections");
+        cursor += len;
+    }
+
+    let (mut p, _) = program(&prefix(), Width::Dword, 0, true);
+    let mut second = p.functions[0].clone();
+    second.id = ProcedureId(9);
+    p.functions.push(second);
+    let compiled = p.compile(&ProcedureCompileOptions::default()).unwrap();
+    let wasm = compiled.wasm();
+
+    let mut cursor = 8;
+    let mut custom_sections = Vec::new();
+    let mut code_bodies = Vec::new();
+    let mut saw_code = false;
+    while cursor < wasm.len() {
+        let id = wasm[cursor];
+        cursor += 1;
+        let len = read_leb_u32(wasm, &mut cursor) as usize;
+        let payload = &wasm[cursor..cursor + len];
+        cursor += len;
+        if id == 0 {
+            assert!(!saw_code, "code metadata sections must precede CodeSection");
+            let mut sub = 0;
+            let name_len = read_leb_u32(payload, &mut sub) as usize;
+            let name = core::str::from_utf8(&payload[sub..sub + name_len]).unwrap();
+            sub += name_len;
+            custom_sections.push((name, &payload[sub..]));
+        } else if id == 10 {
+            saw_code = true;
+            let mut sub = 0;
+            let count = read_leb_u32(payload, &mut sub) as usize;
+            for _ in 0..count {
+                let body_len = read_leb_u32(payload, &mut sub) as usize;
+                code_bodies.push(&payload[sub..sub + body_len]);
+                sub += body_len;
+            }
+        }
+    }
+
+    assert_eq!(custom_sections.len(), 2);
+    assert_eq!(custom_sections[0].0, COMPILATION_HINTS_SECTION_NAME);
+    assert_eq!(custom_sections[1].0, BRANCH_HINT_SECTION_NAME);
+    assert_eq!(
+        custom_sections[0].1,
+        &[
+            2, // 2 functions
+            0,
+            1,
+            0,
+            1,
+            EAGER_OPTIMIZED_COMPILATION_HINT, // func 0
+            1,
+            1,
+            0,
+            1,
+            EAGER_OPTIMIZED_COMPILATION_HINT, // func 1
+        ]
+    );
+
+    let branch_data = custom_sections[1].1;
+    let mut sub = 0;
+    let num_funcs = read_leb_u32(branch_data, &mut sub) as usize;
+    assert_eq!(num_funcs, 2);
+    for expected_func in 0..2 {
+        let func_idx = read_leb_u32(branch_data, &mut sub) as usize;
+        assert_eq!(func_idx, expected_func);
+        let num_hints = read_leb_u32(branch_data, &mut sub) as usize;
+        assert!(num_hints > 0);
+        let mut prev_offset = None;
+        for _ in 0..num_hints {
+            let offset = read_leb_u32(branch_data, &mut sub) as usize;
+            if let Some(prev) = prev_offset {
+                assert!(
+                    offset > prev,
+                    "branch hint offsets must be strictly increasing"
+                );
+            }
+            prev_offset = Some(offset);
+            let size = read_leb_u32(branch_data, &mut sub);
+            assert_eq!(size, 1);
+            let hint = branch_data[sub];
+            sub += 1;
+            assert!(hint <= 1);
+            let opcode = code_bodies[func_idx][offset];
+            assert!(
+                opcode == 0x04 || opcode == 0x0d,
+                "expected If (0x04) or BrIf (0x0d) at offset {offset}, found {opcode:#x}"
+            );
+        }
+    }
+    assert_eq!(sub, branch_data.len());
+}

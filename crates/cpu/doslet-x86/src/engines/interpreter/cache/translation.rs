@@ -53,6 +53,38 @@ pub struct Shape {
 pub fn instruction_length(bytes: &[u8], code32: bool) -> Option<u8> {
     Some(Decoded::decode_mode(bytes, code32)?.length)
 }
+
+/// Whether two 32-bit instruction encodings have the same decoded instruction
+/// length and immutable bytes outside any 4-byte disp32 or imm32 operand slot.
+pub fn same_template32(a: &[u8], b: &[u8]) -> bool {
+    let Some(decoded) = Decoded::decode_mode(a, true) else {
+        return false;
+    };
+    let len = usize::from(decoded.length);
+    if a.len() < len || b.len() < len {
+        return false;
+    }
+    if a[..len] == b[..len] {
+        return true;
+    }
+    if decoded.disp32_offset == u8::MAX && decoded.imm32_offset == u8::MAX {
+        return false;
+    }
+    let mut masked_a = [0u8; 15];
+    let mut masked_b = [0u8; 15];
+    masked_a[..len].copy_from_slice(&a[..len]);
+    masked_b[..len].copy_from_slice(&b[..len]);
+    for off in [decoded.disp32_offset, decoded.imm32_offset] {
+        if off != u8::MAX {
+            let start = usize::from(off);
+            if start + 4 <= len {
+                masked_a[start..start + 4].fill(0);
+                masked_b[start..start + 4].fill(0);
+            }
+        }
+    }
+    masked_a[..len] == masked_b[..len]
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NearFlow {
     Next,
