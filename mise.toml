@@ -17,7 +17,8 @@ run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets --lock
 
 [tasks.run]
 description = "Launch the optimized iced desktop application"
-run = "cargo run -p doslet --release --locked"
+env = { RUSTFLAGS='-C target-cpu=native -C llvm-args=-align-all-functions=6', CARGO_PROFILE_RELEASE_LTO = "fat" }
+run = "cargo run -p doslet --release --locked --"
 
 [tasks.run-debug]
 description = "Launch the iced desktop application with the debug profile"

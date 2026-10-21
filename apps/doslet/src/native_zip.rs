@@ -88,6 +88,25 @@ pub fn program_bytes(path: &Path, settings: &LaunchSettings) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
+pub fn cached_game(
+    path: &Path,
+    settings: &LaunchSettings,
+    directory: Option<&Path>,
+) -> Result<Option<crate::native_speed_tiers::Controller>, Box<dyn Error>> {
+    if let Some((spec, mount)) = settings
+        .machine_spec
+        .as_ref()
+        .and_then(|s| mount(s).map(|m| (s, m)))
+    {
+        let archive = read(Path::new(spec.binding(&mount.source)))?;
+        let program = select(&archive, path.to_str())?;
+        let bytes = archive.program_bytes(&program)?;
+        crate::native_speed_tiers::Controller::cached_game_bytes(&bytes, directory)
+    } else {
+        crate::native_speed_tiers::Controller::cached_game(path, directory)
+    }
+}
+
 pub fn bind_game(
     controller: &mut crate::native_speed_tiers::Controller,
     path: &Path,
@@ -116,6 +135,34 @@ mod tests {
     use zip::CompressionMethod;
 
     const EXIT: &[u8] = &[0xb8, 7, 0x4c, 0xcd, 0x21];
+
+    #[test]
+    fn archived_recording_restores_saved_rates_without_enabling_learning() {
+        let fixture = Fixture::new("version=2");
+        let path = zip(&fixture, &[("GAME/PLAY.COM", EXIT)]);
+        let cli = Cli::parse_from(["doslet", "--zip", path.to_str().unwrap(), "--no-audio"])
+            .resolve()
+            .unwrap();
+        let program = cli.game.as_deref().unwrap();
+        {
+            let mut tiers = crate::native_speed_tiers::Controller::untrained();
+            tiers.configure(Some(450), 95, 9, false);
+            bind_game(&mut tiers, program, &cli.launch, Some(&fixture.root)).unwrap();
+            tiers.set_learning(true);
+        }
+        let tiers = cached_game(program, &cli.launch, Some(&fixture.root))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                tiers.stats.hot_mhz,
+                tiers.stats.grey_mhz,
+                tiers.stats.cold_mhz
+            ),
+            (Some(450), 95, 9)
+        );
+        assert!(!tiers.stats.learning);
+    }
 
     #[test]
     fn archived_program_uses_the_same_fingerprint_as_host_binary() {

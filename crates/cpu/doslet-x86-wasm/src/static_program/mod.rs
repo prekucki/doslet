@@ -324,8 +324,88 @@ pub enum DoubleShift {
     Right,
 }
 
+/// Exact masked-PC24 operations admitted only by the explicit memory-procedure
+/// compiler. The opcode retains the original eleven-bit x87 FOP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct X87Instruction {
+    pub opcode: u16,
+    pub operation: X87Operation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X87Operation {
+    LoadReal32 {
+        address: memory::MemoryAddress,
+    },
+    LoadInteger32 {
+        address: memory::MemoryAddress,
+    },
+    ArithmeticReal32 {
+        address: memory::MemoryAddress,
+        operation: u8,
+    },
+    ArithmeticRegister {
+        index: u8,
+        operation: u8,
+        target_top: bool,
+        pop: bool,
+    },
+    Duplicate {
+        index: u8,
+    },
+    Exchange {
+        index: u8,
+    },
+    StoreInteger32 {
+        address: memory::MemoryAddress,
+        pop: bool,
+    },
+    CompareReal32 {
+        address: memory::MemoryAddress,
+        pop: bool,
+    },
+    /// FCOM/FCOMP ST(i), or FCOMPP as index=1,pops=2.
+    CompareRegister {
+        index: u8,
+        pops: u8,
+    },
+    /// FNSTSW AX preserves flags, upper EAX and all FPU/pointer state.
+    StoreStatusAx,
+    /// FST/FSTP ST(i), copying the full retained source and tag.
+    StoreRegister {
+        index: u8,
+        pop: bool,
+    },
+}
+
+impl X87Operation {
+    pub fn address(self) -> Option<memory::MemoryAddress> {
+        match self {
+            Self::LoadReal32 { address }
+            | Self::LoadInteger32 { address }
+            | Self::ArithmeticReal32 { address, .. }
+            | Self::CompareReal32 { address, .. }
+            | Self::StoreInteger32 { address, .. } => Some(address),
+            _ => None,
+        }
+    }
+    pub fn with_address(self, address: memory::MemoryAddress) -> Self {
+        match self {
+            Self::LoadReal32 { .. } => Self::LoadReal32 { address },
+            Self::LoadInteger32 { .. } => Self::LoadInteger32 { address },
+            Self::ArithmeticReal32 { operation, .. } => {
+                Self::ArithmeticReal32 { address, operation }
+            }
+            Self::StoreInteger32 { pop, .. } => Self::StoreInteger32 { address, pop },
+            Self::CompareReal32 { pop, .. } => Self::CompareReal32 { address, pop },
+            other => other,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
+    X87(X87Instruction),
     Nop,
     Move {
         target: Register,
@@ -803,6 +883,9 @@ impl<'a> Checked<'a> {
                 }
             }
             for op in &r.operations {
+                if matches!(op, Operation::X87(_)) {
+                    return Err(CompileError::InvalidMemoryOperation(r.id));
+                }
                 validate_operation(op, r.id, options.direct_memory)?;
                 if operation_uses_virtual_register(*op) {
                     return Err(CompileError::InvalidMemoryOperation(r.id));
@@ -844,6 +927,9 @@ impl<'a> Checked<'a> {
 }
 
 fn operation_accesses_memory(op: Operation) -> bool {
+    if let Operation::X87(instruction) = op {
+        return instruction.operation.address().is_some();
+    }
     matches!(
         &op,
         Operation::LoadMemory { .. }
@@ -866,6 +952,7 @@ fn operation_uses_virtual_register(op: Operation) -> bool {
     let vreg_source = |s: Source| matches!(s, Source::VirtualRegister(_));
     let vreg_addr = |a: memory::MemoryAddress| a.scale & memory::VIRTUAL_DISPLACEMENT != 0;
     match op {
+        Operation::X87(instruction) => instruction.operation.address().is_some_and(vreg_addr),
         Operation::Move { source, .. }
         | Operation::Alu { source, .. }
         | Operation::WideMultiply { source, .. }
@@ -899,6 +986,43 @@ fn validate_operation(
     id: RegionId,
     direct_memory: bool,
 ) -> Result<(), CompileError> {
+    if let Operation::X87(instruction) = *op {
+        if instruction.opcode > 0x7ff {
+            return Err(CompileError::InvalidMemoryOperation(id));
+        }
+        use X87Operation::*;
+        match instruction.operation {
+            CompareRegister { index, pops } if pops > 2 || (pops == 2 && index != 1) => {
+                return Err(CompileError::InvalidMemoryOperation(id));
+            }
+            ArithmeticReal32 { operation, .. } | ArithmeticRegister { operation, .. }
+                if !matches!(operation, 0 | 1 | 4 | 5 | 6 | 7) =>
+            {
+                return Err(CompileError::InvalidMemoryOperation(id));
+            }
+            ArithmeticRegister { index, .. }
+            | Duplicate { index }
+            | Exchange { index }
+            | CompareRegister { index, .. }
+            | StoreRegister { index, .. }
+                if index > 7 =>
+            {
+                return Err(CompileError::InvalidMemoryOperation(id));
+            }
+            _ => {}
+        }
+        if let Some(address) = instruction.operation.address() {
+            return validate_operation(
+                &Operation::LoadMemory {
+                    target: Register::Eax,
+                    address,
+                },
+                id,
+                direct_memory,
+            );
+        }
+        return Ok(());
+    }
     let extension = match *op {
         Operation::Extend { target, source, .. } => Some((target, source.width())),
         Operation::ExtendMemory { target, width, .. } => Some((target, width)),

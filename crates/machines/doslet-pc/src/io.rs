@@ -86,17 +86,21 @@ impl Default for PcBus {
     }
 }
 impl PcBus {
-    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn interpreter_batch_bus(
         &mut self,
     ) -> Option<crate::memory::batch::BorrowedRamBus<'_>> {
         if !self.a20.enabled {
             return None;
         }
-        self.ram.interpreter_batch_bus_with_video(&mut self.vga)
+        #[cfg(feature = "wasm-procedures")]
+        if self.ram.storage.video().is_some() {
+            return self.ram.interpreter_batch_bus_with_video(&mut self.vga);
+        }
+        // Native RAM retains its owner. VGA accesses decline this RAM-only bus
+        // before any operand effect, then run through the complete PC bus.
+        self.ram.interpreter_batch_bus()
     }
 
-    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn complete_interpreter_batch(&mut self, effects: crate::memory::batch::Effects) {
         self.device_accesses = self.device_accesses.wrapping_add(effects.device_accesses);
         #[cfg(feature = "profiling")]

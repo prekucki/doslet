@@ -11,6 +11,8 @@ use doslet_x86_wasm::static_program::{
     Source, Terminator, abi,
 };
 
+pub mod x87;
+
 pub const START_IP: u32 = 0x1000;
 pub const END_OFFSET: u32 = 10;
 pub const INSTRUCTIONS_PER_ITERATION: u32 = 5;

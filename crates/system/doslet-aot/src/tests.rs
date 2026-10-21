@@ -121,6 +121,9 @@ fn reconstructs_partial_last_page_and_bss_without_relocating() {
     let records = single(7, 2, 1, 0x1234_5678);
     let bytes = fixture(&[(48, 0x2007, 2)], &[1, 2], &[records, vec![]], 5);
     let image = prepare(&bytes).unwrap();
+    assert_eq!(image.format(), ImageFormat::Le);
+    // Offset-space bindings describe COFF selectors only.
+    assert!(coff_offset_bindings(&image, 0xaf).is_empty());
     let object = image.object(1).unwrap();
     assert_eq!(object.object_number(), 1);
     assert_eq!(object.metadata().preferred_base, 0x10000);

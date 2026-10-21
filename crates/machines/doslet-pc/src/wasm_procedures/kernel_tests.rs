@@ -197,6 +197,20 @@ fn setup(count: u32) -> (PcMachine, PcMachine) {
     fast.install_wasm_procedures(
         compiled.wasm(),
         vec![Binding {
+            x87: None,
+            execution_sites: Some(
+                super::tier_tests::labels(&fast, COPY, |_| 0)
+                    .into_iter()
+                    .map(|label| ExecutionSite {
+                        ip: label.address,
+                        length: doslet_x86::translation::instruction_length(
+                            &COPY[(label.address - ENTRY) as usize..],
+                            true,
+                        )
+                        .unwrap(),
+                    })
+                    .collect(),
+            ),
             function_id: 9,
             entry_ip: ENTRY,
             maximum_instructions: 4096,
@@ -204,6 +218,7 @@ fn setup(count: u32) -> (PcMachine, PcMachine) {
             rle_kernel: None,
             finite_computation: None,
             kernel_interrupts: KernelInterrupts::Defer,
+            code_segment: CodeSegment::FLAT,
             code: vec![CodePart {
                 linear: ENTRY,
                 expected: COPY.to_vec(),
@@ -441,6 +456,8 @@ fn with_interpreted_boundaries(count: u32) -> (PcMachine, PcMachine) {
     let vram = reference.bus.vram_view().as_ptr();
     reference
         .install_interpreted_procedure_boundaries(vec![Binding {
+            x87: None,
+            execution_sites: None,
             function_id: 9,
             entry_ip: ENTRY,
             maximum_instructions: 4096,
@@ -448,6 +465,7 @@ fn with_interpreted_boundaries(count: u32) -> (PcMachine, PcMachine) {
             rle_kernel: None,
             finite_computation: None,
             kernel_interrupts: KernelInterrupts::Defer,
+            code_segment: CodeSegment::FLAT,
             code: vec![CodePart {
                 linear: ENTRY,
                 expected: COPY.to_vec(),

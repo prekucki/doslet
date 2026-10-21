@@ -409,6 +409,7 @@ fn register_code(r: Register) -> u8 {
 }
 fn encoding(op: Operation) -> Vec<u8> {
     let r = match op {
+        Operation::X87(_) => unreachable!("register-only fixture encoder"),
         Operation::Move { target, .. } | Operation::Alu { target, .. } => target,
         Operation::Inc(r) | Operation::Dec(r) | Operation::Neg(r) | Operation::Not(r) => r,
         Operation::Exchange { left, .. } => left,
@@ -446,6 +447,7 @@ fn encoding(op: Operation) -> Vec<u8> {
         out.extend_from_slice(&value.to_le_bytes()[..width.bits() as usize / 8]);
     };
     match op {
+        Operation::X87(_) => unreachable!("register-only fixture encoder"),
         Operation::Move {
             target,
             source: Source::Register(s),
@@ -572,6 +574,7 @@ fn differential(op: Operation, cases: usize) {
         }
         if case < boundary.len() * boundary.len() {
             let target = match op {
+                Operation::X87(_) => unreachable!("register-only differential test"),
                 Operation::Alu { target, .. }
                 | Operation::Move { target, .. }
                 | Operation::Shift { target, .. }

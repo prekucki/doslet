@@ -44,6 +44,8 @@ fn machine(cached: bool) -> PcMachine {
     }
     m.cpu.flags = 2;
     m.cpu.set_decode_cache(cached);
+    // Exercise the optimized batch path even on targets retaining conservative defaults.
+    m.cpu.set_selective_code_guards(cached);
     m
 }
 

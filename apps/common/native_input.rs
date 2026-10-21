@@ -220,6 +220,7 @@ pub fn install_wasm_procedures(
             wasm_procedures::Expect::Dpmi(dpmi_layout(session.dpmi_mode())),
             settings.interpret_procedures,
             settings.compiled_cache.as_deref(),
+            false,
         )?;
         #[cfg(not(feature = "wasm-procedures"))]
         return Err(format!(
@@ -231,8 +232,9 @@ pub fn install_wasm_procedures(
     Ok(())
 }
 
-/// Install a cached module into a running session whose LE objects were
-/// found at `layout` (`le_layout::Layout::key`).
+/// Install a cached module into a running session whose program was found
+/// at `layout` (`le_layout::Layout::key`), replacing the module of an
+/// earlier layout of the same program.
 #[cfg(feature = "wasm-procedures")]
 #[allow(
     dead_code,
@@ -244,18 +246,20 @@ pub fn install_layout_procedures(
     layout: &str,
     compiled_cache: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
+    let replace = session.wasm_procedure_code_segment().is_some();
     wasm_procedures::install(
         session,
         path,
         wasm_procedures::Expect::Layout(layout),
         false,
         compiled_cache,
+        replace,
     )
 }
 
 #[cfg(feature = "wasm-procedures")]
 #[path = "native_wasm_procedures.rs"]
-mod wasm_procedures;
+pub(crate) mod wasm_procedures;
 pub fn set_heroes_menu_idle(session: &mut Session, enabled: bool) {
     session.set_menu_idle_site(enabled.then_some(doslet_runtime::session::MenuIdleSite {
         head: 0x217da2,

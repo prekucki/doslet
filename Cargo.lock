@@ -1284,6 +1284,7 @@ dependencies = [
  "doslet-midi-routing",
  "doslet-midi-synth",
  "doslet-mt32",
+ "doslet-pc",
  "doslet-pcm",
  "doslet-pulse",
  "doslet-runtime",
@@ -1651,9 +1652,12 @@ dependencies = [
 name = "doslet-static-probe"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "doslet-bus",
+ "doslet-state",
  "doslet-x86",
  "doslet-x86-wasm",
+ "doslet-x87",
 ]
 
 [[package]]
@@ -1813,6 +1817,7 @@ dependencies = [
  "doslet-bus",
  "doslet-vga",
  "doslet-x86",
+ "doslet-x87",
  "serde_json",
  "wasm-encoder 0.262.0",
  "wasmi",

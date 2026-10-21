@@ -11,6 +11,229 @@ use doslet_x86_wasm::static_program::{
 mod rle_fixture;
 
 #[test]
+fn pc24_discovery_compiles_balanced_integer_load_register_arithmetic_loop() {
+    // FILD [EAX]; FLD ST0; FMUL ST0,ST1; FADDP ST1,ST0;
+    // FISTP [EDI]; DEC ECX; JNZ entry; RET.
+    let image = image(
+        &[
+            0xdb, 0x00, 0xd9, 0xc0, 0xd8, 0xc9, 0xde, 0xc1, 0xdb, 0x1f, 0x49, 0x75, 0xf3, 0xc3,
+        ],
+        DefaultBitness::Bits32,
+    );
+    let binding = binding(&image, 0x10000);
+    let graph = StaticCfg::analyze_bound(&binding, &[], CfgLimits::default()).unwrap();
+    let limits = MemoryProcedureLimits {
+        max_work_per_call: Some(128),
+        ..Default::default()
+    };
+    let legacy =
+        PreparedMemoryProcedures::from_bound_graph_with_long_fragments(&graph, &binding, limits, 1)
+            .unwrap();
+    assert!(
+        legacy
+            .program()
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .all(|i| !matches!(i.operation, Operation::X87(_)))
+    );
+    let prepared =
+        PreparedMemoryProcedures::from_bound_graph_with_pc24_fragments(&graph, &binding, limits, 1)
+            .unwrap();
+    let function = prepared
+        .program()
+        .functions
+        .iter()
+        .find(|f| f.entry.offset == 0x10000)
+        .unwrap();
+    assert_eq!(
+        function
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| matches!(i.operation, Operation::X87(_)))
+            .count(),
+        5
+    );
+    let compiled = prepared
+        .program()
+        .compile_with_pc24_locals_and_work_limits(&ProcedureCompileOptions::default(), 128, 4096)
+        .unwrap();
+    let masks = compiled.x87(function.id).unwrap();
+    assert_eq!(masks.read_mask, 0);
+    assert_eq!(masks.write_mask, 0xc0);
+    assert!(compiled.finite_maximum_work(function.id).is_none());
+}
+
+#[test]
+fn pc24_lowering_preserves_fop_reversed_arithmetic_and_memory_address() {
+    use doslet_x86_wasm::static_program::X87Operation as X;
+    for (code, expected) in [
+        (
+            [0xd8, 0xe1],
+            X::ArithmeticRegister {
+                index: 1,
+                operation: 4,
+                target_top: true,
+                pop: false,
+            },
+        ),
+        (
+            [0xdc, 0xe1],
+            X::ArithmeticRegister {
+                index: 1,
+                operation: 5,
+                target_top: false,
+                pop: false,
+            },
+        ),
+        (
+            [0xde, 0xe9],
+            X::ArithmeticRegister {
+                index: 1,
+                operation: 4,
+                target_top: false,
+                pop: true,
+            },
+        ),
+        (
+            [0xde, 0xf1],
+            X::ArithmeticRegister {
+                index: 1,
+                operation: 7,
+                target_top: false,
+                pop: true,
+            },
+        ),
+        ([0xd8, 0xd7], X::CompareRegister { index: 7, pops: 0 }),
+        ([0xd8, 0xd9], X::CompareRegister { index: 1, pops: 1 }),
+        ([0xde, 0xd9], X::CompareRegister { index: 1, pops: 2 }),
+        ([0xdf, 0xe0], X::StoreStatusAx),
+        (
+            [0xdd, 0xd3],
+            X::StoreRegister {
+                index: 3,
+                pop: false,
+            },
+        ),
+        (
+            [0xdd, 0xd8],
+            X::StoreRegister {
+                index: 0,
+                pop: true,
+            },
+        ),
+        (
+            [0xdd, 0xdb],
+            X::StoreRegister {
+                index: 3,
+                pop: true,
+            },
+        ),
+    ] {
+        let image = image(&[code[0], code[1], 0xc3], DefaultBitness::Bits32);
+        let binding = binding(&image, 0x10000);
+        let graph = StaticCfg::analyze_bound(&binding, &[], CfgLimits::default()).unwrap();
+        let node = &graph.nodes()[0];
+        let (decoded, offsets, ip) = decode_node_with_offsets(node, &graph, &binding).unwrap();
+        let result = super::super::x87::lower(
+            &decoded,
+            &offsets,
+            ip,
+            node,
+            &graph,
+            &binding,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Operation::X87(doslet_x86_wasm::static_program::X87Instruction {
+                opcode: (u16::from(code[0] & 7) << 8) | u16::from(code[1]),
+                operation: expected,
+            })
+        );
+    }
+    let image = image(
+        &[0x36, 0xdb, 0x44, 0x8d, 0xf0, 0xc3],
+        DefaultBitness::Bits32,
+    );
+    let binding = binding(&image, 0x10000);
+    let graph = StaticCfg::analyze_bound(&binding, &[], CfgLimits::default()).unwrap();
+    let node = &graph.nodes()[0];
+    let (decoded, offsets, ip) = decode_node_with_offsets(node, &graph, &binding).unwrap();
+    let Operation::X87(instruction) = super::super::x87::lower(
+        &decoded,
+        &offsets,
+        ip,
+        node,
+        &graph,
+        &binding,
+        &Default::default(),
+    )
+    .unwrap() else {
+        panic!("x87 lowering")
+    };
+    let X::LoadInteger32 { address } = instruction.operation else {
+        panic!("FILD32 lowering")
+    };
+    assert_eq!(address.segment, memory::Segment::Ss);
+    assert_eq!(address.base, Some(Register::Ebp));
+    assert_eq!(address.index, Some(Register::Ecx));
+    assert_eq!(address.scale, 4);
+    assert_eq!(address.displacement, (-16i32) as u32);
+}
+
+#[test]
+fn pc24_compare_lowering_preserves_memory_address_and_rejects_other_forms() {
+    use doslet_x86_wasm::static_program::X87Operation as X;
+    for (code, expected_pop) in [
+        (vec![0x36, 0xd8, 0x54, 0x8d, 0xf0, 0xc3], Some(false)),
+        (vec![0x36, 0xd8, 0x5c, 0x8d, 0xf0, 0xc3], Some(true)),
+        // Ordered real64 and unordered comparisons remain interpreter work.
+        (vec![0xdc, 0x10, 0xc3], None),
+        (vec![0xdd, 0xe1, 0xc3], None),
+        (vec![0xda, 0xe9, 0xc3], None),
+        // FNSTSW memory and FNSTCW memory have distinct effects.
+        (vec![0xdd, 0x38, 0xc3], None),
+        (vec![0xd9, 0x38, 0xc3], None),
+    ] {
+        let image = image(&code, DefaultBitness::Bits32);
+        let binding = binding(&image, 0x10000);
+        let graph = StaticCfg::analyze_bound(&binding, &[], CfgLimits::default()).unwrap();
+        let node = &graph.nodes()[0];
+        let (decoded, offsets, ip) = decode_node_with_offsets(node, &graph, &binding).unwrap();
+        let result = super::super::x87::lower(
+            &decoded,
+            &offsets,
+            ip,
+            node,
+            &graph,
+            &binding,
+            &Default::default(),
+        );
+        if let Some(expected_pop) = expected_pop {
+            let Some(Operation::X87(instruction)) = result else {
+                panic!("missing compare: {code:x?}")
+            };
+            let X::CompareReal32 { address, pop } = instruction.operation else {
+                panic!("unexpected compare: {instruction:?}")
+            };
+            assert_eq!(pop, expected_pop);
+            assert_eq!(address.segment, memory::Segment::Ss);
+            assert_eq!(address.base, Some(Register::Ebp));
+            assert_eq!(address.index, Some(Register::Ecx));
+            assert_eq!(address.scale, 4);
+            assert_eq!(address.displacement, (-16i32) as u32);
+            assert_eq!(instruction.opcode, u16::from(code[2]));
+        } else {
+            assert!(result.is_none(), "unexpectedly lowered {code:x?}");
+        }
+    }
+}
+
+#[test]
 fn computation_discovery_preserves_whole_procedures_jumping_to_lower_addresses() {
     // CALL thunk; RET; body: INC EAX; RET; NOP; NOP; thunk: JMP body.
     let image = image(
@@ -101,6 +324,426 @@ fn unchanged_external_variable_wait_is_not_a_finite_computational_fragment() {
     )
     .unwrap();
     assert!(!prepared.entries().contains(&at(1)));
+}
+
+#[test]
+fn bounded_fragments_require_an_explicit_work_limit_and_keep_legacy_admission() {
+    // PUSH ES; loop: CMP byte [EAX],0; JZ done; SUB byte [EAX],1;
+    // MOV [EDI],ECX; JMP loop; done: POP ES; RET.
+    let image = image(
+        &[
+            0x06, 0x80, 0x38, 0, 0x74, 7, 0x80, 0x28, 1, 0x89, 0x0f, 0xeb, 0xf4, 0x07, 0xc3,
+        ],
+        DefaultBitness::Bits32,
+    );
+    let binding = binding(&image, 0x10000);
+    let graph = StaticCfg::analyze_bound(&binding, &[], CfgLimits::default()).unwrap();
+    assert!(matches!(
+        PreparedMemoryProcedures::from_bound_graph_with_bounded_fragments(
+            &graph,
+            &binding,
+            MemoryProcedureLimits::default(),
+        ),
+        Err(crate::wasm::memory_procedures::MemoryProcedureError::InputLimit)
+    ));
+    let limits = MemoryProcedureLimits {
+        max_work_per_call: Some(24),
+        ..Default::default()
+    };
+    let legacy =
+        PreparedMemoryProcedures::from_bound_graph_with_computations(&graph, &binding, limits)
+            .unwrap();
+    assert!(!legacy.entries().contains(&at(1)));
+    let prepared =
+        PreparedMemoryProcedures::from_bound_graph_with_bounded_fragments(&graph, &binding, limits)
+            .unwrap();
+    assert!(
+        PreparedMemoryProcedures::from_bound_graph_with_long_fragments(
+            &graph, &binding, limits, 32,
+        )
+        .unwrap()
+        .entries()
+        .contains(&at(1))
+    );
+    let index = prepared
+        .entries()
+        .iter()
+        .position(|&entry| entry == at(1))
+        .unwrap();
+    let function = &prepared.program().functions[index];
+    assert!(function.finite_maximum_work().is_err());
+    assert!(function.blocks.iter().any(|block| matches!(
+        block.terminator.kind,
+        rle_api::procedure_memory::ProcedureTerminatorKind::Exit
+    )));
+    let compiled = prepared
+        .program()
+        .compile_with_computation_kernels(&ProcedureCompileOptions::default(), 24)
+        .unwrap();
+    assert_eq!(compiled.maximum_work(function.id), Some(24));
+    assert_eq!(compiled.finite_maximum_work(function.id), None);
+    assert_eq!(compiled.semantic_kernel(function.id), None);
+    assert_eq!(compiled.rle_kernel(function.id), None);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, compiled.wasm()).unwrap();
+    let mut store = Store::new(&engine, ());
+    let memory = Memory::new(&mut store, MemoryType::new(2, Some(2))).unwrap();
+    let mut linker = Linker::new(&engine);
+    linker
+        .define(abi::IMPORT_MODULE, abi::MEMORY_IMPORT, memory)
+        .unwrap();
+    let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+    let callable = instance
+        .get_typed_func::<u32, u32>(&store, compiled.export_name(function.id).unwrap())
+        .unwrap();
+    for initial in 0u8..=3 {
+        for grant in 0..=27u32 {
+            for protected_page in [None, Some(4usize), Some(5)] {
+                let bytes = memory.data_mut(&mut store);
+                bytes.fill(0);
+                let frame = Frame {
+                    gpr: [0x4000, 0x12345678, 0, 0, 0x7000, 0, 0, 0x5000],
+                    eflags: 0x203,
+                    address: Address {
+                        space: 0,
+                        offset: 0x10001,
+                    },
+                    ..Default::default()
+                };
+                frame.write(bytes).unwrap();
+                Descriptor {
+                    ram: RamDescriptor {
+                        pointer: 0x10500,
+                        linear_base: 0x500,
+                        length: 0xfb00,
+                        generations_pointer: 0x200,
+                        generations_length: 16,
+                        code_pages_pointer: 0x280,
+                        code_pages_length: 16,
+                        ..Default::default()
+                    },
+                    stack_address: StackAddress::Bits32,
+                    windows: [[SegmentBounds {
+                        valid: true,
+                        base: 0,
+                        first: 0,
+                        last: u32::MAX,
+                    }; 6]; 2],
+                    inline_grant: grant,
+                    ..Default::default()
+                }
+                .write(&mut bytes[memory::OFFSET as usize..])
+                .unwrap();
+                bytes[0x14000] = initial;
+                if let Some(page) = protected_page {
+                    bytes[0x280 + page] = 1;
+                }
+
+                // Independent instruction-boundary model for this tiny loop.
+                // Values stay in 0..=3, so these are the complete CMP/SUB flags
+                // (IF is preserved; CF/OF/AF clear; parity only for zero/three).
+                let mut ip = 1;
+                let mut counter = initial;
+                let mut flags = frame.eflags;
+                let mut work = 0u64;
+                let mut updates = 0u64;
+                let mut stores = 0u64;
+                while work < u64::from(grant.min(24)) && ip != 13 {
+                    match ip {
+                        1 => {
+                            flags = match counter {
+                                0 => 0x246,
+                                3 => 0x206,
+                                _ => 0x202,
+                            };
+                            ip = 4;
+                        }
+                        4 => ip = if counter == 0 { 13 } else { 6 },
+                        6 => {
+                            if protected_page == Some(4) {
+                                break;
+                            }
+                            counter -= 1;
+                            flags = if counter == 0 { 0x246 } else { 0x202 };
+                            updates += 1;
+                            ip = 9;
+                        }
+                        9 => {
+                            if protected_page == Some(5) {
+                                break;
+                            }
+                            stores += 1;
+                            ip = 11;
+                        }
+                        11 => ip = 1,
+                        _ => unreachable!(),
+                    }
+                    work += 1;
+                }
+                assert_eq!(
+                    callable.call(&mut store, 0).unwrap(),
+                    rle_api::procedure_memory::SIDE_EXIT
+                );
+                let bytes = memory.data(&store);
+                let actual = Frame::read(bytes).unwrap();
+                assert_eq!(actual.gpr, frame.gpr);
+                assert_eq!(actual.eflags, flags);
+                assert_eq!(actual.address.offset, 0x10000 + ip);
+                assert_eq!(actual.charged_work, work);
+                assert_eq!(bytes[0x14000], counter);
+                let output = if stores == 0 { 0u32 } else { frame.gpr[1] };
+                assert_eq!(&bytes[0x15000..0x15004], &output.to_le_bytes());
+                for (page, expected) in [(4, updates), (5, stores)] {
+                    let start = 0x200 + page * 8;
+                    assert_eq!(
+                        u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap()),
+                        expected
+                    );
+                }
+                let start = (memory::OFFSET + memory::RAM_WRITES) as usize;
+                assert_eq!(
+                    u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap()),
+                    updates + stores
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bounded_fragments_reject_tiny_prefixes_internal_diamonds_and_multiple_cycles() {
+    for code in [
+        &[0x40, 0x07, 0xc3][..], // Acyclic INC; unsupported POP ES.
+        &[0x40, 0x75, 0xfd, 0x48, 0x75, 0xfd, 0x07, 0xc3], // Two loops.
+        // loop: TEST EAX,EAX; JZ merge; INC EBX; merge: DEC ECX; JNZ loop;
+        // unsupported POP ES; RET. The loop contains an internal diamond.
+        &[0x85, 0xc0, 0x74, 1, 0x43, 0x49, 0x75, 0xf8, 0x07, 0xc3],
+    ] {
+        let image = image(code, DefaultBitness::Bits32);
+        let binding = binding(&image, 0x10000);
+        let graph = StaticCfg::analyze_bound(&binding, &[], CfgLimits::default()).unwrap();
+        let prepared = PreparedMemoryProcedures::from_bound_graph_with_bounded_fragments(
+            &graph,
+            &binding,
+            MemoryProcedureLimits {
+                max_work_per_call: Some(24),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!prepared.entries().contains(&at(0)));
+        assert!(
+            prepared
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.entry == at(0)
+                    && diagnostic.reason == MemoryProcedureRejection::UnsupportedLoop)
+        );
+    }
+}
+
+fn long_fragment_code(count: usize, terminal: &[u8]) -> Vec<u8> {
+    let mut code = Vec::new();
+    for _ in 1..count {
+        code.extend_from_slice(&[0x89, 0xc8]);
+    } // MOV EAX,ECX.
+    code.extend_from_slice(&[0x89, 0x07]); // MOV [EDI],EAX.
+    code.extend_from_slice(terminal);
+    code.push(0xc3);
+    code
+}
+
+#[test]
+fn long_fragments_validate_threshold_and_preserve_legacy_admission() {
+    for terminal in [&[0xd9, 0xe8][..], &[0xe8, 0, 0, 0, 0]] {
+        // FLD1 / CALL next.
+        for count in [31, 32] {
+            let code = long_fragment_code(count, terminal);
+            let image = image(&code, DefaultBitness::Bits32);
+            let binding = binding(&image, 0x10000);
+            let graph = StaticCfg::analyze_bound(&binding, &[], CfgLimits::default()).unwrap();
+            let limits = MemoryProcedureLimits {
+                max_work_per_call: Some(1),
+                ..Default::default()
+            };
+            for minimum in [0, 4097, u32::MAX] {
+                assert!(matches!(
+                    PreparedMemoryProcedures::from_bound_graph_with_long_fragments(
+                        &graph, &binding, limits, minimum,
+                    ),
+                    Err(crate::wasm::memory_procedures::MemoryProcedureError::InputLimit)
+                ));
+            }
+            assert!(
+                PreparedMemoryProcedures::from_bound_graph_with_long_fragments(
+                    &graph,
+                    &binding,
+                    MemoryProcedureLimits::default(),
+                    32,
+                )
+                .is_err()
+            );
+            for legacy in [
+                PreparedMemoryProcedures::from_bound_graph(&graph, &binding, limits).unwrap(),
+                PreparedMemoryProcedures::from_bound_graph_with_computations(
+                    &graph, &binding, limits,
+                )
+                .unwrap(),
+                PreparedMemoryProcedures::from_bound_graph_with_bounded_fragments(
+                    &graph, &binding, limits,
+                )
+                .unwrap(),
+            ] {
+                assert!(!legacy.entries().contains(&at(0)));
+            }
+            let prepared = PreparedMemoryProcedures::from_bound_graph_with_long_fragments(
+                &graph, &binding, limits, 32,
+            )
+            .unwrap();
+            let index = prepared.entries().iter().position(|entry| *entry == at(0));
+            assert_eq!(index.is_some(), count == 32);
+            if let Some(index) = index {
+                let function = &prepared.program().functions[index];
+                let compiled = prepared
+                    .program()
+                    .compile_with_computation_kernels(&ProcedureCompileOptions::default(), 1)
+                    .unwrap();
+                // Acyclic reservations use the complete longest path, not the
+                // cyclic quota. No finite/atomic computation is selected.
+                assert_eq!(compiled.maximum_work(function.id), Some(32));
+                assert_eq!(compiled.finite_maximum_work(function.id), None);
+                assert_eq!(compiled.semantic_kernel(function.id), None);
+                assert_eq!(compiled.rle_kernel(function.id), None);
+            }
+        }
+    }
+}
+
+#[test]
+fn long_fragments_dag_paths_and_store_refusals_exit_before_x87_or_call() {
+    for terminal in [&[0xd9, 0xe8][..], &[0xe8, 0, 0, 0, 0]] {
+        // TEST ECX,ECX; JZ exit; 29 MOV EAX,ECX; MOV [EDI],EAX;
+        // exit: FLD1 / CALL next; RET. Short path costs 2, longest costs 32.
+        let mut code = vec![0x85, 0xc9, 0x74, 60];
+        code.extend_from_slice(&long_fragment_code(30, terminal));
+        let image = image(&code, DefaultBitness::Bits32);
+        let binding = binding(&image, 0x10000);
+        let graph = StaticCfg::analyze_bound(&binding, &[], CfgLimits::default()).unwrap();
+        let prepared = PreparedMemoryProcedures::from_bound_graph_with_long_fragments(
+            &graph,
+            &binding,
+            MemoryProcedureLimits {
+                max_work_per_call: Some(1),
+                ..Default::default()
+            },
+            32,
+        )
+        .unwrap();
+        let index = prepared
+            .entries()
+            .iter()
+            .position(|entry| *entry == at(0))
+            .unwrap();
+        let function = &prepared.program().functions[index];
+        let compiled = prepared
+            .program()
+            .compile_with_computation_kernels(&ProcedureCompileOptions::default(), 1)
+            .unwrap();
+        assert_eq!(compiled.maximum_work(function.id), Some(32));
+        assert_eq!(compiled.finite_maximum_work(function.id), None);
+        let engine = Engine::default();
+        let module = Module::new(&engine, compiled.wasm()).unwrap();
+        let mut store = Store::new(&engine, ());
+        let memory = Memory::new(&mut store, MemoryType::new(2, Some(2))).unwrap();
+        let mut linker = Linker::new(&engine);
+        linker
+            .define(abi::IMPORT_MODULE, abi::MEMORY_IMPORT, memory)
+            .unwrap();
+        let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+        let callable = instance
+            .get_typed_func::<u32, u32>(&store, compiled.export_name(function.id).unwrap())
+            .unwrap();
+        for input in [0, 1] {
+            for protected in [false, true] {
+                let bytes = memory.data_mut(&mut store);
+                bytes.fill(0);
+                let frame = Frame {
+                    gpr: [0xdeadbeef, input, 0, 0, 0x7000, 0, 0, 0x5000],
+                    eflags: 0x202,
+                    address: Address {
+                        space: 0,
+                        offset: 0x10000,
+                    },
+                    remaining_budget: 7,
+                    charged_work: 11,
+                    ..Default::default()
+                };
+                frame.write(bytes).unwrap();
+                Descriptor {
+                    ram: RamDescriptor {
+                        pointer: 0x10500,
+                        linear_base: 0x500,
+                        length: 0xfb00,
+                        generations_pointer: 0x200,
+                        generations_length: 16,
+                        code_pages_pointer: 0x280,
+                        code_pages_length: 16,
+                        ..Default::default()
+                    },
+                    stack_address: StackAddress::Bits32,
+                    windows: [[SegmentBounds {
+                        valid: true,
+                        base: 0,
+                        first: 0,
+                        last: u32::MAX,
+                    }; 6]; 2],
+                    inline_grant: 32, // The owner reserves the full acyclic maximum.
+                    ..Default::default()
+                }
+                .write(&mut bytes[memory::OFFSET as usize..])
+                .unwrap();
+                bytes[0x17000..0x17004].copy_from_slice(&0x23456u32.to_le_bytes());
+                if protected {
+                    bytes[0x285] = 1;
+                }
+                assert_eq!(
+                    callable.call(&mut store, 0).unwrap(),
+                    rle_api::procedure_memory::SIDE_EXIT
+                );
+                let bytes = memory.data(&store);
+                let actual = Frame::read(bytes).unwrap();
+                let refused = input != 0 && protected;
+                let work = if input == 0 {
+                    2
+                } else if refused {
+                    31
+                } else {
+                    32
+                };
+                let mut expected = frame;
+                if input != 0 {
+                    expected.gpr[0] = input;
+                }
+                expected.eflags = if input == 0 { 0x246 } else { 0x202 };
+                expected.charged_work += work;
+                expected.address.offset += if refused { 62 } else { 64 };
+                assert_eq!(actual, expected); // Includes unchanged ESP and frame budget.
+                assert_eq!(&bytes[0x17000..0x17004], &0x23456u32.to_le_bytes());
+                let written = u32::from(input != 0 && !protected);
+                assert_eq!(&bytes[0x15000..0x15004], &written.to_le_bytes());
+                assert_eq!(
+                    u64::from_le_bytes(bytes[0x228..0x230].try_into().unwrap()),
+                    u64::from(written)
+                );
+                let start = (memory::OFFSET + memory::RAM_WRITES) as usize;
+                assert_eq!(
+                    u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap()),
+                    u64::from(written)
+                );
+            }
+        }
+    }
 }
 
 #[test]

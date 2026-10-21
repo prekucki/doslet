@@ -161,8 +161,12 @@ fn main() -> Result<()> {
     };
     let recipe = procedure_cache::Recipe {
         max_work_per_call,
+        copy_work_per_call: None,
         copy_kernels,
         computation_kernels,
+        bounded_fragments: false,
+        long_fragments: false,
+        pc24_locals: false,
         kernels_only,
         kernel_interrupts,
         hot_profile: profile_path.is_some(),

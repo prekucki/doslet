@@ -1,8 +1,10 @@
 //! Forward structured edges keep all architectural state in the same locals.
 
 use super::procedure_memory_emit::{
-    COMPLETED, EXIT_STATUS, PC, VirtualRegisters, finish, initialize_with_vregs, instruction_body,
+    COMPLETED, EXIT_STATUS, PC, VirtualRegisters, finish, initialize_with_vregs,
+    initialize_with_x87, instruction_body,
 };
+use super::procedure_x87_emit as x87_emit;
 use super::*;
 use crate::static_program::procedure_memory::{
     COMPLETE, ProcedureCompileError, ProcedureGraphFunction, ProcedureTerminatorKind, SIDE_EXIT,
@@ -58,7 +60,8 @@ pub(in crate::static_program) fn body(
             .iter()
             .flat_map(|block| block.instructions.iter().map(|i| i.operation)),
     )?;
-    let mut f = initialize_with_vregs(
+    let x87_locals = plan.x87.as_ref().map(|_| x87_emit::Locals::new(&vregs));
+    let mut f = initialize_with_x87(
         procedure.blocks.iter().any(|block| {
             block.instructions.iter().any(|instruction| {
                 matches!(
@@ -68,8 +71,14 @@ pub(in crate::static_program) fn body(
             })
         }),
         &vregs,
+        x87_locals.is_some(),
     );
     ins(&mut f, W::Block(BlockType::Empty)); // common exit, outside all CFG labels
+    if let (Some(locals), Some(x87)) = (x87_locals, plan.x87.as_ref()) {
+        x87_emit::initialize(&mut f, locals, x87.permissions, |f| {
+            refused(f, procedure.entry, 0, 0)
+        });
+    }
     vregs.emit_prologue(&mut f, procedure.entry);
     for _ in 1..plan.order.len() {
         ins(&mut f, W::Block(BlockType::Empty));
@@ -77,10 +86,17 @@ pub(in crate::static_program) fn body(
     for (position, &index) in plan.order.iter().enumerate() {
         let block = &procedure.blocks[index];
         let remaining_blocks = (plan.order.len() - position - 1) as u32;
+        let mut top = plan.x87.as_ref().map_or(0, |p| p.tops[index]);
         for (prefix, instruction) in block.instructions.iter().enumerate() {
-            instruction_body(&mut f, &vregs, instruction.operation, |f| {
-                refused(f, instruction.address, remaining_blocks, prefix)
-            });
+            x87_emit::dispatch(
+                &mut f,
+                &vregs,
+                x87_locals,
+                instruction.address,
+                instruction.operation,
+                &mut top,
+                |f| refused(f, instruction.address, remaining_blocks, prefix),
+            );
             if f.byte_len() > max_output {
                 return Err(ProcedureCompileError::OutputTooLarge);
             }
@@ -146,6 +162,9 @@ pub(in crate::static_program) fn body(
         }
     }
     ins(&mut f, W::End); // common exit
+    if let Some(locals) = x87_locals {
+        x87_emit::finish(&mut f, locals);
+    }
     finish(&mut f, procedure.entry);
     if f.byte_len() > max_output {
         return Err(ProcedureCompileError::OutputTooLarge);

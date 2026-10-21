@@ -1,6 +1,5 @@
 use core::ops::Range;
 use doslet_bus::{BusError, CodeCheck, CodeOwnerId};
-#[cfg(feature = "wasm-procedures")]
 pub(crate) mod batch;
 mod journal;
 pub(crate) mod storage;
@@ -67,11 +66,10 @@ impl Default for Ram {
     }
 }
 impl Ram {
-    /// Resolve the foreign owner's slices once for an ordinary decoded batch.
+    /// Resolve the owner's slices once for an ordinary decoded RAM-only batch.
     /// Logging paths retain the full PC bus so every write remains observable.
-    #[cfg(all(test, feature = "wasm-procedures"))]
     pub(crate) fn interpreter_batch_bus(&mut self) -> Option<batch::BorrowedRamBus<'_>> {
-        if !matches!(self.storage, storage::Storage::Wasm(_)) || !self.direct_execution_ready() {
+        if !self.direct_execution_ready() {
             return None;
         }
         let (bytes, generations) = self.storage.parts_mut();
@@ -101,7 +99,6 @@ impl Ram {
         ))
     }
 
-    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn complete_interpreter_batch(&mut self, effects: batch::Effects) {
         self.complete_direct_writes(effects.page_writes);
         if effects.code_exhausted {
@@ -110,7 +107,6 @@ impl Ram {
         }
     }
 
-    #[cfg(feature = "wasm-procedures")]
     pub(crate) fn direct_execution_ready(&self) -> bool {
         self.code_space != 0 && self.log.is_none() && !self.journal.recording()
     }

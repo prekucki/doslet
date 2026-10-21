@@ -45,6 +45,8 @@ fn configured(n: u32, input: &[u8], initial_run: u32) -> (PcMachine, Vec<u8>, Bi
         .unwrap()[..input.len()]
         .copy_from_slice(input);
     let binding = Binding {
+        x87: None,
+        execution_sites: None,
         function_id: 9,
         entry_ip: ENTRY,
         maximum_instructions: u32::MAX,
@@ -52,6 +54,7 @@ fn configured(n: u32, input: &[u8], initial_run: u32) -> (PcMachine, Vec<u8>, Bi
         rle_kernel: Some(RleKernel),
         finite_computation: None,
         kernel_interrupts: KernelInterrupts::Defer,
+        code_segment: CodeSegment::FLAT,
         code: vec![CodePart {
             linear: ENTRY,
             expected: fixture.code,

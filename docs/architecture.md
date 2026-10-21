@@ -29,21 +29,38 @@ memory-procedure compiler and metadata as native AOT. The browser Worker imports
 its own linear memory into that module, owns RAM, VRAM and code generations in
 stable allocations there, and passes only a small call frame at procedure
 boundaries. Native and browser dispatch share source-byte guards, work and IRQ
-admission, and interpreter fallback. Procedure bundles carry post-relocation
+admission, and interpreter fallback. `ProcedureGraphProgram::prepare` computes
+execution and x87 effect classes before WASM generation. The prepared object
+borrows immutable CPU IR and owns private lowering proofs; its diagnostic
+colors cannot change the generated code's admission contract. Shared application
+preparation uses these classes for selection and embeds them as versioned
+diagnostics, while runtime owners retain their existing validated bindings.
+Procedure bundles carry post-relocation
 absolute addresses, so preparation must use the browser's actual loader layout.
 Tier-aware register grants use the existing instruction labels and scheduler:
 every bound block must have one live tier, transitions end the grant, and the
 runtime charges that tier's counters before advancing devices. Other foreign
 engines retain their existing refusal of labels unless they explicitly provide
 live classification and matching tier accounting. Memory procedures provide
-it: a call needs one live tier for all source instructions, or exact per-tier
+it: a call needs one live tier for all executed instruction sites, or exact per-tier
 counts for a canonical copy. The browser always enables it, and native speed
 tiers enable it with their labels. The uniform tier is kept per procedure for
 the CPU's label generation while the guarded source bytes match.
+New bundles identify executed EIPs and lengths separately from protected source
+bytes. Unexecuted fallback instructions remain guarded, but do not contribute
+to tier classification. The owner validates each listed instruction and its
+mutable operand holes. Legacy bundles retain conservative source decoding;
+unavailable instruction metadata or absolute operand slots require recompilation
+when the code segment moves.
 On the desktop, `apps/common/le_layout.rs` finds where a DOS extender loaded a
-running LE program's objects from relocation-free code anchors. Procedure
-modules are cached per layout and installed while the game runs; learned
-speed-tier labels and relocatable patches move with their objects.
+running LE program's objects or DJGPP COFF sections from code anchors. COFF
+bindings retain selector-relative EIPs; source proofs use the live CS base plus
+those offsets. Stable changes to loaded text produce a new layout. Procedure
+modules are cached per compiler revision and layout, then installed while the
+game runs; learned speed-tier labels and relocatable patches follow their
+objects. A moved COFF segment can rebase ordinary source proofs; modules with
+absolute mutable operand slots require recompilation. Automatic browser COFF
+layout discovery is not implemented.
 
 `doslet-storage` defines bounded positional reads, source identities, request
 epochs and atomic commit messages. `doslet-iso9660` parses either an owned
@@ -117,9 +134,9 @@ from the launch profile. Mutable RAM, devices, overlays and handles have one
 owner each. See [portable states](save-states.md).
 
 Optional native tier learning samples actual executed counters once per host
-second, excluding skipped iterations. GREY above 10% schedules one independent
+second, excluding skipped iterations. GREY above 10% captures one independent
 state copy for paired one-second guest-time replays at the GREY rate (capped at
-333 MHz) and three times that rate. Only the background copy disables idle/VGA
+333 MHz) and three times that rate. Only the diagnostic copy disables idle/VGA
 acceleration and traces instructions. Immutable media are shared; guest RAM and
 mutable devices/filesystem state are copied explicitly at a batch boundary.
 Diagnostic copies retain private file overlays and handle positions but omit
@@ -127,13 +144,14 @@ persistent-store leases and host writeback. Guest writes and later reads operate
 in that copy's RAM; profiling never publishes those changes. Capture waits for
 an in-flight host storage operation to settle, while an idle persistent lease
 no longer blocks learning. Portable state-file restrictions are unchanged.
-Fresh entry is captured before the first live batch; at most four further
-high-GREY snapshots wait for the single worker. The worker yields periodically,
-has a 120-second host deadline, and cancels on session replacement or policy disable.
-Pausing the guest drains already captured replays and applies their results;
-no new snapshots are captured while paused. Progress changes wake presentation
-without advancing guest execution. An attached, stopped debugger retains its
-existing freeze behavior. Each queued job takes the latest settled instruction labels when it starts.
+Fresh entry is captured before the first live batch. The owner waits synchronously
+for one diagnostic worker with an 8-MiB stack; no snapshots are queued and the
+live guest cannot advance during the replay. The worker retains bounded chunks
+and a 120-second host deadline. Playback pauses during analysis; after installing
+the result, the application resets its host-time anchor before resuming, so
+profiling time does not advance guest hardware. An already paused guest does
+not start learning. An attached debugger retains its existing freeze behavior.
+Each replay uses the latest settled instruction labels.
 After its first, lower-throughput replay, it skips the second replay if every
 observed instruction has matching code bytes and an established or manual label.
 Unknown/GREY sites, changed code and empty traces keep the paired check. This
@@ -218,6 +236,14 @@ procedures borrow slices from the selected owner. Selection uses an enum rather
 than a trait object in memory hot paths. Enabling an offline module migrates
 existing RAM and generations once during setup and invalidates old owner
 proofs; procedure calls exchange only their small CPU frame and descriptor.
+The explicit PC24 recipe additionally stages a fixed 192-byte FPU boundary and
+six segment selectors. The CPU keeps its FPU parked while generated code holds
+eight stack values in WASM locals. A generic procedure-bus finish hook commits
+the validated numerical prefix only after scalar result validation. The wire
+format contains values and provenance, not Rust layouts or pointers. Scalar
+entries retain their existing transfer path. Sources, memory spans, work grants
+and live FPU controls remain separate admission requirements; see
+[PC24 procedure integration](compatibility/x87-performance.md#pc24-instructions-in-compiled-memory-procedures).
 Ordinary interpreter batches borrow RAM, generations and physical VRAM once
 from this owner, alongside the VGA controller. A concrete slice-backed bus
 admits both RAM and VGA operands until the bounded batch ends. VGA byte

@@ -117,7 +117,7 @@ impl Doslet {
             },
             core: if self.aot_installed() {
                 Core::Aot
-            } else if self.session.dynamic_core_enabled() {
+            } else if crate::cpu_config::JIT_AVAILABLE && self.session.dynamic_core_enabled() {
                 Core::Jit
             } else {
                 Core::Interpreter
@@ -163,7 +163,7 @@ impl Doslet {
         if settings.mode == Mode::Tiers && settings.learning && !self.cpu_settings().learning {
             self.session
                 .check_working_state()
-                .map_err(|e| format!("Background learning is unavailable: {e}"))?;
+                .map_err(|e| format!("Tier learning is unavailable: {e}"))?;
         }
         // Prepare an optional profile before changing live execution settings.
         if settings.mode == Mode::Tiers && self.speed_tiers.is_none() {
@@ -417,6 +417,18 @@ mod tests {
         app.reset();
         assert_eq!(app.session.hardware_config().cpu_mhz, 100);
         assert!(!app.session.dynamic_core_enabled());
+    }
+    #[test]
+    fn current_cpu_settings_always_select_an_available_core() {
+        let mut app = app();
+        // Workspace feature unification can enable the runtime's dynamic core
+        // without enabling this frontend's compiler worker.
+        app.session.set_dynamic_core(true);
+        let settings = app.cpu_settings();
+        assert!(settings.valid());
+        if !crate::cpu_config::JIT_AVAILABLE {
+            assert_eq!(settings.core, Core::Interpreter);
+        }
     }
     #[test]
     fn tier_rates_and_core_apply_together_and_learning_requires_opt_in() {

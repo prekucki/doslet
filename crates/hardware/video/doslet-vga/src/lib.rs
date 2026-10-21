@@ -158,6 +158,14 @@ impl Vga {
         self.memory = Box::default();
     }
 
+    /// Setup-only return of transferred memory, when the machine's memory
+    /// owner reverts to ordinary storage. Allocates one VRAM-sized backing.
+    pub fn restore_memory(&mut self, memory: &[u8]) {
+        assert_eq!(memory.len(), VRAM_LEN, "physical VGA backing length");
+        assert!(self.memory.is_empty(), "VGA backing was not transferred");
+        self.memory = memory.into();
+    }
+
     pub fn memory_configuration(&self) -> (u8, u8, u8, u16, u8, u8) {
         self.registers.memory_config()
     }

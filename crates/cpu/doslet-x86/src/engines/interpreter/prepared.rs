@@ -23,7 +23,9 @@ pub(in crate::engines::interpreter) struct Prepared {
     immediate: u32,
     displacement: u32,
     handler: u16,
-    length: u8, // high bit remembers native_candidate, low bits are byte length
+    // Low nibble: byte length; bits 4-5: tier; bit 6: mutable bus access;
+    // bit 7: native_candidate.
+    length: u8,
     destination: u8,
     source: u8,
     base: u8,
@@ -69,6 +71,14 @@ impl Prepared {
         self.handler == 0
     }
 
+    /// Mutable bus accesses can invalidate the following decoded code even
+    /// for reads: the batch-memory contract permits device effects. Register
+    /// operations and LEA cannot change bus storage or mappings.
+    #[inline]
+    pub(super) fn accesses_bus(self) -> bool {
+        self.length & 0x40 != 0
+    }
+
     pub(super) fn set_immediate(&mut self, immediate: u32) {
         self.immediate = immediate;
     }
@@ -79,7 +89,8 @@ impl Prepared {
 
     pub(super) fn new(i: Instruction) -> Self {
         let mut p = Self {
-            length: i.length,
+            // Early returns select fallback handlers, which stay conservative.
+            length: i.length | 0x40,
             ..Self::EMPTY
         };
         #[cfg(all(
@@ -236,6 +247,22 @@ impl Prepared {
             4 => 2,
             _ => unreachable!(),
         };
+        let accesses_bus = match i.operation {
+            Operation::Move { target, source } | Operation::Alu { target, source, .. } => {
+                matches!(target, Target::Memory { .. })
+                    || matches!(source, Value::Operand(Target::Memory { .. }))
+            }
+            Operation::IncTarget { target, .. } | Operation::Shift { target, .. } => {
+                matches!(target, Target::Memory { .. })
+            }
+            Operation::MoveExtend { source, .. } => matches!(source, Target::Memory { .. }),
+            Operation::X87 { x87, .. } => x87.kind() < x87_batch::MEMORY_KINDS,
+            Operation::Inc { .. } | Operation::Lea { .. } | Operation::Branch { .. } => false,
+            _ => true,
+        };
+        if !accesses_bus {
+            p.length &= !0x40;
+        }
         p.handler = (1 + group * VARIANTS + width * 2 + usize::from(address32)) as u16;
         p
     }

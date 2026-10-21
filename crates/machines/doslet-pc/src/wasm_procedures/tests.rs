@@ -15,12 +15,20 @@ use doslet_x86_wasm::static_program::{
 
 #[path = "finite_tests.rs"]
 mod finite_tests;
+#[path = "imul_metadata_tests.rs"]
+mod imul_metadata_tests;
 #[path = "kernel_tests.rs"]
 mod kernel_tests;
+#[path = "per_entry_admission_tests.rs"]
+mod per_entry_admission_tests;
 #[path = "rle_tests.rs"]
 mod rle_tests;
+#[path = "segment_tests.rs"]
+mod segment_tests;
 #[path = "tier_tests.rs"]
 mod tier_tests;
+#[path = "x87_tests.rs"]
+mod x87_tests;
 
 const ENTRY: u32 = 0x8000;
 const DATA: u32 = 0x2000;
@@ -92,6 +100,8 @@ fn module() -> Vec<u8> {
 
 fn binding() -> Binding {
     Binding {
+        x87: None,
+        execution_sites: None,
         function_id: 9,
         entry_ip: ENTRY,
         maximum_instructions: 4,
@@ -99,6 +109,7 @@ fn binding() -> Binding {
         rle_kernel: None,
         finite_computation: None,
         kernel_interrupts: KernelInterrupts::Defer,
+        code_segment: CodeSegment::FLAT,
         code: vec![CodePart {
             linear: ENTRY,
             expected: CODE.to_vec(),
@@ -944,9 +955,13 @@ fn first_and_repeated_borrowed_interpreter_batches_allocate_nothing() {
 }
 
 #[test]
-fn borrowed_interpreter_declines_owned_and_recorded_storage() {
+fn borrowed_interpreter_supports_owned_storage_and_declines_recording() {
     let mut owned = machine();
-    assert!(owned.bus.ram.interpreter_batch_bus().is_none());
+    assert!(owned.bus.ram.interpreter_batch_bus().is_some());
+    assert_eq!(
+        owned.borrowed_interpreter_bus,
+        !cfg!(target_arch = "wasm32")
+    );
     let mut machine = installed();
     machine.bus.ram.begin_write_log();
     assert!(machine.bus.ram.interpreter_batch_bus().is_none());
@@ -1302,6 +1317,8 @@ fn setup_caps_registry_parts_and_source_bytes_before_compilation() {
     let mut machine = machine();
     let bindings = (0..=MAX_BINDINGS)
         .map(|id| Binding {
+            x87: None,
+            execution_sites: None,
             function_id: id as u32,
             entry_ip: id as u32,
             maximum_instructions: 1,
@@ -1309,6 +1326,7 @@ fn setup_caps_registry_parts_and_source_bytes_before_compilation() {
             rle_kernel: None,
             finite_computation: None,
             kernel_interrupts: KernelInterrupts::Defer,
+            code_segment: CodeSegment::FLAT,
             code: Vec::new(),
         })
         .collect();
@@ -1395,6 +1413,135 @@ fn entries_prefix_exits_and_source_declines_allocate_nothing() {
     assert_eq!(stats.calls, 64);
     assert_eq!(stats.side_exits, 32);
     assert_eq!(stats.source_refusals, 32);
+}
+
+#[test]
+fn entry_stats_follow_real_dispatch_and_exclude_source_refusals() {
+    const SECOND_ENTRY: u32 = ENTRY + 0x20;
+    const FIRST_CODE: &[u8] = &[0x83, 0xc0, 1, 0xc3];
+    const SECOND_CODE: &[u8] = &[0x83, 0xc0, 1, 0x83, 0xc0, 1, 0xc3];
+
+    let function = |id, entry, instruction_addresses: &[u32]| ProcedureFunction {
+        id: ProcedureId(id),
+        entry: address(entry),
+        instructions: instruction_addresses
+            .iter()
+            .map(|&instruction_address| ProcedureInstruction {
+                address: address(instruction_address),
+                operation: Operation::Alu {
+                    kind: Alu::Add,
+                    target: Register::Eax,
+                    source: Source::Immediate(1),
+                },
+            })
+            .collect(),
+        terminator: ProcedureReturn {
+            address: address(entry + instruction_addresses.len() as u32 * 3),
+            width: Width::Dword,
+            pop_bytes: 0,
+        },
+    };
+    let wasm = ProcedureProgram {
+        functions: vec![
+            function(9, ENTRY, &[ENTRY]),
+            function(10, SECOND_ENTRY, &[SECOND_ENTRY, SECOND_ENTRY + 3]),
+        ],
+    }
+    .compile(&ProcedureCompileOptions::default())
+    .unwrap()
+    .into_wasm();
+    let binding = |function_id, entry_ip, maximum_instructions, expected: &[u8]| Binding {
+        x87: None,
+        execution_sites: None,
+        function_id,
+        entry_ip,
+        maximum_instructions,
+        kernel: None,
+        rle_kernel: None,
+        finite_computation: None,
+        kernel_interrupts: KernelInterrupts::Defer,
+        code_segment: CodeSegment::FLAT,
+        code: vec![CodePart {
+            linear: entry_ip,
+            expected: expected.to_vec(),
+        }],
+    };
+    let mut machine = machine();
+    machine
+        .bus
+        .debug_ram_mut(ENTRY, FIRST_CODE.len() as u32)
+        .unwrap()
+        .copy_from_slice(FIRST_CODE);
+    machine
+        .bus
+        .debug_ram_mut(SECOND_ENTRY, SECOND_CODE.len() as u32)
+        .unwrap()
+        .copy_from_slice(SECOND_CODE);
+    machine
+        .install_wasm_procedures(
+            &wasm,
+            vec![
+                binding(9, ENTRY, 2, FIRST_CODE),
+                binding(10, SECOND_ENTRY, 3, SECOND_CODE),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(machine.wasm_procedure_entry_count(), 2);
+    assert_eq!(machine.wasm_procedure_entry_ip(0), Some(ENTRY));
+    assert_eq!(machine.wasm_procedure_entry_ip(1), Some(SECOND_ENTRY));
+    assert_eq!(
+        machine.wasm_procedure_entry_stats(0),
+        Some(ProcedureEntryStats::default())
+    );
+    assert_eq!(
+        machine.wasm_procedure_entry_stats(1),
+        Some(ProcedureEntryStats::default())
+    );
+
+    machine.cpu.registers.ip = ENTRY;
+    machine.cpu.registers.set32(Gpr32::Esp, STACK);
+    assert_eq!(machine.try_wasm_procedure(2).unwrap(), Some(2));
+    assert_eq!(
+        machine.wasm_procedure_entry_stats(0),
+        Some(ProcedureEntryStats {
+            calls: 1,
+            translated_instructions: 2,
+            side_exits: 0,
+        })
+    );
+
+    machine.cpu.registers.ip = ENTRY;
+    machine.cpu.registers.set32(Gpr32::Esp, STACK);
+    machine.bus.write_u8(ENTRY + 2, 2).unwrap();
+    assert_eq!(machine.try_wasm_procedure(2).unwrap(), None);
+    assert_eq!(
+        machine.wasm_procedure_entry_stats(0),
+        Some(ProcedureEntryStats {
+            calls: 1,
+            translated_instructions: 2,
+            side_exits: 0,
+        })
+    );
+    machine.bus.write_u8(ENTRY + 2, 1).unwrap();
+
+    machine.cpu.registers.ip = SECOND_ENTRY;
+    machine.cpu.registers.set32(Gpr32::Esp, STACK);
+    assert_eq!(machine.try_wasm_procedure(3).unwrap(), Some(3));
+
+    let first = machine.wasm_procedure_entry_stats(0).unwrap();
+    let second = machine.wasm_procedure_entry_stats(1).unwrap();
+    assert_eq!(second.calls, 1);
+    assert_eq!(second.translated_instructions, 3);
+    assert_eq!(second.side_exits, 0);
+    let aggregate = machine.wasm_procedure_stats().unwrap();
+    assert_eq!(first.calls + second.calls, aggregate.calls);
+    assert_eq!(
+        first.translated_instructions + second.translated_instructions,
+        aggregate.translated_instructions
+    );
+    assert_eq!(first.side_exits + second.side_exits, aggregate.side_exits);
+    assert_eq!(aggregate.source_refusals, 1);
 }
 
 #[cfg(feature = "save-state")]

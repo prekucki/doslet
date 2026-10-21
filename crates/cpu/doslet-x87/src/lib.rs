@@ -6,11 +6,15 @@ mod exponential;
 mod extended;
 mod fast;
 mod finite;
+mod local;
 mod logarithm;
 mod operations;
 mod transcendental;
 mod wide;
 use finite::{Finite, Rounded};
+pub use local::boundary as pc24_boundary;
+pub use local::boundary::{Pc24Boundary, Pc24BoundaryError};
+pub use local::{Pc24Region, Pc24Result, pc24_binary};
 #[derive(Clone, Debug, PartialEq)]
 pub struct X87 {
     control: u16,

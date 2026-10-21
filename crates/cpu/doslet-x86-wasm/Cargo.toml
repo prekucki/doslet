@@ -11,6 +11,7 @@ native-test = ["dep:wasmi"]
 
 [dependencies]
 doslet-x86.workspace = true
+doslet-x87.workspace = true
 doslet-bus.workspace = true
 wasm-encoder = { version = "0.262", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }

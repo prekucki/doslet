@@ -64,6 +64,74 @@ pub struct ProcedureGraphProgram {
     pub functions: Vec<ProcedureGraphFunction>,
 }
 
+/// Admission policy used before WASM generation. Disabled features retain the
+/// ordinary acyclic compiler's supported scope.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcedureAnalysisOptions {
+    pub ordinary_work_limit: Option<u32>,
+    pub copy_work_limit: Option<u32>,
+    pub computation_kernels: bool,
+    pub pc24_locals: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProcedureExecutionStrategy {
+    Acyclic,
+    BoundedLoop,
+    Finite,
+    GuardedFinite,
+    Copy,
+    Rle,
+}
+
+/// Proven execution behavior, available without generating WASM. Declared exits
+/// describe IR terminators; memory refusals and bounded grants can additionally
+/// resume at intermediate instruction boundaries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcedureColor {
+    pub id: ProcedureId,
+    pub entry: Address,
+    pub strategy: ProcedureExecutionStrategy,
+    pub maximum_work: u64,
+    pub interpreter_exits: Vec<Address>,
+    pub returns: Vec<ProcedureReturn>,
+    pub x87: Option<x87::X87Effects>,
+}
+
+/// Immutable IR and private proof plans. Public colors are observations and
+/// cannot alter the lowering subsequently emitted by `compile`.
+pub struct PreparedProcedureGraphProgram<'a> {
+    program: &'a ProcedureGraphProgram,
+    options: ProcedureCompileOptions,
+    by_id: Vec<usize>,
+    plans: Vec<GraphPlan>,
+    procedures: Vec<Metadata>,
+    colors: Vec<ProcedureColor>,
+}
+
+impl core::fmt::Debug for PreparedProcedureGraphProgram<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedProcedureGraphProgram")
+            .field("options", &self.options)
+            .field("colors", &self.colors)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedProcedureGraphProgram<'_> {
+    /// Colors are sorted by procedure ID, independent of input order.
+    pub fn colors(&self) -> &[ProcedureColor] {
+        &self.colors
+    }
+
+    pub fn color(&self, id: ProcedureId) -> Option<&ProcedureColor> {
+        self.colors
+            .binary_search_by_key(&id, |color| color.id)
+            .ok()
+            .map(|index| &self.colors[index])
+    }
+}
+
 impl ProcedureGraphFunction {
     /// Prove a finite computation without a runtime instruction grant. Register
     /// induction loops may branch and nest; every cycle needs a countdown or
@@ -71,13 +139,36 @@ impl ProcedureGraphFunction {
     /// against the derived trip cap, before loop effects. No guest data is
     /// inspected here. Returns a conservative whole-function reservation.
     pub fn finite_maximum_work(&self) -> Result<u32, ProcedureCompileError> {
+        if self.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i.operation, Operation::X87(_)))
+        }) {
+            return Err(ProcedureCompileError::CyclicGraph(self.id));
+        }
         finite::plan(self, &validate_structure(self)?).map(|plan| plan.maximum_work as u32)
+    }
+
+    /// Validate the explicit PC24 ordinary graph and its balanced static stack
+    /// topology without allocating WASM output.
+    pub fn validate_with_pc24_work_limit(&self, limit: u32) -> Result<(), ProcedureCompileError> {
+        self.validate_with_work_limit_policy(limit, true)?;
+        let structure = validate_structure(self)?;
+        x87::plan(self, &structure.targets).map(|_| ())
     }
 
     /// Check IR validity and supported bounded control flow without emitting a
     /// module. Setup scratch reservations use at most 16 usize values and two
     /// booleans per block, cumulatively; all input counts are bounded first.
     pub fn validate_with_work_limit(&self, limit: u32) -> Result<(), ProcedureCompileError> {
+        self.validate_with_work_limit_policy(limit, false)
+    }
+
+    fn validate_with_work_limit_policy(
+        &self,
+        limit: u32,
+        pc24: bool,
+    ) -> Result<(), ProcedureCompileError> {
         if !(1..=MAX_WORK_PER_CALL).contains(&limit) {
             return Err(ProcedureCompileError::InvalidOptions);
         }
@@ -95,6 +186,19 @@ impl ProcedureGraphFunction {
                 .filter(|&n| n <= MAX_PROCEDURE_OPERATIONS)
                 .ok_or(ProcedureCompileError::ProcedureTooLong(self.id))?;
         }
+        if !pc24
+            && self.blocks.iter().any(|b| {
+                b.instructions
+                    .iter()
+                    .any(|i| matches!(i.operation, Operation::X87(_)))
+            })
+        {
+            return Err(ProcedureCompileError::InvalidOperation {
+                procedure: self.id,
+                operation: 0,
+                reason: CompileError::InvalidMemoryOperation(RegionId(self.id.0)),
+            });
+        }
         validate(self, Some(limit)).map(|_| ())
     }
 }
@@ -106,6 +210,7 @@ pub(in crate::static_program) struct GraphPlan {
     pub maximum_work: u64,
     pub bounded: Option<bounded::LoopPlan>,
     pub finite: Option<finite::FinitePlan>,
+    pub x87: Option<x87::Plan>,
 }
 
 fn real_terminator(kind: ProcedureTerminatorKind) -> usize {
@@ -126,7 +231,7 @@ impl ProcedureGraphProgram {
         &self,
         options: &ProcedureCompileOptions,
     ) -> Result<CompiledProcedureProgram, ProcedureCompileError> {
-        self.compile_impl(options, None, false, false)
+        self.compile_impl(options, None, None, false, false)
     }
 
     /// Also admit a single-entry linear loop ending in a backward JMP/Jcc.
@@ -143,7 +248,7 @@ impl ProcedureGraphProgram {
         if !(1..=MAX_WORK_PER_CALL).contains(&max_work_per_call) {
             return Err(ProcedureCompileError::InvalidOptions);
         }
-        self.compile_impl(options, Some(max_work_per_call), false, false)
+        self.compile_impl(options, Some(max_work_per_call), None, false, false)
     }
 
     /// Also recognize the complete paired strided-byte-copy idiom. Recognized
@@ -160,7 +265,13 @@ impl ProcedureGraphProgram {
         if !(1..=MAX_WORK_PER_CALL).contains(&max_work_per_call) {
             return Err(ProcedureCompileError::InvalidOptions);
         }
-        self.compile_impl(options, Some(max_work_per_call), true, false)
+        self.compile_impl(
+            options,
+            Some(max_work_per_call),
+            Some(max_work_per_call),
+            false,
+            false,
+        )
     }
 
     /// Admit semantic copy/RLE and finite reducible register-induction graphs,
@@ -175,19 +286,101 @@ impl ProcedureGraphProgram {
         options: &ProcedureCompileOptions,
         ordinary_work_limit: u32,
     ) -> Result<CompiledProcedureProgram, ProcedureCompileError> {
-        if !(1..=MAX_WORK_PER_CALL).contains(&ordinary_work_limit) {
+        self.compile_with_computation_kernels_and_work_limits(
+            options,
+            ordinary_work_limit,
+            ordinary_work_limit,
+        )
+    }
+
+    /// Compile ordinary bounded graphs and recognized semantic copies with
+    /// separate reservations. This permits a shorter ordinary event-free grant
+    /// while retaining the copy kernel's existing whole-computation contract.
+    /// Both limits must be in `1..=MAX_WORK_PER_CALL`. Proven finite and RLE
+    /// computations keep their independently derived reservations unchanged.
+    /// The owner must still admit each function using its reported metadata.
+    pub fn compile_with_computation_kernels_and_work_limits(
+        &self,
+        options: &ProcedureCompileOptions,
+        ordinary_work_limit: u32,
+        copy_work_limit: u32,
+    ) -> Result<CompiledProcedureProgram, ProcedureCompileError> {
+        if !(1..=MAX_WORK_PER_CALL).contains(&ordinary_work_limit)
+            || !(1..=MAX_WORK_PER_CALL).contains(&copy_work_limit)
+        {
             return Err(ProcedureCompileError::InvalidOptions);
         }
-        self.compile_impl(options, Some(ordinary_work_limit), true, true)
+        self.compile_impl(
+            options,
+            Some(ordinary_work_limit),
+            Some(copy_work_limit),
+            true,
+            false,
+        )
+    }
+
+    /// Opt in to exact masked-PC24 locals in ordinary acyclic/bounded graphs.
+    /// Scalar functions retain the existing semantic-kernel recognition. The
+    /// owner must export/commit each function's declared x87 boundary and use
+    /// its extended frame; unsupported numeric state refuses transactionally.
+    pub fn compile_with_pc24_locals_and_work_limits(
+        &self,
+        options: &ProcedureCompileOptions,
+        ordinary_work_limit: u32,
+        copy_work_limit: u32,
+    ) -> Result<CompiledProcedureProgram, ProcedureCompileError> {
+        if !(1..=MAX_WORK_PER_CALL).contains(&ordinary_work_limit)
+            || !(1..=MAX_WORK_PER_CALL).contains(&copy_work_limit)
+        {
+            return Err(ProcedureCompileError::InvalidOptions);
+        }
+        self.compile_impl(
+            options,
+            Some(ordinary_work_limit),
+            Some(copy_work_limit),
+            true,
+            true,
+        )
     }
 
     fn compile_impl(
         &self,
         options: &ProcedureCompileOptions,
         max_work_per_call: Option<u32>,
-        copy_kernels: bool,
+        copy_work_limit: Option<u32>,
         computation_kernels: bool,
+        pc24: bool,
     ) -> Result<CompiledProcedureProgram, ProcedureCompileError> {
+        self.prepare(
+            options,
+            &ProcedureAnalysisOptions {
+                ordinary_work_limit: max_work_per_call,
+                copy_work_limit,
+                computation_kernels,
+                pc24_locals: pc24,
+            },
+        )?
+        .compile()
+    }
+
+    /// Validate and color procedures before allocating or emitting WASM.
+    /// The returned plan borrows immutable input and owns the proven lowering.
+    pub fn prepare<'a>(
+        &'a self,
+        options: &ProcedureCompileOptions,
+        analysis: &ProcedureAnalysisOptions,
+    ) -> Result<PreparedProcedureGraphProgram<'a>, ProcedureCompileError> {
+        let max_work_per_call = analysis.ordinary_work_limit;
+        let copy_work_limit = analysis.copy_work_limit;
+        let computation_kernels = analysis.computation_kernels;
+        let pc24 = analysis.pc24_locals;
+        if [max_work_per_call, copy_work_limit]
+            .into_iter()
+            .flatten()
+            .any(|limit| !(1..=MAX_WORK_PER_CALL).contains(&limit))
+        {
+            return Err(ProcedureCompileError::InvalidOptions);
+        }
         if options.max_procedures > MAX_PROCEDURES
             || options.max_procedure_operations > MAX_PROCEDURE_OPERATIONS
             || options.max_total_operations > MAX_TOTAL_OPERATIONS
@@ -239,16 +432,34 @@ impl ProcedureGraphProgram {
         }
         let mut plans = reserved(by_id.len())?;
         let mut procedures = reserved(by_id.len())?;
+        let mut colors = reserved(by_id.len())?;
         for &index in &by_id {
             let function = &self.functions[index];
             let structure = validate_structure(function)?;
-            let rle_kernel = computation_kernels
+            let x87_plan = x87::plan(function, &structure.targets)?;
+            if x87_plan.is_some() && !pc24 {
+                return Err(ProcedureCompileError::InvalidOperation {
+                    procedure: function.id,
+                    operation: 0,
+                    reason: CompileError::InvalidMemoryOperation(RegionId(function.id.0)),
+                });
+            }
+            let has_x87 = x87_plan.is_some();
+            let rle_kernel = (computation_kernels && !has_x87)
                 .then(|| rle_kernel::recognize(function))
                 .flatten();
-            let semantic_kernel = copy_kernels
-                .then(|| copy_kernel::recognize(function, max_work_per_call.unwrap()))
-                .flatten();
-            let plan = if rle_kernel.is_some() {
+            let semantic_kernel = copy_work_limit
+                .filter(|_| !has_x87)
+                .and_then(|limit| copy_kernel::recognize(function, limit));
+            // A recognized copy retains the same structural plan and metadata
+            // as the legacy equal-limit API. Only ordinary graphs use the
+            // shorter grant; changing it must not shrink atomic copy contracts.
+            let plan_limit = if semantic_kernel.is_some() {
+                copy_work_limit
+            } else {
+                max_work_per_call
+            };
+            let mut plan = if rle_kernel.is_some() {
                 GraphPlan {
                     order: Vec::new(),
                     positions: Vec::new(),
@@ -256,22 +467,24 @@ impl ProcedureGraphProgram {
                     maximum_work: u64::from(u32::MAX),
                     bounded: None,
                     finite: None,
+                    x87: None,
                 }
             } else {
                 // A failed termination proof is not an admission: preserve the
                 // ordinary bounded fallback, including its original errors.
-                if computation_kernels && semantic_kernel.is_none() {
+                if computation_kernels && semantic_kernel.is_none() && !has_x87 {
                     match finite::plan(function, &structure) {
                         Ok(proven) if !proven.finite.as_ref().unwrap().loops.is_empty() => proven,
                         Ok(_) | Err(ProcedureCompileError::CyclicGraph(_)) => {
-                            plan(function, structure, max_work_per_call)?
+                            plan(function, structure, plan_limit)?
                         }
                         Err(error) => return Err(error),
                     }
                 } else {
-                    plan(function, structure, max_work_per_call)?
+                    plan(function, structure, plan_limit)?
                 }
             };
+            plan.x87 = x87_plan;
             let mut export_name = String::new();
             export_name
                 .try_reserve_exact("memory_procedure_".len() + 10)
@@ -296,7 +509,55 @@ impl ProcedureGraphProgram {
                     });
                 }
             }
+            let strategy = if rle_kernel.is_some() {
+                ProcedureExecutionStrategy::Rle
+            } else if semantic_kernel.is_some() {
+                ProcedureExecutionStrategy::Copy
+            } else if plan.finite.is_some() {
+                if finite_loop_guards.is_empty() {
+                    ProcedureExecutionStrategy::Finite
+                } else {
+                    ProcedureExecutionStrategy::GuardedFinite
+                }
+            } else if plan.bounded.is_some() {
+                ProcedureExecutionStrategy::BoundedLoop
+            } else {
+                ProcedureExecutionStrategy::Acyclic
+            };
+            let mut interpreter_exits = reserved(function.blocks.len())?;
+            let mut returns = reserved(function.blocks.len())?;
+            for block in &function.blocks {
+                match block.terminator.kind {
+                    ProcedureTerminatorKind::Exit => {
+                        interpreter_exits.push(block.terminator.address)
+                    }
+                    ProcedureTerminatorKind::Return { width, pop_bytes } => {
+                        returns.push(ProcedureReturn {
+                            address: block.terminator.address,
+                            width,
+                            pop_bytes,
+                        })
+                    }
+                    _ => (),
+                }
+            }
+            interpreter_exits.sort_unstable();
+            returns.sort_unstable_by_key(|ret| ret.address);
+            colors.push(ProcedureColor {
+                id: function.id,
+                entry: function.entry,
+                strategy,
+                maximum_work: plan.maximum_work,
+                interpreter_exits,
+                returns,
+                x87: plan
+                    .x87
+                    .as_ref()
+                    .map(|plan| plan.effects.try_clone())
+                    .transpose()?,
+            });
             procedures.push(Metadata {
+                x87: plan.x87.as_ref().map(|p| p.permissions),
                 id: function.id,
                 entry: function.entry,
                 export_name,
@@ -308,22 +569,44 @@ impl ProcedureGraphProgram {
             });
             plans.push(plan);
         }
+        Ok(PreparedProcedureGraphProgram {
+            program: self,
+            options: *options,
+            by_id,
+            plans,
+            procedures,
+            colors,
+        })
+    }
+}
+
+impl PreparedProcedureGraphProgram<'_> {
+    /// Emit only the validated, immutable plan owned by this preparation.
+    pub fn compile(self) -> Result<CompiledProcedureProgram, ProcedureCompileError> {
+        let Self {
+            program,
+            options,
+            by_id,
+            plans,
+            procedures,
+            ..
+        } = self;
         let bytes = encode_procedures(&procedures, options.max_output_bytes, |position| {
             if procedures[position].rle_kernel.is_some() {
                 return emit::memory_rle_kernel_body(
-                    self.functions[by_id[position]].entry,
+                    program.functions[by_id[position]].entry,
                     options.max_output_bytes,
                 );
             }
             if let Some(kernel) = procedures[position].semantic_kernel {
                 return emit::memory_copy_kernel_body(
-                    self.functions[by_id[position]].entry,
+                    program.functions[by_id[position]].entry,
                     kernel,
                     options.max_output_bytes,
                 );
             }
             emit::memory_procedure_graph_body(
-                &self.functions[by_id[position]],
+                &program.functions[by_id[position]],
                 &plans[position],
                 options.max_output_bytes,
             )
@@ -547,5 +830,10 @@ fn plan(
         maximum_work: longest[entry],
         bounded: None,
         finite: None,
+        x87: None,
     })
 }
+
+#[cfg(test)]
+#[path = "procedure_colors_tests.rs"]
+mod color_tests;

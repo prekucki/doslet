@@ -180,7 +180,18 @@ pub(super) fn cached_game(
     exe: &Path,
     root: Option<&Path>,
 ) -> Result<Option<CachedGame>, Box<dyn std::error::Error>> {
-    let (path, identity) = game_location(exe, root)?;
+    cached_location(game_location(exe, root)?)
+}
+pub(super) fn cached_game_bytes(
+    bytes: &[u8],
+    root: Option<&Path>,
+) -> Result<Option<CachedGame>, Box<dyn std::error::Error>> {
+    let hash = format!("{:x}", Sha256::digest(bytes));
+    cached_location(game_location_hash(&hash, root)?)
+}
+fn cached_location(
+    (path, identity): (PathBuf, String),
+) -> Result<Option<CachedGame>, Box<dyn std::error::Error>> {
     let Some(value) = read_value(&path)? else {
         return Ok(None);
     };

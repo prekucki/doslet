@@ -15,6 +15,7 @@ pub(super) fn address(offset: u32) -> ObjectAddress {
 }
 pub(super) fn image(code: &[u8]) -> SymbolicImage {
     SymbolicImage {
+        format: crate::ImageFormat::Le,
         header: LeHeader {
             location: LeLocation {
                 container_offset: 0,

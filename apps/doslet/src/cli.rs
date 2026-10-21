@@ -42,6 +42,7 @@ impl DpmiMode {
 #[derive(Debug, Default, Parser)]
 #[command(
     version,
+    group(clap::ArgGroup::new("tier_source").args(["speed_tier_profile", "learn_speed_tiers"]).multiple(true)),
     after_help = "Without a game source, opens the game library of the user's profile directory, or the color-bar demo when it holds none.\nGame support is experimental. Use --game EXE, --zip ZIP [--program EXE], or --config TOML [--program EXE] for a ZIP profile."
 )]
 pub struct Cli {
@@ -119,19 +120,19 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub speed_tier_cache: Option<PathBuf>,
     /// Disable automatic activation of a previously learned game profile
-    #[arg(long, conflicts_with = "speed_tier_profile")]
+    #[arg(long, conflicts_with_all = ["speed_tier_profile", "learn_speed_tiers"])]
     pub no_speed_tiers: bool,
-    /// Reclassify GREY >10% using paired one-second background state replays
-    #[arg(long, requires = "speed_tier_profile")]
+    /// Record speed tiers for this game; resume its cache or start an untrained profile
+    #[arg(long, conflicts_with_all = ["adaptive_cpu", "adaptive_idle", "analyze_synchronization", "observe_idle", "experimental_heroes_menu_idle", "experimental_heroes_timer_waits"])]
     pub learn_speed_tiers: bool,
-    /// Cold candidate throughput for --speed-tier-profile (default 8 MHz)
-    #[arg(long, value_name = "MHZ", requires = "speed_tier_profile", value_parser = clap::value_parser!(u16).range(1..=1000))]
+    /// Cold candidate throughput for speed tiers (default 8 MHz)
+    #[arg(long, value_name = "MHZ", requires = "tier_source", value_parser = clap::value_parser!(u16).range(1..=1000))]
     pub cold_mhz: Option<u16>,
     /// HOT throughput; omit for MAX (zero instruction-budget cost)
-    #[arg(long, value_name = "MHZ", requires = "speed_tier_profile", value_parser = clap::value_parser!(u16).range(1..=1000))]
+    #[arg(long, value_name = "MHZ", requires = "tier_source", value_parser = clap::value_parser!(u16).range(1..=1000))]
     pub hot_mhz: Option<u16>,
     /// GREY throughput (default 133 MHz), including IRQ code
-    #[arg(long, value_name = "MHZ", requires = "speed_tier_profile", value_parser = clap::value_parser!(u16).range(1..=1000))]
+    #[arg(long, value_name = "MHZ", requires = "tier_source", value_parser = clap::value_parser!(u16).range(1..=1000))]
     pub grey_mhz: Option<u16>,
     /// Resume a Protobuf state (.pb or .pb.gz); use --config to resolve its media
     #[arg(long, value_name = "STATE", conflicts_with_all = ["cpu_mhz", "memory_mib", "no_x87", "no_sb16", "no_mpu401", "drive_mode"])]
@@ -308,6 +309,38 @@ mod tests {
             Cli::try_parse_from(["doslet", "--load-state", "city.pb.gz", "--cpu-mhz", "66"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn recording_accepts_rates_without_a_seed_and_rejects_other_cpu_policies() {
+        let cli = Cli::try_parse_from([
+            "doslet",
+            "--learn-speed-tiers",
+            "--hot-mhz",
+            "500",
+            "--grey-mhz",
+            "100",
+            "--cold-mhz",
+            "8",
+        ])
+        .unwrap();
+        assert!(cli.learn_speed_tiers);
+        assert!(cli.speed_tier_profile.is_none());
+        assert_eq!(
+            (cli.hot_mhz, cli.grey_mhz, cli.cold_mhz),
+            (Some(500), Some(100), Some(8))
+        );
+        for conflict in [
+            "--no-speed-tiers",
+            "--adaptive-cpu",
+            "--adaptive-idle",
+            "--analyze-synchronization",
+            "--observe-idle",
+            "--experimental-heroes-menu-idle",
+            "--experimental-heroes-timer-waits",
+        ] {
+            assert!(Cli::try_parse_from(["doslet", "--learn-speed-tiers", conflict]).is_err());
+        }
     }
 
     #[test]

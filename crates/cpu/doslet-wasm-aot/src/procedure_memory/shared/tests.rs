@@ -18,6 +18,37 @@ const DATA: usize = 0x2000;
 const STACK: usize = 0x4000;
 const RETURN: u32 = 0x9000;
 
+#[test]
+fn coprocessor_boundary_and_selectors_stay_in_fixed_backing_without_allocations() {
+    let mut owner = owner();
+    let descriptor = descriptor(&owner);
+    owner.execute(3, &mut initial(), &descriptor).unwrap();
+    let boundary = core::array::from_fn::<_, PC24_BOUNDARY_BYTES, _>(|index| index as u8);
+    let selectors = [0x10, 0x08, 0x20, 0x30, 0x40, 0x50];
+    let ram_pointer = owner.ram().as_ptr();
+    let allocation = allocation_counter::measure(|| {
+        owner.prepare_pc24_boundary(0x81, 0xc3, &boundary, selectors);
+        owner.execute(3, &mut initial(), &descriptor).unwrap();
+        let (read, write, returned) = owner.pending_pc24_boundary().unwrap();
+        assert_eq!((read, write), (0x81, 0xc3));
+        assert_eq!(returned, boundary);
+        let bytes = owner.memory.data(&owner.store);
+        for (index, selector) in selectors.into_iter().enumerate() {
+            let start = PC24_SELECTORS_OFFSET + index * 2;
+            assert_eq!(&bytes[start..start + 2], &selector.to_le_bytes());
+        }
+        // Permissions are retained outside the foreign writable call frame.
+        owner.memory.data_mut(&mut owner.store)[PC24_BOUNDARY_OFFSET + 12] = 0;
+        let (read, write, _) = owner.pending_pc24_boundary().unwrap();
+        assert_eq!((read, write), (0x81, 0xc3));
+        owner.clear_pc24_boundary();
+        assert!(owner.pending_pc24_boundary().is_none());
+    });
+    assert_eq!(allocation.count_total, 0, "{allocation:?}");
+    assert_eq!(allocation.bytes_total, 0, "{allocation:?}");
+    assert_eq!(ram_pointer, owner.ram().as_ptr());
+}
+
 fn address(offset: u32) -> Address {
     Address { space: 1, offset }
 }

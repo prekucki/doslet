@@ -15,6 +15,7 @@ fn address(object_number: u32, offset: u32) -> ObjectAddress {
 // in the image/parser tests; these tests isolate explicit layout policy.
 fn image(objects: &[(u32, DefaultBitness)]) -> SymbolicImage {
     SymbolicImage {
+        format: crate::ImageFormat::Le,
         header: LeHeader {
             location: LeLocation {
                 container_offset: 0,

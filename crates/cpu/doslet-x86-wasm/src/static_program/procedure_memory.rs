@@ -11,7 +11,9 @@
 //! forward structured WASM branches and keeps registers/flags live across edges;
 //! the original acyclic control-flow emitter remains unchanged. Explicit
 //! [`ProcedureGraphProgram::compile_with_work_limit`] also supports one linear
-//! natural loop with a conditional or unconditional latch. Cyclic functions
+//! natural loop with a conditional or unconditional latch and conditional early
+//! exits along one continuation path. Internal diamonds and additional cycles
+//! are not admitted by this bounded mode. Cyclic functions
 //! stop before exceeding the descriptor grant or compiled per-call limit.
 //! Whole loop iterations check the grant once; a short final prefix checks
 //! each remaining instruction. Unsupported cyclic shapes are rejected.
@@ -78,10 +80,25 @@ pub mod rle;
 pub(super) mod rle_kernel;
 pub use copy_kernel::CopyKernel;
 pub use graph::{
-    MAX_PROCEDURE_BLOCKS, MAX_TOTAL_PROCEDURE_BLOCKS, MAX_WORK_PER_CALL, ProcedureBlock,
-    ProcedureGraphFunction, ProcedureGraphProgram, ProcedureTerminator, ProcedureTerminatorKind,
+    MAX_PROCEDURE_BLOCKS, MAX_TOTAL_PROCEDURE_BLOCKS, MAX_WORK_PER_CALL,
+    PreparedProcedureGraphProgram, ProcedureAnalysisOptions, ProcedureBlock, ProcedureColor,
+    ProcedureExecutionStrategy, ProcedureGraphFunction, ProcedureGraphProgram, ProcedureTerminator,
+    ProcedureTerminatorKind,
 };
 pub use rle_kernel::{RleCall, RleKernel};
+#[path = "procedure_x87.rs"]
+pub(super) mod x87;
+pub use x87::{X87EffectClass, X87Effects, X87ExitBalance};
+/// Physical FPU slots relative to TOP at procedure entry. The owner rotates
+/// these masks once when exporting the portable boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct X87Procedure {
+    pub read_mask: u8,
+    pub write_mask: u8,
+}
+pub const X87_BOUNDARY_OFFSET: u32 = 456;
+pub const X87_SELECTORS_OFFSET: u32 = 648;
+pub const X87_FRAME_BYTES: u32 = 664;
 
 /// A finite computation's dynamic loop-entry proof, exposed for setup-time
 /// manifests and independent original-instruction reference execution.
@@ -207,6 +224,7 @@ struct Metadata {
     rle_kernel: Option<RleKernel>,
     finite_maximum_work: Option<u32>,
     finite_loop_guards: Vec<FiniteLoopGuard>,
+    x87: Option<X87Procedure>,
 }
 
 #[derive(Debug)]
@@ -262,6 +280,9 @@ impl CompiledProcedureProgram {
     /// source-prefix proof and populate [`RleCall`] before every invocation.
     pub fn rle_kernel(&self, id: ProcedureId) -> Option<RleKernel> {
         self.metadata(id).and_then(|p| p.rle_kernel)
+    }
+    pub fn x87(&self, id: ProcedureId) -> Option<X87Procedure> {
+        self.metadata(id).and_then(|p| p.x87)
     }
     fn metadata(&self, id: ProcedureId) -> Option<&Metadata> {
         self.procedures
@@ -331,6 +352,13 @@ impl ProcedureProgram {
                     return Err(ProcedureCompileError::InvalidAddresses(function.id));
                 }
                 previous = Some(instruction.address.offset);
+                if matches!(instruction.operation, Operation::X87(_)) {
+                    return Err(ProcedureCompileError::InvalidOperation {
+                        procedure: function.id,
+                        operation: position,
+                        reason: CompileError::InvalidMemoryOperation(RegionId(function.id.0)),
+                    });
+                }
                 super::validate_operation(&instruction.operation, RegionId(function.id.0), true)
                     .map_err(|reason| ProcedureCompileError::InvalidOperation {
                         procedure: function.id,
@@ -359,6 +387,7 @@ impl ProcedureProgram {
             write!(export_name, "memory_procedure_{}", function.id.0)
                 .map_err(|_| ProcedureCompileError::Allocation)?;
             procedures.push(Metadata {
+                x87: None,
                 id: function.id,
                 entry: function.entry,
                 export_name,

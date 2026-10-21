@@ -327,14 +327,19 @@ capture does. It then installs the cached module of that layout, or compiles
 one on a background thread with the
 `--computation-kernels --kernel-interrupts before-irq` recipe shared through
 `apps/common/procedure_cache.rs`, and installs it at the next batch boundary
-without recorded RAM. The first 10,000 calls decide: an average below 32
-instructions suspends the procedures and leaves `unavailable.txt` beside the
-module. `--no-aot` disables this. For ROTT the live module's code equals the
+without recorded RAM. Native automatic AOT additionally enables bounded cyclic
+fragments and acyclic fragments with a static longest path of at least 32
+instructions. Every 10,000 accepted calls across the module, each entry with
+at least 128 calls is evaluated against a 32-instruction mean. Short entries
+lose interpreter entry points until a replacement module is installed;
+entries still awaiting enough samples remain enabled. If none remain enabled,
+the module is suspended and removed, leaving `unavailable.txt` beside it.
+`--no-aot` disables this. In earlier measurements, ROTT's live module equalled the
 offline module's byte for byte; it compiled in 0.1 s and averaged 702
 instructions per call. HEROES.EXE first calls procedures after about 90
 million steps and averages 7 instructions per call; its module ran 20% slower
 than the interpreter over 40 guest seconds (7.0 s against 5.9 s), so it is
-suspended. Under DPMI Direct from boot,
+suspended under the former module-wide policy. Under DPMI Direct from boot,
 the regenerated 202-entry ROTT module ran steps 60–100 million in 287 ms against
 353 ms interpreted (1.23×). AOT executed 15% of those instructions in 8,992
 calls, and both runs ended at the same PC and guest time. The desktop stores the module's native

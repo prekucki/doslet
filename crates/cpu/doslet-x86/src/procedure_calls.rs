@@ -36,8 +36,12 @@ pub enum FrozenCode {
     AssumeImmutable,
 }
 
-/// Exact code and stack context for a protected-mode 32-bit binding. CS must
-/// cover the full flat 32-bit range; SS must have base zero and a 32-bit stack.
+/// Exact code and stack context for a protected-mode 32-bit binding: a usable
+/// 32-bit code segment and a 32-bit stack. Their bases and limits are part of
+/// the context. A flat binding has CS base zero and limit `u32::MAX`; a
+/// DJGPP program's CS and SS share its memory block's base. Entry addresses
+/// are EIPs in that CS, so the owner must bind them to its base and check that
+/// its limit covers the bound code. Stack accesses use SS's own base.
 /// Constructed from the CPU after the owner has established its segments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcedureContext {
@@ -59,11 +63,8 @@ impl ProcedureContext {
             && registers.protected
             && cs.selector == registers.cs
             && ss.selector == registers.ss
-            && cs.base == 0
-            && cs.limit == u32::MAX
             && cs.usable
             && cs.access & 0x98 == 0x98
-            && ss.base == 0
             && cs.default32
             && ss.default32)
             .then_some(Self {
@@ -72,6 +73,11 @@ impl ProcedureContext {
                 cr0: cpu.control.cr0,
                 cpl: registers.cpl,
             })
+    }
+
+    /// Base and inclusive limit of the code segment.
+    pub fn code_segment(&self) -> (u32, u32) {
+        (self.cs.base, self.cs.limit)
     }
 }
 

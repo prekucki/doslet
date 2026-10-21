@@ -149,6 +149,8 @@ pub struct PcMachine {
     memory_wait_sites: Option<MemoryWaitSites>,
     memory_wait_steps: u64,
     batch_yield_ip: Option<[u32; 2]>,
+    /// Transient interpreter policy; never part of a portable guest state.
+    borrowed_interpreter_bus: bool,
     interrupt_entries: u64,
     #[cfg(feature = "wasm-procedures")]
     wasm_procedures: Option<wasm_procedures::Plan>,
@@ -185,6 +187,7 @@ impl PcMachine {
             memory_wait_sites: None,
             memory_wait_steps: 0,
             batch_yield_ip: None,
+            borrowed_interpreter_bus: !cfg!(target_arch = "wasm32"),
             interrupt_entries: 0,
             #[cfg(feature = "wasm-procedures")]
             wasm_procedures: None,
@@ -192,6 +195,13 @@ impl PcMachine {
     }
 }
 impl PcMachine {
+    /// RAM-only interpreter borrow, enabled by default for a native owner.
+    /// Logging and recurrence recording keep the ordinary PC bus. Foreign WASM
+    /// backing retains its existing RAM/VGA borrowing policy independently.
+    pub fn set_borrowed_interpreter_bus(&mut self, enabled: bool) {
+        self.borrowed_interpreter_bus = enabled;
+    }
+
     /// Optional instruction-boundary scheduling hints; ordinary execution has none.
     pub fn batch_yield_ips(&self) -> Option<[u32; 2]> {
         self.batch_yield_ip
@@ -483,13 +493,16 @@ impl PcMachine {
                 && !self.bus.ram.recurrence_recording()
                 && !prepared_entries;
             #[cfg(feature = "wasm-procedures")]
+            let foreign_backing = matches!(self.bus.ram.storage, memory::storage::Storage::Wasm(_));
+            #[cfg(not(feature = "wasm-procedures"))]
+            let foreign_backing = false;
             let borrowed_ready = !native
                 && self.bus.a20_enabled()
-                && matches!(self.bus.ram.storage, memory::storage::Storage::Wasm(_))
+                && (foreign_backing || self.borrowed_interpreter_bus)
                 && self.bus.ram.direct_execution_ready();
             #[cfg(feature = "wasm-procedure-diagnostics")]
-            let borrowed_ready = borrowed_ready && self.wasm_procedure_borrowed_bus_enabled();
-            #[cfg(feature = "wasm-procedures")]
+            let borrowed_ready =
+                borrowed_ready && (!foreign_backing || self.wasm_procedure_borrowed_bus_enabled());
             let borrowed = if borrowed_ready {
                 // Resolve the hardware deadline before exclusively borrowing
                 // the backing. Device state cannot change inside this batch.
@@ -509,12 +522,19 @@ impl PcMachine {
                 };
                 let effects = bus.finish();
                 self.bus.complete_interpreter_batch(effects);
-                Some(consumed)
+                // A native RAM-only borrow can stop at a VGA operand before
+                // completing anything. Retry through the complete PC bus so
+                // repeated VGA work retains ordinary interpreter batching.
+                // A positive prefix is returned once; the following call owns
+                // the remaining work. Foreign backing keeps its prior policy.
+                if consumed == 0 && !foreign_backing {
+                    None
+                } else {
+                    Some(consumed)
+                }
             } else {
                 None
             };
-            #[cfg(not(feature = "wasm-procedures"))]
-            let borrowed: Option<u32> = None;
             let consumed = if let Some(consumed) = borrowed {
                 consumed
             } else if let Some(head) = self.batch_yield_ip {

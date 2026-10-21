@@ -11,7 +11,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 doslet-x86.workspace = true
 doslet-bus.workspace = true
+doslet-x87 = { workspace = true, features = ["save-state"] }
+doslet-state.workspace = true
 doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm" }
+
+[dev-dependencies]
+allocation-counter = "0.8.1"
 
 # Only the private, trusted synchronous diagnostic FFI dereferences handles.
 [lints.rust]

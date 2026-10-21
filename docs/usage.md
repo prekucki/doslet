@@ -113,7 +113,7 @@ The game starts automatically. Its containing directory is preloaded as C:;
 guest writes use an in-memory overlay and do not modify your installation.
 Keep the executable alongside its original DOS4GW and data files. DOS text
 screens render during startup. Native launches use Doslet's DPMI host
-in `direct` mode, including background speed-tier profiling. Select
+in `direct` mode, including speed-tier profiling. Select
 `--dpmi reflect` for reflected services or `--dpmi off` for the guest
 extender path, or set `machine.dpmi` in the profile. Learned speed tiers,
 relocatable patches and AOT procedures follow the program to wherever the mode
@@ -151,7 +151,7 @@ tier its labels prove: all of its instructions in one tier, or exact per-tier
 counts for a copy kernel. Mixed or changed code runs on the labelled
 interpreter instead. On ROTT under DPMI off with its learned labels, 40
 guest seconds from boot took 8.3 s with tiers alone and 7.3 s with the module
-(1.13×). Background tier learning (`--learn-speed-tiers`) keeps the plain
+(1.13×). Tier learning (`--learn-speed-tiers`) keeps the plain
 interpreter. A cached module that cannot be used is reported and ignored; an
 explicit `--wasm-procedures FILE` is installed at launch and stops it instead.
 
@@ -168,13 +168,17 @@ When a layout has no module yet:
    on the interpreter. ROTT's 202 procedures take about 0.1 s.
 2. The module is installed at the next batch boundary at which RAM is not
    being recorded for an idle-loop proof.
-3. The first 10,000 calls are measured. If they average fewer than 32
-   instructions, the procedures are suspended for the session and an
-   `unavailable.txt` file with the reason is left beside the module; delete
-   it to try again. Shorter calls cost more than they save.
+3. Every 10,000 calls across the module, each entry is evaluated separately.
+   An entry receives at least 128 calls before it can be disabled for averaging
+   fewer than 32 translated instructions. Entries still awaiting that sample
+   remain enabled. Disabled entries retain their compiled functions and are
+   retried when a replacement module is installed. If no entry remains enabled, the
+   module is suspended and removed at a suitable batch boundary, and an
+   `unavailable.txt` reason is left beside it; delete that file to try again.
 
-ROTT averages about 700 instructions per call and keeps its module. HEROES.EXE
-averages 7; its module ran 20% slower than the interpreter and is suspended.
+Earlier measurements found about 700 instructions per call for ROTT and 7 for
+HEROES.EXE. The latter module ran 20% slower than the interpreter; those results
+motivated the 32-instruction threshold. They predate selection by entry.
 The terminal names the live layout, the compilation, the module in use, or why
 there is none. For example, `CIV.EXE is not a 32-bit LE program` means a
 real-mode MZ game without DOS4GW, which the AOT generator cannot translate.
@@ -304,8 +308,8 @@ preparation or an attached GDB session.
 
 On native builds, choose **Create profile** in the CPU panel, enter a JSON file
 path, then **Create & use**. This saves a speed-tier profile and activates it
-without restarting. Learning remains off; enable **Background learning** and
-apply when ready to classify code. **Save profile as…** saves a copy of the
+without restarting. Learning remains off until explicitly enabled.
+**Save profile as…** saves a copy of the
 current labels and tier speeds. Existing files are preserved; choose another
 name or use **Open profile…**. Opening a profile restores its labels and saved
 speeds without enabling learning. Profiles without saved rates use the draft
@@ -314,10 +318,27 @@ CLI rate options retain their existing defaults and overrides. Learned changes
 are persisted separately in the game cache or the profile's `.learned.json`;
 use **Save profile as…** to export the current combined labels.
 
-Background tier learning is **off by default**, including when cached labels
-are restored. Enable it explicitly in Hot/Grey/Cold mode. Turning it off cancels
-queued replays while keeping existing labels. Rates and core selection remain
-active across an in-session restart.
+Tier learning is **off by default**, including when cached labels are restored.
+To record or extend a game's profile without preparing a JSON file, run:
+
+```sh
+cargo run -p doslet --release --locked -- \
+  --config games/Quake.toml --learn-speed-tiers \
+  --hot-mhz 500 --grey-mhz 266 --cold-mhz 8
+```
+
+The application restores the executable's cached labels, or starts an untrained
+profile, and saves updates in the per-game cache. `--speed-tier-cache DIR`
+selects a different cache directory. Existing `--speed-tier-profile FILE.json`
+commands still work. Without rate overrides, recording retains cached rates;
+a new profile uses Hot/Grey/Cold at 500/133/8 MHz.
+
+When a learning window qualifies, guest execution and playback stop while the
+paired diagnostic replays run synchronously. New labels are installed before
+execution resumes. No snapshots queue up, and the pause does not become guest
+catch-up time. A replay can take up to 120 host seconds; failures retain the
+existing labels. Turning learning off prevents subsequent replays. Rates and
+core selection remain active across an in-session restart.
 
 In speed-tier mode, CPU activity is measured against the Grey throughput budget
 for a recent 250-ms guest-time window. Each executed scheduling unit costs four

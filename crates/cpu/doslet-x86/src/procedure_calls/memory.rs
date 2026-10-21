@@ -11,8 +11,10 @@
 //! mappings and write-invalidation requirements before each instruction's first
 //! effect, or preflight the entire finite procedure before any effect.
 //! Unsupported operations and unavailable memory exit before that
-//! instruction, preserving an exact completed prefix. No devices, ports,
-//! segment/control/FPU changes, mode changes or internal guest CALLs are admitted.
+//! instruction, preserving an exact completed prefix. Ports, segment/control
+//! changes, mode changes and internal guest CALLs are excluded. An explicitly
+//! admitted coprocessor backend stages its small result and commits through
+//! `finish_memory_procedure` after the scalar prefix has passed validation.
 //!
 //! A backend error or malformed result is fatal for this invocation: RAM may
 //! already contain committed stores although CPU state has not been committed.
@@ -107,7 +109,20 @@ pub trait MemoryProcedureBus: MemoryBus {
         function_id: u32,
         cpu: &Cpu,
     ) -> Result<MemoryProcedureResult, Self::Error>;
+
+    /// Commit any small coprocessor result after the CPU has validated the
+    /// returned scalar prefix. Failure must leave the coprocessor unchanged.
+    /// Scalar backends have no coprocessor state to transfer.
+    fn finish_memory_procedure(
+        &mut self,
+        _fpu: Option<&mut MemoryProcedureFpu>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
+
+/// Coprocessor state borrowed only while committing a validated procedure.
+pub type MemoryProcedureFpu = doslet_x87::X87;
 
 /// State after an exact prefix of completed instructions. A side exit points to
 /// the first instruction still to interpret; completion includes the real RET.
@@ -299,6 +314,9 @@ impl Cpu {
         if let Some(reason) = invalid {
             return Err(MemoryProcedureError::InvalidResult(reason));
         }
+
+        bus.finish_memory_procedure(self.fpu.as_mut())
+            .map_err(MemoryProcedureError::Backend)?;
 
         // Only small architectural values commit here. RAM already reflects
         // the backend's completed prefix, including stack stores and the RET.

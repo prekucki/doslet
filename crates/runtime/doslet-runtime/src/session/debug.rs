@@ -110,6 +110,31 @@ impl Session {
         }
         observation.instruction
     }
+
+    /// Observe one scheduling unit while preserving the configured DPMI mode.
+    /// Unlike `debug_observed_step`, direct services remain direct; a service
+    /// or IRQ-only step can have no CPU instruction. REP iterations are separate
+    /// scheduling units. This is a diagnostic path, not a timing benchmark.
+    /// Disable idle/analyzer policies and compiled execution before using it.
+    /// Pending code-patch plans require ordinary `advance` to apply them first.
+    /// Captured entries can fault; their presence does not prove retirement.
+    /// Callers must drain audio and check `status` just as for `advance`.
+    pub fn debug_observed_step_configured(&mut self) -> doslet_pc::StepObservation {
+        let mut observation = doslet_pc::StepObservation::default();
+        if self.status != SessionStatus::Running || self.storage_wait {
+            return observation;
+        }
+        self.timeslice_yielded = false;
+        match self.execute_step_mode::<true, false>(1, Some(&mut observation)) {
+            Ok(steps) => self.steps += u64::from(steps),
+            Err(error) if self.dpmi_exception(&error) => self.steps += 1,
+            Err(error) => {
+                self.fault = Some(error);
+                self.status = SessionStatus::Faulted;
+            }
+        }
+        observation
+    }
     pub fn debug_code_bytes(&self, address: u32, length: u8) -> Option<&[u8]> {
         use doslet_bus::MemoryBus;
         self.machine.bus.code_bytes(address, length)

@@ -39,6 +39,7 @@ impl State for PcMachine {
             memory_wait_sites: None,
             memory_wait_steps: 0,
             batch_yield_ip: None,
+            borrowed_interpreter_bus: !cfg!(target_arch = "wasm32"),
             #[cfg(feature = "wasm-procedures")]
             wasm_procedures: None,
         };

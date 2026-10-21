@@ -34,7 +34,7 @@ use crate::{
     finite::{Finite, Rounded},
 };
 
-const LIMIT: u32 = 448;
+pub(super) const LIMIT: u32 = 448;
 /// Fast arithmetic results, so tests can check that they exercised the path.
 #[cfg(test)]
 static HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -49,7 +49,7 @@ const NATIVE: bool = cfg!(any(
 
 /// PC=24 or PC=53 with every exception masked.
 #[inline(always)]
-fn precision(control: u16) -> Option<u32> {
+pub(super) fn precision(control: u16) -> Option<u32> {
     if !NATIVE || control & 0x3F != 0x3F {
         return None;
     }
@@ -62,7 +62,7 @@ fn precision(control: u16) -> Option<u32> {
 
 /// The exact binary64 value of a retained register in the fast domain.
 #[inline(always)]
-fn exact(value: Finite) -> Option<f64> {
+pub(super) fn exact(value: Finite) -> Option<f64> {
     if value.mantissa == 0 {
         return Some(signed_zero(value.negative));
     }
@@ -81,7 +81,7 @@ fn exact(value: Finite) -> Option<f64> {
 
 /// A real32/64 memory operand that is zero or normal within `LIMIT`.
 #[inline(always)]
-fn real(bits: u64, single: bool) -> Option<f64> {
+pub(super) fn real(bits: u64, single: bool) -> Option<f64> {
     if single {
         let bits = bits as u32;
         let exponent = (bits >> 23) & 0xFF;
@@ -247,6 +247,24 @@ fn needs_error(s: f64, precision: u32) -> bool {
 /// 5 b − a, 6 a / b, 7 b / a. None for a zero divisor.
 #[inline(always)]
 fn arithmetic(a: f64, b: f64, operation: u8, control: u16, precision: u32) -> Option<Rounded> {
+    let (value, toward) = arithmetic_components(a, b, operation, control, precision)?;
+    Some(if value == 0.0 {
+        zero(value.is_sign_negative())
+    } else {
+        round(value, toward, control, precision)
+    })
+}
+
+/// RN53 of the exact result and the exact residual's sign. Both the existing
+/// retained-state path and the local PC24 path use these transformations.
+#[inline(always)]
+pub(super) fn arithmetic_components(
+    a: f64,
+    b: f64,
+    operation: u8,
+    control: u16,
+    precision: u32,
+) -> Option<(f64, i32)> {
     let (a, b, operation) = match operation {
         5 => (b, a, 4),
         7 => (b, a, 6),
@@ -258,23 +276,23 @@ fn arithmetic(a: f64, b: f64, operation: u8, control: u16, precision: u32) -> Op
             let b = if operation == 4 { -b } else { b };
             if a == 0.0 && b == 0.0 {
                 let (left, right) = (a.is_sign_negative(), b.is_sign_negative());
-                return Some(zero(if left == right { left } else { down }));
+                return Some((signed_zero(if left == right { left } else { down }), 0));
             }
             let s = a + b;
             if s == 0.0 {
                 // Exact cancellation of nonzero operands; no underflow here.
-                return Some(zero(down));
+                return Some((signed_zero(down), 0));
             }
             let toward = if needs_error(s, precision) {
                 sign(two_sum(a, b).1)
             } else {
                 0
             };
-            round(s, toward, control, precision)
+            (s, toward)
         }
         1 => {
             if a == 0.0 || b == 0.0 {
-                return Some(zero(a.is_sign_negative() != b.is_sign_negative()));
+                return Some((signed_zero(a.is_sign_negative() != b.is_sign_negative()), 0));
             }
             let p = a * b;
             let toward = if needs_error(p, precision) {
@@ -282,14 +300,14 @@ fn arithmetic(a: f64, b: f64, operation: u8, control: u16, precision: u32) -> Op
             } else {
                 0
             };
-            round(p, toward, control, precision)
+            (p, toward)
         }
         6 => {
             if b == 0.0 {
                 return None;
             }
             if a == 0.0 {
-                return Some(zero(a.is_sign_negative() != b.is_sign_negative()));
+                return Some((signed_zero(a.is_sign_negative() != b.is_sign_negative()), 0));
             }
             let q = a / b;
             let toward = if needs_error(q, precision) {
@@ -308,7 +326,7 @@ fn arithmetic(a: f64, b: f64, operation: u8, control: u16, precision: u32) -> Op
             } else {
                 0
             };
-            round(q, toward, control, precision)
+            (q, toward)
         }
         _ => return None,
     })

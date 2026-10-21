@@ -2,12 +2,9 @@
 use crate::speed_tiers::{Node, Profile, Tier};
 use doslet_runtime::{Session, SessionStatus, session::WorkingState};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::{self, JoinHandle},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -15,15 +12,6 @@ type Key = (u32, bool);
 const WINDOW: Duration = Duration::from_secs(1);
 const MAX_NODES: usize = 100_000;
 const MAX_JOB: Duration = Duration::from_secs(120);
-const MAX_PENDING: usize = 4;
-
-struct Pending {
-    snapshot: WorkingState,
-    epoch: u64,
-    pc: u32,
-    nanos: u64,
-}
-
 pub(super) struct ResultSet {
     epoch: u64,
     pub nodes: BTreeMap<Key, Node>,
@@ -32,19 +20,7 @@ pub(super) struct ResultSet {
     #[cfg(test)]
     direct_calls: [u64; 2],
 }
-struct Job {
-    cancel: Arc<AtomicBool>,
-    thread: Option<JoinHandle<Result<ResultSet, String>>>,
-}
-impl Drop for Job {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
-}
-
 pub(super) struct Learner {
-    job: Option<Job>,
-    pending: VecDeque<Pending>,
     epoch: u64,
     previous: [u64; 4],
     sampled: Instant,
@@ -59,8 +35,6 @@ pub(super) struct Learner {
 impl Default for Learner {
     fn default() -> Self {
         Self {
-            job: None,
-            pending: VecDeque::new(),
             epoch: 0,
             previous: [0; 4],
             sampled: Instant::now(),
@@ -76,24 +50,34 @@ impl Default for Learner {
 }
 impl Learner {
     pub fn running(&self) -> bool {
-        self.job.is_some()
+        false
     }
     pub fn pending(&self) -> usize {
-        self.pending.len()
+        0
     }
     pub fn cancel(&mut self) {
-        if let Some(job) = &self.job {
-            job.cancel.store(true, Ordering::Relaxed);
-        }
         self.epoch = 0;
-        self.pending.clear();
     }
+    #[cfg(test)]
     pub fn maintain(
         &mut self,
         session: &mut Session,
         profile: &mut Profile,
         grey_mhz: u16,
     ) -> bool {
+        self.maintain_with_pause(session, profile, grey_mhz, || {})
+    }
+    pub fn maintain_with_pause(
+        &mut self,
+        session: &mut Session,
+        profile: &mut Profile,
+        grey_mhz: u16,
+        before_replay: impl FnOnce(),
+    ) -> bool {
+        // Paused maintenance must not consume the fresh-entry capture.
+        if session.status() != SessionStatus::Running {
+            return false;
+        }
         let new_epoch = self.epoch != session.epoch();
         let startup = new_epoch && session.steps() == 0;
         if new_epoch {
@@ -104,56 +88,7 @@ impl Learner {
             self.backoff = WINDOW;
             self.next = Instant::now();
         }
-        if self
-            .job
-            .as_ref()
-            .is_some_and(|j| j.thread.as_ref().unwrap().is_finished())
-        {
-            let mut job = self.job.take().unwrap();
-            let cancelled = job.cancel.load(Ordering::Relaxed);
-            let handle = job.thread.take().unwrap();
-            match handle
-                .join()
-                .unwrap_or_else(|_| Err("profiling worker panicked".into()))
-            {
-                Ok(result) if !cancelled && result.epoch == session.epoch() => {
-                    let changed = apply(profile, session, result.nodes);
-                    self.changes += changed as u64;
-                    if result.second_skipped {
-                        self.skipped += 1;
-                        eprintln!(
-                            "[INFO doslet] tier learning: window already coloured; skipped second replay ({} skipped)",
-                            self.skipped
-                        );
-                    } else {
-                        eprintln!(
-                            "[INFO doslet] tier learning: {} new HOT/COLD/IRQ labels in {:.2}s host time",
-                            changed, result.seconds
-                        );
-                    }
-                    self.backoff = if changed == 0 {
-                        (self.backoff * 2).min(Duration::from_secs(60))
-                    } else {
-                        WINDOW
-                    };
-                    self.next = Instant::now() + self.backoff;
-                    self.previous = session.executed_tier_counts();
-                    self.sampled = Instant::now();
-                    return changed != 0;
-                }
-                Ok(_) => {}
-                Err(_) if cancelled => {}
-                Err(error) => {
-                    eprintln!("[WARN doslet] tier learning discarded: {error}");
-                    self.next = Instant::now() + Duration::from_secs(30);
-                }
-            }
-        }
-        self.launch_pending(grey_mhz, profile);
-        // Pause stops new captures, but queued independent replays keep draining.
-        if session.status() != SessionStatus::Running {
-            return false;
-        }
+        // The caller cannot advance the guest until this synchronous call returns.
         let now = Instant::now();
         if !startup && now.duration_since(self.sampled) < WINDOW {
             return false;
@@ -164,10 +99,7 @@ impl Learner {
         self.sampled = now;
         let total: u64 = delta.iter().sum();
         self.grey_percent = 100.0 * delta[2] as f64 / total.max(1) as f64;
-        if self.pending.len() >= MAX_PENDING
-            || (!startup && (now < self.next || total < 10_000 || delta[2] <= total / 10))
-            || session.status() != SessionStatus::Running
-        {
+        if !startup && (now < self.next || total < 10_000 || delta[2] <= total / 10) {
             return false;
         }
         let start = Instant::now();
@@ -180,61 +112,85 @@ impl Learner {
             }
         };
         self.capture_micros = start.elapsed().as_micros() as u64;
-        self.pending.push_back(Pending {
-            snapshot,
-            epoch: session.epoch(),
-            pc: session.debug_pc(),
-            nanos: session.emulated_nanos(),
-        });
-        self.launch_pending(grey_mhz, profile);
-        false
-    }
-    fn launch_pending(&mut self, grey_mhz: u16, profile: &Profile) {
-        if self.job.is_some() {
-            return;
-        }
-        let Some(Pending {
-            snapshot,
-            epoch,
-            pc,
-            nanos,
-        }) = self.pending.pop_front()
-        else {
-            return;
-        };
-        let cancel = Arc::new(AtomicBool::new(false));
-        let token = cancel.clone();
+        before_replay();
+        let epoch = session.epoch();
         let low = grey_mhz.min(333);
-        // Capture settled labels when this job starts, after applying the previous
-        // result, rather than when its guest snapshot first entered the queue.
         let known = settled_labels(profile);
-        match thread::Builder::new()
+        eprintln!(
+            "[INFO doslet] tier learning #{}: guest execution stopped; paired 1s at {}/{} MHz; snapshot {} ns pc {:x}; capture {} us",
+            self.jobs + 1,
+            low,
+            low * 3,
+            session.emulated_nanos(),
+            session.debug_pc(),
+            self.capture_micros
+        );
+        // Diagnostic replays need a larger stack. Join immediately: there is no
+        // queued work and live execution stays stopped for the entire replay.
+        let worker = thread::Builder::new()
             .name("doslet-tier-profile".into())
             .stack_size(8 * 1024 * 1024)
             .spawn(move || {
-                profile_pair_known(snapshot, epoch, low, low * 3, 1_000_000_000, &token, &known)
-            }) {
-            Ok(thread) => {
-                self.jobs += 1;
-                self.job = Some(Job {
-                    cancel,
-                    thread: Some(thread),
-                });
-                eprintln!(
-                    "[INFO doslet] tier learning #{}: GREY {:.1}%, capture {} us, paired 1s at {}/{} MHz; snapshot {} ns pc {:x}; {} pending",
-                    self.jobs,
-                    self.grey_percent,
-                    self.capture_micros,
+                profile_pair_known(
+                    snapshot,
+                    epoch,
                     low,
                     low * 3,
-                    nanos,
-                    pc,
-                    self.pending.len()
-                );
+                    1_000_000_000,
+                    &AtomicBool::new(false),
+                    &known,
+                )
+            });
+        let result = match worker {
+            Ok(worker) => {
+                self.jobs += 1;
+                worker
+                    .join()
+                    .unwrap_or_else(|_| Err("profiling worker panicked".into()))
             }
+            Err(error) => Err(format!("cannot start tier learning: {error}")),
+        };
+        let changed = self.finish(session, profile, result);
+        eprintln!("[INFO doslet] tier learning: diagnostic complete; returning to guest execution");
+        changed
+    }
+    fn finish(
+        &mut self,
+        session: &Session,
+        profile: &mut Profile,
+        result: Result<ResultSet, String>,
+    ) -> bool {
+        match result {
+            Ok(result) if result.epoch == session.epoch() && result.epoch == self.epoch => {
+                let changed = apply(profile, session, result.nodes);
+                self.changes += changed as u64;
+                if result.second_skipped {
+                    self.skipped += 1;
+                    eprintln!(
+                        "[INFO doslet] tier learning: window already coloured; skipped second replay ({} skipped)",
+                        self.skipped
+                    );
+                } else {
+                    eprintln!(
+                        "[INFO doslet] tier learning: {} new HOT/COLD/IRQ labels in {:.2}s host time",
+                        changed, result.seconds
+                    );
+                }
+                self.backoff = if changed == 0 {
+                    (self.backoff * 2).min(Duration::from_secs(60))
+                } else {
+                    WINDOW
+                };
+                self.next = Instant::now() + self.backoff;
+                self.previous = session.executed_tier_counts();
+                self.sampled = Instant::now();
+                changed != 0
+            }
+            Ok(_) => false,
             Err(error) => {
-                eprintln!("[WARN doslet] cannot start tier learning: {error}");
+                eprintln!("[WARN doslet] tier learning discarded: {error}");
                 self.next = Instant::now() + Duration::from_secs(30);
+                false
             }
         }
     }
@@ -341,7 +297,6 @@ fn trace(
     let mut trace = Trace::default();
     let mut pcm = [doslet_pcm::EMPTY; 1024];
     let mut midi = [0; 1024];
-    let mut since_yield = Instant::now();
     let mut stalled = 0;
     let mut interrupts = Interrupts {
         // A fresh executable has executed no interrupt entry. Unlike arbitrary
@@ -426,11 +381,6 @@ fn trace(
         }
         while s.drain_pcm_timed(&mut pcm) != 0 {}
         while s.drain_midi(&mut midi) != 0 {}
-        // Keep the background replay below one saturated core; never delay live time.
-        if since_yield.elapsed() >= Duration::from_millis(2) {
-            thread::sleep(Duration::from_millis(2));
-            since_yield = Instant::now();
-        }
     }
     if s.audio_status().dsp.block_irq_deadline_misses > misses {
         return Err("replay missed an SB16 service deadline".into());
@@ -989,98 +939,133 @@ mod tests {
         assert_eq!(settled_labels(&p).len(), 1);
     }
 
-    #[test]
-    fn paused_guest_drains_existing_snapshots_without_capturing_or_advancing() {
-        let mut s = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
-        s.start();
-        s.pause();
-        let before = (s.steps(), s.emulated_nanos(), s.debug_pc());
-        let mut learner = Learner {
-            epoch: s.epoch(),
-            ..Default::default()
-        };
-        for _ in 0..2 {
-            learner.pending.push_back(Pending {
-                snapshot: s.capture_working_state().unwrap(),
-                epoch: s.epoch(),
-                pc: s.debug_pc(),
-                nanos: s.emulated_nanos(),
-            });
-        }
-        let mut profile = Profile::from_json(
+    fn empty_profile() -> Profile {
+        Profile::from_json(
             &serde_json::json!({"nodes":[],"unknown":"grey","irq_policy":"static-grey"}),
             None,
             false,
         )
-        .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            learner.maintain(&mut s, &mut profile, 1);
-            if !learner.running() && learner.pending() == 0 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "paused learner did not drain");
-            thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(learner.jobs, 2);
-        assert_eq!(learner.skipped, 1);
-        assert!(learner.changes > 0);
-        assert_eq!(s.status(), SessionStatus::Paused);
-        assert_eq!((s.steps(), s.emulated_nanos(), s.debug_pc()), before);
-        assert!(!learner.maintain(&mut s, &mut profile, 1));
-        assert_eq!(learner.jobs, 2);
-        assert_eq!(learner.pending(), 0);
+        .unwrap()
     }
 
     #[test]
-    fn transient_snapshot_queue_is_bounded_and_cancelled_with_epoch() {
-        let mut s = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
-        s.debug_disable_accelerations();
-        s.set_execution_tiers(Some(vec![]), [Some(500), Some(8), Some(100)])
-            .unwrap();
-        s.start();
-        s.advance(20000);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let token = cancel.clone();
-        let handle = thread::spawn(move || {
-            while !token.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err("cancelled".into())
-        });
+    fn synchronous_learning_finishes_before_return_without_advancing_live_guest() {
+        let mut session = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
+        session.start();
+        let before = (
+            session.steps(),
+            session.emulated_nanos(),
+            session.debug_pc(),
+        );
+        let mut learner = Learner::default();
+        let mut profile = empty_profile();
+        let mut pauses = 0;
+        assert!(learner.maintain_with_pause(&mut session, &mut profile, 1, || pauses += 1));
+        assert_eq!(pauses, 1);
+        assert_eq!(learner.jobs, 1);
+        assert!(learner.changes > 0);
+        assert!(!profile.nodes.is_empty());
+        assert!(!learner.running());
+        assert_eq!(learner.pending(), 0);
+        assert_eq!(session.status(), SessionStatus::Running);
+        assert_eq!(
+            (
+                session.steps(),
+                session.emulated_nanos(),
+                session.debug_pc()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn paused_guest_neither_captures_nor_resumes() {
+        let mut session = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
+        session.start();
+        session.pause();
+        let before = (
+            session.steps(),
+            session.emulated_nanos(),
+            session.debug_pc(),
+        );
+        let mut learner = Learner::default();
+        let mut profile = empty_profile();
+        assert!(
+            !learner.maintain_with_pause(&mut session, &mut profile, 1, || {
+                panic!("paused guest must not request an audio pause")
+            })
+        );
+        assert!(!learner.maintain(&mut session, &mut profile, 1));
+        assert_eq!(learner.jobs, 0);
+        assert_eq!(learner.capture_micros, 0);
+        assert!(profile.nodes.is_empty());
+        assert_eq!(session.status(), SessionStatus::Paused);
+        assert_eq!(
+            (
+                session.steps(),
+                session.emulated_nanos(),
+                session.debug_pc()
+            ),
+            before
+        );
+        session.start();
+        assert!(learner.maintain(&mut session, &mut profile, 1));
+        assert_eq!(learner.jobs, 1, "resume retains the fresh-entry capture");
+        assert_eq!(session.steps(), before.0);
+    }
+
+    #[test]
+    fn failed_or_stale_replays_do_not_change_live_state_or_labels() {
+        let session = Session::new(&[0x90, 0xeb, 0xfd]).unwrap();
+        let before = (
+            session.steps(),
+            session.emulated_nanos(),
+            session.debug_pc(),
+            session.status(),
+        );
         let mut learner = Learner {
-            epoch: s.epoch(),
-            job: Some(Job {
-                cancel: cancel.clone(),
-                thread: Some(handle),
-            }),
+            epoch: session.epoch(),
             ..Default::default()
         };
-        let mut p = Profile::from_json(
-            &serde_json::json!({"nodes":[],"unknown":"grey","irq_policy":"static-grey"}),
-            None,
-            false,
+        let mut profile = empty_profile();
+        let timeout = trace(
+            &session.capture_working_state().unwrap(),
+            1,
+            10_000_000,
+            &AtomicBool::new(false),
+            Instant::now() - MAX_JOB - Duration::from_secs(1),
+        )
+        .err()
+        .expect("expired replay must fail");
+        assert_eq!(timeout, "120s host limit");
+        for error in ["profiling worker panicked", timeout.as_str()] {
+            assert!(!learner.finish(&session, &mut profile, Err(error.into())));
+            assert!(learner.next > Instant::now());
+        }
+        let mut result = profile_pair(
+            session.capture_working_state().unwrap(),
+            session.epoch(),
+            1,
+            3,
+            10_000_000,
+            &AtomicBool::new(false),
         )
         .unwrap();
-        for _ in 0..MAX_PENDING + 2 {
-            learner.sampled = Instant::now() - WINDOW;
-            learner.previous = [0; 4];
-            assert!(!learner.maintain(&mut s, &mut p, 1));
-        }
-        assert_eq!(learner.pending(), MAX_PENDING);
+        assert!(!result.nodes.is_empty());
+        result.epoch = session.epoch().wrapping_add(1);
+        assert!(!learner.finish(&session, &mut profile, Ok(result)));
+        assert!(profile.nodes.is_empty());
+        assert_eq!(
+            (
+                session.steps(),
+                session.emulated_nanos(),
+                session.debug_pc(),
+                session.status()
+            ),
+            before
+        );
         learner.cancel();
-        assert!(learner.pending.is_empty());
-        assert!(cancel.load(Ordering::Relaxed));
-        let result = learner
-            .job
-            .take()
-            .unwrap()
-            .thread
-            .take()
-            .unwrap()
-            .join()
-            .unwrap();
-        assert!(result.is_err());
+        assert_eq!(learner.epoch, 0);
     }
     #[test]
     #[ignore = "local Heroes fixture, paired one-second replay"]

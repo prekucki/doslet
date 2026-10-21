@@ -60,6 +60,7 @@ fn machine(protected: bool, batched: bool, fast: bool) -> PcMachine {
     m.cpu.set_decode_cache(batched);
     m.cpu.set_x87_batching(batched);
     m.cpu.set_x87_fast_paths(fast);
+    m.cpu.set_selective_code_guards(batched);
     m
 }
 

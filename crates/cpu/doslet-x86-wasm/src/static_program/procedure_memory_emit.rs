@@ -61,6 +61,9 @@ impl VirtualRegisters {
                 | Operation::AluMemoryStore {
                     address, source, ..
                 } => slots = [a(address), s(source)],
+                Operation::X87(instruction) => {
+                    slots[0] = instruction.operation.address().and_then(a)
+                }
                 _ => {}
             }
             for addr in slots.into_iter().flatten() {
@@ -100,14 +103,14 @@ impl VirtualRegisters {
         }
     }
 
-    fn bind_address(&self, mut address: memory::MemoryAddress) -> memory::MemoryAddress {
+    pub(super) fn bind_address(&self, mut address: memory::MemoryAddress) -> memory::MemoryAddress {
         if address.scale & memory::VIRTUAL_DISPLACEMENT != 0 {
             address.displacement = self.local(address.displacement);
         }
         address
     }
 
-    fn bind(&self, op: Operation) -> Operation {
+    pub(super) fn bind(&self, op: Operation) -> Operation {
         if self.len == 0 {
             return op;
         }
@@ -233,8 +236,19 @@ impl VirtualRegisters {
                 address: self.bind_address(address),
                 width,
             },
+            Operation::X87(mut instruction) => {
+                if let Some(address) = instruction.operation.address() {
+                    instruction.operation = instruction
+                        .operation
+                        .with_address(self.bind_address(address));
+                }
+                Operation::X87(instruction)
+            }
             other => other,
         }
+    }
+    pub(super) fn locals_end(&self) -> u32 {
+        VREG_LOCAL_BASE + self.len as u32
     }
 }
 
@@ -309,9 +323,16 @@ pub(super) fn initialize(device_stores: bool) -> Function {
 }
 
 pub(super) fn initialize_with_vregs(device_stores: bool, vregs: &VirtualRegisters) -> Function {
+    initialize_with_x87(device_stores, vregs, false)
+}
+pub(super) fn initialize_with_x87(
+    device_stores: bool,
+    vregs: &VirtualRegisters,
+    x87: bool,
+) -> Function {
     // Match the shared region emitter's local identities and value types.
     // Only FRAME is a parameter. QUOTA/BUDGET are unused padding.
-    let mut f = Function::new([
+    let mut locals = alloc::vec![
         (10, ValType::I32),
         (2, ValType::I64),
         (5, ValType::I32),
@@ -320,7 +341,11 @@ pub(super) fn initialize_with_vregs(device_stores: bool, vregs: &VirtualRegister
             memory_emit::PROCEDURE_LOCAL_COUNT + 3 + vregs.len as u32,
             ValType::I32,
         ),
-    ]);
+    ];
+    if x87 {
+        super::procedure_x87_emit::append_locals(&mut locals);
+    }
+    let mut f = Function::new(locals);
     for i in 0..8 {
         load(&mut f, abi::GPR + i * 4, false);
         set(&mut f, GPR + i);

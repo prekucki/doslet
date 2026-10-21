@@ -280,9 +280,11 @@ mod tests {
 
     #[test]
     fn global_settings_round_trip_with_custom_presets() {
-        let mut settings = GlobalSettings::default();
-        settings.audio_mixer = "application".into();
-        settings.midi_output = "moont".into();
+        let mut settings = GlobalSettings {
+            audio_mixer: "application".into(),
+            midi_output: "moont".into(),
+            ..GlobalSettings::default()
+        };
         settings.input.deadzone_percent = 18;
         settings.presets.push(HardwarePreset {
             id: "fast-dos".into(),

@@ -583,6 +583,41 @@ fn observed_call_uses_real_instruction_without_changing_configured_mode() {
 }
 
 #[test]
+fn configured_observation_preserves_direct_services_and_step_state() {
+    let mut ordinary = prepared(Mode::Direct);
+    let mut observed = prepared(Mode::Direct);
+    for s in [&mut ordinary, &mut observed] {
+        s.machine.bus.write_u16(0x3001C, 0x0100).unwrap();
+        s.machine.bus.write_u16(0x30020, 0x202).unwrap();
+        s.machine.cpu.registers.set(Gpr16::Ax, 0x300);
+        s.machine.cpu.registers.set(Gpr16::Bx, 0x16);
+        s.machine.cpu.registers.set(Gpr16::Cx, 0);
+        s.machine.cpu.registers.set32(Gpr32::Edi, 0x30000);
+    }
+    let cs = ordinary.registers().cs;
+    let mut service_steps = 0;
+    for _ in 0..10 {
+        assert_eq!(ordinary.advance(1), 1);
+        let trace = observed.debug_observed_step_configured();
+        service_steps += usize::from(trace.instruction.is_none());
+        assert_eq!(observed.status(), SessionStatus::Running);
+        assert_eq!(ordinary.registers(), observed.registers());
+        assert_eq!(ordinary.eflags(), observed.eflags());
+        assert_eq!(ordinary.steps(), observed.steps());
+        assert_eq!(ordinary.emulated_nanos(), observed.emulated_nanos());
+        assert_eq!(ordinary.ram_view(0..0x90000), observed.ram_view(0..0x90000));
+        if ordinary.registers().cs == cs && ordinary.registers().ip == 0x20002 {
+            break;
+        }
+    }
+    assert_eq!(ordinary.registers().ip, 0x20002);
+    assert_eq!(observed.dpmi_stats().unwrap().direct, 1);
+    assert_eq!(observed.dpmi_stats().unwrap().reflected, 0);
+    assert_eq!(observed.dpmi.as_ref().unwrap().mode, Mode::Direct);
+    assert_eq!(service_steps, 1);
+}
+
+#[test]
 fn direct_services_charge_the_dispatch_label_with_weighted_timing() {
     for tier in 0..4 {
         let mut direct = prepared(Mode::Direct);

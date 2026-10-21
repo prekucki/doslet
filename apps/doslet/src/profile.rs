@@ -360,6 +360,9 @@ impl Cli {
                         spec.hardware.gameport |= global.gameport;
                     }
                 }
+                if self.learn_speed_tiers {
+                    spec.cpu_mode = Some(doslet_config::CpuMode::SpeedTiers);
+                }
                 if let Some(cpu_mode) = spec.cpu_mode {
                     match cpu_mode {
                         doslet_config::CpuMode::Adaptive => {

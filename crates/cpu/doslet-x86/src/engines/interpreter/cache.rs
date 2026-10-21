@@ -75,9 +75,10 @@ struct Entry {
 const BLOCK_CAPACITY: usize = 4096;
 pub(super) const BLOCK_INSTRUCTIONS: usize = 8;
 
-/// Consecutive decoded instructions up to the first control transfer, validated
-/// once per lookup. A block starting with an instruction that cannot be batched
-/// has `count == 0` and remembers that rejection against the same code check.
+/// Consecutive decoded instructions up to the first control transfer, repeated
+/// string or EIP wrap, validated once per lookup. Every successful nonfinal
+/// instruction falls through. A block starting with an instruction that cannot
+/// be batched has `count == 0` and remembers that rejection against its check.
 #[derive(Clone, Copy)]
 struct Block {
     /// Linear start address; `u32::MAX`, which is never RAM, marks a free slot.
@@ -167,7 +168,10 @@ struct EntryHint {
 /// Immutable registry and replaceable membership hints, allocated only when a
 /// machine installs entries. Hints depend on EIP membership, never code bytes.
 struct PreparedEntries {
+    /// Linear entry addresses: `base` plus each registered EIP.
     ips: Box<[u32]>,
+    /// The CS base the entries were registered for.
+    base: u32,
     hints: Box<[EntryHint; ENTRY_HINT_CAPACITY]>,
 }
 impl PreparedEntries {
@@ -215,6 +219,9 @@ pub(super) struct Cache {
     pub(super) x87: bool,
     /// Batched x87 forms use the exact binary64 fast paths of `doslet-x87`.
     pub(super) x87_fast: bool,
+    /// Skip intra-block code checks only after instructions without mutable bus
+    /// access. Kept selectable for identical-state interpreter comparisons.
+    selective_code_guards: bool,
     pub(super) profile: Option<crate::execution_tiers::ExecutionProfile>,
     #[cfg(feature = "profiling")]
     pub stats: DecodeCacheStats,
@@ -249,6 +256,7 @@ impl Default for Cache {
             enabled: true,
             x87: true,
             x87_fast: true,
+            selective_code_guards: cfg!(not(target_arch = "wasm32")),
             profile: None,
             #[cfg(feature = "profiling")]
             stats: DecodeCacheStats::default(),
@@ -745,9 +753,10 @@ impl Cache {
             code32: self.code32,
             ..Block::EMPTY
         };
-        // Block keys are linear, so annotate and split by linear addresses even
-        // in a non-flat CS. Only a flat-32 caller may act on these annotations;
-        // compatible CS contexts can therefore continue sharing the same block.
+        // Block keys are linear, as are the registered entries, so annotate and
+        // split by linear addresses in any CS. Only a 32-bit caller whose CS
+        // has the registered base may act on these annotations; compatible CS
+        // contexts can therefore continue sharing the same block.
         let entries = self
             .prepared_entries
             .as_ref()
@@ -820,7 +829,9 @@ impl Cache {
                     | Operation::JumpIndirect(_)
                     | Operation::Return(_)
                     | Operation::Loop { .. }
-            ) {
+                    | Operation::String { repeat: true, .. }
+            ) || ip.checked_add(end as u32).is_none()
+            {
                 break;
             }
         }
@@ -1423,7 +1434,10 @@ enum Source {
 #[derive(Default)]
 pub(super) struct Windows([[Option<Option<SegmentWindow>>; 2]; 6]);
 impl Windows {
-    #[inline]
+    // Prepared handlers know the operand width and access kind. Keep those
+    // constants at the call site instead of passing a seventh ABI argument.
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     fn linear<B: CpuBus>(
         &mut self,
         r: &Registers,
@@ -1472,6 +1486,13 @@ impl Windows {
 }
 
 impl Cpu {
+    /// Skip intra-block code validation after instructions that cannot access
+    /// the mutable bus. All memory reads, writes and fallback handlers retain
+    /// their checks. Selection happens once per interpreter batch.
+    pub fn set_selective_code_guards(&mut self, enabled: bool) {
+        self.decode_cache.selective_code_guards = enabled;
+    }
+
     /// Replace immutable flat-32 procedure-entry EIPs at a setup/batch boundary.
     /// Entries must be strictly increasing; returned indices retain this order.
     /// Invalid input preserves the previous registry and caches. Installation
@@ -1482,14 +1503,37 @@ impl Cpu {
         &mut self,
         sorted_entries: alloc::vec::Vec<u32>,
     ) -> Result<(), &'static str> {
+        self.set_prepared_entries_at(0, sorted_entries)
+    }
+
+    /// As [`Self::set_prepared_entries`], for 32-bit code whose CS has base
+    /// `code_base`, such as a DJGPP program's: entries are EIPs in that
+    /// segment. Decoded blocks, keyed by linear address, split at
+    /// `code_base + EIP`, and only a CS with this base uses the registry.
+    /// Entries whose linear address would wrap are rejected.
+    pub fn set_prepared_entries_at(
+        &mut self,
+        code_base: u32,
+        mut sorted_entries: alloc::vec::Vec<u32>,
+    ) -> Result<(), &'static str> {
         if sorted_entries.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err("prepared entries must be sorted and unique");
         }
         if sorted_entries.len() as u64 > u64::from(u32::MAX - 1) {
             return Err("too many prepared entries");
         }
+        if sorted_entries
+            .last()
+            .is_some_and(|&last| code_base.checked_add(last).is_none())
+        {
+            return Err("prepared entries wrap the linear address space");
+        }
+        for entry in &mut sorted_entries {
+            *entry += code_base;
+        }
         let entries = (!sorted_entries.is_empty()).then(|| PreparedEntries {
             ips: sorted_entries.into_boxed_slice(),
+            base: code_base,
             hints: alloc::vec![EntryHint { ip: 0, index: u32::MAX }; ENTRY_HINT_CAPACITY]
                 .into_boxed_slice()
                 .try_into()
@@ -1510,21 +1554,21 @@ impl Cpu {
     /// Cached registry membership at the current EIP, including when decoding
     /// is disabled. A result is a scheduling hint: the caller must still check
     /// source bytes and its complete execution/context contract before dispatch.
-    /// Only default-32-bit code with CS base zero uses registered flat EIPs.
+    /// Only default-32-bit code with the registered CS base uses the entries.
     pub fn prepared_entry_index(&mut self) -> Option<usize> {
-        self.decode_cache.prepared_entries.as_ref()?;
+        let base = self.decode_cache.prepared_entries.as_ref()?.base;
         if self.registers.protected != self.protected_mode() {
             return None;
         }
         let (window, cs) = self.decode_cache.code_context(&self.registers)?;
-        if !self.decode_cache.code32 || cs.base != 0 {
+        if !self.decode_cache.code32 || cs.base != base {
             return None;
         }
         window.address(self.registers.ip, 1)?;
         self.decode_cache
             .prepared_entries
             .as_mut()?
-            .index(self.registers.ip)
+            .index(base.wrapping_add(self.registers.ip))
     }
 
     /// Execute a bounded run of decoded ordinary-RAM instructions without the
@@ -1662,6 +1706,40 @@ impl Cpu {
         heads: [u32; 2],
         sorted_entries: &[u32],
     ) -> u32 {
+        if self.decode_cache.selective_code_guards {
+            self.interpret_batch_guard_mode::<B, YIELD, ENTRIES, PREPARED, COUNT, true>(
+                bus,
+                budget,
+                limit,
+                heads,
+                sorted_entries,
+            )
+        } else {
+            self.interpret_batch_guard_mode::<B, YIELD, ENTRIES, PREPARED, COUNT, false>(
+                bus,
+                budget,
+                limit,
+                heads,
+                sorted_entries,
+            )
+        }
+    }
+
+    fn interpret_batch_guard_mode<
+        B: CpuBus,
+        const YIELD: bool,
+        const ENTRIES: bool,
+        const PREPARED: bool,
+        const COUNT: bool,
+        const SELECTIVE: bool,
+    >(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        limit: impl FnOnce(&B) -> u32,
+        heads: [u32; 2],
+        sorted_entries: &[u32],
+    ) -> u32 {
         if budget < 2 || !self.batch_ready() || !self.decode_cache.enabled {
             return 0;
         }
@@ -1673,7 +1751,8 @@ impl Cpu {
             && self
                 .decode_cache
                 .context
-                .is_some_and(|context| context.cs.base == 0);
+                .zip(self.decode_cache.prepared_entries.as_ref())
+                .is_some_and(|(context, entries)| context.cs.base == entries.base);
         let budget = budget.min(BATCH_STEPS).min(limit(bus));
         let mut completed = 0;
         'blocks: while completed < budget {
@@ -1701,7 +1780,17 @@ impl Cpu {
             {
                 break;
             }
-            for position in 0..count {
+            // Block formation guarantees fixed fallthrough before the final
+            // instruction. Bound the loop once; its final executed instruction
+            // returns to lookup, which validates its actual successor's code.
+            // The unoptimized policy retains the per-instruction reference
+            // checks for paired comparisons.
+            let run = if SELECTIVE {
+                count.min((budget - completed) as usize)
+            } else {
+                count
+            };
+            for position in 0..run {
                 if completed != 0
                     && ((YIELD && heads.contains(&self.registers.ip))
                         || (ENTRIES && entry_head == Some(self.registers.ip)))
@@ -1709,10 +1798,13 @@ impl Cpu {
                     break 'blocks;
                 }
                 let instruction = self.block_instruction(index, position);
-                let next = self
-                    .registers
-                    .ip
-                    .wrapping_add(u32::from(instruction.length()));
+                let next = if SELECTIVE {
+                    0
+                } else {
+                    self.registers
+                        .ip
+                        .wrapping_add(u32::from(instruction.length()))
+                };
                 if !self.try_prepared(
                     bus,
                     &mut windows,
@@ -1726,12 +1818,14 @@ impl Cpu {
                     self.execution_counts[instruction.tier()] += 1;
                 }
                 completed += 1;
-                // A taken branch, a repeated string or the budget ends the run;
-                // a store to the same code page revalidates via virtual registers
-                // before flushing the remaining instructions in this block.
-                if completed == budget
-                    || self.registers.ip != next
-                    || (!bus.code_valid(&check)
+                // Before another instruction in this block, revalidate code
+                // after any bus access that could change it. Operand-only SMC
+                // retains instruction lengths and block termination; any other
+                // change returns to lookup before executing the cached suffix.
+                if (SELECTIVE && position + 1 == run)
+                    || (!SELECTIVE && (completed == budget || self.registers.ip != next))
+                    || ((!SELECTIVE || instruction.accesses_bus())
+                        && !bus.code_valid(&check)
                         && !self
                             .decode_cache
                             .revalidate_in_batch(index, bus, &mut check))
@@ -2170,7 +2264,8 @@ impl Cpu {
 
     /// The validated block at the current IP: its slot, instruction count and
     /// code check. Batched instructions cannot change the CS context.
-    #[inline]
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     pub(super) fn batch_block<B: CpuBus>(
         &mut self,
         code: SegmentWindow,
@@ -3514,6 +3609,8 @@ mod tests {
     use crate::Gpr32;
     use doslet_bus::{BusError, MemoryBus, PortBus};
 
+    mod loop_tests;
+
     #[test]
     fn compact_blocks_keep_decoded_ir_off_the_hot_table() {
         assert_eq!(core::mem::size_of::<Prepared>(), 16);
@@ -3588,6 +3685,111 @@ mod tests {
         }
     }
 
+    struct CheckedBus {
+        flat: Flat,
+        checks: core::cell::Cell<u32>,
+        /// Only the low 256-byte code region is cacheable; data has its own
+        /// storage generation so ordinary string writes do not stale code.
+        code_generation: u64,
+        /// A permitted batch-memory read side effect: change a later opcode.
+        patch_on_read: bool,
+    }
+    impl CheckedBus {
+        fn new(code: &[u8]) -> Self {
+            let mut flat = Flat {
+                ram: [0; 0x200],
+                generation: 0,
+            };
+            flat.ram[..code.len()].copy_from_slice(code);
+            Self {
+                flat,
+                checks: core::cell::Cell::new(0),
+                code_generation: 0,
+                patch_on_read: false,
+            }
+        }
+    }
+    impl MemoryBus for CheckedBus {
+        fn read_u8(&mut self, address: u32) -> Result<u8, BusError> {
+            let byte = self.flat.read_u8(address)?;
+            if self.patch_on_read && address == 0x100 {
+                self.patch_on_read = false;
+                self.flat.write_u8(6, 0xBA)?; // MOV EDX, imm32 replaces MOV ECX.
+                self.code_generation += 1;
+            }
+            Ok(byte)
+        }
+        fn write_u8(&mut self, address: u32, value: u8) -> Result<(), BusError> {
+            self.flat.write_u8(address, value)?;
+            self.code_generation += u64::from(address < 0x100);
+            Ok(())
+        }
+        fn code_check(&self, address: u32, length: u8) -> Option<CodeCheck> {
+            (address as usize + usize::from(length) <= 0x100).then_some(CodeCheck {
+                space: 1 << 32,
+                pages: [0; 2],
+                generations: [self.code_generation; 2],
+            })
+        }
+        fn code_valid(&self, check: &CodeCheck) -> bool {
+            self.checks.set(self.checks.get() + 1);
+            check.generations[0] == self.code_generation
+        }
+        fn code_bytes(&self, address: u32, length: u8) -> Option<&[u8]> {
+            let start = address as usize;
+            self.flat
+                .ram
+                .get(start..(start + usize::from(length)).min(0x100))
+        }
+        fn is_batch_memory(&self, address: u32, length: u8) -> bool {
+            self.flat.is_batch_memory(address, length)
+        }
+    }
+    impl PortBus for CheckedBus {
+        fn read_port_u8(&mut self, port: u16) -> Result<u8, BusError> {
+            self.flat.read_port_u8(port)
+        }
+        fn write_port_u8(&mut self, port: u16, value: u8) -> Result<(), BusError> {
+            self.flat.write_port_u8(port, value)
+        }
+    }
+
+    #[test]
+    fn selective_code_guards_skip_only_bus_free_instructions() {
+        let run = |selective| {
+            let mut bus = CheckedBus::new(&[0x40; 8]); // INC EAX eight times.
+            let mut cpu = prepared_cpu();
+            cpu.set_selective_code_guards(selective);
+            assert_eq!(cpu.interpret_batch(&mut bus, 8, |_| 8), 8);
+            assert_eq!(cpu.registers.ip, 8);
+            assert_eq!(cpu.registers.get32(Gpr32::Eax), 8);
+            bus.checks.get()
+        };
+        assert_eq!(run(false) - run(true), 7);
+
+        // Both reads and stores can change a following opcode. Test an opcode
+        // change, not an operand slot eligible for virtual-register updates.
+        for selective in [false, true] {
+            for read in [false, true] {
+                let code = if read {
+                    [0x8B, 0x05, 0, 1, 0, 0, 0xB9, 9, 0, 0, 0]
+                } else {
+                    [0x89, 0x1D, 6, 0, 0, 0, 0xB9, 1, 0, 0, 0]
+                };
+                let mut bus = CheckedBus::new(&code);
+                bus.patch_on_read = read;
+                let mut cpu = prepared_cpu();
+                cpu.set_selective_code_guards(selective);
+                cpu.registers.set32(Gpr32::Ebx, 0x0000_09BA);
+                assert_eq!(cpu.interpret_batch(&mut bus, 2, |_| 2), 2);
+                assert_eq!(cpu.registers.ip, 11);
+                assert_eq!(cpu.registers.get32(Gpr32::Edx), 9);
+                assert_eq!(cpu.registers.get32(Gpr32::Ecx), 0);
+                assert!(bus.checks.get() != 0);
+            }
+        }
+    }
+
     fn prepared_cpu() -> Cpu {
         let mut cpu = Cpu::default();
         cpu.set_protected_mode(true);
@@ -3643,6 +3845,46 @@ mod tests {
         assert_eq!(cpu.registers.ip, 6);
         assert_eq!(cpu.prepared_entry_index(), Some(1));
         assert_eq!(cpu.registers.get32(Gpr32::Eax), 14);
+    }
+
+    #[test]
+    fn prepared_entries_follow_their_code_base() {
+        let mut bus = Flat {
+            ram: [0x40; 0x200],
+            generation: 0,
+        };
+        let mut cpu = prepared_cpu();
+        let mut cs = cpu.registers.segment_cache(SegmentRegister::Cs);
+        cs.base = 0x100;
+        cpu.registers.set_segment(SegmentRegister::Cs, cs);
+        // Flat entries never match a CS with another base.
+        cpu.set_prepared_entries(alloc::vec![3]).unwrap();
+        cpu.registers.ip = 3;
+        assert_eq!(cpu.prepared_entry_index(), None);
+        cpu.set_prepared_entries_at(0x100, alloc::vec![3, 6])
+            .unwrap();
+        assert_eq!(cpu.prepared_entry_index(), Some(0));
+        cpu.registers.ip = 0;
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            3
+        );
+        assert_eq!(cpu.registers.ip, 3);
+        // Blocks are keyed and split by linear address.
+        assert!(cpu.decode_cache.blocks[0x103].prepared_entry);
+        assert_eq!(
+            cpu.interpret_batch_until_prepared_entry(&mut bus, 32, |_| 32),
+            3
+        );
+        assert_eq!(cpu.prepared_entry_index(), Some(1));
+        // The same EIP in a flat CS is a different linear address.
+        cs.base = 0;
+        cpu.registers.set_segment(SegmentRegister::Cs, cs);
+        assert_eq!(cpu.prepared_entry_index(), None);
+        assert_eq!(
+            cpu.set_prepared_entries_at(u32::MAX - 4, alloc::vec![3, 6]),
+            Err("prepared entries wrap the linear address space")
+        );
     }
 
     #[test]
@@ -4018,6 +4260,44 @@ mod tests {
             assert_eq!(cpu.decode_cache.stats.block_misses, 1);
             assert_eq!(cpu.decode_cache.stats.block_stale, 0);
             assert_eq!(cpu.decode_cache.stats.block_hits, 1);
+        }
+    }
+
+    #[test]
+    fn self_modified_x87_displacements_map_to_virtual_registers() {
+        for selective in [false, true] {
+            let mut bus = Flat {
+                ram: [0x90; 0x200],
+                generation: 0,
+            };
+            let code = [
+                0x89, 0x0D, 0x08, 0x00, 0x00, 0x00, // mov [0x08], ecx (patch FLD disp32)
+                0xD9, 0x05, 0x78, 0x56, 0x34, 0x12, // fld dword [0x12345678]
+                0xD9, 0x1D, 0x90, 0x00, 0x00, 0x00, // fstp dword [0x90]
+            ];
+            bus.ram[..code.len()].copy_from_slice(&code);
+            bus.ram[0x80..0x84].copy_from_slice(&1.5f32.to_le_bytes());
+            bus.ram[0x84..0x88].copy_from_slice(&2.5f32.to_le_bytes());
+            let mut cpu = prepared_cpu().with_x87();
+            cpu.set_selective_code_guards(selective);
+            for (source, value) in [(0x80, 1.5f32), (0x84, 2.5)] {
+                cpu.registers.ip = 0;
+                cpu.registers.set32(Gpr32::Ecx, source);
+                let info = allocation_counter::measure(|| {
+                    assert_eq!(cpu.interpret_batch(&mut bus, 3, |_| 3), 3);
+                });
+                if source == 0x84 {
+                    assert_eq!(info.count_total, 0);
+                }
+                assert_eq!(cpu.registers.ip, 0x12);
+                assert_eq!(bus.ram[0x90..0x94], value.to_le_bytes());
+            }
+            #[cfg(feature = "profiling")]
+            {
+                assert_eq!(cpu.decode_cache.stats.block_misses, 1);
+                assert_eq!(cpu.decode_cache.stats.block_stale, 0);
+                assert_eq!(cpu.decode_cache.stats.block_hits, 1);
+            }
         }
     }
 }

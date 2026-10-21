@@ -15,6 +15,7 @@ fn at(object_number: u32, offset: u32) -> ObjectAddress {
 
 fn image(objects: &[(&[u8], bool)]) -> SymbolicImage {
     SymbolicImage {
+        format: crate::ImageFormat::Le,
         header: LeHeader {
             location: LeLocation {
                 container_offset: 0,

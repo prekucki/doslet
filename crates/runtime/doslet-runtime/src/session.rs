@@ -257,7 +257,11 @@ impl Session {
                 command_tail
                     .get(offset)
                     .copied()
-                    .unwrap_or(if offset == command_tail.len() { 0x0D } else { 0 }),
+                    .unwrap_or(if offset == command_tail.len() {
+                        0x0D
+                    } else {
+                        0
+                    }),
             )?;
         }
         for (offset, byte) in program.iter().enumerate() {
@@ -570,6 +574,10 @@ impl Session {
     pub fn set_decode_cache(&mut self, enabled: bool) {
         self.machine.cpu.set_decode_cache(enabled);
     }
+    /// Compare selective interpreter code guards with checking after every instruction.
+    pub fn set_selective_code_guards(&mut self, enabled: bool) {
+        self.machine.cpu.set_selective_code_guards(enabled);
+    }
     /// Reference comparisons can keep x87 instructions out of batches.
     pub fn set_x87_batching(&mut self, enabled: bool) {
         self.machine.cpu.set_x87_batching(enabled);
@@ -577,6 +585,11 @@ impl Session {
     /// Reference comparisons can disable the exact binary64 x87 fast paths.
     pub fn set_x87_fast_paths(&mut self, enabled: bool) {
         self.machine.cpu.set_x87_fast_paths(enabled);
+    }
+    /// Transient RAM-only interpreter bus, enabled by default on native targets.
+    /// Saved states omit this policy; disable it for reference comparisons.
+    pub fn set_borrowed_interpreter_bus(&mut self, enabled: bool) {
+        self.machine.set_borrowed_interpreter_bus(enabled);
     }
     pub fn set_dynamic_core(&mut self, enabled: bool) {
         self.machine.cpu.set_dynamic_core(enabled);
@@ -981,6 +994,19 @@ impl Session {
             .install_wasm_procedures_cached(wasm, bindings, cache)
     }
 
+    /// Replace installed procedures, for example after the program patched
+    /// its code; memory moves once to the new module.
+    #[cfg(all(feature = "wasm-procedures", not(target_arch = "wasm32")))]
+    pub fn replace_wasm_procedures_cached(
+        &mut self,
+        wasm: &[u8],
+        bindings: alloc::vec::Vec<doslet_pc::wasm_procedures::Binding>,
+        cache: &mut dyn doslet_pc::wasm_procedures::CompiledCache,
+    ) -> Result<(), alloc::string::String> {
+        self.machine
+            .replace_wasm_procedures_cached(wasm, bindings, cache)
+    }
+
     #[cfg(feature = "wasm-procedures")]
     pub fn install_interpreted_procedure_boundaries(
         &mut self,
@@ -1011,6 +1037,44 @@ impl Session {
     }
 
     #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedure_entry_ip(&self, index: usize) -> Option<u32> {
+        self.machine.wasm_procedure_entry_ip(index)
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedure_entry_stats(
+        &self,
+        index: usize,
+    ) -> Option<doslet_pc::wasm_procedures::ProcedureEntryStats> {
+        self.machine.wasm_procedure_entry_stats(index)
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedure_entry_enabled(&self, index: usize) -> Option<bool> {
+        self.machine.wasm_procedure_entry_enabled(index)
+    }
+
+    #[cfg(feature = "wasm-procedures")]
+    pub fn set_wasm_procedure_entry_enabled(
+        &mut self,
+        index: usize,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        self.machine
+            .set_wasm_procedure_entry_enabled(index, enabled)
+    }
+
+    /// Apply a complete admission selection in ascending entry-EIP order.
+    /// Compiled functions and per-entry execution totals remain installed.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn set_wasm_procedure_entries_enabled(
+        &mut self,
+        enabled: &[bool],
+    ) -> Result<(), &'static str> {
+        self.machine.set_wasm_procedure_entries_enabled(enabled)
+    }
+
+    #[cfg(feature = "wasm-procedures")]
     pub fn wasm_procedure_copy_tier_entries(&self) -> impl Iterator<Item = u32> + '_ {
         self.machine.wasm_procedure_copy_tier_entries()
     }
@@ -1019,6 +1083,26 @@ impl Session {
     #[cfg(feature = "wasm-procedures")]
     pub fn set_wasm_procedures_suspended(&mut self, suspended: bool) -> Result<(), &'static str> {
         self.machine.set_wasm_procedures_suspended(suspended)
+    }
+
+    /// Remove installed procedures; RAM and VRAM return to their ordinary
+    /// owners, which interpret faster than a suspended plan's shared memory.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn uninstall_wasm_procedures(&mut self) -> Result<(), &'static str> {
+        self.machine.uninstall_wasm_procedures()
+    }
+
+    /// The code segment installed procedures are bound to.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedure_code_segment(&self) -> Option<doslet_pc::wasm_procedures::CodeSegment> {
+        self.machine.wasm_procedure_code_segment()
+    }
+
+    /// Move installed procedures' source proofs with their code segment's new
+    /// base, keeping the compiled module.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn rebase_wasm_procedures(&mut self, base: u32) -> Result<(), alloc::string::String> {
+        self.machine.rebase_wasm_procedures(base)
     }
 
     /// Procedures are installed and not suspended.
@@ -1031,6 +1115,12 @@ impl Session {
     #[cfg(feature = "wasm-procedures")]
     pub fn wasm_procedures_installable(&self) -> bool {
         self.machine.wasm_procedures_installable()
+    }
+
+    /// Installed procedures can be replaced at this batch boundary.
+    #[cfg(feature = "wasm-procedures")]
+    pub fn wasm_procedures_replaceable(&self) -> bool {
+        self.machine.wasm_procedures_replaceable()
     }
 
     #[cfg(feature = "wasm-procedures")]
@@ -1068,15 +1158,15 @@ impl Session {
         }
     }
     fn execute_step(&mut self, budget: u32) -> Result<u32, RuntimeError> {
-        self.execute_step_mode::<false>(budget, None)
+        self.execute_step_mode::<false, false>(budget, None)
     }
     fn execute_step_observed(
         &mut self,
         observation: &mut doslet_pc::StepObservation,
     ) -> Result<u32, RuntimeError> {
-        self.execute_step_mode::<true>(1, Some(observation))
+        self.execute_step_mode::<true, true>(1, Some(observation))
     }
-    fn execute_step_mode<const OBSERVE: bool>(
+    fn execute_step_mode<const OBSERVE: bool, const REFLECT_DPMI: bool>(
         &mut self,
         budget: u32,
         mut observation: Option<&mut doslet_pc::StepObservation>,
@@ -1093,14 +1183,15 @@ impl Session {
         };
         self.apply_input();
         if self.continuation.is_none() && self.dpmi.is_some() {
-            // Observed execution needs the actual real-mode instruction and
-            // its bus trace. Retain the configured mode for subsequent calls.
+            // The bus-tracing analyzer needs the actual real-mode instruction.
+            // Configured diagnostic replays instead retain direct services so
+            // that their instruction stream matches ordinary execution.
             let mode = self.dpmi.as_ref().unwrap().mode;
-            if OBSERVE {
+            if REFLECT_DPMI {
                 self.dpmi.as_mut().unwrap().mode = dpmi::Mode::Reflect;
             }
             let result = self.dpmi_dispatch();
-            if OBSERVE {
+            if REFLECT_DPMI {
                 self.dpmi.as_mut().unwrap().mode = mode;
             }
             result?;
@@ -2612,7 +2703,8 @@ mod tests {
             0xB8, 0x00, 0x00, // MOV AX,0
             0xCD, 0x65, // INT 65h -> AL = 4
             0xCD, 0x10, // INT 10h AX=0004 (CGA 320x200x4)
-            0xB4, 0x0B, 0xBB, 0x00, 0x01, 0xCD, 0x10, // INT 10h AH=0Bh BH=1 BL=0 (green/red/brown palette)
+            0xB4, 0x0B, 0xBB, 0x00, 0x01, 0xCD,
+            0x10, // INT 10h AH=0Bh BH=1 BL=0 (green/red/brown palette)
             0xB8, 0x41, 0x0E, 0xBB, 0x02, 0x00, 0xCD, 0x10, // INT 10h AH=0Eh 'A' color 2
             0xB4, 0x0F, 0xCD, 0x10, // INT 10h AH=0Fh -> AX = 2804h
             0x89, 0xC1, // MOV CX,AX
@@ -2624,12 +2716,20 @@ mod tests {
         session.advance(500);
         assert_eq!(session.status(), SessionStatus::Exited(0));
         assert_eq!(session.registers().get(Gpr16::Cx), 0x2804);
-        assert_eq!(alloc::format!("{}", session.video_mode_label()), "320×200×2 CGA");
+        assert_eq!(
+            alloc::format!("{}", session.video_mode_label()),
+            "320×200×2 CGA"
+        );
         let frame = session.presentation_frame();
         assert_eq!((frame.width(), frame.height()), (320, 200));
         let mut rgba = vec![0u8; 320 * 200 * 4];
         frame.write_rgba(&mut rgba).unwrap();
-        assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[..3] != [0, 0, 0]));
+        assert!(
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[..3] != [0, 0, 0])
+        );
     }
     #[test]
     fn bios_rtc_time_reads_cmos_and_reports_updates_through_returned_carry() {

@@ -275,6 +275,8 @@ fn completed_address() -> Address {
 
 #[path = "procedure_memory_finite_tests.rs"]
 mod finite_tests;
+#[path = "procedure_memory_work_limit_tests.rs"]
+mod work_limit_tests;
 
 /// Seven real instructions per iteration, independently hand-encoded. Two
 /// byte stores use the low/high halves of the word loaded through ESI.
@@ -368,6 +370,240 @@ fn copy_frame(iterations: u32) -> Frame {
     frame.gpr[6] = 0x1000;
     frame.gpr[7] = 0x1800;
     frame
+}
+
+/// A memory-controlled loop whose bounds check may leave before the latch.
+/// The two branch orientations and distinct normal/early exits are intentional.
+fn early_exit_loop(exit_taken: bool, conditional_latch: bool) -> (ProcedureGraphProgram, Vec<u8>) {
+    let body = if exit_taken { 9 } else { 16 };
+    let exit = if exit_taken { 32 } else { 9 };
+    let bound = u32::from(conditional_latch) * 2;
+    let mut code = vec![0xcc; 48];
+    put(&mut code, 0, &[0x83, 0x3d, 0, 0x10, 0, 0, bound as u8]);
+    let branch = if exit_taken { 0x74 } else { 0x75 };
+    let target = if exit_taken { exit } else { body };
+    put(&mut code, 7, &[branch, (target - 9) as u8]);
+    put(&mut code, body as usize, &[0x89, 0x07, 0x83, 0xc7, 4]);
+    put(
+        &mut code,
+        body as usize + 5,
+        &[0x83, 0x2d, 0, 0x10, 0, 0, 1],
+    );
+    put(
+        &mut code,
+        body as usize + 12,
+        &[
+            if conditional_latch { 0x75 } else { 0xeb },
+            (-(body as i32 + 14)) as u8,
+        ],
+    );
+    put(&mut code, exit as usize, &[0x43, 0xc3]); // Early exit: INC EBX; RET.
+    let normal = body + 14;
+    if conditional_latch {
+        put(&mut code, normal as usize, &[0x4a, 0xc3]); // Normal exit: DEC EDX; RET.
+    }
+    let mut blocks = vec![
+        block(
+            0,
+            vec![instruction(
+                0,
+                Operation::CompareMemory {
+                    test: false,
+                    address: ds(0x1000),
+                    width: Width::Dword,
+                    source: Source::Immediate(bound),
+                },
+            )],
+            7,
+            ProcedureTerminatorKind::Branch {
+                condition: if exit_taken {
+                    Condition::Equal
+                } else {
+                    Condition::NotEqual
+                },
+                taken: at(target),
+                not_taken: at(if exit_taken { body } else { exit }),
+            },
+        ),
+        block(
+            body,
+            vec![
+                instruction(
+                    body,
+                    Operation::StoreMemory {
+                        width: Width::Dword,
+                        source: Source::Register(Register::Eax),
+                        address: address(Some(Register::Edi), 0, Segment::Ds),
+                    },
+                ),
+                instruction(
+                    body + 2,
+                    Operation::Alu {
+                        kind: Alu::Add,
+                        target: Register::Edi,
+                        source: Source::Immediate(4),
+                    },
+                ),
+                instruction(
+                    body + 5,
+                    Operation::AluMemoryStore {
+                        kind: Alu::Sub,
+                        address: ds(0x1000),
+                        width: Width::Dword,
+                        source: Source::Immediate(1),
+                    },
+                ),
+            ],
+            body + 12,
+            if conditional_latch {
+                ProcedureTerminatorKind::Branch {
+                    condition: Condition::NotEqual,
+                    taken: ENTRY,
+                    not_taken: at(normal),
+                }
+            } else {
+                ProcedureTerminatorKind::Jump(ENTRY)
+            },
+        ),
+        block(
+            exit,
+            vec![instruction(exit, Operation::Inc(Register::Ebx))],
+            exit + 1,
+            ret(Width::Dword, 0),
+        ),
+    ];
+    if conditional_latch {
+        blocks.push(block(
+            normal,
+            vec![instruction(normal, Operation::Dec(Register::Edx))],
+            normal + 1,
+            ret(Width::Dword, 0),
+        ));
+    }
+    (graph(blocks), code)
+}
+
+#[test]
+fn bounded_early_exits_match_memory_flags_epochs_and_every_grant_prefix() {
+    for exit_taken in [false, true] {
+        for conditional_latch in [false, true] {
+            let (program, code) = early_exit_loop(exit_taken, conditional_latch);
+            let options = ProcedureCompileOptions::default();
+            assert!(matches!(
+                program.compile(&options),
+                Err(ProcedureCompileError::CyclicGraph(_))
+            ));
+            let compiled = program.compile_with_work_limit(&options, 31).unwrap();
+            assert_eq!(compiled.maximum_work(ProcedureId(3)), Some(31));
+            let mut runner = Runner::compiled(&compiled);
+            for counter in [0u32, 1, 2, 3, u32::MAX] {
+                let full_work = if conditional_latch {
+                    match counter {
+                        1 => Some(8),
+                        2 => Some(4),
+                        3 => Some(10),
+                        _ => None,
+                    }
+                } else {
+                    counter.checked_mul(6).and_then(|n| n.checked_add(4))
+                };
+                for grant in 0..=34 {
+                    let mut d = descriptor();
+                    d.inline_grant = grant;
+                    let work = grant.min(31).min(full_work.unwrap_or(u32::MAX));
+                    let mut frame = initial();
+                    frame.gpr[7] = 0x1800;
+                    frame.eflags = 0xa03;
+                    compare_until(
+                        &mut runner,
+                        &code,
+                        frame,
+                        d,
+                        ENTRY,
+                        if full_work == Some(work) {
+                            COMPLETE
+                        } else {
+                            SIDE_EXIT
+                        },
+                        Some(u64::from(work)),
+                        |runner| {
+                            let offset = RAM + (0x1000 - RAM_BASE) as usize;
+                            runner.bytes()[offset..offset + 4]
+                                .copy_from_slice(&counter.to_le_bytes());
+                        },
+                    );
+                }
+            }
+            let mut reverse = program.clone();
+            reverse.functions[0].blocks.reverse();
+            assert_eq!(
+                compiled.wasm(),
+                reverse
+                    .compile_with_work_limit(&options, 31)
+                    .unwrap()
+                    .wasm()
+            );
+        }
+    }
+}
+
+#[test]
+fn bounded_early_exit_refusals_preserve_prior_writes_and_stop_before_the_fault() {
+    let (program, code) = early_exit_loop(true, false);
+    let compiled = program
+        .compile_with_work_limit(&ProcedureCompileOptions::default(), 31)
+        .unwrap();
+    let mut runner = Runner::compiled(&compiled);
+    for refusal in 0..3 {
+        let mut d = descriptor();
+        d.inline_grant = 31;
+        let mut frame = initial();
+        frame.gpr[7] = 0x1800;
+        let (counter, work) = match refusal {
+            0 => {
+                d.windows[0][Segment::Ds as usize].last = 0xfff;
+                (3u32, 0)
+            }
+            1 => {
+                d.windows[1][Segment::Ds as usize].last = 0x1803;
+                (3, 8)
+            }
+            _ => {
+                d.windows[0][Segment::Ss as usize].valid = false;
+                (1, 9)
+            }
+        };
+        compare_until(
+            &mut runner,
+            &code,
+            frame,
+            d,
+            ENTRY,
+            SIDE_EXIT,
+            Some(work),
+            |runner| {
+                let offset = RAM + (0x1000 - RAM_BASE) as usize;
+                runner.bytes()[offset..offset + 4].copy_from_slice(&counter.to_le_bytes());
+            },
+        );
+    }
+}
+
+#[test]
+fn bounded_early_exit_does_not_admit_an_internal_diamond_or_second_cycle() {
+    let (mut program, _) = early_exit_loop(true, false);
+    // The apparent early exit now returns to the header: two continuing paths.
+    program.functions[0].blocks[2].terminator.kind = ProcedureTerminatorKind::Jump(ENTRY);
+    assert!(matches!(
+        program.compile_with_work_limit(&ProcedureCompileOptions::default(), 31),
+        Err(ProcedureCompileError::CyclicGraph(_))
+    ));
+    // A separate self-loop outside the body also remains unsupported.
+    program.functions[0].blocks[2].terminator.kind = ProcedureTerminatorKind::Jump(at(32));
+    assert!(matches!(
+        program.compile_with_work_limit(&ProcedureCompileOptions::default(), 31),
+        Err(ProcedureCompileError::CyclicGraph(_))
+    ));
 }
 
 #[test]
@@ -582,6 +818,69 @@ fn bounded_loop_options_acyclic_bytes_and_unsupported_shapes_are_explicit() {
         Some(10),
         |_| {},
     );
+}
+
+#[test]
+fn bounded_rotated_fallthrough_latch_is_declined_without_charging_synthetic_edges() {
+    // +0: MOV EAX,1; +5: DEC EDX; +6: JMP +0.
+    // Entry at +5 rotates the cycle so the last graph edge is the synthetic
+    // fallthrough from +0 to +5. It is not a one-instruction guest branch.
+    let code = [0xb8, 1, 0, 0, 0, 0x4a, 0xeb, 0xf8];
+    let mut program = graph(vec![
+        block(
+            0,
+            vec![instruction(
+                0,
+                Operation::Move {
+                    target: Register::Eax,
+                    source: Source::Immediate(1),
+                },
+            )],
+            5,
+            ProcedureTerminatorKind::Fallthrough(at(5)),
+        ),
+        block(
+            5,
+            vec![instruction(5, Operation::Dec(Register::Edx))],
+            6,
+            ProcedureTerminatorKind::Jump(at(0)),
+        ),
+    ]);
+    let options = ProcedureCompileOptions::default();
+    for reverse in [false, true] {
+        if reverse {
+            program.functions[0].blocks.reverse();
+        }
+        program.functions[0].entry = at(5);
+        assert!(matches!(
+            program.functions[0].validate_with_work_limit(17),
+            Err(ProcedureCompileError::CyclicGraph(_))
+        ));
+        assert!(matches!(
+            program.compile_with_work_limit(&options, 17),
+            Err(ProcedureCompileError::CyclicGraph(_))
+        ));
+        // At the original header the same graph has a real JMP latch and is
+        // supported. Every budget prefix must match exactly three guest
+        // instructions per full iteration, without charging the fallthrough.
+        program.functions[0].entry = at(0);
+        let compiled = program.compile_with_work_limit(&options, 17).unwrap();
+        let mut runner = Runner::compiled(&compiled);
+        for grant in 0..=20 {
+            let mut d = descriptor();
+            d.inline_grant = grant;
+            compare_until(
+                &mut runner,
+                &code,
+                initial(),
+                d,
+                ENTRY,
+                SIDE_EXIT,
+                Some(u64::from(grant.min(17))),
+                |_| {},
+            );
+        }
+    }
 }
 
 #[test]
@@ -1214,3 +1513,6 @@ fn bounded_blocks_operations_output_and_deterministic_function_order() {
         Err(ProcedureCompileError::DuplicateId(_))
     ));
 }
+
+#[path = "procedure_x87_tests.rs"]
+mod pc24_tests;

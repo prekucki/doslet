@@ -5,7 +5,9 @@ use super::rle::{RleAdmission, RleMemory, prepare_rle};
 use doslet_x86_wasm::static_program::{
     Frame,
     memory::{self, Descriptor, RamDescriptor, SegmentBounds, StackAddress},
-    procedure_memory::{COMPLETE, MAX_PROCEDURES, SIDE_EXIT},
+    procedure_memory::{
+        COMPLETE, MAX_PROCEDURES, SIDE_EXIT, X87_BOUNDARY_OFFSET, X87_SELECTORS_OFFSET,
+    },
 };
 use wasmtime::{Instance, Memory, MemoryType, Store, TypedFunc};
 
@@ -17,6 +19,9 @@ const RAM_BASE: u32 = 0x500;
 const VIDEO_BYTES: usize = 512 * 1024;
 const VGA_START: u32 = 0xa_0000;
 const VGA_END: u32 = 0xc_0000;
+const PC24_BOUNDARY_OFFSET: usize = X87_BOUNDARY_OFFSET as usize;
+const PC24_SELECTORS_OFFSET: usize = X87_SELECTORS_OFFSET as usize;
+const PC24_BOUNDARY_BYTES: usize = PC24_SELECTORS_OFFSET - PC24_BOUNDARY_OFFSET;
 
 /// All offsets are into the one fixed Wasmtime backing. RAM index zero is
 /// physical address zero; direct procedures see only the ordinary span at 500h.
@@ -100,6 +105,7 @@ pub struct SharedProcedureMemory {
     failed: bool,
     compile_seconds: f64,
     load_seconds: f64,
+    pc24_masks: Option<(u8, u8)>,
 }
 
 impl SharedProcedureMemory {
@@ -162,6 +168,7 @@ impl SharedProcedureMemory {
             failed: false,
             compile_seconds: artifact.compile_seconds,
             load_seconds: artifact.load_seconds,
+            pc24_masks: None,
         })
     }
 
@@ -176,6 +183,40 @@ impl SharedProcedureMemory {
 
     pub fn load_seconds(&self) -> f64 {
         self.load_seconds
+    }
+
+    /// Install one admitted coprocessor boundary in the fixed call scratch.
+    /// Masks remain in trusted owner state rather than generated memory.
+    pub fn prepare_pc24_boundary(
+        &mut self,
+        read_mask: u8,
+        write_mask: u8,
+        boundary: &[u8; PC24_BOUNDARY_BYTES],
+        selectors: [u16; 6],
+    ) {
+        let bytes = self.memory.data_mut(&mut self.store);
+        bytes[PC24_BOUNDARY_OFFSET..PC24_SELECTORS_OFFSET].copy_from_slice(boundary);
+        for (selector, output) in selectors.into_iter().zip(
+            bytes[PC24_SELECTORS_OFFSET..PC24_SELECTORS_OFFSET + 12]
+                .as_chunks_mut::<2>()
+                .0,
+        ) {
+            output.copy_from_slice(&selector.to_le_bytes());
+        }
+        self.pc24_masks = Some((read_mask, write_mask));
+    }
+
+    pub fn pending_pc24_boundary(&self) -> Option<(u8, u8, &[u8])> {
+        let (read, write) = self.pc24_masks?;
+        Some((
+            read,
+            write,
+            &self.memory.data(&self.store)[PC24_BOUNDARY_OFFSET..PC24_SELECTORS_OFFSET],
+        ))
+    }
+
+    pub fn clear_pc24_boundary(&mut self) {
+        self.pc24_masks = None;
     }
 
     /// Resolve a compiler ID once during plan installation. The index belongs

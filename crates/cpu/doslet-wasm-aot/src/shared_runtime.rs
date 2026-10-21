@@ -83,6 +83,30 @@ impl SharedArtifacts {
         }) {
             return Err("WASM memory-write helpers require runtime export static_memory_write(i32, i32, i32, i32) -> i32".into());
         }
+        // Diagnostic x87 proof: direct WASM-to-WASM functions, never native
+        // host callbacks. Keep the names identical for later module merging.
+        if let Some(export) = runtime.get_export(&mut store, "static_x87_operation") {
+            let helper = export
+                .into_func()
+                .ok_or("static_x87_operation must be a function")?;
+            helper
+                .typed::<(u32, u32, u32, u32, u32), u64>(&store)
+                .map_err(|e| format!("invalid static_x87_operation signature: {e}"))?;
+            linker
+                .define(&store, abi::IMPORT_MODULE, "static_x87_operation", helper)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(export) = runtime.get_export(&mut store, "x87_probe_frame") {
+            let helper = export
+                .into_func()
+                .ok_or("x87_probe_frame must be a function")?;
+            helper
+                .typed::<u32, u32>(&store)
+                .map_err(|e| format!("invalid x87_probe_frame signature: {e}"))?;
+            linker
+                .define(&store, abi::IMPORT_MODULE, "x87_probe_frame", helper)
+                .map_err(|e| e.to_string())?;
+        }
         let program = linker
             .instantiate(&mut store, &self.program.module)
             .map_err(|e| e.to_string())?;
@@ -108,6 +132,28 @@ pub struct SharedRunner {
 }
 
 impl SharedRunner {
+    /// A closed diagnostic module produced by merging the Rust runtime and
+    /// generated functions. Both exports use this one instance and memory;
+    /// no imported host functions are accepted by this constructor.
+    pub fn instantiate_merged(artifact: &Artifact) -> Result<Self, String> {
+        let mut store = Store::new(&artifact.engine, ());
+        let instance =
+            Instance::new(&mut store, &artifact.module, &[]).map_err(|e| e.to_string())?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or("merged WASM module has no memory export")?;
+        let run = instance
+            .get_typed_func::<u32, u32>(&mut store, abi::RUN_EXPORT)
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            store,
+            runtime: instance,
+            memory,
+            run,
+            failed: false,
+        })
+    }
+
     /// Copy bounded fixture data into a buffer allocated by the runtime. This
     /// setup operation must finish before generated execution starts.
     pub fn write_bytes(&mut self, pointer: u32, bytes: &[u8]) -> Result<(), String> {

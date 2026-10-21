@@ -9,6 +9,7 @@
 pub mod memory_procedures;
 mod mutable_sources;
 pub mod procedures;
+mod x87;
 
 use alloc::vec::Vec;
 use core::{fmt, mem::size_of};
@@ -672,6 +673,7 @@ fn lower_instruction(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_instruction_with_virtual_registers(
     instruction: &Instruction,
     offsets: &iced_x86::ConstantOffsets,

@@ -1,6 +1,6 @@
 //! Bounded native loading of an offline-generated procedure module and sources.
 #[path = "procedure_manifest.rs"]
-mod procedure_manifest;
+pub(crate) mod procedure_manifest;
 use doslet_runtime::{Session, wasm_procedures::bundle};
 use sha2::{Digest, Sha256};
 use std::{
@@ -182,12 +182,24 @@ fn check(manifest: &serde_json::Value, expect: &Expect<'_>) -> Result<(), Box<dy
     }
 }
 
+/// Compiles every launch.
+struct NoCache;
+impl doslet_runtime::wasm_procedures::CompiledCache for NoCache {
+    fn load(&mut self, _: &[u8], _: u64) -> Option<Vec<u8>> {
+        None
+    }
+    fn store(&mut self, _: &[u8], _: u64, _: &[u8]) {}
+}
+
+/// Install the module at `path`; with `replace`, in place of installed
+/// procedures.
 pub fn install(
     session: &mut Session,
     path: &Path,
     expect: Expect<'_>,
     interpret: bool,
     compiled_cache: Option<&Path>,
+    replace: bool,
 ) -> Result<(), Box<dyn Error>> {
     let ProcedureBundle { manifest, module } = load(path)?;
     check(&manifest, &expect)?;
@@ -204,6 +216,20 @@ pub fn install(
         eprintln!(
             "[INFO doslet] Interpreter: {} bounded procedure boundaries installed; original RAM/VRAM ownership retained ({})",
             count,
+            path.display()
+        );
+    } else if replace {
+        match compiled_cache {
+            Some(directory) => session.replace_wasm_procedures_cached(
+                &module,
+                bindings,
+                &mut DiskCache { directory },
+            )?,
+            None => session.replace_wasm_procedures_cached(&module, bindings, &mut NoCache)?,
+        }
+        eprintln!(
+            "[INFO doslet] AOT-WASM: {} procedures replace the installed ones ({})",
+            entry_count,
             path.display()
         );
     } else {

@@ -46,6 +46,8 @@ use desktop as frontend;
 mod app;
 #[cfg(not(target_arch = "wasm32"))]
 mod archive;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod archive_native_tests;
 #[cfg(not(target_arch = "wasm32"))]
 mod audio;
 #[cfg(target_arch = "wasm32")]

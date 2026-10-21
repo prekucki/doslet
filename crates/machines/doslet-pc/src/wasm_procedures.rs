@@ -26,14 +26,19 @@ pub(crate) use browser::SharedProcedureMemory;
 use doslet_x86::procedure_calls::{
     FrozenCode, MAX_PROCEDURE_INSTRUCTIONS, ProcedureContext, ProcedureRegisters,
     memory::{
-        MemoryProcedureBus, MemoryProcedureEntry, MemoryProcedureError, MemoryProcedureOutcome,
-        MemoryProcedureRegistry, MemoryProcedureResult, MemoryProcedureResultError,
+        MemoryProcedureBus, MemoryProcedureEntry, MemoryProcedureError, MemoryProcedureFpu,
+        MemoryProcedureOutcome, MemoryProcedureRegistry, MemoryProcedureResult,
+        MemoryProcedureResultError,
     },
 };
 use doslet_x86::{Access, Cpu, Gpr32, Registers, SegmentCache, SegmentRegister};
 pub use doslet_x86_wasm::static_program::procedure_memory::CopyKernel;
 pub use doslet_x86_wasm::static_program::procedure_memory::RleKernel;
+pub use doslet_x86_wasm::static_program::procedure_memory::X87Procedure;
 pub use doslet_x86_wasm::static_program::procedure_memory::bundle;
+use doslet_x86_wasm::static_program::procedure_memory::{
+    X87_BOUNDARY_OFFSET, X87_SELECTORS_OFFSET,
+};
 use doslet_x86_wasm::static_program::{
     Address, Frame,
     memory::{
@@ -61,6 +66,35 @@ pub struct CodePart {
     pub expected: Vec<u8>,
 }
 
+/// The code segment procedures were bound to. Entry, terminal and guard
+/// addresses are EIPs in it; source parts are linear addresses, its base plus
+/// those EIPs. A call needs a live CS with this base and at least this
+/// inclusive limit. DOS/4GW programs run flat; a DJGPP program's CS has its
+/// memory block's base and a smaller limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeSegment {
+    pub base: u32,
+    pub limit: u32,
+}
+
+impl CodeSegment {
+    pub const FLAT: Self = Self {
+        base: 0,
+        limit: u32::MAX,
+    };
+
+    /// The linear address of an EIP in this segment, unless it lies outside.
+    fn linear(self, ip: u32) -> Option<u32> {
+        (ip <= self.limit).then(|| self.base.checked_add(ip))?
+    }
+}
+
+impl Default for CodeSegment {
+    fn default() -> Self {
+        Self::FLAT
+    }
+}
+
 /// IRQ delivery at a whole-computation boundary, selected by the bundle owner.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KernelInterrupts {
@@ -75,6 +109,13 @@ pub struct Binding {
     pub function_id: u32,
     pub entry_ip: u32,
     pub maximum_instructions: u32,
+    /// Compiler-authored executed sites, independent of immutable byte guards.
+    /// Exit boundary bytes stay guarded but never contribute a tier or work.
+    /// Legacy None retains conservative decoding of all source bytes.
+    pub execution_sites: Option<Vec<ExecutionSite>>,
+    /// Explicit PC24 coprocessor permissions, relative to the entry TOP.
+    /// Absence keeps legacy scalar admission and calls free of FPU transfers.
+    pub x87: Option<X87Procedure>,
     /// A compiler-proved, finite whole-procedure kernel. Its live arguments
     /// determine admission cost; IRQ delivery may wait until its return.
     pub kernel: Option<CopyKernel>,
@@ -83,7 +124,16 @@ pub struct Binding {
     /// Generic statically terminating CFG, independent of any semantic idiom.
     pub finite_computation: Option<FiniteComputation>,
     pub kernel_interrupts: KernelInterrupts,
+    /// Shared by every binding of one installation.
+    pub code_segment: CodeSegment,
     pub code: Vec<CodePart>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionSite {
+    /// Architectural EIP in the binding's code segment, unchanged by rebasing.
+    pub ip: u32,
+    pub length: u8,
 }
 
 /// Compiler terminals used by the optional original-x86 boundary reference.
@@ -124,6 +174,14 @@ pub struct Stats {
     pub device_changes: u64,
 }
 
+/// Accepted execution totals for one prepared procedure entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcedureEntryStats {
+    pub calls: u64,
+    pub translated_instructions: u64,
+    pub side_exits: u64,
+}
+
 /// Controlled interpreter variants retaining the installed plan and shared RAM.
 /// This opt-in diagnostic selection is excluded from portable machine states.
 #[cfg(feature = "wasm-procedure-diagnostics")]
@@ -154,6 +212,8 @@ struct SourceGuard {
 struct PreparedBinding {
     binding: Binding,
     function_index: u32,
+    /// Control-time admission policy; compiled code and statistics stay intact.
+    enabled: bool,
     guards: Vec<SourceGuard>,
     checked: bool,
     matches: bool,
@@ -164,6 +224,7 @@ struct PreparedBinding {
     /// The uniform tier of the guarded source bytes and the label generation
     /// it was classified under.
     uniform: Option<(u64, Option<u8>)>,
+    execution: ProcedureEntryStats,
 }
 
 struct SourceInstruction {
@@ -316,7 +377,10 @@ impl PreparedBinding {
 
 pub(crate) struct Plan {
     backend: Backend,
+    code: CodeSegment,
     bindings: Vec<PreparedBinding>,
+    /// CPU hint indices name only enabled entries, not all retained bindings.
+    entry_bindings: Vec<usize>,
     source_pages: Vec<u8>,
     stats: Stats,
     failure: Option<ExecutionError>,
@@ -328,10 +392,408 @@ pub(crate) struct Plan {
     diagnostic_mode: DiagnosticMode,
 }
 
+impl Plan {
+    fn diagnostic_dispatch_enabled(&self) -> bool {
+        #[cfg(feature = "wasm-procedure-diagnostics")]
+        {
+            self.diagnostic_mode == DiagnosticMode::Normal
+        }
+        #[cfg(not(feature = "wasm-procedure-diagnostics"))]
+        {
+            true
+        }
+    }
+
+    fn dispatches_entries(&self) -> bool {
+        !self.suspended && self.diagnostic_dispatch_enabled()
+    }
+}
+
+/// Build both control-time lists before publishing either. Binding indices
+/// remain stable when the CPU's sorted entry list omits disabled procedures.
+fn procedure_entry_hints(
+    plan: &Plan,
+    dispatch: bool,
+    enabled: impl Fn(usize, &PreparedBinding) -> bool,
+) -> Result<(Vec<u32>, Vec<usize>), &'static str> {
+    let mut entries = Vec::new();
+    let mut indices = Vec::new();
+    if dispatch {
+        let count = plan
+            .bindings
+            .iter()
+            .enumerate()
+            .filter(|(index, binding)| enabled(*index, binding))
+            .count();
+        entries
+            .try_reserve_exact(count)
+            .map_err(|_| "WASM entry allocation")?;
+        indices
+            .try_reserve_exact(count)
+            .map_err(|_| "WASM entry allocation")?;
+        for (index, binding) in plan.bindings.iter().enumerate() {
+            if enabled(index, binding) {
+                entries.push(binding.binding.entry_ip);
+                indices.push(index);
+            }
+        }
+    }
+    Ok((entries, indices))
+}
+
+/// Sorted, disjoint parts in ordinary RAM and inside `code`, covering the
+/// entry and every finite terminal and guard. `place` gives each part's
+/// linear address from its recorded one, so a move can be checked first.
+fn validate_sources(
+    binding: &Binding,
+    code: CodeSegment,
+    ram_size: usize,
+    place: impl Fn(u32) -> Option<u32>,
+) -> Result<(), String> {
+    let entry = code
+        .linear(binding.entry_ip)
+        .ok_or("WASM procedure entry outside its code segment")?;
+    let mut previous_end = 0;
+    let mut entry_covered = false;
+    for part in &binding.code {
+        let linear = place(part.linear).ok_or("WASM procedure source outside RAM")?;
+        let length =
+            u32::try_from(part.expected.len()).map_err(|_| "WASM procedure source too large")?;
+        let end = linear
+            .checked_add(length)
+            .filter(|&end| length != 0 && end as usize <= ram_size)
+            .ok_or("WASM procedure source outside RAM")?;
+        if linear < 0x500 || (linear < 0xc0000 && end > 0xa0000) {
+            return Err("WASM procedure source outside ordinary RAM".into());
+        }
+        if linear < code.base || end - 1 - code.base > code.limit {
+            return Err("WASM procedure source outside its code segment".into());
+        }
+        if linear < previous_end {
+            return Err("overlapping WASM procedure source parts".into());
+        }
+        previous_end = end;
+        entry_covered |= (linear..end).contains(&entry);
+    }
+    if !entry_covered {
+        return Err("WASM procedure entry has no source proof".into());
+    }
+    if let Some(sites) = &binding.execution_sites {
+        if sites.is_empty() || sites.len() > MAX_SOURCE_PARTS {
+            return Err("invalid WASM execution site count".into());
+        }
+        let mut previous_end = 0u64;
+        for site in sites {
+            let end = u64::from(site.ip) + u64::from(site.length);
+            if !(1..=15).contains(&site.length)
+                || u64::from(site.ip) < previous_end
+                || end > u64::from(code.limit) + 1
+            {
+                return Err("invalid or overlapping WASM execution sites".into());
+            }
+            let linear = code
+                .linear(site.ip)
+                .ok_or("WASM execution site outside code segment")?;
+            let end = linear
+                .checked_add(u32::from(site.length))
+                .filter(|&end| end as usize <= ram_size)
+                .ok_or("WASM execution site outside RAM")?;
+            if linear < 0x500 || linear < 0xc0000 && end > 0xa0000 {
+                return Err("WASM execution site outside ordinary RAM".into());
+            }
+            if !binding.code.iter().any(|part| {
+                place(part.linear).is_some_and(|at| {
+                    at <= linear && u64::from(linear) < u64::from(at) + part.expected.len() as u64
+                })
+            }) {
+                return Err("WASM execution site has no opcode source proof".into());
+            }
+            previous_end = u64::from(site.ip) + u64::from(site.length);
+        }
+        let contains = |ip| sites.binary_search_by_key(&ip, |site| site.ip).is_ok();
+        if !contains(binding.entry_ip) {
+            return Err("WASM execution sites omit the entry".into());
+        }
+        if let Some(finite) = &binding.finite_computation
+            && (finite.exits.iter().any(|&ip| {
+                sites.iter().any(|site| {
+                    site.ip <= ip && u64::from(ip) < u64::from(site.ip) + u64::from(site.length)
+                })
+            }) || finite
+                .returns
+                .iter()
+                .chain(finite.guards.iter().map(|guard| &guard.entry_ip))
+                .any(|&ip| !contains(ip)))
+        {
+            return Err("WASM execution sites disagree with finite terminals or guards".into());
+        }
+    }
+    let sourced = |ip: u32| {
+        code.linear(ip).is_some_and(|linear| {
+            binding
+                .code
+                .iter()
+                .any(|part| place(part.linear) == Some(linear))
+        })
+    };
+    if let Some(finite) = &binding.finite_computation {
+        if !finite
+            .exits
+            .iter()
+            .chain(&finite.returns)
+            .all(|&ip| sourced(ip))
+        {
+            return Err("finite computation terminal has no instruction source".into());
+        }
+        if !finite.guards.iter().all(|guard| sourced(guard.entry_ip)) {
+            return Err("finite loop guard has no instruction source".into());
+        }
+    }
+    Ok(())
+}
+
+/// Page-bounded byte guards of a binding's sources. Their pages are marked in
+/// `source_pages` and passed to `protect` for generated stores.
+fn source_guards(
+    binding: &Binding,
+    instructions: Option<&[SourceInstruction]>,
+    source_pages: &mut [u8],
+    mut protect: impl FnMut(u32, u32) -> Result<(), String>,
+) -> Result<Vec<SourceGuard>, String> {
+    let mut guards = Vec::new();
+    let count = binding
+        .code
+        .iter()
+        .map(|part| (part.linear as usize % PAGE_BYTES + part.expected.len()).div_ceil(PAGE_BYTES))
+        .sum();
+    guards
+        .try_reserve_exact(count)
+        .map_err(|_| "WASM source guard allocation")?;
+    for part in &binding.code {
+        let first = part.linear as usize / PAGE_BYTES;
+        let last = (part.linear as usize + part.expected.len() - 1) / PAGE_BYTES;
+        source_pages[first..=last].fill(1);
+        protect(part.linear, part.expected.len() as u32)?;
+        let mut start = part.linear as usize;
+        let end = start + part.expected.len();
+        while start < end {
+            let chunk_end = end.min((start / PAGE_BYTES + 1) * PAGE_BYTES);
+            guards.push(SourceGuard {
+                start,
+                end: chunk_end,
+                check: None,
+            });
+            start = chunk_end;
+        }
+    }
+    // Mutable operand slots are excluded from byte matching, but a generated
+    // store into any part of their instruction must still leave the module.
+    for insn in instructions.into_iter().flatten() {
+        if insn.prefix_length < insn.length {
+            let end = (insn.address as usize).saturating_add(usize::from(insn.length));
+            if end <= source_pages.len() * PAGE_BYTES {
+                let first = insn.address as usize / PAGE_BYTES;
+                let last = (end - 1) / PAGE_BYTES;
+                source_pages[first..=last].fill(1);
+                protect(insn.address, u32::from(insn.length))?;
+            }
+        }
+    }
+    Ok(guards)
+}
+
+/// Decode a complete x87 instruction's length and displacement without
+/// interpreting an address. This is used only for explicit x87 source proofs.
+fn x87_source_shape(bytes: &[u8]) -> Option<(u8, core::ops::Range<usize>)> {
+    let mut at = 0;
+    let mut address16 = false;
+    loop {
+        match *bytes.get(at)? {
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 => at += 1,
+            0x67 => {
+                address16 = true;
+                at += 1;
+            }
+            _ => break,
+        }
+        if at >= 13 {
+            return None;
+        }
+    }
+    let opcode = *bytes.get(at)?;
+    if !(0xd8..=0xdf).contains(&opcode) {
+        return None;
+    }
+    let modrm = *bytes.get(at + 1)?;
+    let group = (modrm >> 3) & 7;
+    let emitted = if modrm >> 6 == 3 {
+        match opcode {
+            0xd8 => true,
+            0xd9 => matches!(group, 0 | 1),
+            0xdc => matches!(group, 0 | 1 | 4..=7),
+            0xdd => matches!(group, 2 | 3),
+            0xde => matches!(group, 0 | 1 | 4..=7) || modrm == 0xd9,
+            0xdf => modrm == 0xe0,
+            _ => false,
+        }
+    } else {
+        match opcode {
+            0xd8 => true,
+            0xd9 => group == 0,
+            0xdb => matches!(group, 0 | 2 | 3),
+            _ => false,
+        }
+    };
+    if !emitted {
+        return None;
+    }
+    if !matches!(doslet_x86::x87_decode::decode(opcode, modrm),
+        doslet_x86::x87_decode::Encoding::I387(instruction) if instruction.implemented())
+    {
+        return None;
+    }
+    at += 2;
+    let mode = modrm >> 6;
+    let rm = modrm & 7;
+    let displacement = if mode == 3 {
+        0
+    } else if address16 {
+        match mode {
+            0 if rm == 6 => 2,
+            1 => 1,
+            2 => 2,
+            _ => 0,
+        }
+    } else {
+        let base = if rm == 4 {
+            let sib = *bytes.get(at)?;
+            at += 1;
+            sib & 7
+        } else {
+            rm
+        };
+        match mode {
+            0 if base == 5 => 4,
+            1 => 1,
+            2 => 4,
+            _ => 0,
+        }
+    };
+    let end = at + displacement;
+    if end > 15 || bytes.len() < end {
+        return None;
+    }
+    Some((end as u8, at..end))
+}
+
 fn source_instructions(binding: &Binding) -> Option<Vec<SourceInstruction>> {
+    let Some(sites) = &binding.execution_sites else {
+        return source_instructions_from_parts(&binding.code);
+    };
+    let mut instructions = Vec::new();
+    instructions.try_reserve_exact(sites.len()).ok()?;
+    for site in sites {
+        let start = binding.code_segment.linear(site.ip)?;
+        let end = start.checked_add(u32::from(site.length))?;
+        let mut window = [0u8; 15];
+        let mut holes = [0usize; 2];
+        let mut hole_count = 0;
+        let mut prefix_length = site.length;
+        let mut cursor = start;
+        let first = binding.code.partition_point(|part| {
+            part.linear
+                .checked_add(part.expected.len() as u32)
+                .is_some_and(|end| end <= start)
+        });
+        for part in &binding.code[first..] {
+            if part.linear >= end {
+                break;
+            }
+            let low = part.linear.max(start);
+            let high = part
+                .linear
+                .checked_add(part.expected.len() as u32)?
+                .min(end);
+            if high <= low {
+                continue;
+            }
+            if low > cursor {
+                if cursor == start || (low - cursor) % 4 != 0 {
+                    return None;
+                }
+                while cursor < low {
+                    if hole_count == holes.len() {
+                        return None;
+                    }
+                    holes[hole_count] = (cursor - start) as usize;
+                    prefix_length = prefix_length.min((cursor - start) as u8);
+                    hole_count += 1;
+                    cursor = cursor.checked_add(4)?;
+                }
+            }
+            window[(low - start) as usize..(high - start) as usize].copy_from_slice(
+                &part.expected[(low - part.linear) as usize..(high - part.linear) as usize],
+            );
+            cursor = high;
+        }
+        if cursor == start || (end - cursor) % 4 != 0 {
+            return None;
+        }
+        while cursor < end {
+            if hole_count == holes.len() {
+                return None;
+            }
+            holes[hole_count] = (cursor - start) as usize;
+            prefix_length = prefix_length.min((cursor - start) as u8);
+            hole_count += 1;
+            cursor = cursor.checked_add(4)?;
+        }
+        let bytes = &window[..usize::from(site.length)];
+        let x87 = binding.x87.and_then(|_| x87_source_shape(bytes));
+        if binding.x87.is_some()
+            && bytes
+                .iter()
+                .copied()
+                .find(|byte| !matches!(byte, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67))
+                .is_some_and(|opcode| (0xd8..=0xdf).contains(&opcode))
+            && x87.is_none()
+        {
+            return None;
+        }
+        if doslet_x86::translation::instruction_length(bytes, true) != Some(site.length)
+            && x87.as_ref().map(|shape| shape.0) != Some(site.length)
+        {
+            return None;
+        }
+        for &offset in &holes[..hole_count] {
+            let mut patched = window;
+            patched[offset..offset + 4].fill(0xff);
+            if !doslet_x86::translation::same_template32(
+                bytes,
+                &patched[..usize::from(site.length)],
+            ) && !x87.as_ref().is_some_and(|(_, displacement)| {
+                displacement.len() == 4 && displacement.start == offset
+            }) {
+                return None;
+            }
+        }
+        instructions.push(SourceInstruction {
+            address: start,
+            length: site.length,
+            prefix_length,
+            flow: match x87 {
+                Some(_) => doslet_x86::translation::NearFlow::Next,
+                None => doslet_x86::translation::near_flow(bytes, true)?,
+            },
+        });
+    }
+    Some(instructions)
+}
+
+fn source_instructions_from_parts(parts: &[CodePart]) -> Option<Vec<SourceInstruction>> {
     let mut instructions = Vec::new();
     let mut skip_in_next = 0usize;
-    for (part_index, part) in binding.code.iter().enumerate() {
+    for (part_index, part) in parts.iter().enumerate() {
         if skip_in_next > part.expected.len() {
             return None;
         }
@@ -366,7 +828,7 @@ fn source_instructions(binding: &Binding) -> Option<Vec<SourceInstruction>> {
             let after_gap = gap_start.checked_add(4)?;
             let mut window = [0u8; 15];
             window[..prefix_len].copy_from_slice(remaining);
-            if let Some(next_part) = binding.code.get(part_index + 1)
+            if let Some(next_part) = parts.get(part_index + 1)
                 && next_part.linear == after_gap
             {
                 let copy_len = next_part.expected.len().min(15 - (prefix_len + 4));
@@ -379,7 +841,7 @@ fn source_instructions(binding: &Binding) -> Option<Vec<SourceInstruction>> {
             }
             let suffix_needed = usize::from(length) - (prefix_len + 4);
             if suffix_needed != 0 {
-                let next_part = binding.code.get(part_index + 1)?;
+                let next_part = parts.get(part_index + 1)?;
                 if next_part.linear == after_gap && next_part.expected.len() >= suffix_needed {
                     skip_in_next = suffix_needed;
                 } else if suffix_needed != 4 {
@@ -601,7 +1063,7 @@ impl PcMachine {
         wasm: &[u8],
         bindings: Vec<Binding>,
     ) -> Result<(), String> {
-        self.install_procedures(Module::Native(wasm, None), bindings)
+        self.install_procedures(Module::Native(wasm, None), bindings, false)
     }
 
     /// As `install_wasm_procedures`, reusing compatible native code from the host.
@@ -612,7 +1074,21 @@ impl PcMachine {
         bindings: Vec<Binding>,
         cache: &mut dyn CompiledCache,
     ) -> Result<(), String> {
-        self.install_procedures(Module::Native(wasm, Some(cache)), bindings)
+        self.install_procedures(Module::Native(wasm, Some(cache)), bindings, false)
+    }
+
+    /// As `install_wasm_procedures_cached`, replacing installed procedures,
+    /// for example after a program patched its own code. RAM, page
+    /// generations and VRAM move once from the current owner to the new one;
+    /// statistics restart. Validation failure keeps the installed plan.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn replace_wasm_procedures_cached(
+        &mut self,
+        wasm: &[u8],
+        bindings: Vec<Binding>,
+        cache: &mut dyn CompiledCache,
+    ) -> Result<(), String> {
+        self.install_procedures(Module::Native(wasm, Some(cache)), bindings, true)
     }
 
     /// Install exports from a module importing this worker's linear memory.
@@ -623,7 +1099,7 @@ impl PcMachine {
         callback: BrowserCall,
         bindings: Vec<Binding>,
     ) -> Result<(), String> {
-        self.install_procedures(Module::Browser(callback), bindings)
+        self.install_procedures(Module::Browser(callback), bindings, false)
     }
 
     /// Interpret admitted finite semantic procedures through RET before IRQ
@@ -633,16 +1109,21 @@ impl PcMachine {
         &mut self,
         bindings: Vec<Binding>,
     ) -> Result<(), String> {
-        self.install_procedures(Module::Interpreter(core::marker::PhantomData), bindings)
+        self.install_procedures(
+            Module::Interpreter(core::marker::PhantomData),
+            bindings,
+            false,
+        )
     }
 
     fn install_procedures(
         &mut self,
         module: Module<'_>,
         mut bindings: Vec<Binding>,
+        replace: bool,
     ) -> Result<(), String> {
         let wasm = !matches!(&module, Module::Interpreter(_));
-        if self.wasm_procedures.is_some() {
+        if self.wasm_procedures.is_some() && !replace {
             return Err("WASM procedures already installed".into());
         }
         if !self.bus.ram.direct_execution_ready() {
@@ -663,9 +1144,22 @@ impl PcMachine {
         if ids.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err("duplicate WASM procedure function ID".into());
         }
+        let code = bindings[0].code_segment;
+        if bindings.iter().any(|binding| binding.code_segment != code) {
+            return Err("WASM procedures must share one code segment".into());
+        }
         let mut source_parts = 0usize;
         let mut source_bytes = 0usize;
+        let mut execution_sites = 0usize;
         for binding in &mut bindings {
+            if binding.x87.is_some()
+                && (!wasm
+                    || binding.kernel.is_some()
+                    || binding.rle_kernel.is_some()
+                    || binding.execution_sites.is_none())
+            {
+                return Err("x87 procedures require an ordinary WASM body".into());
+            }
             if !wasm
                 && binding.kernel.is_none()
                 && binding.rle_kernel.is_none()
@@ -725,46 +1219,28 @@ impl PcMachine {
                 .filter(|&count| count <= MAX_SOURCE_PARTS)
                 .ok_or("WASM procedure sources exceed 65536 parts")?;
             binding.code.sort_unstable_by_key(|part| part.linear);
-            let mut previous_end = 0;
-            let mut entry_covered = false;
             for part in &binding.code {
                 source_bytes = source_bytes
                     .checked_add(part.expected.len())
                     .filter(|&count| count <= MAX_SOURCE_BYTES)
                     .ok_or("WASM procedure sources exceed 16 MiB")?;
-                let length = u32::try_from(part.expected.len())
-                    .map_err(|_| "WASM procedure source too large")?;
-                let end = part
-                    .linear
-                    .checked_add(length)
-                    .filter(|&end| length != 0 && end as usize <= self.bus.ram_size())
-                    .ok_or("WASM procedure source outside RAM")?;
-                if part.linear < 0x500 || (part.linear < 0xc0000 && end > 0xa0000) {
-                    return Err("WASM procedure source outside ordinary RAM".into());
-                }
-                if part.linear < previous_end {
-                    return Err("overlapping WASM procedure source parts".into());
-                }
-                previous_end = end;
-                entry_covered |= (part.linear..end).contains(&binding.entry_ip);
             }
-            if !entry_covered {
-                return Err("WASM procedure entry has no source proof".into());
-            }
-            if let Some(finite) = &binding.finite_computation {
-                for terminal in finite.exits.iter().chain(&finite.returns) {
-                    if !binding.code.iter().any(|part| part.linear == *terminal) {
-                        return Err("finite computation terminal has no instruction source".into());
-                    }
-                }
-                for guard in &finite.guards {
-                    if !binding
-                        .code
-                        .iter()
-                        .any(|part| part.linear == guard.entry_ip)
-                    {
-                        return Err("finite loop guard has no instruction source".into());
-                    }
+            validate_sources(binding, code, self.bus.ram_size(), Some)?;
+            if let Some(sites) = &binding.execution_sites {
+                execution_sites = execution_sites
+                    .checked_add(sites.len())
+                    .filter(|&count| count <= MAX_SOURCE_PARTS)
+                    .ok_or("WASM execution sites exceed 65536 entries")?;
+                let instructions = source_instructions(binding)
+                    .ok_or("WASM execution sites disagree with frozen instruction bytes")?;
+                if let Some(kernel) = binding.kernel
+                    && !canonical_copy_sources(
+                        kernel,
+                        code.linear(binding.entry_ip).expect("validated entry"),
+                        &instructions,
+                    )
+                {
+                    return Err("WASM execution sites disagree with canonical copy contract".into());
                 }
             }
         }
@@ -787,85 +1263,60 @@ impl PcMachine {
         let mut prepared = Vec::new();
         let mut source_pages = alloc::vec![0u8; self.bus.ram_size().div_ceil(PAGE_BYTES)];
         let mut entry_ips = Vec::new();
+        let mut entry_bindings = Vec::new();
         prepared
             .try_reserve_exact(bindings.len())
             .map_err(|_| "WASM binding allocation")?;
         entry_ips
             .try_reserve_exact(bindings.len())
             .map_err(|_| "WASM entry allocation")?;
+        entry_bindings
+            .try_reserve_exact(bindings.len())
+            .map_err(|_| "WASM entry allocation")?;
         for binding in bindings {
             let instructions = source_instructions(&binding);
+            if binding.execution_sites.is_some() && instructions.is_none() {
+                return Err("WASM execution site preparation failed".into());
+            }
             let canonical_copy =
                 binding
                     .kernel
                     .zip(instructions.as_ref())
                     .is_some_and(|(kernel, sources)| {
-                        canonical_copy_sources(kernel, binding.entry_ip, sources)
+                        canonical_copy_sources(kernel, code.base + binding.entry_ip, sources)
                     });
             let function_index = ids
                 .binary_search(&binding.function_id)
                 .expect("validated procedure ID") as u32;
-            let mut guards = Vec::new();
-            let count = binding
-                .code
-                .iter()
-                .map(|part| {
-                    (part.linear as usize % PAGE_BYTES + part.expected.len()).div_ceil(PAGE_BYTES)
-                })
-                .sum();
-            guards
-                .try_reserve_exact(count)
-                .map_err(|_| "WASM source guard allocation")?;
-            for part in &binding.code {
-                let first = part.linear as usize / PAGE_BYTES;
-                let last = (part.linear as usize + part.expected.len() - 1) / PAGE_BYTES;
-                source_pages[first..=last].fill(1);
-                if let Some(owner) = &mut owner {
-                    owner.protect_source(part.linear, part.expected.len() as u32)?;
-                }
-                let mut start = part.linear as usize;
-                let end = start + part.expected.len();
-                while start < end {
-                    let chunk_end = end.min((start / PAGE_BYTES + 1) * PAGE_BYTES);
-                    guards.push(SourceGuard {
-                        start,
-                        end: chunk_end,
-                        check: None,
-                    });
-                    start = chunk_end;
-                }
-            }
-            if let Some(instructions) = &instructions {
-                for insn in instructions {
-                    if insn.prefix_length < insn.length {
-                        let end = (insn.address as usize).saturating_add(usize::from(insn.length));
-                        if end <= self.bus.ram_size() {
-                            let first = insn.address as usize / PAGE_BYTES;
-                            let last = (end - 1) / PAGE_BYTES;
-                            source_pages[first..=last].fill(1);
-                            if let Some(owner) = &mut owner {
-                                owner.protect_source(insn.address, u32::from(insn.length))?;
-                            }
-                        }
-                    }
-                }
-            }
+            let guards = source_guards(
+                &binding,
+                instructions.as_deref(),
+                &mut source_pages,
+                |linear, length| {
+                    owner
+                        .as_mut()
+                        .map_or(Ok(()), |owner| owner.protect_source(linear, length))
+                },
+            )?;
             entry_ips.push(binding.entry_ip);
+            entry_bindings.push(prepared.len());
             prepared.push(PreparedBinding {
                 binding,
                 function_index,
+                enabled: true,
                 guards,
                 checked: false,
                 matches: false,
                 instructions,
                 canonical_copy,
                 uniform: None,
+                execution: ProcedureEntryStats::default(),
             });
         }
         // Publish hints only after every fallible preparation step. They never
         // authorize execution: context, budget and source proofs stay below.
         self.cpu
-            .set_prepared_entries(entry_ips)
+            .set_prepared_entries_at(code.base, entry_ips)
             .map_err(String::from)?;
         if let Some(mut owner) = owner {
             // Setup-only copies. The old allocation is dropped by replace_storage.
@@ -875,7 +1326,11 @@ impl PcMachine {
             owner
                 .generations_mut()
                 .copy_from_slice(self.bus.ram.storage.generations());
-            self.bus.vga.transfer_memory_into(owner.video_mut());
+            // A replaced owner holds VRAM; otherwise VGA still owns it.
+            match self.bus.ram.storage.video() {
+                Some(video) => owner.video_mut().copy_from_slice(video),
+                None => self.bus.vga.transfer_memory_into(owner.video_mut()),
+            }
             self.bus.ram.replace_storage(Storage::Wasm(Box::new(owner)));
         }
         self.cpu.set_dynamic_core(false);
@@ -885,7 +1340,9 @@ impl PcMachine {
             } else {
                 Backend::Interpreter
             },
+            code,
             bindings: prepared,
+            entry_bindings,
             source_pages,
             stats: Stats::default(),
             failure: None,
@@ -911,19 +1368,127 @@ impl PcMachine {
         if plan.suspended == suspended {
             return Ok(());
         }
-        let entries = if suspended {
-            Vec::new()
-        } else {
-            plan.bindings
-                .iter()
-                .map(|binding| binding.binding.entry_ip)
-                .collect()
+        let (entries, indices) = procedure_entry_hints(
+            plan,
+            !suspended && plan.diagnostic_dispatch_enabled(),
+            |_, binding| binding.enabled,
+        )?;
+        self.cpu.set_prepared_entries_at(plan.code.base, entries)?;
+        let plan = self.wasm_procedures.as_mut().expect("installed plan");
+        plan.suspended = suspended;
+        plan.entry_bindings = indices;
+        Ok(())
+    }
+
+    /// Remove installed procedures and return RAM, page generations and VRAM
+    /// to their ordinary owners, as before installation. A suspended plan's
+    /// shared backing still costs the interpreter time on every access
+    /// outside batches. Needs unrecorded RAM, like installation; copies once.
+    pub fn uninstall_wasm_procedures(&mut self) -> Result<(), &'static str> {
+        if self.wasm_procedures.is_none() {
+            return Err("WASM procedures are not installed");
+        }
+        if !self.bus.ram.direct_execution_ready() {
+            return Err("WASM procedures can be removed only while RAM is not recorded");
+        }
+        self.cpu.set_prepared_entries(Vec::new())?;
+        self.bus.wasm_rle_call = None;
+        self.wasm_procedures = None;
+        let owned = match &self.bus.ram.storage {
+            Storage::Wasm(owner) => {
+                self.bus.vga.restore_memory(owner.video());
+                Some(Storage::Owned {
+                    bytes: owner.ram().into(),
+                    generations: owner.generations().into(),
+                })
+            }
+            Storage::Owned { .. } => None,
         };
-        self.cpu.set_prepared_entries(entries)?;
-        self.wasm_procedures
+        if let Some(storage) = owned {
+            self.bus.ram.replace_storage(storage);
+        }
+        Ok(())
+    }
+
+    /// The code segment the installed procedures are bound to.
+    pub fn wasm_procedure_code_segment(&self) -> Option<CodeSegment> {
+        self.wasm_procedures.as_ref().map(|plan| plan.code)
+    }
+
+    /// Follow code that moved with its segment to `base`, as a DJGPP program's
+    /// does when DPMI 0503h moves its block. Compiled procedures name EIPs and
+    /// are kept; source proofs, guards, page protections and entry hints move.
+    /// Every moved source is validated before anything changes. The previous
+    /// pages stay protected, so generated stores there leave to the interpreter.
+    pub fn rebase_wasm_procedures(&mut self, base: u32) -> Result<(), String> {
+        let ram_size = self.bus.ram_size();
+        let plan = self
+            .wasm_procedures
             .as_mut()
-            .expect("installed plan")
-            .suspended = suspended;
+            .ok_or("WASM procedures are not installed")?;
+        let old = plan.code;
+        if old.base == base {
+            return Ok(());
+        }
+        // Virtual operand slots are absolute addresses in generated code.
+        // Changing only source proofs would leave those loads at the old base.
+        if plan.bindings.iter().any(|prepared| {
+            prepared.instructions.as_ref().is_none_or(|instructions| {
+                instructions
+                    .iter()
+                    .any(|insn| insn.prefix_length < insn.length)
+            })
+        }) {
+            return Err(
+                "procedures with mutable or unknown operand metadata require recompilation before rebasing"
+                    .into(),
+            );
+        }
+        let code = CodeSegment {
+            base,
+            limit: old.limit,
+        };
+        let place = |linear: u32| base.checked_add(linear.checked_sub(old.base)?);
+        for prepared in &plan.bindings {
+            validate_sources(&prepared.binding, code, ram_size, place)?;
+        }
+        let mut owner = match &mut self.bus.ram.storage {
+            #[cfg(feature = "wasm-procedures")]
+            Storage::Wasm(owner) => Some(owner),
+            _ => None,
+        };
+        let mut source_pages = alloc::vec![0u8; plan.source_pages.len()];
+        for prepared in &mut plan.bindings {
+            for part in &mut prepared.binding.code {
+                part.linear = place(part.linear).expect("validated moved source");
+            }
+            prepared.binding.code_segment = code;
+            prepared.instructions = source_instructions(&prepared.binding);
+            prepared.guards = source_guards(
+                &prepared.binding,
+                prepared.instructions.as_deref(),
+                &mut source_pages,
+                |at, length| {
+                    owner
+                        .as_mut()
+                        .map_or(Ok(()), |owner| owner.protect_source(at, length))
+                },
+            )?;
+            prepared.checked = false;
+            prepared.matches = false;
+            prepared.uniform = None;
+        }
+        plan.source_pages = source_pages;
+        plan.code = code;
+        let (entries, indices) =
+            procedure_entry_hints(plan, plan.dispatches_entries(), |_, binding| {
+                binding.enabled
+            })
+            .map_err(String::from)?;
+        self.cpu
+            .set_prepared_entries_at(base, entries)
+            .map_err(String::from)?;
+        plan.entry_bindings = indices;
         Ok(())
     }
 
@@ -931,6 +1496,11 @@ impl PcMachine {
     /// recurrence proof, which ends at a later batch boundary.
     pub fn wasm_procedures_installable(&self) -> bool {
         self.wasm_procedures.is_none() && self.bus.ram.direct_execution_ready()
+    }
+
+    /// Installed, and RAM is not being recorded, so a replacement can move it.
+    pub fn wasm_procedures_replaceable(&self) -> bool {
+        self.wasm_procedures.is_some() && self.bus.ram.direct_execution_ready()
     }
 
     /// Installed and not suspended.
@@ -948,6 +1518,95 @@ impl PcMachine {
         self.wasm_procedures
             .as_ref()
             .map_or(0, |plan| plan.bindings.len())
+    }
+
+    /// EIP of the indexed prepared entry; ordering is ascending by EIP.
+    pub fn wasm_procedure_entry_ip(&self, index: usize) -> Option<u32> {
+        self.wasm_procedures
+            .as_ref()?
+            .bindings
+            .get(index)
+            .map(|prepared| prepared.binding.entry_ip)
+    }
+
+    /// A copy of the indexed entry's accepted execution totals.
+    pub fn wasm_procedure_entry_stats(&self, index: usize) -> Option<ProcedureEntryStats> {
+        self.wasm_procedures
+            .as_ref()?
+            .bindings
+            .get(index)
+            .map(|prepared| prepared.execution)
+    }
+
+    /// Configured admission for the indexed entry, independent of suspension.
+    pub fn wasm_procedure_entry_enabled(&self, index: usize) -> Option<bool> {
+        Some(self.wasm_procedures.as_ref()?.bindings.get(index)?.enabled)
+    }
+
+    /// Change one interpreter-to-procedure entry without removing its function
+    /// or statistics. Hint rebuilding may allocate here, outside execution.
+    pub fn set_wasm_procedure_entry_enabled(
+        &mut self,
+        index: usize,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        let plan = self
+            .wasm_procedures
+            .as_ref()
+            .ok_or("WASM procedures are not installed")?;
+        let binding = plan
+            .bindings
+            .get(index)
+            .ok_or("WASM procedure entry index outside plan")?;
+        if binding.enabled == enabled {
+            return Ok(());
+        }
+        let (entries, indices) =
+            procedure_entry_hints(plan, plan.dispatches_entries(), |candidate, binding| {
+                if candidate == index {
+                    enabled
+                } else {
+                    binding.enabled
+                }
+            })?;
+        self.cpu.set_prepared_entries_at(plan.code.base, entries)?;
+        let plan = self.wasm_procedures.as_mut().expect("installed plan");
+        plan.bindings[index].enabled = enabled;
+        plan.entry_bindings = indices;
+        Ok(())
+    }
+
+    /// Apply one selection in ascending entry-EIP order, rebuilding interpreter
+    /// fences once. A bad length or failed preparation leaves admission intact.
+    /// Disabled entries retain their compiled functions and accumulated totals.
+    pub fn set_wasm_procedure_entries_enabled(
+        &mut self,
+        enabled: &[bool],
+    ) -> Result<(), &'static str> {
+        let plan = self
+            .wasm_procedures
+            .as_ref()
+            .ok_or("WASM procedures are not installed")?;
+        if enabled.len() != plan.bindings.len() {
+            return Err("WASM procedure entry selection length differs from plan");
+        }
+        if plan
+            .bindings
+            .iter()
+            .zip(enabled)
+            .all(|(binding, enabled)| binding.enabled == *enabled)
+        {
+            return Ok(());
+        }
+        let (entries, indices) =
+            procedure_entry_hints(plan, plan.dispatches_entries(), |index, _| enabled[index])?;
+        self.cpu.set_prepared_entries_at(plan.code.base, entries)?;
+        let plan = self.wasm_procedures.as_mut().expect("installed plan");
+        for (binding, &enabled) in plan.bindings.iter_mut().zip(enabled) {
+            binding.enabled = enabled;
+        }
+        plan.entry_bindings = indices;
+        Ok(())
     }
 
     pub fn wasm_procedure_copy_tier_entries(&self) -> impl Iterator<Item = u32> + '_ {
@@ -991,19 +1650,18 @@ impl PcMachine {
         if plan.diagnostic_mode == mode {
             return Ok(());
         }
-        let entries = if mode == DiagnosticMode::Normal {
-            plan.bindings
-                .iter()
-                .map(|binding| binding.binding.entry_ip)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        self.cpu.set_prepared_entries(entries)?;
-        self.wasm_procedures
+        let (entries, indices) = procedure_entry_hints(
+            plan,
+            !plan.suspended && mode == DiagnosticMode::Normal,
+            |_, binding| binding.enabled,
+        )?;
+        self.cpu.set_prepared_entries_at(plan.code.base, entries)?;
+        let plan = self
+            .wasm_procedures
             .as_mut()
-            .expect("installed diagnostic plan")
-            .diagnostic_mode = mode;
+            .expect("installed diagnostic plan");
+        plan.diagnostic_mode = mode;
+        plan.entry_bindings = indices;
         Ok(())
     }
 
@@ -1040,14 +1698,15 @@ impl PcMachine {
         // Membership is cached independently of code bytes. This hint avoids
         // searching the registry for ordinary interpreter batches; the source
         // and architectural proofs still authorize every foreign invocation.
-        let Some(index) = self.cpu.prepared_entry_index() else {
+        let Some(hint) = self.cpu.prepared_entry_index() else {
             return Ok(None);
         };
-        if plan
-            .bindings
-            .get(index)
-            .is_none_or(|binding| binding.binding.entry_ip != self.cpu.registers.ip)
-        {
+        let Some(&index) = plan.entry_bindings.get(hint) else {
+            return Ok(None);
+        };
+        if plan.bindings.get(index).is_none_or(|binding| {
+            !binding.enabled || binding.binding.entry_ip != self.cpu.registers.ip
+        }) {
             return Ok(None);
         }
         if self.vga_wait.candidate.is_some()
@@ -1062,6 +1721,12 @@ impl PcMachine {
         let Some(context) = ProcedureContext::capture(&self.cpu) else {
             return Ok(None);
         };
+        // Entries are EIPs in the bound segment; its limit must cover every
+        // source, branch and exit the compiler proved within that code.
+        let (base, limit) = context.code_segment();
+        if base != plan.code.base || limit < plan.code.limit {
+            return Ok(None);
+        }
         let tier = if self.cpu.execution_labels_enabled() {
             let plan = self.wasm_procedures.as_mut().expect("prepared plan");
             let tier = plan
@@ -1079,6 +1744,33 @@ impl PcMachine {
         let plan = self.wasm_procedures.as_ref().expect("prepared plan");
         let binding = &plan.bindings[index];
         self.bus.wasm_rle_call = None;
+        if let Storage::Wasm(owner) = &mut self.bus.ram.storage {
+            owner.clear_pc24_boundary();
+        }
+        if let Some(x87) = binding.binding.x87 {
+            if self.cpu.control.cr0 & 12 != 0 {
+                return Ok(None);
+            }
+            let Some(fpu) = self.cpu.fpu.as_ref() else {
+                return Ok(None);
+            };
+            let top = u32::from((fpu.status() >> 11) & 7);
+            let read = x87.read_mask.rotate_left(top);
+            let write = x87.write_mask.rotate_left(top);
+            let mut boundary = [0; (X87_SELECTORS_OFFSET - X87_BOUNDARY_OFFSET) as usize];
+            if !fpu.write_pc24_boundary(read, write, &mut boundary) {
+                return Ok(None);
+            }
+            let Storage::Wasm(owner) = &mut self.bus.ram.storage else {
+                return Ok(None);
+            };
+            owner.prepare_pc24_boundary(
+                read,
+                write,
+                &boundary,
+                SegmentRegister::ALL.map(|segment| self.cpu.registers.selector(segment)),
+            );
+        }
         let atomic = binding.binding.kernel.is_some()
             || binding.binding.rle_kernel.is_some()
             || binding.binding.finite_computation.is_some();
@@ -1191,15 +1883,22 @@ impl PcMachine {
                 return Err(MachineError::WasmProcedure(failure));
             }
         };
-        let instructions = match outcome {
+        let (instructions, side_exit) = match outcome {
             MemoryProcedureOutcome::Declined(_) => return Ok(None),
-            MemoryProcedureOutcome::Complete { instructions } => instructions,
+            MemoryProcedureOutcome::Complete { instructions } => (instructions, false),
             MemoryProcedureOutcome::SideExit { instructions } => {
                 plan.stats.side_exits += 1;
-                instructions
+                (instructions, true)
             }
         };
         plan.stats.calls += 1;
+        binding.execution.calls += 1;
+        if plan.backend != Backend::Interpreter {
+            binding.execution.translated_instructions += u64::from(instructions);
+        }
+        if side_exit {
+            binding.execution.side_exits += 1;
+        }
         if plan.backend == Backend::Interpreter {
             plan.stats.interpreted_calls += 1;
             plan.stats.interpreted_instructions += u64::from(instructions);
@@ -1241,6 +1940,22 @@ impl PcMachine {
 
 impl MemoryProcedureBus for PcBus {
     type Error = String;
+
+    fn finish_memory_procedure(
+        &mut self,
+        fpu: Option<&mut MemoryProcedureFpu>,
+    ) -> Result<(), String> {
+        let Storage::Wasm(owner) = &mut self.ram.storage else {
+            return Ok(());
+        };
+        if let Some((read, write, boundary)) = owner.pending_pc24_boundary() {
+            fpu.ok_or("WASM procedure lost its x87 state")?
+                .commit_pc24_boundary(read, write, boundary)
+                .map_err(|error| alloc::format!("invalid WASM x87 result: {error:?}"))?;
+            owner.clear_pc24_boundary();
+        }
+        Ok(())
+    }
 
     fn execute_memory_procedure(
         &mut self,

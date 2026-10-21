@@ -6,10 +6,15 @@ use doslet_x86_wasm::static_program::{
     Frame,
     memory::{self, Descriptor, RamDescriptor, SegmentBounds, StackAddress},
     procedure_memory::{
-        COMPLETE, RleCall, SIDE_EXIT,
+        COMPLETE, RleCall, SIDE_EXIT, X87_BOUNDARY_OFFSET, X87_FRAME_BYTES, X87_SELECTORS_OFFSET,
         rle::{RleAdmission, RleMemory, prepare_rle},
     },
 };
+
+const PC24_BOUNDARY_OFFSET: usize = X87_BOUNDARY_OFFSET as usize;
+const PC24_SELECTORS_OFFSET: usize = X87_SELECTORS_OFFSET as usize;
+const PC24_BOUNDARY_BYTES: usize = PC24_SELECTORS_OFFSET - PC24_BOUNDARY_OFFSET;
+const PC24_FRAME_BYTES: usize = X87_FRAME_BYTES as usize;
 
 /// Calls a previously resolved export by its index in sorted function-ID order.
 /// The host must not reenter the machine while executing this synchronous call.
@@ -36,6 +41,7 @@ pub(crate) struct SharedProcedureMemory {
     callback: BrowserCall,
     descriptor: Option<Descriptor>,
     failed: bool,
+    pc24_masks: Option<(u8, u8)>,
 }
 
 impl SharedProcedureMemory {
@@ -52,11 +58,13 @@ impl SharedProcedureMemory {
             generations: vec![0; ram_bytes / 4096].into_boxed_slice(),
             video: vec![0; 512 * 1024].into_boxed_slice(),
             protected: vec![0; ram_bytes / 4096].into_boxed_slice(),
-            scratch: vec![0; RleCall::OFFSET as usize + RleCall::BYTES].into_boxed_slice(),
+            scratch: vec![0; PC24_FRAME_BYTES.max(RleCall::OFFSET as usize + RleCall::BYTES)]
+                .into_boxed_slice(),
             functions: ids.len(),
             callback,
             descriptor: None,
             failed: false,
+            pc24_masks: None,
         })
     }
 
@@ -65,6 +73,34 @@ impl SharedProcedureMemory {
             ram_bytes: self.ram.len(),
             video_pointer: self.video.as_ptr() as u32,
         }
+    }
+    pub fn prepare_pc24_boundary(
+        &mut self,
+        read_mask: u8,
+        write_mask: u8,
+        boundary: &[u8; PC24_BOUNDARY_BYTES],
+        selectors: [u16; 6],
+    ) {
+        self.scratch[PC24_BOUNDARY_OFFSET..PC24_SELECTORS_OFFSET].copy_from_slice(boundary);
+        for (selector, output) in selectors.into_iter().zip(
+            self.scratch[PC24_SELECTORS_OFFSET..PC24_SELECTORS_OFFSET + 12]
+                .as_chunks_mut::<2>()
+                .0,
+        ) {
+            output.copy_from_slice(&selector.to_le_bytes());
+        }
+        self.pc24_masks = Some((read_mask, write_mask));
+    }
+    pub fn pending_pc24_boundary(&self) -> Option<(u8, u8, &[u8])> {
+        let (read, write) = self.pc24_masks?;
+        Some((
+            read,
+            write,
+            &self.scratch[PC24_BOUNDARY_OFFSET..PC24_SELECTORS_OFFSET],
+        ))
+    }
+    pub fn clear_pc24_boundary(&mut self) {
+        self.pc24_masks = None;
     }
     pub fn ram(&self) -> &[u8] {
         &self.ram

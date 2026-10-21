@@ -87,7 +87,8 @@ fn induction(
             match instruction.operation {
                 Operation::Inc(register) => return Some((node, position, register, false)),
                 Operation::Dec(register) => return Some((node, position, register, true)),
-                Operation::Nop
+                Operation::X87(_)
+                | Operation::Nop
                 | Operation::Move { .. }
                 | Operation::Extend { .. }
                 | Operation::Lea { .. }
@@ -122,7 +123,8 @@ fn writes(operation: Operation, register: Register) -> bool {
     let overlaps =
         |other: Register| other.index() == register.index() && mask(other) & mask(register) != 0;
     match operation {
-        Operation::Nop
+        Operation::X87(_)
+        | Operation::Nop
         | Operation::StoreMemory { .. }
         | Operation::CompareMemory { .. }
         | Operation::AluMemoryStore { .. }
@@ -580,6 +582,7 @@ pub(super) fn plan(
         targets,
         maximum_work,
         bounded: None,
+        x87: None,
         finite: Some(FinitePlan {
             loops,
             regions: finished,

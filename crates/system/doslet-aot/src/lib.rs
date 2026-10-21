@@ -13,6 +13,7 @@ extern crate alloc;
 
 pub mod binding;
 pub mod cfg;
+mod coff;
 pub mod procedures;
 pub mod profile;
 pub mod regions;
@@ -109,6 +110,8 @@ pub struct Relocation<'a> {
     pub provenance: &'a [SourceProvenance],
 }
 
+pub use coff::coff_offset_bindings;
+
 #[derive(Debug)]
 pub struct SymbolicObject {
     object_number: u32,
@@ -154,9 +157,19 @@ struct Site {
     provenance: Range<usize>,
 }
 
+/// The executable format an image was reconstructed from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFormat {
+    Le,
+    /// A DJGPP COFF image: objects are its sections, in section order, and
+    /// their preferred bases are offsets in the program's selectors.
+    Coff,
+}
+
 /// Complete owned image, published only after reconstruction and validation.
 #[derive(Debug)]
 pub struct SymbolicImage {
+    format: ImageFormat,
     header: LeHeader,
     objects: Vec<SymbolicObject>,
     sites: Vec<Site>,
@@ -164,6 +177,10 @@ pub struct SymbolicImage {
 }
 
 impl SymbolicImage {
+    pub fn format(&self) -> ImageFormat {
+        self.format
+    }
+
     /// Reconstruct all objects and validate every mapped fixup stream. Source
     /// writes must fit their object completely; target offsets remain symbolic.
     /// No partially prepared image is returned on any failure.
@@ -306,6 +323,7 @@ impl SymbolicImage {
         }
         let (sites, provenance) = canonicalize(pending, &mut budget)?;
         Ok(Self {
+            format: ImageFormat::Le,
             header,
             objects,
             sites,
@@ -313,6 +331,8 @@ impl SymbolicImage {
         })
     }
 
+    /// The LE header, or for COFF an equivalent one: no pages, one object
+    /// per section and the entry in the text object.
     pub fn header(&self) -> LeHeader {
         self.header
     }
@@ -376,6 +396,8 @@ pub enum ImageError {
         width: u8,
         virtual_size: u32,
     },
+    /// A COFF construct outside the supported executable subset.
+    UnsupportedCoff(&'static str),
     ConflictingRelocations {
         source: ObjectAddress,
         first: SourceProvenance,
@@ -417,6 +439,7 @@ impl fmt::Display for ImageError {
                 f,
                 "{provenance:?}: write at {object_offset} of width {width} exceeds object size {virtual_size}"
             ),
+            Self::UnsupportedCoff(reason) => write!(f, "unsupported COFF image: {reason}"),
             Self::ConflictingRelocations {
                 source,
                 first,

@@ -385,6 +385,7 @@ impl X87 {
     }
 
     /// True when every reference failure path is excluded for this state.
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
     fn ready(self, fpu: &doslet_x87::X87) -> bool {
         let control = fpu.control();
         // No unmasked exception can be raised, and PC=01 is not reserved.

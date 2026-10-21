@@ -264,6 +264,18 @@ impl Controller {
         self.persistence = Some(persistence);
         Ok(())
     }
+    pub fn cached_game_bytes(
+        bytes: &[u8],
+        directory: Option<&Path>,
+    ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let Some((path, rates, _learning)) = persistence::cached_game_bytes(bytes, directory)?
+        else {
+            return Ok(None);
+        };
+        let mut controller = Self::load(&path, rates[1].unwrap(), rates[0], rates[2].unwrap())?;
+        controller.bind_game_bytes(bytes, directory)?;
+        Ok(Some(controller))
+    }
     pub fn cached_game(
         exe: &Path,
         directory: Option<&Path>,
@@ -273,7 +285,7 @@ impl Controller {
         };
         let mut controller = Self::load(&path, rates[1].unwrap(), rates[0], rates[2].unwrap())?;
         controller.bind_game(exe, directory)?;
-        // Restoring labels is passive. Background replays always require opt-in.
+        // Restoring labels is passive. Diagnostic replays always require opt-in.
         eprintln!(
             "[INFO doslet] automatic speed-tier profile: {}",
             path.display()
@@ -321,8 +333,6 @@ impl Controller {
         // the browser; others fall back to labelled interpretation.
         #[cfg(feature = "wasm-procedures")]
         let _ = session.set_wasm_procedure_tier_accounting(true);
-        // Capture fresh program entry before the first live execution batch.
-        self.maintain_learning(session);
     }
     fn labels(&self) -> Vec<doslet_x86::ExecutionLabel> {
         labels(&self.profile)
@@ -376,9 +386,6 @@ impl Controller {
         }
         (moved, dropped)
     }
-    pub fn learn_in_background(&mut self) {
-        self.set_learning(true);
-    }
     pub fn set_learning(&mut self, enabled: bool) {
         if enabled && self.learner.is_none() {
             self.learner = Some(learning::Learner::default());
@@ -398,14 +405,27 @@ impl Controller {
         }
     }
     pub fn maintain_learning(&mut self, session: &mut Session) {
+        self.maintain_learning_with_pause(session, || {});
+    }
+    /// Calls `before_replay` only when the guest will stop for a diagnostic replay.
+    /// Returns whether that callback ran, including replay failures.
+    pub fn maintain_learning_with_pause(
+        &mut self,
+        session: &mut Session,
+        before_replay: impl FnOnce(),
+    ) -> bool {
         self.maintain_persistence();
         if !self.stats.enabled {
-            return;
+            return false;
         }
         let Some(learner) = &mut self.learner else {
-            return;
+            return false;
         };
-        if learner.maintain(session, &mut self.profile, self.stats.grey_mhz) {
+        let mut ran = false;
+        if learner.maintain_with_pause(session, &mut self.profile, self.stats.grey_mhz, || {
+            ran = true;
+            before_replay();
+        }) {
             let labels = labels(&self.profile);
             session
                 .replace_execution_labels(labels)
@@ -421,6 +441,7 @@ impl Controller {
         self.stats.learning_grey_percent = learner.grey_percent;
         self.stats.learning_capture_micros = learner.capture_micros;
         self.maintain_persistence();
+        ran
     }
     fn maintain_persistence(&mut self) {
         if let Some(p) = &mut self.persistence {

@@ -59,6 +59,7 @@ doslet-pulse = { path = "../../crates/runtime/doslet-pulse" }
 [lints]
 workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+doslet-pc.workspace = true
 doslet-x86-wasm = { path = "../../crates/cpu/doslet-x86-wasm" }
 serde_json = "1"
 base64 = "0.22"

@@ -424,6 +424,7 @@ fn validate_source(width: Width, source: Source) -> Result<(), ProcedureOperatio
 }
 fn validate_operation(op: Operation) -> Result<(), ProcedureOperationError> {
     match op {
+        Operation::X87(_) => return Err(ProcedureOperationError::Unsupported),
         Operation::Nop => {}
         Operation::Move { target, source } | Operation::Alu { target, source, .. } => {
             validate_register(target)?;

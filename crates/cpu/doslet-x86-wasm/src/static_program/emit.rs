@@ -9,6 +9,11 @@ use wasm_encoder::{
     ImportSection, Instruction as W, MemArg, MemoryType, Module, Section, TypeSection, ValType,
 };
 
+#[path = "procedure_x87_emit.rs"]
+mod procedure_x87_emit;
+#[path = "x87_numeric_emit.rs"]
+pub(super) mod x87_numeric_emit;
+
 #[path = "inline_admission_emit.rs"]
 mod inline_admission_emit;
 #[path = "procedure_memory_emit.rs"]
@@ -447,6 +452,7 @@ fn alu_result(f: &mut Function, kind: Alu, width: Width, preserve_carry: bool) {
 }
 pub(super) fn operation(f: &mut Function, op: Operation) {
     match op {
+        Operation::X87(_) => unreachable!("x87 requires opted-in procedure emitter"),
         Operation::Nop => {}
         Operation::Move { target, source: s } => {
             source(f, s);

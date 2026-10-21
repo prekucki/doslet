@@ -3,6 +3,7 @@
 use super::*;
 use crate::static_program::procedure_memory::graph::finite::{FinitePlan, FiniteRegion};
 
+#[allow(clippy::too_many_arguments)]
 fn region_body(
     f: &mut Function,
     vregs: &VirtualRegisters,

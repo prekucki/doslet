@@ -317,6 +317,11 @@ impl Doslet {
     #[inline(never)]
     pub fn from_cli(cli: crate::cli::Cli) -> Result<Box<Self>, Box<dyn std::error::Error>> {
         let cli = cli.resolve()?;
+        if cli.learn_speed_tiers && cli.game.is_none() {
+            return Err(
+                "--learn-speed-tiers requires a game executable (--game, --zip or --config)".into(),
+            );
+        }
         let mut app = Self::boxed_new();
         app.audio_backend = cli.audio_backend;
         app.audio_mixer = cli.audio_mixer;
@@ -338,17 +343,10 @@ impl Doslet {
             && !app.launch.observe_idle
             && !app.launch.heroes_menu_idle
             && !app.launch.heroes_timer_waits
-            && !app
-                .launch
-                .machine_spec
-                .as_ref()
-                .is_some_and(|s| crate::native_zip::mount(s).is_some())
             && let Some(exe) = &cli.game
         {
-            match crate::native_speed_tiers::Controller::cached_game(
-                exe,
-                cli.speed_tier_cache.as_deref(),
-            ) {
+            match crate::native_zip::cached_game(exe, &app.launch, cli.speed_tier_cache.as_deref())
+            {
                 Ok(tiers) => tiers,
                 Err(error) => {
                     app.notice = Some(format!("Cannot load learned game profile: {error}"));
@@ -427,13 +425,25 @@ impl Doslet {
         if app.launch.adaptive_cpu {
             app.session.set_adaptive_cpu(true);
         }
-        if let Some(path) = cli.speed_tier_profile {
-            let mut tiers = crate::native_speed_tiers::Controller::load(
-                &path,
-                cli.cold_mhz.unwrap_or(8),
-                cli.hot_mhz,
-                cli.grey_mhz.unwrap_or(133),
-            )?;
+        if cli.speed_tier_profile.is_some() || cli.learn_speed_tiers {
+            let mut tiers = if let Some(path) = &cli.speed_tier_profile {
+                crate::native_speed_tiers::Controller::load(
+                    path,
+                    cli.cold_mhz.unwrap_or(8),
+                    cli.hot_mhz,
+                    cli.grey_mhz.unwrap_or(133),
+                )?
+            } else {
+                let mut tiers = automatic_tiers
+                    .unwrap_or_else(crate::native_speed_tiers::Controller::untrained);
+                tiers.configure(
+                    cli.hot_mhz.or(tiers.stats.hot_mhz),
+                    cli.grey_mhz.unwrap_or(tiers.stats.grey_mhz),
+                    cli.cold_mhz.unwrap_or(tiers.stats.cold_mhz),
+                    false,
+                );
+                tiers
+            };
             if let Some(exe) = &app.source {
                 crate::native_zip::bind_game(
                     &mut tiers,
@@ -443,7 +453,7 @@ impl Doslet {
                 )?;
             }
             if cli.learn_speed_tiers {
-                tiers.learn_in_background();
+                tiers.set_learning(true);
             }
             tiers.enable(&mut app.session);
             eprintln!(
@@ -454,7 +464,10 @@ impl Doslet {
                     .map_or_else(|| "MAX".into(), |m| format!("{m} MHz")),
                 tiers.stats.cold_mhz,
                 tiers.stats.grey_mhz,
-                path.display()
+                cli.speed_tier_profile.as_ref().map_or_else(
+                    || "game recording".into(),
+                    |path| path.display().to_string(),
+                )
             );
             app.speed_tiers = Some(tiers);
         } else if let Some(mut tiers) = automatic_tiers {
@@ -2275,11 +2288,9 @@ impl Doslet {
             }
             if !M::DEBUG && !prepared {
                 self.jit.maintain(&mut self.session);
-                if let Some(tiers) = &mut self.speed_tiers {
-                    tiers.maintain_learning(&mut self.session);
-                    if let Some(error) = tiers.take_persistence_error() {
-                        self.notice = Some(error);
-                    }
+                if self.maintain_tier_learning() {
+                    // Profiling wall time is a pause, never guest catch-up time.
+                    return;
                 }
                 prepared = true;
             }
@@ -2828,7 +2839,35 @@ impl Doslet {
                 && self.workspace.panel.is_none()
                 && !self.configurator.pending
     }
-    fn poll_paused_learning(&mut self) {
+    fn maintain_tier_learning(&mut self) -> bool {
+        let Some(tiers) = &mut self.speed_tiers else {
+            return false;
+        };
+        let mut output_error = None;
+        let ran = tiers.maintain_learning_with_pause(&mut self.session, || {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(audio) = &self.audio {
+                audio.set_active(false);
+            }
+            if let Some(output) = &mut self.host_midi {
+                output_error = output.set_active(false).err();
+            }
+        });
+        if let Some(error) = tiers.take_persistence_error() {
+            self.notice = Some(error);
+        }
+        if ran {
+            self.anchor = None;
+            self.presentation_revision = self.presentation_revision.wrapping_add(1);
+            // update() restores playback from the unchanged guest position.
+            if let Some(error) = output_error {
+                self.notice = Some(error);
+                self.session.pause();
+            }
+        }
+        ran
+    }
+    fn poll_paused_tier_persistence(&mut self) {
         if self.session.status() != SessionStatus::Paused
             || self.configurator.pending
             || self.debugger.as_ref().is_some_and(|gdb| gdb.connected())
@@ -2857,8 +2896,8 @@ impl Doslet {
             }
         }
     }
-    /// Watch for the live layout of a 32-bit LE program: learned tiers,
-    /// relocatable patches and AOT procedures follow it.
+    /// Watch for the live layout of a 32-bit LE or DJGPP COFF program:
+    /// learned tiers, relocatable patches and AOT procedures follow it.
     #[cfg(not(target_arch = "wasm32"))]
     fn watch_layout(&mut self, aot: bool) {
         let Some(path) = &self.source else {
@@ -2876,7 +2915,7 @@ impl Doslet {
         if self.layout.is_none() {
             if aot {
                 eprintln!(
-                    "[INFO doslet] AOT: {program} is not a 32-bit LE program; using the interpreter"
+                    "[INFO doslet] AOT: {program} is neither a 32-bit LE nor a DJGPP COFF program; using the interpreter"
                 );
             }
             return;
@@ -2926,16 +2965,22 @@ impl Doslet {
             return;
         };
         if let Some(layout) = watcher.poll(&self.session) {
-            eprintln!(
-                "[INFO doslet] {}: LE objects at {}",
-                self.name,
-                layout
-                    .objects
-                    .iter()
-                    .map(|o| format!("{}:{:#x}", o.number, o.base))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            let objects = layout
+                .objects
+                .iter()
+                .map(|o| format!("{}:{:#x}", o.number, o.base))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if layout.text.is_some() {
+                eprintln!(
+                    "[INFO doslet] {}: COFF sections at {objects} (code segment base {:#x}, layout {})",
+                    self.name,
+                    layout.code.base,
+                    layout.key()
+                );
+            } else {
+                eprintln!("[INFO doslet] {}: LE objects at {objects}", self.name);
+            }
             crate::native_layout::follow(
                 &mut self.session,
                 &self.launch.patches,
@@ -2968,7 +3013,7 @@ impl Doslet {
         } else {
             Task::none()
         };
-        self.poll_paused_learning();
+        self.poll_paused_tier_persistence();
         let effects = if self.session.status() == SessionStatus::Running
             || self.session.storage_waiting()
             || self.debugger.is_some()
@@ -3122,6 +3167,10 @@ impl Doslet {
 #[cfg(all(test, feature = "wasm-procedures", not(target_arch = "wasm32")))]
 #[path = "wasm_presentation_tests.rs"]
 mod wasm_presentation_tests;
+
+#[cfg(all(test, feature = "wasm-procedures", not(target_arch = "wasm32")))]
+#[path = "app_quake_tests.rs"]
+mod quake_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
@@ -3357,6 +3406,146 @@ enabled = false
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn zip_recording_activates_passively_on_next_launch_and_tracks_executable_bytes() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let fixture = crate::profile::tests::Fixture::new("version=2");
+                let zip = |fixture: &crate::profile::tests::Fixture, files: &[(&str, &[u8])]| {
+                    let path = fixture.root.join("game.zip");
+                    std::fs::write(
+                        &path,
+                        crate::archive::tests::pack(files, zip::CompressionMethod::Deflated)
+                            .as_slice(),
+                    )
+                    .unwrap();
+                    path
+                };
+                let path = zip(&fixture, &[("GAME/PLAY.COM", &[0xb8, 7, 0x4c, 0xcd, 0x21])]);
+                let cache = fixture.root.join("tier-cache");
+                let launch = |extra: &[&str]| {
+                    let mut arguments = vec![
+                        "doslet",
+                        "--zip",
+                        path.to_str().unwrap(),
+                        "--no-audio",
+                        "--speed-tier-cache",
+                        cache.to_str().unwrap(),
+                    ];
+                    arguments.extend_from_slice(extra);
+                    Doslet::from_cli(crate::cli::Cli::parse_from(arguments)).unwrap()
+                };
+                {
+                    let app = launch(&[
+                        "--learn-speed-tiers",
+                        "--hot-mhz",
+                        "450",
+                        "--grey-mhz",
+                        "95",
+                        "--cold-mhz",
+                        "9",
+                    ]);
+                    assert!(app.speed_tiers.as_ref().unwrap().stats.learning);
+                }
+                {
+                    let app = launch(&[]);
+                    let tiers = app.speed_tiers.as_ref().unwrap();
+                    assert!(tiers.stats.enabled);
+                    assert!(!tiers.stats.learning);
+                    assert_eq!(
+                        (
+                            tiers.stats.hot_mhz,
+                            tiers.stats.grey_mhz,
+                            tiers.stats.cold_mhz
+                        ),
+                        (Some(450), 95, 9),
+                    );
+                    assert!(!app.launch.preload_local_media);
+                }
+                assert!(launch(&["--no-speed-tiers"]).speed_tiers.is_none());
+                zip(&fixture, &[("GAME/PLAY.COM", &[0x90, 0xcd, 0x20])]);
+                assert!(launch(&[]).speed_tiers.is_none());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn recording_starts_without_a_seed_and_persists_game_cache() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                for mode in ["fixed", "adaptive"] {
+                    let fixture = crate::profile::tests::Fixture::new(&format!(
+                        r#"
+version = 2
+[game]
+executable = "../TINY.EXE"
+[machine]
+cpu_mode = "{mode}"
+[output]
+audio = false
+"#
+                    ));
+                    let cache = fixture.root.join("tier-cache");
+                    {
+                        let app = Doslet::from_cli(fixture.cli(&[
+                            "--learn-speed-tiers",
+                            "--speed-tier-cache",
+                            cache.to_str().unwrap(),
+                            "--hot-mhz",
+                            "400",
+                            "--grey-mhz",
+                            "90",
+                            "--cold-mhz",
+                            "7",
+                        ]))
+                        .unwrap();
+                        let stats = app.speed_tiers.as_ref().unwrap().stats;
+                        assert!(stats.enabled && stats.learning);
+                        assert_eq!(
+                            (stats.hot_mhz, stats.grey_mhz, stats.cold_mhz),
+                            (Some(400), 90, 7)
+                        );
+                        assert!(app.launch.preload_local_media);
+                        assert!(!app.launch.adaptive_cpu);
+                    }
+                    let app = Doslet::from_cli(fixture.cli(&[
+                        "--learn-speed-tiers",
+                        "--speed-tier-cache",
+                        cache.to_str().unwrap(),
+                    ]))
+                    .unwrap();
+                    let stats = app.speed_tiers.as_ref().unwrap().stats;
+                    assert!(stats.enabled && stats.learning);
+                    assert_eq!(
+                        (stats.hot_mhz, stats.grey_mhz, stats.cold_mhz),
+                        (Some(400), 90, 7)
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn recording_requires_an_executable_identity() {
+        use clap::Parser;
+        let error = Doslet::from_cli(crate::cli::Cli::parse_from([
+            "doslet",
+            "--demo",
+            "--no-audio",
+            "--learn-speed-tiers",
+        ]))
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("requires a game executable"));
     }
 
     #[test]
@@ -4721,38 +4910,31 @@ enabled = false
         assert!(app.audio_engine.ready().unwrap());
     }
     #[test]
-    fn paused_worker_collects_learning_results_and_refreshes_the_ui() {
+    fn synchronous_learning_finishes_before_execution_and_rebases_host_time() {
         let mut app = Doslet::new();
         app.session = Session::new(&[0x90, 0xeb, 0xfd]).unwrap().into();
         app.session.start();
         let mut tiers = crate::native_speed_tiers::Controller::untrained();
         tiers.configure(Some(1), 1, 1, true);
         tiers.enable(&mut app.session);
-        assert!(tiers.stats.learning_running);
+        assert_eq!(tiers.stats.learning_jobs, 0);
         app.speed_tiers = Some(tiers);
-        app.session.pause();
         let before = (
             app.session.steps(),
             app.session.emulated_nanos(),
             app.session.debug_pc(),
         );
         let revision = app.presentation_revision;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let _ = app.worker_tick();
-            let stats = app.speed_tier_stats().unwrap();
-            if !stats.learning_running {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "paused worker never collected result"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        let now = Instant::now();
+        app.anchor = Some((now - Duration::from_secs(30), 0));
+        app.tick_at(now);
+        assert_eq!(app.speed_tier_stats().unwrap().learning_jobs, 1);
+        assert!(!app.speed_tier_stats().unwrap().learning_running);
+        assert_eq!(app.speed_tier_stats().unwrap().learning_pending, 0);
         assert!(app.speed_tier_stats().unwrap().learning_changes > 0);
         assert!(app.presentation_revision > revision);
-        assert_eq!(app.session.status(), SessionStatus::Paused);
+        assert_eq!(app.session.status(), SessionStatus::Running);
+        assert!(app.anchor.is_none());
         assert_eq!(
             (
                 app.session.steps(),
@@ -4761,6 +4943,19 @@ enabled = false
             ),
             before
         );
+        // A fresh anchor excludes the whole profiling pause from guest time.
+        let resumed = Instant::now();
+        app.tick_at(resumed);
+        assert_eq!(app.session.steps(), before.0);
+        app.tick_at(resumed + Duration::from_millis(1));
+        assert!(app.session.steps() > before.0);
+        assert!(app.session.emulated_nanos() <= 1_100_000);
+        app.session.pause();
+        let paused = (app.session.steps(), app.session.emulated_nanos());
+        let _ = app.worker_tick();
+        assert_eq!(app.speed_tier_stats().unwrap().learning_jobs, 1);
+        assert_eq!(app.session.status(), SessionStatus::Paused);
+        assert_eq!((app.session.steps(), app.session.emulated_nanos()), paused);
     }
     #[test]
     fn audio_worker_errors_reach_the_notice_even_when_the_pc_is_paused() {

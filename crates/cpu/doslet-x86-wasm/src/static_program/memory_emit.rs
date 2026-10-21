@@ -856,6 +856,41 @@ pub(super) fn procedure_access(
     }
 }
 
+/// The extended portable FPU frame must be disjoint from every advertised
+/// writable/readable backing span before any procedure instruction executes.
+/// This is additional to the unchanged per-operand scalar proofs.
+pub(super) fn x87_frame_layout(f: &mut Function) {
+    use crate::static_program::procedure_memory::X87_FRAME_BYTES;
+    preflight_descriptor(f);
+    local_wide(f, FRAME);
+    wide(f, u64::from(X87_FRAME_BYTES));
+    ins(f, W::I64Add);
+    memory_size(f);
+    ins(f, W::I64LeU);
+    require(f, 0);
+    for (pointer, length, stride) in [
+        (m::RAM_POINTER, m::RAM_LENGTH, 1),
+        (m::GENERATIONS_POINTER, m::GENERATIONS_LENGTH, 8),
+        (m::CODE_PAGES_POINTER, m::CODE_PAGES_LENGTH, 1),
+        (m::DEVICE_POINTER, m::DEVICE_BACKING_LENGTH, 1),
+    ] {
+        descriptor_wide(f, pointer);
+        descriptor_wide(f, length);
+        wide(f, stride);
+        ins(f, W::I64Mul);
+        ins(f, W::I64Add);
+        local_wide(f, FRAME);
+        ins(f, W::I64LeU);
+        descriptor_wide(f, pointer);
+        local_wide(f, FRAME);
+        wide(f, u64::from(X87_FRAME_BYTES));
+        ins(f, W::I64Add);
+        ins(f, W::I64GeU);
+        ins(f, W::I32Or);
+        require(f, 0);
+    }
+}
+
 /// A guest store must never overwrite its descriptor, frame, generation table
 /// or code-page protection table through an overlapping advertised RAM backing.
 /// These are host control buffers, with exclusive ownership during this call.

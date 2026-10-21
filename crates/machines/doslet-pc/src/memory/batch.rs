@@ -47,6 +47,7 @@ impl<'a> BorrowedRamBus<'a> {
         }
     }
 
+    #[cfg(feature = "wasm-procedures")]
     pub(super) fn with_video(
         bytes: &'a mut [u8],
         generations: &'a mut [u64],
@@ -76,7 +77,8 @@ impl<'a> BorrowedRamBus<'a> {
         Some(start..end)
     }
 
-    #[inline]
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     fn read<const N: usize>(&mut self, address: u32) -> Result<[u8; N], BusError> {
         let Some(range) = self.ram_range(address, N) else {
             let video = self
@@ -105,7 +107,8 @@ impl<'a> BorrowedRamBus<'a> {
             .expect("fixed RAM access width"))
     }
 
-    #[inline]
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     fn write<const N: usize>(&mut self, address: u32, value: [u8; N]) -> Result<(), BusError> {
         // Check the complete span before changing bytes or page generations.
         let Some(range) = self.ram_range(address, N) else {
@@ -143,32 +146,38 @@ impl<'a> BorrowedRamBus<'a> {
 }
 
 impl MemoryBus for BorrowedRamBus<'_> {
-    #[inline]
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     fn read_u8(&mut self, address: u32) -> Result<u8, BusError> {
         self.read(address).map(|[value]| value)
     }
 
-    #[inline]
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     fn read_u16(&mut self, address: u32) -> Result<u16, BusError> {
         self.read(address).map(u16::from_le_bytes)
     }
 
-    #[inline]
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     fn read_u32(&mut self, address: u32) -> Result<u32, BusError> {
         self.read(address).map(u32::from_le_bytes)
     }
 
-    #[inline]
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     fn write_u8(&mut self, address: u32, value: u8) -> Result<(), BusError> {
         self.write(address, [value])
     }
 
-    #[inline]
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     fn write_u16(&mut self, address: u32, value: u16) -> Result<(), BusError> {
         self.write(address, value.to_le_bytes())
     }
 
-    #[inline]
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     fn write_u32(&mut self, address: u32, value: u32) -> Result<(), BusError> {
         self.write(address, value.to_le_bytes())
     }
@@ -242,5 +251,8 @@ impl PortBus for BorrowedRamBus<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "wasm-procedures"))]
 mod tests;
+
+#[cfg(test)]
+mod native_tests;

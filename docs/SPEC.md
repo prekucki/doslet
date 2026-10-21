@@ -343,6 +343,14 @@ rejection is remembered against the same code check, so the original interpreter
 runs without another decode attempt until those bytes change.
 Both paths consume one scheduling step and preserve the existing IRQ boundaries.
 
+Native interpreter batches omit the in-block code-generation check after
+prepared register-only instructions, including register x87 forms and LEA.
+Every memory access and fallback handler retains the check; block entry still
+validates its code. The instruction classification uses existing cache storage
+and does not change execution budgets. `Session::set_selective_code_guards(false)`
+selects the previous checking policy for differential tests. Browser builds keep
+that previous default until their throughput is measured separately.
+
 PC RAM tracks checked write generations for 4-KiB pages, including mutations
 through wide write views. A code span checks both page generations, its RAM
 owner identity and A20 mapping generation; its physical pages are resolved at
@@ -378,7 +386,12 @@ variant and reports must say so; counted instrumentation remains selectable.
 Adaptive and speed-tier policies remain independent. Borrowed LE inspection,
 internal fixup decoding, bounded symbolic image reconstruction and conservative
 static control-flow discovery are implemented in `doslet-executable` and
-`doslet-aot`. The CFG preserves valid overlapping instruction streams and reports
+`doslet-aot`. DJGPP MZ-stub/COFF section inspection and bounded symbolic mapping
+are also implemented. Native automatic AOT validates live COFF text and retains
+segment-relative EIPs separately from linear source addresses. Mutable operand
+slot addresses include the checked CS base; their loaded values remain unchanged.
+Modules containing these absolute slot addresses require recompilation when
+their segment moves. The CFG preserves valid overlapping instruction streams and reports
 unresolved paths. Offline relocation plans validate explicitly declared load and
 selector bindings; bounded region grouping preserves graph entry identities.
 An optional `doslet-aot/wasm` adapter now lowers register operations and direct
@@ -422,6 +435,57 @@ All variants compare full saved states and PCM/MIDI digests against the same
 native oracle, separately from measured execution time.
 Existing execution and adaptive scheduling strategies keep their current defaults.
 
+The separate bounded memory-procedure compiler admits conditional early exits
+along one loop continuation path, including memory-dependent conditions. It
+preserves exact prefix work and exit EIP when a grant or memory proof fails.
+
+Procedure graph compilation first creates an immutable analyzed plan. Before
+WASM emission, each entry is classified as acyclic, budgeted, finite, guarded
+finite, copy or RLE. Its x87 summary records entry-value dependence, control and
+status requirements, signed stack excursions and the balance at each declared
+exit. Balanced declared exits do not imply balanced intermediate refusals or
+unchanged FPU state. Unknown signed stack topology stays unknown. Generation
+consumes the private proof plans; diagnostic colors cannot relax runtime
+admission. The application selects candidates using these plans rather than
+compiling each candidate separately, and embeds versioned analysis metadata.
+
+The AOT discovery API `from_bound_graph_with_bounded_fragments` additionally
+admits cyclic fragments ending before unsupported instructions when an explicit
+work limit is supplied, without proving termination of a memory counter.
+Native automatic AOT enables this policy with an explicit 128-instruction
+ordinary-loop limit, retaining a separate 4096-instruction reservation for
+recognized copy kernels. Proven finite and RLE computations keep their own
+reservations. The long-fragment planner also admits acyclic fallback regions
+whose static longest path reaches 32 instructions; their full longest path
+must fit the hardware grant. The offline example retains its previous admission policy. Neither
+policy relaxes the PC's device grant or supports additional cyclic graph shapes.
+Native automatic AOT checks admission every 10,000 accepted calls across the
+module. Each entry receives at least 128 calls before entries averaging fewer
+than 32 translated instructions are disabled. Unseen entries remain available
+for sampling. Disabled entries keep their
+compiled functions and source guards, but no longer split interpreter batches.
+Disabled entries are retried when a replacement module is installed. A module
+with no enabled entry is removed using the existing deferred removal path.
+Automatic desktop selection still falls back on x87. An explicit PC24 procedure
+recipe now lowers FLD32, FILD32, FLD ST(i), FXCH, six basic memory/register
+arithmetic forms, FIST32/FISTP32, ordered FCOM/FCOMP32 and register comparisons,
+FCOMPP, FNSTSW AX and FST/FSTP ST(i) into bounded WASM regions. Stack positions
+must agree at every join and backedge. Values stay in statically assigned `f64`
+locals; exact rounding/status and retained-state commit use the independent x87
+component's contract. A fixed 192-byte boundary follows the memory descriptor,
+with segment selectors after it. The PC guards FPU presence, EM/TS and masked
+PC24 admission, then commits FPU output after validating scalar results.
+PC53/64, unsupported forms and numeric domains retain interpreter fallback.
+Rejected PC24 candidates may retain a straight prefix of at least 32
+instructions, capped by the ordinary work grant. FNSTSW AX continuations are
+also stable candidates: after a failed full attempt, a continuation can exit
+at lower-address targets while retaining its supported inner loop. Graph and
+CALL entry points keep their original full-procedure policy. Both recovery
+paths retain source guards and share the bounded setup scan budget.
+The recipe is exercised through synthetic integration and opt-in game replay;
+it does not establish a Quake frame rate. See the
+[DJGPP integration plan](compatibility/x87-performance.md#djgpp-and-compiled-x87-work-plan).
+
 Native x86-64/AArch64 frontends can include a Cranelift dynamic core through the
 `dynamic-core` feature. The headless frontend enables it by default; the desktop
 app does not, because on ROTT gameplay it was slower than the interpreter. Its first scope is bounded blocks of 2–16 register-only
@@ -462,6 +526,19 @@ unsupported instructions remain boundaries; accesses entirely inside the VGA
 aperture are batchable (see below). Hardware clocks and execution counters advance
 once per slice; RAM writes still invalidate code immediately. The bus must opt
 into the ordinary-RAM batching contract, which defaults to disabled.
+
+On native targets, interpreter slices may instead borrow RAM directly. The
+borrow is limited to one slice: the machine computes the next hardware deadline
+before the borrow, then advances device clocks and reconciles accumulated bus
+effects when the slice ends. Each RAM write updates touched code-page generations
+as it occurs; the owner applies write counters and code-generation exhaustion
+effects at slice completion. This RAM-only bus has no VGA mapping. If the first
+instruction cannot proceed without VGA and the slice consumed zero steps, the
+machine retries through the complete PC bus; after a positive prefix it returns
+that prefix and handles the VGA instruction on the next slice. The setting is
+transient execution policy, enabled by default on native targets and disabled on
+WASM. It is omitted from portable state, so loading state applies the current
+target's default; callers can select the ordinary bus for reference comparisons.
 
 Without the native core, including WASM and `--no-dynamic-core`, the machine
 uses the same slice boundaries for cached interpreter instructions. Data-segment

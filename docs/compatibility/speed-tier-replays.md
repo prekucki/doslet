@@ -407,7 +407,7 @@ Clippy and formatting also pass. Before the static IRQ correction, the broader
 desktop suite passed 116 tests with 20 ignored; it did not cover the live IRQ-scope
 failure. The new city regression extends the former 500-ms smoke test.
 
-## Optional background learning
+## Optional synchronous learning
 
 Start the game from its executable on the interpreter with the existing profile:
 
@@ -422,21 +422,22 @@ target/release/doslet --config games/HoMnM.toml \
 instruction/microstep counts. Proven skipped iterations stay in the existing
 Steps overlay but do not trigger profiling. Above 10%, with at least 10,000
 executed steps in the window, it captures an independent working state and runs
-one background job. Fresh executable entry is captured before the first live
-batch. While a job runs, up to four subsequent high-GREY sampling windows retain
-independent snapshots for sequential analysis. This bounds memory use and prevents
-short loading/logo stages from disappearing before the profiler becomes available.
-Reset or policy disable cancels the job and clears pending snapshots.
+one synchronous calculation. Fresh executable entry is captured before the first
+live batch. The guest stops advancing until both replays finish and their labels
+are installed. There is no snapshot queue. An already paused guest starts no
+new work; disabling learning prevents subsequent calculations.
 The capture shares immutable media;
 RAM, device state, writable file overlays and handle positions remain independent.
 
 Each job compares the same one-second interval of **guest time** at the GREY
 frequency (capped at 333 MHz) and three times that frequency. Both diagnostic
 copies disable JIT and idle/VGA acceleration. This can take substantially longer
-than one host second. The worker sleeps for 2 ms after approximately 2 ms of
-work, checks cancellation between bounded chunks, and discards a pair that faults,
+than one host second. The owner immediately joins an 8-MiB-stack worker, which
+checks its deadline between bounded chunks and discards a pair that faults,
 stalls, misses an SB16 service deadline, exceeds its graph bounds or takes over
-120 host seconds. Paging and A20 code aliases are not supported by the tracer.
+120 host seconds. Playback is paused and the host-time anchor is reset after
+analysis, so the guest does not catch up the profiling pause. Paging and A20 code
+aliases are not supported by the tracer.
 
 For instructions seen at least 32 times in both replays, counts within 80–120%
 are HOT candidates; growth of at least 50% is a COLD candidate. Other observations
@@ -469,16 +470,21 @@ No-change results back off from 2 to 60 seconds; failed captures/replays defer
 for 30 seconds. The live guest retains its normal idle/VGA acceleration.
 MCP `status.speed_tiers.learning` reports job count, running state, newly added
 HOT/COLD/IRQ labels (GREY bookkeeping is excluded), executed GREY percentage,
-the latest capture duration in microseconds and `pending_snapshots` (0..4).
+the latest capture duration in microseconds. For compatibility, `running` and
+`pending_snapshots` remain present; they are false and zero when synchronous
+maintenance returns.
 
 ### Persistent game profiles
 
 Native CLI launches identify the game by SHA-256 of the executable contents.
-Once a game has been launched with `--speed-tier-profile`, subsequent launches
+Use `--learn-speed-tiers` alone to create or extend the game's cached profile;
+no seed JSON is required. Optional `--hot-mhz`, `--grey-mhz` and `--cold-mhz`
+override cached rates. A fresh profile defaults to 500/133/8 MHz.
+Once a game has been launched with recording or `--speed-tier-profile`, subsequent launches
 of the same executable automatically restore its labels and HOT/COLD/GREY rates.
-Background learning starts disabled, even if the saved profile records learning
+Learning starts disabled, even if the saved profile records learning
 as enabled. Opt in through the CPU panel or an explicit `--learn-speed-tiers`
-launch with `--speed-tier-profile`. Renaming or moving the executable preserves its identity;
+launch. Renaming or moving the executable preserves its identity;
 changing its contents selects a different profile. IRQ retains the GREY rate.
 Use `--no-speed-tiers` to skip automatic activation. Explicit adaptive/analysis
 strategies also suppress automatic activation.
@@ -528,7 +534,8 @@ an orderly MCP exit followed by a launch without `--speed-tier-profile` restored
 5,559 non-GREY labels, HOT 500 / GREY 100 / COLD 8 MHz and enabled learning.
 The restored count includes the seed labels and labels added by live learning.
 
-Validation of the background learner (local native build, `target-cpu=native`):
+Historical validation of the earlier background learner (local native build,
+`target-cpu=native`; this predates synchronous profiling):
 
 - Synthetic tests cover paired-copy isolation, classification thresholds, IRQ
   actual hardware/software interrupt nesting, live-code checks, monotonic HOT/COLD labels and
@@ -575,7 +582,7 @@ COLD, or IRQ using the existing interrupt-frame tracker. A fourth decoded label
 and counter expose IRQ separately without splitting native blocks or adding live
 interrupt-stack instrumentation. IRQ uses the GREY clock. Native trace reports
 pack three 9-bit counts (HOT, COLD, IRQ) alongside steps and exit reason; a full
-256-step block remains supported. Unknown GREY alone triggers background work.
+256-step block remains supported. Unknown GREY alone triggers diagnostic work.
 
 From the same saved scene, one paired 100/300-MHz guest-second observation was
 applied to the cold-first baseline, followed by two guest seconds at 500/100/8 MHz:

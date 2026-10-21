@@ -1,8 +1,9 @@
 //! Bounded procedure declarations shared by native and browser owners.
 use doslet_runtime::wasm_procedures::{
-    Binding, CodePart, CopyKernel, FiniteComputation, FiniteLoopGuard, KernelInterrupts, RleKernel,
-    bundle,
+    Binding, CodePart, CodeSegment, CopyKernel, ExecutionSite, FiniteComputation, FiniteLoopGuard,
+    KernelInterrupts, RleKernel, bundle,
 };
+use doslet_x86_wasm::static_program::procedure_memory::X87Procedure;
 use std::error::Error;
 const MAX_FUNCTIONS: usize = 4096;
 const MAX_SOURCES: usize = 65_536;
@@ -12,6 +13,33 @@ fn word(value: &serde_json::Value, key: &str) -> Result<u32, Box<dyn Error>> {
         .and_then(serde_json::Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| format!("invalid AOT field {key}").into())
+}
+fn byte(value: &serde_json::Value, key: &str) -> Result<u8, Box<dyn Error>> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u8::try_from(n).ok())
+        .ok_or_else(|| format!("invalid AOT x87 field {key}").into())
+}
+fn x87_procedure(value: &serde_json::Value) -> Result<Option<X87Procedure>, Box<dyn Error>> {
+    let Some(metadata) = value.get("x87") else {
+        return Ok(None);
+    };
+    if metadata.is_null() {
+        return Ok(None);
+    }
+    let object = metadata
+        .as_object()
+        .ok_or("invalid AOT x87 metadata object")?;
+    for key in object.keys() {
+        if !matches!(key.as_str(), "read_mask" | "write_mask") {
+            return Err(format!("unexpected AOT x87 field {key}").into());
+        }
+    }
+    Ok(Some(X87Procedure {
+        read_mask: byte(metadata, "read_mask")?,
+        write_mask: byte(metadata, "write_mask")?,
+    }))
 }
 fn terminals(value: &serde_json::Value, key: &str) -> Result<Vec<u32>, Box<dyn Error>> {
     let values = value
@@ -50,6 +78,15 @@ pub fn bindings(manifest: &serde_json::Value) -> Result<Vec<Binding>, Box<dyn Er
             "AOT memory ABI differs; regenerate the procedure bundle with this compiler".into(),
         );
     }
+    // Modules for flat DOS/4GW code predate the field. A DJGPP module names
+    // its program's code segment: base and the limit its code needs.
+    let code_segment = match manifest.get("code_segment") {
+        None | Some(serde_json::Value::Null) => CodeSegment::FLAT,
+        Some(segment) => CodeSegment {
+            base: word(segment, "base")?,
+            limit: word(segment, "limit")?,
+        },
+    };
     let entries = manifest
         .get("functions")
         .and_then(serde_json::Value::as_array)
@@ -59,6 +96,7 @@ pub fn bindings(manifest: &serde_json::Value) -> Result<Vec<Binding>, Box<dyn Er
     }
     let mut bindings = Vec::with_capacity(entries.len());
     let mut source_count = 0usize;
+    let mut execution_count = 0usize;
     for entry in entries {
         let sources = entry
             .get("sources")
@@ -91,7 +129,43 @@ pub fn bindings(manifest: &serde_json::Value) -> Result<Vec<Binding>, Box<dyn Er
                 expected,
             });
         }
+        let execution_sites = match entry.get("execution_sites") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => {
+                let sites = value
+                    .as_array()
+                    .filter(|sites| !sites.is_empty())
+                    .ok_or("invalid AOT execution site list")?;
+                execution_count = execution_count
+                    .checked_add(sites.len())
+                    .filter(|&count| count <= MAX_SOURCES)
+                    .ok_or("too many AOT execution sites")?;
+                let mut result = Vec::with_capacity(sites.len());
+                let mut end = 0u64;
+                for site in sites {
+                    let ip = word(site, "ip")?;
+                    let length = u8::try_from(word(site, "length")?)?;
+                    if !(1..=15).contains(&length)
+                        || u64::from(ip) < end
+                        || u64::from(ip) + u64::from(length) > u64::from(u32::MAX) + 1
+                    {
+                        return Err("invalid or overlapping AOT execution sites".into());
+                    }
+                    result.push(ExecutionSite { ip, length });
+                    end = u64::from(ip) + u64::from(length);
+                }
+                if result
+                    .binary_search_by_key(&word(entry, "entry")?, |site| site.ip)
+                    .is_err()
+                {
+                    return Err("AOT execution sites omit the entry".into());
+                }
+                Some(result)
+            }
+        };
         bindings.push(Binding {
+            x87: x87_procedure(entry)?,
+            execution_sites,
             function_id: word(entry, "id")?,
             entry_ip: word(entry, "entry")?,
             maximum_instructions: word(entry, "maximum_work")?,
@@ -170,6 +244,7 @@ pub fn bindings(manifest: &serde_json::Value) -> Result<Vec<Binding>, Box<dyn Er
                 Some("before-irq") => KernelInterrupts::BeforeNextIrq,
                 Some(_) => return Err("unsupported AOT kernel interrupt policy".into()),
             },
+            code_segment,
             code,
         });
     }
@@ -219,6 +294,24 @@ mod tests {
     }
 
     #[test]
+    fn code_segment_defaults_to_flat_and_applies_to_every_binding() {
+        let binding = decode(&manifest()).unwrap().pop().unwrap();
+        assert_eq!(binding.code_segment, CodeSegment::FLAT);
+        let mut value = manifest();
+        value["code_segment"] = json!({"base": 0x120000, "limit": 0xedffff});
+        let binding = decode(&value).unwrap().pop().unwrap();
+        assert_eq!(
+            binding.code_segment,
+            CodeSegment {
+                base: 0x120000,
+                limit: 0xedffff
+            }
+        );
+        value["code_segment"] = json!({"base": 0x120000});
+        assert!(decode(&value).is_err());
+    }
+
+    #[test]
     fn semantic_kernels_preserve_native_work_reservations() {
         let mut value = manifest();
         value["functions"][0]["semantic_kernel"] =
@@ -262,5 +355,71 @@ mod tests {
         let mut value = manifest();
         value["functions"][0]["kernel_interrupts"] = json!("unknown");
         assert!(decode(&value).is_err());
+    }
+
+    #[test]
+    fn x87_permissions_are_optional_and_parse_byte_masks() {
+        let legacy = decode(&manifest()).unwrap().pop().unwrap();
+        assert!(legacy.x87.is_none());
+
+        let mut value = manifest();
+        value["functions"][0]["x87"] = serde_json::Value::Null;
+        assert!(decode(&value).unwrap().pop().unwrap().x87.is_none());
+
+        value["functions"][0]["x87"] = json!({"read_mask":0,"write_mask":255});
+        let x87 = decode(&value).unwrap().pop().unwrap().x87.unwrap();
+        assert_eq!(x87.read_mask, 0);
+        assert_eq!(x87.write_mask, u8::MAX);
+    }
+
+    #[test]
+    fn malformed_x87_permissions_are_rejected() {
+        for invalid in [
+            json!(false),
+            json!([]),
+            json!({}),
+            json!({"read_mask":1}),
+            json!({"write_mask":1}),
+            json!({"read_mask":-1,"write_mask":0}),
+            json!({"read_mask":256,"write_mask":0}),
+            json!({"read_mask":1.5,"write_mask":0}),
+            json!({"read_mask":"1","write_mask":0}),
+            json!({"read_mask":0,"write_mask":0,"other":1}),
+        ] {
+            let mut value = manifest();
+            value["functions"][0]["x87"] = invalid;
+            assert!(decode(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_execution_sites_preserve_guard_bytes_and_reject_malformed_lists() {
+        let legacy = decode(&manifest()).unwrap().pop().unwrap();
+        assert!(legacy.execution_sites.is_none());
+        let mut value = manifest();
+        value["functions"][0]["sources"][0]["bytes"] = json!([64, 217, 232]);
+        value["functions"][0]["execution_sites"] = json!([{"ip":65536,"length":1}]);
+        let binding = decode(&value).unwrap().pop().unwrap();
+        assert_eq!(
+            binding.execution_sites.unwrap(),
+            [ExecutionSite {
+                ip: 65536,
+                length: 1
+            }]
+        );
+        assert_eq!(binding.code[0].expected, [64, 217, 232]);
+        for invalid in [
+            json!([]),
+            json!({}),
+            json!([{"ip":65537,"length":1}]),
+            json!([{"ip":65536,"length":0}]),
+            json!([{"ip":65536,"length":16}]),
+            json!([{"ip":65536,"length":2},{"ip":65537,"length":1}]),
+            json!([{"ip":65536,"length":1},{"ip":65536,"length":1}]),
+            json!([{"ip":65536}]),
+        ] {
+            value["functions"][0]["execution_sites"] = invalid;
+            assert!(decode(&value).is_err());
+        }
     }
 }

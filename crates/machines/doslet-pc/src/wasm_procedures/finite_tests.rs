@@ -123,6 +123,8 @@ fn configured() -> (PcMachine, Vec<u8>, Binding) {
         .unwrap()
         .copy_from_slice(BODY);
     let binding = Binding {
+        x87: None,
+        execution_sites: None,
         function_id: 9,
         entry_ip: ENTRY,
         maximum_instructions,
@@ -134,6 +136,7 @@ fn configured() -> (PcMachine, Vec<u8>, Binding) {
             guards: vec![],
         }),
         kernel_interrupts: KernelInterrupts::Defer,
+        code_segment: CodeSegment::FLAT,
         // Instruction starts remain explicit for the optional reference.
         code: [0usize, 5, 6, 8, 10, 12, 13, 15, 17]
             .into_iter()
@@ -287,6 +290,8 @@ fn guarded_countdown(value: u32) -> (PcMachine, Vec<u8>, Binding, u32) {
         .unwrap()
         .copy_from_slice(&[0xaa, 0x49, 0x75, 0xfc, 0x90]);
     let binding = Binding {
+        x87: None,
+        execution_sites: None,
         function_id: 9,
         entry_ip: ENTRY,
         maximum_instructions: compiled.finite_maximum_work(ProcedureId(9)).unwrap(),
@@ -303,6 +308,7 @@ fn guarded_countdown(value: u32) -> (PcMachine, Vec<u8>, Binding, u32) {
             }],
         }),
         kernel_interrupts: KernelInterrupts::Defer,
+        code_segment: CodeSegment::FLAT,
         code: vec![
             CodePart {
                 linear: ENTRY,
@@ -348,6 +354,12 @@ fn interpreted_reference_honors_live_dword_entry_guard_without_executing_a_wrap(
 
 #[test]
 fn virtual_register_displacement_and_immediate_reflect_live_code_patches_without_source_refusal() {
+    for explicit in [false, true] {
+        virtual_register_slot_case(explicit);
+    }
+}
+
+fn virtual_register_slot_case(explicit: bool) {
     // 00: 8A 83 [disp32 @ ENTRY+2]  MOV AL, [EBX + disp32]
     // 06: 81 C7 [imm32  @ ENTRY+8]  ADD EDI, imm32
     // 0C: 88 07                     MOV [EDI], AL
@@ -435,7 +447,18 @@ fn virtual_register_displacement_and_immediate_reflect_live_code_patches_without
     .unwrap();
     let guard = compiled.finite_loop_guards(ProcedureId(11)).unwrap()[0];
     let binding = Binding {
+        x87: None,
+        execution_sites: explicit.then(|| {
+            [(0, 6), (6, 6), (12, 2), (14, 1), (15, 2), (17, 1)]
+                .into_iter()
+                .map(|(offset, length)| ExecutionSite {
+                    ip: ENTRY + offset,
+                    length,
+                })
+                .collect()
+        }),
         function_id: 11,
+        code_segment: CodeSegment::FLAT,
         entry_ip: ENTRY,
         maximum_instructions: compiled.finite_maximum_work(ProcedureId(11)).unwrap(),
         kernel: None,
@@ -503,6 +526,11 @@ fn virtual_register_displacement_and_immediate_reflect_live_code_patches_without
     let mut fast = setup(DATA, 3);
     let mut reference = setup(DATA, 3);
     fast.install_wasm_procedures(&wasm, vec![binding]).unwrap();
+    // Slot addresses in this module are absolute. A declined move must leave
+    // the old entry and source proofs usable for the ordinary call below.
+    assert!(fast.rebase_wasm_procedures(0x10_0000).is_err());
+    assert_eq!(fast.wasm_procedure_code_segment(), Some(CodeSegment::FLAT));
+    same_state(&mut fast, &mut reference);
 
     // First call with disp = DATA, stride = 3
     let work1 = fast.try_wasm_procedure(1).unwrap().unwrap();

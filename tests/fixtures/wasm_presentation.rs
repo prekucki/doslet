@@ -1,6 +1,6 @@
 use doslet_runtime::{
     Session,
-    wasm_procedures::{Binding, CodePart, KernelInterrupts},
+    wasm_procedures::{Binding, CodePart, CodeSegment, KernelInterrupts},
 };
 use doslet_x86_wasm::static_program::{
     Address, Width,
@@ -37,6 +37,8 @@ pub fn install(session: &mut Session) {
         .install_wasm_procedures(
             &module,
             vec![Binding {
+                x87: None,
+                execution_sites: None,
                 function_id: 1,
                 entry_ip: ENTRY,
                 maximum_instructions: 1,
@@ -44,6 +46,7 @@ pub fn install(session: &mut Session) {
                 rle_kernel: None,
                 finite_computation: None,
                 kernel_interrupts: KernelInterrupts::Defer,
+                code_segment: CodeSegment::FLAT,
                 code: vec![CodePart {
                     linear: ENTRY,
                     expected: vec![0xc3],

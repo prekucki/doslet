@@ -1,10 +1,9 @@
 //! Speed-tier labels and memory patches name linear addresses. When the
-//! program's LE objects are found at another layout than the one those were
-//! recorded at, both follow their objects to the live bases.
-use crate::le_layout::{Layout, ObjectSpan, locate, spans};
+//! program's LE objects or COFF sections are found at another layout than the
+//! one those were recorded at, both follow their objects to the live bases.
+use crate::le_layout::{Layout, ObjectSpan, locate, program_image, spans};
 use crate::native_speed_tiers::Controller;
-use doslet_aot::{ImageLimits, SymbolicImage};
-use doslet_executable::{LeImage, LeLimits};
+use doslet_aot::SymbolicImage;
 use doslet_runtime::Session;
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -18,10 +17,7 @@ pub fn follow(
     exe: &[u8],
     layout: &Layout,
 ) {
-    let Ok(le) = LeImage::discover(exe, LeLimits::default()) else {
-        return;
-    };
-    let Ok(image) = SymbolicImage::from_le(&le, ImageLimits::default()) else {
+    let Ok(image) = program_image(exe, None) else {
         return;
     };
     if !patches.is_empty() {
@@ -43,7 +39,7 @@ fn follow_patches(session: &mut Session, paths: &[PathBuf], exe: &[u8], layout: 
     match crate::native_input::patches::relocate(paths, exe, &sizes, &live) {
         Ok(plan) if plan.as_slice() == session.memory_patches() => {}
         Ok(plan) => match session.relocate_patches(plan) {
-            Ok(()) => eprintln!("[INFO doslet] Patches follow the program to its live LE layout"),
+            Ok(()) => eprintln!("[INFO doslet] Patches follow the program to its live layout"),
             Err(error) => eprintln!("[WARN doslet] Cannot relocate patches: {error}"),
         },
         Err(error) => eprintln!("[WARN doslet] Cannot relocate patches: {error}"),
@@ -147,7 +143,7 @@ fn follow_tiers(
         moves.get(&address).copied().flatten()
     });
     eprintln!(
-        "[INFO doslet] Speed tiers: {moved} labels follow the program to its live LE layout; {dropped} no longer match"
+        "[INFO doslet] Speed tiers: {moved} labels follow the program to its live layout; {dropped} no longer match"
     );
 }
 

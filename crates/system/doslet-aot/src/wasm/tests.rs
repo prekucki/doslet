@@ -13,6 +13,8 @@ use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module, Store};
 mod call_tests;
 #[path = "extension_tests.rs"]
 mod extension_tests;
+#[path = "memory_prefix_tests.rs"]
+mod memory_prefix_tests;
 #[path = "memory_procedure_tests.rs"]
 mod memory_procedure_tests;
 #[path = "multiply_tests.rs"]
@@ -68,6 +70,7 @@ fn explicit_runtime_entry_stops_before_effects_and_cannot_create_code() {
 }
 fn image(code: &[u8], bitness: DefaultBitness) -> SymbolicImage {
     SymbolicImage {
+        format: crate::ImageFormat::Le,
         header: LeHeader {
             location: LeLocation {
                 container_offset: 0,

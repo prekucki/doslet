@@ -28,6 +28,60 @@ const BRANCH_BODY: &[u8] = &[
 ];
 
 #[test]
+fn coprocessor_commit_follows_scalar_validation_for_complete_and_side_exit_prefixes() {
+    for stop_after in [u32::MAX, 2] {
+        let (mut cpu, mut bus) = enter(Program::ReturnSlot);
+        let entries = [entry(&cpu)];
+        bus.stop_after = stop_after;
+        bus.finish_control = Some(0x007f);
+        cpu.try_call_memory_procedure(&mut bus, &registry(&entries), WORK)
+            .unwrap();
+        assert_eq!(bus.finish_calls, 1);
+        assert_eq!(cpu.fpu.as_ref().unwrap().control(), 0x007f);
+    }
+
+    for fault in [Fault::Count(WORK + 1, true), Fault::Flag(flags::INTERRUPT)] {
+        let (mut cpu, mut bus) = enter(Program::ReturnSlot);
+        let entries = [entry(&cpu)];
+        let before = cpu.fpu.clone();
+        bus.fault = Some(fault);
+        bus.finish_control = Some(0x007f);
+        assert!(
+            cpu.try_call_memory_procedure(&mut bus, &registry(&entries), WORK)
+                .is_err()
+        );
+        assert_eq!(bus.finish_calls, 0);
+        assert!(
+            cpu.fpu
+                .as_ref()
+                .unwrap()
+                .bitwise_eq(before.as_ref().unwrap())
+        );
+    }
+}
+
+#[test]
+fn invalid_coprocessor_result_does_not_commit_scalar_registers() {
+    let (mut cpu, mut bus) = enter(Program::ReturnSlot);
+    let entries = [entry(&cpu)];
+    let before = cpu.snapshot();
+    let fpu = cpu.fpu.clone();
+    bus.finish_failure = true;
+    assert_eq!(
+        cpu.try_call_memory_procedure(&mut bus, &registry(&entries), WORK),
+        Err(MemoryProcedureError::Backend("invalid coprocessor result"))
+    );
+    assert!(cpu.matches(&before));
+    assert!(cpu.fpu.as_ref().unwrap().bitwise_eq(fpu.as_ref().unwrap()));
+    assert_eq!(bus.finish_calls, 1);
+    assert_eq!(
+        bus.load(DATA),
+        0x8000_0006,
+        "completed guest stores stay committed"
+    );
+}
+
+#[test]
 fn complete_tier_proof_charges_exact_counts_only_after_a_validated_result() {
     let counts = [2, 1, 3, 1];
     let (mut cpu, mut bus) = enter(Program::ReturnSlot);
@@ -91,6 +145,9 @@ struct Bus {
     stores: u32,
     stop_after: u32,
     fault: Option<Fault>,
+    finish_calls: u32,
+    finish_control: Option<u16>,
+    finish_failure: bool,
 }
 
 impl MemoryBus for Bus {
@@ -153,6 +210,21 @@ impl Bus {
 
 impl MemoryProcedureBus for Bus {
     type Error = &'static str;
+
+    fn finish_memory_procedure(
+        &mut self,
+        fpu: Option<&mut MemoryProcedureFpu>,
+    ) -> Result<(), Self::Error> {
+        self.finish_calls += 1;
+        if self.finish_failure {
+            return Err("invalid coprocessor result");
+        }
+        if let Some(control) = self.finish_control {
+            fpu.expect("fixture has a coprocessor")
+                .load_control(control);
+        }
+        Ok(())
+    }
 
     fn execute_memory_procedure(
         &mut self,
@@ -334,6 +406,9 @@ fn setup(program: Program) -> (Cpu, Bus) {
         stores: 0,
         stop_after: u32::MAX,
         fault: None,
+        finish_calls: 0,
+        finish_control: None,
+        finish_failure: false,
     };
     bus.ram[..5].copy_from_slice(&[0xE8, 0x1B, 0, 0, 0]);
     let body = match program {
