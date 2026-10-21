@@ -834,6 +834,9 @@ impl Session {
 
 impl Session {
     pub(super) fn finish_exit(&mut self, code: u8) -> Result<(), RuntimeError> {
+        if self.handles.depth() > 0 {
+            return self.end_child(code);
+        }
         self.drive.close_all();
         self.handles.clear();
         if let Some(cd) = &mut self.cdrom {

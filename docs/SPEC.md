@@ -590,8 +590,29 @@ and PRN) are not open. Because files are numbered up to 100, PSP:32h/34h
 describe a 101-entry JFT at 0080:0070, as after INT 21h/67h. The PSP's own 20
 entries at 18h are kept equal for older readers. States saved before these
 tables existed restore without them.
-The runtime still owns one process; EXEC/AL=00, child-process restoration and
-handle inheritance remain unsupported.
+EXEC/AL=00 (4B00h) runs a child process while its parent waits inside that
+INT 21h, up to four nested levels. The child is a COM or MZ program from C:,
+or the DOS stub of an LE/LX program, loaded into the largest free block. The
+child's PSP gets:
+
+- the caller's command tail and FCBs;
+- a copy of the environment the caller names, or of the parent's, with the
+  program's full path appended;
+- the parent's PSP and the INT 22h–24h vectors;
+- a 20-entry JFT in its own PSP. Handles past 19 work but are not recorded
+  there.
+
+The child inherits its parent's handles except those opened with bit 7 of the
+open mode set (no inheritance). Closing an inherited handle leaves the parent's
+open. A child terminates through 4Ch, INT 20h or the divide-error abort, which
+closes the files only it used, frees every block it owned and restores INT
+22h–24h. Its parent then resumes with CF clear, and 4Dh returns the exit code
+once. If the child entered the DPMI host, the host forgets that client, so a
+later program can enter again. A protected-mode 4Ch takes the same path. 4Bh
+AL=01h (load without running), the INT 22h–24h handlers themselves and 31h
+(keep resident) are not implemented. EXEC from a protected-mode client with a
+zero environment segment reads a selector at PSP:2Ch, so such callers must
+pass a segment.
 
 The native desktop and headless runners optionally accept GDB remote TCP
 connections through `--gdb IP:PORT`. Desktop also has a Session-panel toggle;

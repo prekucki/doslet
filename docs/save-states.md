@@ -22,14 +22,18 @@ register writes alone would not restore the same sound.
 
 The envelope identifies the file format and machine model. Unsupported versions
 are rejected. Versions 1 (embedded media), 2 (external media) and 3 remain
-readable; new captures use version 4. Version 3 added pending memory patch plans,
+readable; new captures use version 5. Version 3 added pending memory patch plans,
 their deadlines and the completed prefix, so restoration does not reapply
 completed patches. Version 4 adds the DPMI host's own records: its mode,
 descriptor allocation map, DOS-block selectors, exception vectors, memory blocks
 and statistics, callbacks, active nested frames with their CPU contexts, and a
 pending direct return. Its descriptor tables, gates and real-mode shims live in
 guest RAM and are saved with it. Older readers reject version 4 instead of
-silently dropping a host. Very old state formats have no importer. Future compatible changes
+silently dropping a host. Version 5 adds DOS processes: the running PSP, the
+last child's exit code, the process that entered the DPMI host, and each
+waiting parent's PSP, DTA, CPU context at its EXEC call and handles. Older
+readers reject it instead of resuming a child as if it were the only process.
+Version 1–4 states restore as one process. Very old state formats have no importer. Future compatible changes
 must retain field numbers; removed fields must be reserved. A breaking change
 must increment the format or model version instead of guessing how to restore it.
 Lazy VGA time is encoded as the effective raster phase and pixel fraction, so

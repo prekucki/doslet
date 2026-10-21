@@ -25,6 +25,7 @@ pub mod dpmi;
 mod file_tables;
 mod idle;
 mod observation;
+mod process;
 mod synchronization;
 pub mod wait_budget;
 use cdrom::CdromImage;
@@ -154,6 +155,16 @@ pub struct Session {
     break_check: bool,
     cdrom: Option<CdromImage>,
     handles: HandleTable,
+    /// The running process; its parents wait in `parents`.
+    psp: u16,
+    parents: [Option<process::Parent>; doslet_vfs::MAX_PROCESS_DEPTH],
+    /// The last child's exit code for 4Dh, cleared once read.
+    return_code: u16,
+    /// The process that entered the DPMI host, or zero.
+    dpmi_client_psp: u16,
+    /// A protected-mode exit resumed the parent at its INT 21h IRET, which
+    /// this step executes instead of dispatching that service again.
+    parent_resumed: bool,
     staging: Box<[u8]>,
     continuation: Option<storage::Continuation>,
     storage_wait: bool,
@@ -348,6 +359,11 @@ impl Session {
             break_check: false,
             cdrom: None,
             handles: HandleTable::default(),
+            psp: doslet_dos::loader::PSP_SEGMENT,
+            parents: process::no_parents(),
+            return_code: 0,
+            dpmi_client_psp: 0,
+            parent_resumed: false,
             staging: alloc::vec![0;65536].into_boxed_slice(),
             continuation: None,
             storage_wait: false,
@@ -983,7 +999,8 @@ impl Session {
             }
         } else {
             self.dispatch_mouse()?;
-            if !self.machine.cpu.protected_mode()
+            if !core::mem::take(&mut self.parent_resumed)
+                && !self.machine.cpu.protected_mode()
                 && self.machine.cpu.registers.cs == bios::SHIM_SEGMENT
             {
                 let ip = self.machine.cpu.registers.ip;
@@ -1254,7 +1271,11 @@ impl Session {
                 self.machine.cpu.registers.set(Gpr16::Bx, 0xFF00);
                 self.machine.cpu.registers.set(Gpr16::Cx, 0);
             }
-            (0x21, 0x51 | 0x62) => self.machine.cpu.registers.set(Gpr16::Bx, 0x1000),
+            (0x21, 0x51 | 0x62) => self.machine.cpu.registers.set(Gpr16::Bx, self.psp),
+            (0x21, 0x4D) => {
+                self.machine.cpu.registers.set(Gpr16::Ax, self.return_code);
+                self.return_code = 0;
+            }
             (0x21, 0x34) => {
                 self.machine.cpu.registers.es = bios::SHIM_SEGMENT;
                 self.machine
@@ -1566,6 +1587,16 @@ impl Session {
                 match self.drive.change_directory(&name[..length]) {
                     Ok(()) => self.set_carry(false)?,
                     Err(code) => self.dos_error(code)?,
+                }
+            }
+            (0x21, 0x4B) if ax as u8 == 0 => {
+                let Some((name, length)) = self.read_path()? else {
+                    return Ok(());
+                };
+                let r = &self.machine.cpu.registers;
+                let parameters = linear_address(r.es, r.get(Gpr16::Bx));
+                if let Err(code) = self.exec(&name[..length], parameters)? {
+                    self.dos_error(code)?;
                 }
             }
             (0x21, 0x4B) if ax as u8 == 3 => {
@@ -1920,16 +1951,18 @@ impl Session {
             (0x21, 0x48..=0x4A) => {
                 let r = &self.machine.cpu.registers;
                 let result = match ax >> 8 {
-                    0x48 => self.memory.allocate(r.get(Gpr16::Bx), 0x1000).map(Some),
+                    0x48 => self.memory.allocate(r.get(Gpr16::Bx), self.psp).map(Some),
                     0x49 => self.memory.free(r.es).map(|()| None),
                     _ => self.memory.resize(r.es, r.get(Gpr16::Bx)).map(|()| None),
                 };
                 self.memory.write_mcbs(&mut self.machine.bus)?;
                 if ax >> 8 == 0x4A
-                    && self.machine.cpu.registers.es == 0x1000
-                    && let Ok(end) = self.memory.block_end(0x1000)
+                    && self.machine.cpu.registers.es == self.psp
+                    && let Ok(end) = self.memory.block_end(self.psp)
                 {
-                    self.machine.bus.write_u16(0x10002, end)?;
+                    self.machine
+                        .bus
+                        .write_u16(u32::from(self.psp) * 16 + 2, end)?;
                 }
                 match result {
                     Ok(segment) => {

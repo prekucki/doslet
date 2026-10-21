@@ -232,16 +232,21 @@ conforming general-purpose DPMI server. Remaining gaps:
 - Metadata is bounded to 8176 LDT entries for 0000h plus 15 for 000Dh, 512
   memory blocks, 32 callbacks and 16 nested host frames. Nested real-mode calls
   have 1 KiB private stack slices.
-- Large tiled conventional allocations for 16-bit clients are rejected;
-  16-bit-client compatibility is unvalidated.
+- Large tiled conventional allocations for 16-bit clients are rejected. A
+  runtime test covers only a 16-bit client's entry and its protected-mode exit;
+  broader 16-bit-client compatibility is unvalidated.
 - Unsupported functions return DPMI carry/error status and are counted.
   ROTT, Heroes and PRINCE probe only 0A00h (vendor extensions) and 0506h (DPMI
   1.0 page attributes), and continue after the error. 0800h (physical address
   mapping) is unsupported: the VBE 1.2 adapter has no linear frame buffer to
   map. Debug watchpoints (0B00h–0B03h) are unsupported.
-- External hosts, nested clients, extender replacement after entry and resource
-  teardown followed by another protected client in the same session are outside
-  the validated scope. There is no mid-run fallback to the original DOS/4GW host.
+- When the process that entered the host terminates, even from protected mode
+  with 4Ch, the host forgets its descriptors, memory, callbacks and handlers,
+  and the process's DOS memory is freed. A later program, for example a game
+  started from a launcher through DOS EXEC, can then enter again; a runtime test
+  runs two such clients in turn. External hosts, nested clients (a client that
+  EXECs another client) and extender replacement after entry are outside the
+  validated scope. There is no mid-run fallback to the original DOS/4GW host.
 
 ## Recorded local evidence
 

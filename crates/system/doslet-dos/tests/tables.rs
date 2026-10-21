@@ -128,3 +128,24 @@ fn file_handles_resolve_through_jft_and_sft_chain() {
     let entry = sft_entry(&mut ram, 100).unwrap() as usize;
     assert_eq!(&ram.0[entry..entry + 0x3B], [0; 0x3B]);
 }
+
+#[test]
+fn a_child_keeps_its_twenty_handles_in_its_own_psp() {
+    let mut ram = Ram(vec![0; 0x30000]);
+    tables::install(&mut ram, PSP).unwrap();
+    let child = 0x2000;
+    tables::install_child(&mut ram, child).unwrap();
+    let base = u32::from(child) * 16;
+    assert_eq!(ram.read_u16(base + 0x32).unwrap(), 20);
+    assert_eq!(far(&mut ram, base + 0x34), base + 0x18);
+    assert_eq!(
+        &ram.0[base as usize + 0x18..base as usize + 0x1D],
+        [0, 0, 0, 0xFF, 0xFF]
+    );
+    tables::set_handle(&mut ram, child, 5, Some(tables::FIRST_FILE + 1)).unwrap();
+    tables::set_handle(&mut ram, child, 25, Some(tables::FIRST_FILE + 2)).unwrap();
+    assert_eq!(ram.0[base as usize + 0x18 + 5], 2);
+    // The parent's tables are untouched; handles past 20 are not recorded.
+    assert_eq!(sft_entry(&mut ram, 5), None);
+    assert_eq!(ram.0[base as usize + 0x18 + 25], 0);
+}
