@@ -770,6 +770,7 @@ impl Session {
                 }
                 // A DPMI client's exception handler receives its faults.
                 Err(error) if self.dpmi_exception(&error) => completed += 1,
+                Err(error) if self.divide_error(&error) => completed += 1,
                 Err(error) => {
                     self.fault = Some(error);
                     self.status = SessionStatus::Faulted;
@@ -1233,6 +1234,14 @@ impl Session {
             (0x10, 0) if ax as u8 == 0x13 => {
                 self.machine.bus.set_video_mode_13h();
                 self.mouse_video_mode_changed();
+            }
+            // MS-DOS reports a divide error the program did not handle, then
+            // aborts it like Ctrl-C, through the default INT 23h: code 0.
+            (0x00, _) => {
+                for &byte in b"Divide overflow\r\n" {
+                    self.console_output(byte)?;
+                }
+                self.finish_exit(0)?;
             }
             (0x20, _) => {
                 self.finish_exit(0)?;
@@ -2125,6 +2134,23 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// A divide error changes nothing but IP, so it is delivered as a 386
+    /// would, even without precise faults: as interrupt 0 through the IVT in
+    /// real mode or the IDT in protected mode. A DPMI client's 0205h handler
+    /// receives it; the host's default gate reflects it to the real-mode
+    /// vector, by default DOS's "Divide overflow" abort.
+    fn divide_error(&mut self, error: &RuntimeError) -> bool {
+        let RuntimeError::Cpu(CpuError::DivideError { cs, ip }) = *error else {
+            return false;
+        };
+        let cpu = &mut self.machine.cpu;
+        if cpu.registers.cs != cs {
+            return false;
+        }
+        cpu.registers.ip = ip;
+        cpu.interrupt(&mut self.machine.bus, 0).is_ok()
     }
 
     fn file_is_open(&self, handle: u16) -> bool {

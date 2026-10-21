@@ -15,6 +15,7 @@ const IRQ0_CODE: [u8; 9] = [0x50, 0xCD, 0x1C, 0xB0, 0x20, 0xE6, 0x20, 0x58, 0xCF
 /// Default handlers of IRQ 2–15 acknowledge the PIC and return, as a BIOS's
 /// do, 16 bytes apart. IRQ 12's vector holds the mouse driver's event wrapper.
 const IRQ_DEFAULT_BASE: u16 = 0x500;
+const DUMMY_OFFSET: u16 = 1;
 const MASTER_IRQ_CODE: [u8; 7] = IRQ1_CODE;
 const SLAVE_IRQ_CODE: [u8; 9] = [0x50, 0xB0, 0x20, 0xE6, 0xA0, 0xE6, 0x20, 0x58, 0xCF];
 
@@ -92,6 +93,7 @@ pub fn set_text_mode<B: MemoryBus>(bus: &mut B, preserve: bool) -> Result<(), Bu
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceSelector {
+    DivideOverflow,
     Timer,
     KeyboardIrq,
     Video,
@@ -107,6 +109,7 @@ pub enum ServiceSelector {
 impl ServiceSelector {
     pub const fn vector(self) -> u8 {
         match self {
+            Self::DivideOverflow => 0,
             Self::Timer => 8,
             Self::KeyboardIrq => 9,
             Self::Video => 0x10,
@@ -126,7 +129,13 @@ struct ServiceDefinition {
     offset: u16,
     signature: &'static [u8],
 }
-const SERVICES: [ServiceDefinition; 11] = [
+const SERVICES: [ServiceDefinition; 12] = [
+    // DOS's divide-error handler.
+    ServiceDefinition {
+        selector: ServiceSelector::DivideOverflow,
+        offset: 0,
+        signature: &[0xCF],
+    },
     ServiceDefinition {
         selector: ServiceSelector::Timer,
         offset: IRQ0_OFFSET,
@@ -215,6 +224,12 @@ pub fn install<B: MemoryBus>(bus: &mut B) -> Result<(), BusError> {
         for (index, byte) in service.signature.iter().enumerate() {
             bus.write_u8(SHIM_BASE + u32::from(service.offset) + index as u32, *byte)?;
         }
+    }
+    // Vectors 1-7 return at once, as a BIOS's dummy handler does.
+    bus.write_u8(SHIM_BASE + u32::from(DUMMY_OFFSET), 0xCF)?;
+    for vector in 1..8u32 {
+        bus.write_u16(vector * 4, DUMMY_OFFSET)?;
+        bus.write_u16(vector * 4 + 2, SHIM_SEGMENT)?;
     }
     for irq in (2..16).filter(|irq| *irq != 12) {
         let offset = IRQ_DEFAULT_BASE + irq * 16;

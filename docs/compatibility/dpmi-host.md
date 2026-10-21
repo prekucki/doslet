@@ -222,10 +222,13 @@ conforming general-purpose DPMI server. Remaining gaps:
 
 - Paging, demand commitment, VM86 and privilege-changing gates remain absent.
   Clients execute at CPL 3 with IOPL 3 under the existing CPU model.
-- Exceptions without a client handler, faults while a handler runs and faults
-  in host code still stop the session with the existing diagnostic. Reflecting
-  exceptions 0–7 to protected-mode interrupts, as hosts may do without a handler,
-  is not implemented.
+- A divide error without a 0203h handler, or inside one, becomes interrupt 0,
+  as DPMI hosts reflect exceptions 0–7. It reaches the client's 0205h handler,
+  or the host's gate reflects it to the real-mode vector, by default DOS's
+  "Divide overflow" abort with exit code 0. Of exceptions 0–7, the CPU model
+  raises only the divide error. Other faults without a handler, faults while a
+  handler runs and faults in host code still stop the session with the existing
+  diagnostic.
 - Metadata is bounded to 8176 LDT entries for 0000h plus 15 for 000Dh, 512
   memory blocks, 32 callbacks and 16 nested host frames. Nested real-mode calls
   have 1 KiB private stack slices.

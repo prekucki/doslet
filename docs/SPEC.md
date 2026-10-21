@@ -227,7 +227,8 @@ arithmetic for comparisons. See the [x87 performance report](compatibility/x87-p
 Dword ENTER builds bounded nested stack frames and BSF/BSR support both operand
 widths, including their defined zero flag. BT/BTS/BTR/BTC take an immediate or a
 register bit offset. With a memory operand, a register offset is signed and may
-select another word or dword than the addressed one.
+select another word or dword than the addressed one. INT3 and INTO enter
+vectors 3 and 4 like INT n; INTO only with OF set.
 
 CPU segment translation produces an unmasked linear address; machine A20 wiring
 controls address bit 20. The default PC has 16 MiB of RAM, with A20 initially
@@ -678,8 +679,10 @@ reports no IPX driver (AL=00h).
 Further DOS services for DJGPP programs:
 
 - INT 21h/60h (TRUENAME) qualifies a path lexically, without requiring the file:
-  `c:dir/../x` becomes `C:\X`. Wildcards, other drives and names over the
-  128-byte buffer return error 3.
+  `c:dir/../x` becomes `C:\X`. In the last component, `*` fills the rest of
+  its 8.3 field with `?`, as in DOS: `*.pak` becomes `C:\DIR\????????.PAK`.
+  Wildcards in directories, other drives and names over the 128-byte buffer
+  return error 3.
 - IOCTL 4409h reports C: as local (DX=0000h) and an MSCDEX drive as remote
   (bit 12). Other drives return error 0Fh.
 - 5D06h has no swappable data area to return and fails with error 1.
@@ -716,7 +719,13 @@ INT 1Ch user hook and sends PIC EOI through guest instructions while preserving
 AX. IRQs 2–15, apart from IRQ 12, whose vector holds the mouse driver's wrapper,
 start at default handlers in guest code. These send EOI (also to the slave PIC
 for IRQs 8–15) and return, as a BIOS's do. An unclaimed IRQ therefore never
-runs vector 0000:0000. Modified shims execute as guest code. INT 1Ah/AH=02h reads hours, minutes,
+runs vector 0000:0000. Vectors 1–7 return at once. Vector 0 is DOS's
+divide-error handler: it prints "Divide overflow" and ends the program with
+code 0, as MS-DOS aborts through the default INT 23h. A divide error changes
+nothing but IP, so the CPU delivers it as interrupt 0 in every mode, even
+without precise faults: through the IVT, or through the IDT in protected mode.
+A program's own INT 0 handler, such as Turbo Pascal's runtime error 200,
+therefore runs. Modified shims execute as guest code. INT 1Ah/AH=02h reads hours, minutes,
 seconds and the daylight-saving flag from the installed CMOS registers, returning
 CF set while its update-in-progress bit is set. The initial clock uses BCD and
 24-hour format; RTC ticking and format conversion remain pending.

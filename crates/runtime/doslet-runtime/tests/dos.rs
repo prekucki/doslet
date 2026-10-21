@@ -233,6 +233,45 @@ fn a_guest_opens_reads_and_writes_a_mounted_file_to_stdout() {
 }
 
 #[test]
+fn divide_errors_reach_dos_or_the_programs_int_0_handler() {
+    // XOR CX,CX; MOV AX,1; DIV CX.
+    let divide = [
+        0x31, 0xC9, 0xB8, 1, 0, 0xF7, 0xF1, 0xB8, 1, 0x4C, 0xCD, 0x21,
+    ];
+    let mut session = Session::new(&divide).unwrap();
+    session.start();
+    session.advance(100);
+    assert_eq!(session.status(), SessionStatus::Exited(0));
+    assert_eq!(session.console(), b"Divide overflow\r\n");
+
+    // A Turbo Pascal-style handler reports runtime error 200 itself.
+    let mut program = vec![
+        0x31, 0xC0, 0x8E, 0xC0, // XOR AX,AX; MOV ES,AX.
+        0x26, 0xC7, 0x06, 0, 0, 0x20, 0x01, // MOV ES:[0],0120h.
+        0x26, 0x8C, 0x0E, 2, 0, // MOV ES:[2],CS.
+    ];
+    program.extend_from_slice(&divide);
+    program.resize(0x20, 0x90);
+    program.extend_from_slice(&[0xB8, 0xC8, 0x4C, 0xCD, 0x21]); // Exit with code 200.
+    let mut session = Session::new(&program).unwrap();
+    session.start();
+    session.advance(100);
+    assert_eq!(session.status(), SessionStatus::Exited(200));
+    assert_eq!(session.console(), b"");
+
+    // The BIOS's dummy handlers return from vectors 1-7.
+    let mut session = Session::new(&[0xCC, 0xCD, 0x04, 0xB8, 5, 0x4C, 0xCD, 0x21]).unwrap();
+    session.start();
+    session.advance(100);
+    assert_eq!(
+        session.status(),
+        SessionStatus::Exited(5),
+        "{:?}",
+        session.fault()
+    );
+}
+
+#[test]
 fn ioctl_reports_c_as_local_and_rejects_absent_drives() {
     let mut program = vec![0; 0x100];
     let code = [
