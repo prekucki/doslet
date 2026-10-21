@@ -127,6 +127,87 @@ fn real_bios_timer_calls_protected_tick_and_allows_chaining_to_default() {
     }
 }
 
+/// Enter a real-mode `STI; JMP $` loop at 5000:0000 through 0301h, which
+/// never returns.
+fn real_mode_loop(s: &mut Session) {
+    for (i, b) in [0xFB, 0xEB, 0xFE].into_iter().enumerate() {
+        s.machine.bus.write_u8(0x50000 + i as u32, b).unwrap();
+    }
+    for i in 0..50 {
+        s.machine.bus.write_u8(0x30000 + i, 0).unwrap();
+    }
+    s.machine.bus.write_u16(0x3002C, 0x5000).unwrap();
+    s.machine.cpu.registers.ip = 0x20000;
+    s.machine.cpu.registers.set(Gpr16::Ax, 0x301);
+    s.machine.cpu.registers.set(Gpr16::Bx, 0);
+    s.machine.cpu.registers.set(Gpr16::Cx, 0);
+    s.machine.cpu.registers.set32(Gpr32::Edi, 0x30000);
+    for _ in 0..100 {
+        s.advance(1);
+        if !s.machine.cpu.protected_mode() && s.registers().cs == 0x5000 {
+            return;
+        }
+    }
+    panic!("real-mode procedure not reached: {:?}", s.registers());
+}
+
+#[test]
+fn real_mode_hardware_interrupts_reach_the_protected_handler() {
+    for mode in [Mode::Reflect, Mode::Direct] {
+        let mut s = prepared(mode);
+        let code = s.registers().cs;
+        let handler = [
+            0x1E, 0x66, 0xB8, DATA as u8, 0, 0x8E, 0xD8, // Save DS; load flat data.
+            0xFF, 0x05, 0, 0x10, 3, 0, // INC DWORD PTR [31000h].
+            0xB0, 0x20, 0xE6, 0x20, 0x1F, 0xCF, // EOI; restore DS; IRETD.
+        ];
+        for (i, byte) in handler.into_iter().enumerate() {
+            s.machine.bus.write_u8(0x40000 + i as u32, byte).unwrap();
+        }
+        s.dpmi_gate(9, code, 0x40000).unwrap();
+        real_mode_loop(&mut s);
+        let depth = s.dpmi.as_ref().unwrap().depth;
+        for presses in 1..=2 {
+            s.machine.bus.pic.raise_edge(1);
+            s.advance(20);
+            assert_eq!(s.status(), SessionStatus::Running, "{:?}", s.fault());
+            assert_eq!(
+                s.machine.bus.read_u32(0x31000).unwrap(),
+                presses,
+                "{mode:?}"
+            );
+            assert!(!s.machine.cpu.protected_mode());
+            assert_eq!(s.registers().cs, 0x5000);
+            assert_eq!(s.dpmi.as_ref().unwrap().depth, depth);
+        }
+    }
+}
+
+#[test]
+fn unhandled_irqs_return_through_the_bios_default_handler() {
+    let mut s = prepared(Mode::Direct);
+    assert_eq!(
+        s.machine.bus.read_u16(0x0D * 4 + 2).unwrap(),
+        bios::SHIM_SEGMENT
+    );
+    for (i, b) in [0xFB, 0xEB, 0xFE].into_iter().enumerate() {
+        s.machine.bus.write_u8(0x20010 + i as u32, b).unwrap();
+    }
+    s.machine.cpu.registers.ip = 0x20010;
+    // IRQ 5 in protected mode reflects to its real-mode default handler.
+    s.machine.bus.pic.raise_edge(5);
+    s.advance(40);
+    assert_eq!(s.status(), SessionStatus::Running, "{:?}", s.fault());
+    assert!(s.machine.cpu.protected_mode());
+    assert_eq!(s.dpmi_stats().unwrap().reflected, 1);
+    real_mode_loop(&mut s);
+    s.machine.bus.pic.raise_edge(5);
+    s.advance(40);
+    assert_eq!(s.status(), SessionStatus::Running, "{:?}", s.fault());
+    assert_eq!(s.registers().cs, 0x5000);
+    assert!(!s.machine.bus.pic.has_interrupt());
+}
+
 #[test]
 fn installed_guest_handler_and_changed_shim_are_never_bypassed() {
     for altered_shim in [false, true] {

@@ -173,7 +173,7 @@ impl DirectoryTree {
         None
     }
 }
-fn short_name(name: &[u8]) -> Option<[u8; 11]> {
+pub(super) fn short_name(name: &[u8]) -> Option<[u8; 11]> {
     let dot = name.iter().position(|b| *b == b'.').unwrap_or(name.len());
     let (base, ext) = (&name[..dot], name.get(dot + 1..).unwrap_or_default());
     if base.is_empty() || base.len() > 8 || ext.len() > 3 || ext.contains(&b'.') {

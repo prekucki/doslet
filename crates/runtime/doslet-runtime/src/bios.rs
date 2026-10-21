@@ -12,6 +12,58 @@ pub const IRQ0_OFFSET: u16 = 0x180;
 pub const IRQ1_OFFSET: u16 = 0x1A0;
 const IRQ1_CODE: [u8; 7] = [0x50, 0xB0, 0x20, 0xE6, 0x20, 0x58, 0xCF];
 const IRQ0_CODE: [u8; 9] = [0x50, 0xCD, 0x1C, 0xB0, 0x20, 0xE6, 0x20, 0x58, 0xCF];
+/// Default handlers of IRQ 2–15 acknowledge the PIC and return, as a BIOS's
+/// do, 16 bytes apart. IRQ 12's vector holds the mouse driver's event wrapper.
+const IRQ_DEFAULT_BASE: u16 = 0x500;
+const MASTER_IRQ_CODE: [u8; 7] = IRQ1_CODE;
+const SLAVE_IRQ_CODE: [u8; 9] = [0x50, 0xB0, 0x20, 0xE6, 0xA0, 0xE6, 0x20, 0x58, 0xCF];
+
+const fn irq_vector(irq: u16) -> u8 {
+    if irq < 8 {
+        8 + irq as u8
+    } else {
+        0x70 + irq as u8 - 8
+    }
+}
+fn default_irq_code(irq: u16) -> &'static [u8] {
+    if irq < 8 {
+        &MASTER_IRQ_CODE
+    } else {
+        &SLAVE_IRQ_CODE
+    }
+}
+
+/// The hardware interrupt whose BIOS handler starts at `offset` in the shim
+/// segment, with the offset of that handler's final IRET.
+pub fn interrupt_handler<B: MemoryBus>(
+    bus: &mut B,
+    offset: u32,
+) -> Result<Option<(u8, u16)>, BusError> {
+    let Ok(offset) = u16::try_from(offset) else {
+        return Ok(None);
+    };
+    let (vector, code): (u8, &[u8]) = match offset {
+        IRQ0_OFFSET => (8, &IRQ0_CODE),
+        IRQ1_OFFSET => (9, &IRQ1_CODE),
+        _ => {
+            let Some(irq) = offset
+                .checked_sub(IRQ_DEFAULT_BASE)
+                .filter(|delta| delta % 16 == 0)
+                .map(|delta| delta / 16)
+                .filter(|irq| (2..16).contains(irq) && *irq != 12)
+            else {
+                return Ok(None);
+            };
+            (irq_vector(irq), default_irq_code(irq))
+        }
+    };
+    for (index, byte) in code.iter().enumerate() {
+        if bus.read_u8(SHIM_BASE + u32::from(offset) + index as u32)? != *byte {
+            return Ok(None);
+        }
+    }
+    Ok(Some((vector, offset + code.len() as u16 - 1)))
+}
 
 /// Selected mode-03h BIOS state. B800h is currently ordinary PC RAM;
 /// VGA text-memory mapping and glyph scanout remain pending.
@@ -162,6 +214,15 @@ pub fn install<B: MemoryBus>(bus: &mut B) -> Result<(), BusError> {
         bus.write_u16(u32::from(vector) * 4 + 2, SHIM_SEGMENT)?;
         for (index, byte) in service.signature.iter().enumerate() {
             bus.write_u8(SHIM_BASE + u32::from(service.offset) + index as u32, *byte)?;
+        }
+    }
+    for irq in (2..16).filter(|irq| *irq != 12) {
+        let offset = IRQ_DEFAULT_BASE + irq * 16;
+        let vector = u32::from(irq_vector(irq));
+        bus.write_u16(vector * 4, offset)?;
+        bus.write_u16(vector * 4 + 2, SHIM_SEGMENT)?;
+        for (index, byte) in default_irq_code(irq).iter().enumerate() {
+            bus.write_u8(SHIM_BASE + u32::from(offset) + index as u32, *byte)?;
         }
     }
     // The default user timer hook is ordinary guest IRET code; replacement

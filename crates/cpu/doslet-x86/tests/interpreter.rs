@@ -675,6 +675,53 @@ fn bit_scans_cover_both_widths_zero_inputs_and_one_hot_positions() {
 }
 
 #[test]
+fn register_offset_bit_tests_wrap_in_registers_and_address_beyond_memory_operands() {
+    // BT, BTS, BTR, BTC EDX/DX, EAX/AX with offsets beyond the width. Bit 4
+    // of EDX is set and bit 5 clear; results are for those two bits.
+    for dword in [false, true] {
+        for (opcode, results) in [
+            (0xA3, [0x10, 0x10]),
+            (0xAB, [0x10, 0x30]),
+            (0xB3, [0x00, 0x10]),
+            (0xBB, [0x00, 0x30]),
+        ] {
+            for (bit, result) in [4, 5].into_iter().zip(results) {
+                let mut code = Vec::new();
+                if dword {
+                    code.push(0x66);
+                }
+                code.extend_from_slice(&[0x0F, opcode, 0xC2]);
+                let mut bus = TestBus::new(&code);
+                let mut cpu = Cpu::default();
+                cpu.registers
+                    .set32(Gpr32::Eax, bit + if dword { 32 } else { 16 });
+                cpu.registers.set32(Gpr32::Edx, 0xABCD_0010);
+                cpu.step(&mut bus).unwrap();
+                assert_eq!(cpu.flags & flags::CARRY, u32::from(bit == 4));
+                assert_eq!(cpu.registers.get32(Gpr32::Edx), 0xABCD_0000 | result);
+            }
+        }
+    }
+    // BTS [200h], AX: negative and large offsets select other words.
+    for (offset, address, byte) in [(0xFFFF, 0x1FF, 0x80), (35, 0x204, 0x08)] {
+        let mut bus = TestBus::new(&[0x0F, 0xAB, 0x06, 0, 2]);
+        let mut cpu = Cpu::default();
+        cpu.registers.set(Gpr16::Ax, offset);
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(bus.ram[address], byte);
+        assert_eq!(cpu.flags & flags::CARRY, 0);
+    }
+    // BTR DWORD [200h], EAX: bit 65 is bit 1 of the dword at 208h.
+    let mut bus = TestBus::new(&[0x66, 0x0F, 0xB3, 0x06, 0, 2]);
+    bus.ram[0x208] = 0xFF;
+    let mut cpu = Cpu::default();
+    cpu.registers.set32(Gpr32::Eax, 65);
+    cpu.step(&mut bus).unwrap();
+    assert_eq!(bus.ram[0x208], 0xFD);
+    assert_eq!(cpu.flags & flags::CARRY, 1);
+}
+
+#[test]
 fn fistp_writes_each_integer_width_and_unmasked_invalid_does_not_store_or_pop() {
     for (opcode, modrm, width) in [(0xDF, 0x1E, 2), (0xDB, 0x1E, 4), (0xDF, 0x3E, 8)] {
         let mut bus = TestBus::new(&[opcode, modrm, 0, 2]);

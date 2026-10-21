@@ -123,6 +123,21 @@ impl HandleTable {
         let desc = self.handles.get(index).copied().flatten().ok_or(6u16)?;
         self.descriptions[desc as usize].as_mut().ok_or(6)
     }
+    /// The open description behind a handle; DOS numbers these in its SFT.
+    pub fn description_index(&self, handle: u16) -> Option<usize> {
+        let index = usize::from(handle.checked_sub(5)?);
+        self.handles.get(index).copied().flatten().map(usize::from)
+    }
+    pub fn description(&self, index: usize) -> Option<&OpenFile> {
+        self.descriptions.get(index)?.as_ref()
+    }
+    /// Handles sharing one open description.
+    pub fn references(&self, index: usize) -> u16 {
+        self.handles
+            .iter()
+            .filter(|desc| desc.map(usize::from) == Some(index))
+            .count() as u16
+    }
     pub fn close(&mut self, handle: u16) -> Result<(), u16> {
         let slot = handle.checked_sub(5).ok_or(6u16)? as usize;
         let desc = self.handles.get_mut(slot).ok_or(6u16)?.take().ok_or(6u16)?;
@@ -181,13 +196,19 @@ mod tests {
             })
             .unwrap();
         let d = handles.duplicate(h).unwrap();
+        let index = handles.description_index(h).unwrap();
+        assert_eq!(handles.description_index(d), Some(index));
+        assert_eq!(handles.references(index), 2);
         handles.get_mut(h).unwrap().position = 42;
         assert_eq!(handles.get(d).unwrap().position, 42);
         handles.close(h).unwrap();
         assert_eq!(handles.get(d).unwrap().position, 42);
+        assert_eq!(handles.references(index), 1);
         handles.force_duplicate(d, d).unwrap();
         handles.close(d).unwrap();
         assert_eq!(handles.get(d), Err(6));
+        assert_eq!(handles.description(index), None);
+        assert_eq!(handles.description_index(d), None);
     }
 }
 

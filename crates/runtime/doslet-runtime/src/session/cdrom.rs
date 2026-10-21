@@ -113,6 +113,19 @@ impl CdromImage {
         self.handles[(handle - HANDLE_BASE) as usize] = None;
         Ok(())
     }
+    /// Position and length of an open file.
+    pub fn handle_info(&self, handle: u16) -> Result<(u32, u64), u16> {
+        let h = self
+            .handles
+            .get(handle.checked_sub(HANDLE_BASE).ok_or(6u16)? as usize)
+            .and_then(Option::as_ref)
+            .ok_or(6u16)?;
+        let length = match &h.entry {
+            FileEntry::Local(entry) => entry.data.len() as u64,
+            FileEntry::Remote(entry) => entry.data.end - entry.data.start,
+        };
+        Ok((h.position, length))
+    }
     pub fn prepare_read(&mut self, handle: u16, count: u16) -> Result<(u32, usize), u16> {
         let h = self.handle(handle)?;
         let length = match &h.entry {

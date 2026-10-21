@@ -129,23 +129,22 @@ impl<'a> MzImage<'a> {
             // its build text there. Only a pointer to a header names one.
             if offset != 0
                 && let Some(signature) = bytes.get(offset..offset.saturating_add(2))
+                && (signature == b"LE" || signature == b"LX")
             {
-                if signature == b"LE" || signature == b"LX" {
-                    let ext = bytes.get(offset..).ok_or(ExecutableError::Truncated)?;
-                    if *ext.get(2).ok_or(ExecutableError::Truncated)? != 0
-                        || *ext.get(3).ok_or(ExecutableError::Truncated)? != 0
-                    {
-                        return Err(ExecutableError::UnsupportedByteOrder);
-                    }
-                    extended = Some(ExtendedHeader {
-                        signature: [signature[0], signature[1]],
-                        file_offset: offset,
-                        cpu_type: word(ext, 8)?,
-                        os_type: word(ext, 10)?,
-                        entry_object: dword(ext, 24)?,
-                        entry_offset: dword(ext, 28)?,
-                    });
+                let ext = bytes.get(offset..).ok_or(ExecutableError::Truncated)?;
+                if *ext.get(2).ok_or(ExecutableError::Truncated)? != 0
+                    || *ext.get(3).ok_or(ExecutableError::Truncated)? != 0
+                {
+                    return Err(ExecutableError::UnsupportedByteOrder);
                 }
+                extended = Some(ExtendedHeader {
+                    signature: [signature[0], signature[1]],
+                    file_offset: offset,
+                    cpu_type: word(ext, 8)?,
+                    os_type: word(ext, 10)?,
+                    entry_object: dword(ext, 24)?,
+                    entry_offset: dword(ext, 28)?,
+                });
             }
         }
         Ok(Self {

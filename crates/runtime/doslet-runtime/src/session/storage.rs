@@ -609,6 +609,7 @@ impl Session {
                                 .finish_read(handle, length)
                                 .map_err(|_| RuntimeError::Storage(StorageError::Corrupt))?;
                         }
+                        self.sync_backend(handle)?;
                         self.begin_copy(target, length, length as u16);
                         if length <= 4096 {
                             self.resume_storage()

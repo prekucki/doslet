@@ -185,6 +185,21 @@ This path requires the unchanged default BIOS `INT 1Ch` shim; reflection of
 return codes and never raises either interrupt, so a client's handlers for them
 are never called.
 
+Hardware interrupts follow the same path. An IRQ that arrives in real mode
+reaches its BIOS handler: IRQ 0, IRQ 1, or the default handler that the BIOS
+installs for IRQs 2–15. IRQ 12's vector holds the mouse driver's wrapper. If
+the client installed a protected-mode handler with 0205h, the host calls that
+handler and returns through the BIOS handler's final IRET, skipping the BIOS
+handler's own work. DJGPP programs hook IRQs only in protected mode, so without
+this routing Quake lost keys pressed while it waited in DOS. Reflections of the
+client's own interrupts, 0300h–0302h calls and chains to the default handler
+leave the host's return address on the real-mode stack. They run the BIOS
+handler, so a chained handler cannot recurse. A routed handler does not nest:
+while one runs, further real-mode IRQs and ticks use the BIOS handlers.
+Without a client handler, the BIOS default acknowledges the PIC and returns.
+Before these defaults existed, those vectors were 0000:0000, and Quake's Sound
+Blaster block IRQ executed the interrupt table.
+
 Without that timer delivery, a PRINCE menu click left its PCM effect in the
 continuous DMA buffer. Sound Blaster block IRQs were acknowledged on time, but
 the effect repeated because the game's software mixer did not receive timer
@@ -226,6 +241,27 @@ conforming general-purpose DPMI server. Remaining gaps:
   the validated scope. There is no mid-run fallback to the original DOS/4GW host.
 
 ## Recorded local evidence
+
+On 2026-10-20, a local Quake v1.06 shareware run (DJGPP, normally with
+CWSDPMI) used `--dpmi direct` and the interpreter without AOT. It ran for 60
+emulated seconds. Space was pressed at 3 s to dismiss the "MSCDEX not loaded"
+notice, and ESC at 12 s to skip joystick calibration. Quake then played its
+demo behind the main menu with no fault, after 3,990,010,000 steps in 87 host
+seconds. Reaching that point needed these changes, in order:
+
+- MZ loading of the DJGPP stub;
+- segment reloads after descriptor changes;
+- DOS 33h/58h;
+- the DOS SFT and JFT for `fstat()`;
+- TRUENAME (60h);
+- the IPX probe;
+- IRQ defaults and routing;
+- IOCTL 4409h;
+- an SDA refusal (5D06h);
+- BT/BTS/BTR/BTC with a register bit offset.
+
+This is a menu-and-demo run without gameplay input, audio listening or the
+desktop application.
 
 On 2026-10-17, native interpreter comparisons ran the local PRINCE and Heroes
 executables for 100,000,000 logical steps each with 16 MiB guest RAM. Both reached
