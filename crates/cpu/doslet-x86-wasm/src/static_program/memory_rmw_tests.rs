@@ -105,6 +105,7 @@ fn encoding(op: Operation) -> Vec<u8> {
             match source {
                 Source::Register(r) => (group * 8 + word, register_code(r), None),
                 Source::Immediate(v) => (0x80 + word, group, Some(v)),
+                Source::VirtualRegister(_) => unreachable!("test source"),
             }
         }
         Operation::UnaryMemory { kind, .. } => match kind {

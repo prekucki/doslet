@@ -29,7 +29,7 @@ fn stack_offset(f: &mut Function, width: Width, push: bool) {
     ins(f, W::I32Eq);
     ins(f, W::I32Or);
     ins(f, W::I32Eqz);
-    ins(f, W::BrIf(0)); // shared preflight refusal, before any effects
+    ins_hinted(f, false, W::BrIf(0)); // shared preflight refusal, before any effects
 
     read_register(f, Register::Esp);
     if push {

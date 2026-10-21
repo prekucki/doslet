@@ -58,11 +58,12 @@
 //! fallible reservations and a bounded output cap limit compiler memory use.
 
 use super::{Address, CompileError, Operation, RegionId, Width, abi, emit};
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::fmt::Write;
+use emit::Function;
 use wasm_encoder::{
-    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
-    MemoryType, Module, Section, TypeSection, ValType,
+    BranchHints, CodeSection, CustomSection, Encode, EntityType, ExportKind, ExportSection,
+    FunctionSection, ImportSection, MemoryType, Module, Section, TypeSection, ValType,
 };
 
 #[path = "procedure_memory_bundle.rs"]
@@ -98,6 +99,10 @@ pub struct FiniteLoopGuard {
 
 pub const COMPLETE: u32 = 0;
 pub const SIDE_EXIT: u32 = 1;
+pub const COMPILATION_HINTS_SECTION_NAME: &str = "metadata.code.compilation_hints";
+pub const BRANCH_HINT_SECTION_NAME: &str = "metadata.code.branch_hint";
+/// `strategy = kEager (2) | (baseline_tier = kOptimized (3) << 2) | (top_tier = kOptimized (3) << 4)`.
+pub const EAGER_OPTIMIZED_COMPILATION_HINT: u8 = 0x3e;
 pub const MAX_PROCEDURES: usize = 4096;
 pub const MAX_PROCEDURE_OPERATIONS: usize = 4096;
 pub const MAX_TOTAL_OPERATIONS: usize = 65_536;
@@ -414,22 +419,46 @@ fn encode_procedures(
     let mut functions = FunctionSection::new();
     let mut exports = ExportSection::new();
     exports.export("memory", ExportKind::Memory, 0);
+    let mut compilation_hints_data = if metadata.is_empty() {
+        Vec::new()
+    } else {
+        let cap = metadata
+            .len()
+            .checked_mul(9)
+            .and_then(|n| n.checked_add(5))
+            .ok_or(ProcedureCompileError::OutputTooLarge)?;
+        let mut data = reserved(cap)?;
+        (metadata.len() as u32).encode(&mut data);
+        data
+    };
+    let mut branch_hints = BranchHints::new();
+    let mut total_branch_hints = 0usize;
     let mut code = CodeSection::new();
     for (position, procedure) in metadata.iter().enumerate() {
+        let func_idx = position as u32;
         functions.function(0);
-        exports.export(&procedure.export_name, ExportKind::Func, position as u32);
+        exports.export(&procedure.export_name, ExportKind::Func, func_idx);
+        func_idx.encode(&mut compilation_hints_data);
+        compilation_hints_data.extend_from_slice(&[1, 0, 1, EAGER_OPTIMIZED_COMPILATION_HINT]);
         let body = body(position)?;
+        if !body.branch_hints().is_empty() {
+            total_branch_hints = total_branch_hints
+                .checked_add(body.branch_hints().len())
+                .ok_or(ProcedureCompileError::OutputTooLarge)?;
+            branch_hints.function_hints(func_idx, body.branch_hints().iter().copied());
+        }
         code.byte_len()
             .checked_add(leb_len(body.byte_len()))
             .and_then(|n| n.checked_add(body.byte_len()))
             .filter(|&n| n <= max_output_bytes)
             .ok_or(ProcedureCompileError::OutputTooLarge)?;
-        code.function(&body);
+        code.function(body.wasm());
     }
     let header_capacity = metadata
         .len()
-        .checked_mul(48)
-        .and_then(|n| n.checked_add(160))
+        .checked_mul(64)
+        .and_then(|n| n.checked_add(total_branch_hints.checked_mul(6)?))
+        .and_then(|n| n.checked_add(256))
         .ok_or(ProcedureCompileError::OutputTooLarge)?;
     let mut bytes = reserved(header_capacity)?;
     bytes.extend_from_slice(&Module::HEADER);
@@ -437,6 +466,16 @@ fn encode_procedures(
     imports.append_to(&mut bytes);
     functions.append_to(&mut bytes);
     exports.append_to(&mut bytes);
+    if !compilation_hints_data.is_empty() {
+        CustomSection {
+            name: Cow::Borrowed(COMPILATION_HINTS_SECTION_NAME),
+            data: Cow::Borrowed(&compilation_hints_data),
+        }
+        .append_to(&mut bytes);
+    }
+    if !branch_hints.is_empty() {
+        branch_hints.append_to(&mut bytes);
+    }
     let payload = code
         .byte_len()
         .checked_add(leb_len(code.len() as usize))
@@ -448,9 +487,11 @@ fn encode_procedures(
         .and_then(|n| n.checked_add(payload))
         .filter(|&n| n <= max_output_bytes)
         .ok_or(ProcedureCompileError::OutputTooLarge)?;
-    bytes
-        .try_reserve_exact(total - bytes.len())
-        .map_err(|_| ProcedureCompileError::Allocation)?;
+    if total > bytes.capacity() {
+        bytes
+            .try_reserve_exact(total - bytes.len())
+            .map_err(|_| ProcedureCompileError::Allocation)?;
+    }
     code.append_to(&mut bytes);
     debug_assert_eq!(bytes.len(), total);
     Ok(bytes)

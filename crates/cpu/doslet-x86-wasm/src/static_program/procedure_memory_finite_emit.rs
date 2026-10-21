@@ -5,6 +5,7 @@ use crate::static_program::procedure_memory::graph::finite::{FinitePlan, FiniteR
 
 fn region_body(
     f: &mut Function,
+    vregs: &VirtualRegisters,
     procedure: &ProcedureGraphFunction,
     graph: &GraphPlan,
     finite: &FinitePlan,
@@ -41,13 +42,14 @@ fn region_body(
                 c(f, loop_plan.trips);
                 ins(f, W::I32GtU);
                 ins(f, W::I32Or);
-                ins(f, W::If(BlockType::Empty));
+                ins_hinted(f, false, W::If(BlockType::Empty));
                 refused(f, procedure.blocks[index].entry, depth, 0);
                 ins(f, W::End);
             }
             ins(f, W::Loop(BlockType::Empty));
             region_body(
                 f,
+                vregs,
                 procedure,
                 graph,
                 finite,
@@ -60,7 +62,7 @@ fn region_body(
         } else {
             let block = &procedure.blocks[index];
             for (prefix, instruction) in block.instructions.iter().enumerate() {
-                instruction_body(f, instruction.operation, |f| {
+                instruction_body(f, vregs, instruction.operation, |f| {
                     refused(f, instruction.address, depth, prefix)
                 });
                 if f.byte_len() > max_output {
@@ -73,7 +75,7 @@ fn region_body(
                 condition(f, Condition::NotEqual);
                 // The sole loop continuation tests the flags produced by the
                 // proven final induction update. Zero falls out of the loop.
-                ins(f, W::BrIf(remaining));
+                ins_hinted(f, true, W::BrIf(remaining));
             } else {
                 let target = |arm: usize| region.positions[graph.targets[index][arm].unwrap()];
                 match terminator.kind {
@@ -138,16 +140,28 @@ pub(super) fn body(
     max_output: usize,
 ) -> Result<Function, ProcedureCompileError> {
     let finite = graph.finite.as_ref().unwrap();
-    let mut f = initialize(procedure.blocks.iter().any(|block| {
-        block.instructions.iter().any(|instruction| {
-            matches!(
-                instruction.operation,
-                Operation::StoreMemory { .. } | Operation::StringStore { .. }
-            )
-        })
-    }));
+    let vregs = VirtualRegisters::collect(
+        procedure
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter().map(|i| i.operation)),
+    )?;
+    let mut f = initialize_with_vregs(
+        procedure.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.operation,
+                    Operation::StoreMemory { .. } | Operation::StringStore { .. }
+                )
+            })
+        }),
+        &vregs,
+    );
     ins(&mut f, W::Block(BlockType::Empty));
-    region_body(&mut f, procedure, graph, finite, None, 0, max_output)?;
+    vregs.emit_prologue(&mut f, procedure.entry);
+    region_body(
+        &mut f, &vregs, procedure, graph, finite, None, 0, max_output,
+    )?;
     ins(&mut f, W::End);
     finish(&mut f, procedure.entry);
     if f.byte_len() > max_output {

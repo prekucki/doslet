@@ -345,3 +345,193 @@ fn interpreted_reference_honors_live_dword_entry_guard_without_executing_a_wrap(
         );
     }
 }
+
+#[test]
+fn virtual_register_displacement_and_immediate_reflect_live_code_patches_without_source_refusal() {
+    // 00: 8A 83 [disp32 @ ENTRY+2]  MOV AL, [EBX + disp32]
+    // 06: 81 C7 [imm32  @ ENTRY+8]  ADD EDI, imm32
+    // 0C: 88 07                     MOV [EDI], AL
+    // 0E: 49                        DEC ECX
+    // 0F: 75 EF                     JNZ 00
+    // 11: C3                        RET
+    let code_bytes: [u8; 18] = [
+        0x8a, 0x83, 0x00, 0x20, 0x00, 0x00, // MOV AL, [EBX + 0x2000]
+        0x81, 0xc7, 0x04, 0x00, 0x00, 0x00, // ADD EDI, 4
+        0x88, 0x07, // MOV [EDI], AL
+        0x49, // DEC ECX
+        0x75, 0xef, // JNZ ENTRY
+        0xc3, // RET
+    ];
+    let a = |offset| address(ENTRY + offset);
+    let function = ProcedureGraphFunction {
+        id: ProcedureId(11),
+        entry: a(0),
+        blocks: vec![
+            ProcedureBlock {
+                entry: a(0),
+                instructions: vec![
+                    ProcedureInstruction {
+                        address: a(0),
+                        operation: Operation::LoadMemory {
+                            target: Register::Al,
+                            address: MemoryAddress {
+                                base: Some(Register::Ebx),
+                                index: None,
+                                scale: 1
+                                    | doslet_x86_wasm::static_program::memory::VIRTUAL_DISPLACEMENT,
+                                displacement: ENTRY + 2,
+                                address16: false,
+                                segment: Segment::Ds,
+                            },
+                        },
+                    },
+                    ProcedureInstruction {
+                        address: a(6),
+                        operation: Operation::Alu {
+                            kind: Alu::Add,
+                            target: Register::Edi,
+                            source: Source::VirtualRegister(ENTRY + 8),
+                        },
+                    },
+                    ProcedureInstruction {
+                        address: a(12),
+                        operation: Operation::StoreMemory {
+                            address: operand(Some(Register::Edi), 0),
+                            width: Width::Byte,
+                            source: Source::Register(Register::Al),
+                        },
+                    },
+                    ProcedureInstruction {
+                        address: a(14),
+                        operation: Operation::Dec(Register::Ecx),
+                    },
+                ],
+                terminator: ProcedureTerminator {
+                    address: a(15),
+                    kind: ProcedureTerminatorKind::Branch {
+                        condition: Condition::NotEqual,
+                        taken: a(0),
+                        not_taken: a(17),
+                    },
+                },
+            },
+            ProcedureBlock {
+                entry: a(17),
+                instructions: vec![],
+                terminator: ProcedureTerminator {
+                    address: a(17),
+                    kind: ProcedureTerminatorKind::Return {
+                        width: Width::Dword,
+                        pop_bytes: 0,
+                    },
+                },
+            },
+        ],
+    };
+    let compiled = ProcedureGraphProgram {
+        functions: vec![function],
+    }
+    .compile_with_computation_kernels(&ProcedureCompileOptions::default(), 4096)
+    .unwrap();
+    let guard = compiled.finite_loop_guards(ProcedureId(11)).unwrap()[0];
+    let binding = Binding {
+        function_id: 11,
+        entry_ip: ENTRY,
+        maximum_instructions: compiled.finite_maximum_work(ProcedureId(11)).unwrap(),
+        kernel: None,
+        rle_kernel: None,
+        finite_computation: Some(FiniteComputation {
+            exits: vec![],
+            returns: vec![ENTRY + 17],
+            guards: vec![FiniteLoopGuard {
+                entry_ip: guard.entry.offset,
+                counter: guard.counter.index() as u8,
+                decrement: guard.decrement,
+                maximum_trips: guard.maximum_trips,
+            }],
+        }),
+        kernel_interrupts: KernelInterrupts::Defer,
+        // Split around virtual-register slots [ENTRY+2..ENTRY+6] and [ENTRY+8..ENTRY+12].
+        code: vec![
+            CodePart {
+                linear: ENTRY,
+                expected: vec![0x8a, 0x83],
+            },
+            CodePart {
+                linear: ENTRY + 6,
+                expected: vec![0x81, 0xc7],
+            },
+            CodePart {
+                linear: ENTRY + 12,
+                expected: vec![0x88, 0x07],
+            },
+            CodePart {
+                linear: ENTRY + 14,
+                expected: vec![0x49],
+            },
+            CodePart {
+                linear: ENTRY + 15,
+                expected: vec![0x75, 0xef],
+            },
+            CodePart {
+                linear: ENTRY + 17,
+                expected: vec![0xc3],
+            },
+        ],
+    };
+    let wasm = compiled.into_wasm();
+    let setup = |disp: u32, stride: u32| {
+        let mut m = machine();
+        m.bus
+            .debug_ram_mut(ENTRY, code_bytes.len() as u32)
+            .unwrap()
+            .copy_from_slice(&code_bytes);
+        m.bus.write_u32(ENTRY + 2, disp).unwrap();
+        m.bus.write_u32(ENTRY + 8, stride).unwrap();
+        m.bus
+            .debug_ram_mut(DATA, 8)
+            .unwrap()
+            .copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0xaa, 0xbb, 0xcc, 0xdd]);
+        m.cpu.registers.set32(Gpr32::Ebx, 1);
+        m.cpu.registers.set32(Gpr32::Edi, OUTPUT);
+        m.cpu.registers.set32(Gpr32::Ecx, 2);
+        m.cpu.registers.set32(Gpr32::Esp, 0x7000);
+        m.bus.write_u32(0x7000, RETURN).unwrap();
+        m
+    };
+
+    let mut fast = setup(DATA, 3);
+    let mut reference = setup(DATA, 3);
+    fast.install_wasm_procedures(&wasm, vec![binding]).unwrap();
+
+    // First call with disp = DATA, stride = 3
+    let work1 = fast.try_wasm_procedure(1).unwrap().unwrap();
+    assert!(work1 > 0);
+    while reference.cpu.registers.ip != RETURN {
+        reference_steps(&mut reference, 1);
+    }
+    same_state(&mut fast, &mut reference);
+
+    // Patch virtual registers in-place via bus writes (as self-modifying guest code does)
+    for m in [&mut fast, &mut reference] {
+        m.cpu.registers.ip = ENTRY;
+        m.cpu.registers.set32(Gpr32::Ebx, 2);
+        m.cpu.registers.set32(Gpr32::Edi, OUTPUT + 0x20);
+        m.cpu.registers.set32(Gpr32::Ecx, 2);
+        m.cpu.registers.set32(Gpr32::Esp, 0x7000);
+        m.bus.write_u32(0x7000, RETURN).unwrap();
+        m.bus.write_u32(ENTRY + 2, DATA + 4).unwrap();
+        m.bus.write_u32(ENTRY + 8, 5).unwrap();
+    }
+
+    let work2 = fast.try_wasm_procedure(1).unwrap().unwrap();
+    assert_eq!(work2, work1);
+    while reference.cpu.registers.ip != RETURN {
+        reference_steps(&mut reference, 1);
+    }
+    same_state(&mut fast, &mut reference);
+
+    let stats = fast.wasm_procedure_stats().unwrap();
+    assert_eq!(stats.calls, 2);
+    assert_eq!(stats.source_refusals, 0);
+}

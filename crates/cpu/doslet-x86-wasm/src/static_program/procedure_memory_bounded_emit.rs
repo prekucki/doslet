@@ -11,13 +11,14 @@ fn guard(f: &mut Function, address: Address, depth: u32, prefix: usize) {
     }
     get(f, QUOTA);
     ins(f, W::I32GeU);
-    ins(f, W::If(BlockType::Empty));
+    ins_hinted(f, false, W::If(BlockType::Empty));
     refused(f, address, depth, prefix);
     ins(f, W::End);
 }
 
 fn iteration(
     f: &mut Function,
+    vregs: &VirtualRegisters,
     procedure: &ProcedureGraphFunction,
     loop_plan: &LoopPlan,
     outer_depth: u32,
@@ -32,7 +33,7 @@ fn iteration(
             if check_each {
                 guard(f, instruction.address, depth, prefix);
             }
-            instruction_body(f, instruction.operation, |f| {
+            instruction_body(f, vregs, instruction.operation, |f| {
                 refused(f, instruction.address, depth, prefix)
             });
             prefix += 1;
@@ -59,6 +60,7 @@ fn iteration(
 
 fn loop_body(
     f: &mut Function,
+    vregs: &VirtualRegisters,
     procedure: &ProcedureGraphFunction,
     plan: &GraphPlan,
     position: usize,
@@ -74,10 +76,10 @@ fn loop_body(
     ins(f, W::I32Add);
     get(f, QUOTA);
     ins(f, W::I32LeU);
-    ins(f, W::If(BlockType::Empty));
-    iteration(f, procedure, loop_plan, depth, false, max_output)?;
+    ins_hinted(f, true, W::If(BlockType::Empty));
+    iteration(f, vregs, procedure, loop_plan, depth, false, max_output)?;
     ins(f, W::Else);
-    iteration(f, procedure, loop_plan, depth, true, max_output)?;
+    iteration(f, vregs, procedure, loop_plan, depth, true, max_output)?;
     ins(f, W::End);
     completed(f, 1); // actual latch JMP/Jcc, after its grant was established
     let exit = match procedure.blocks[latch].terminator.kind {
@@ -98,7 +100,7 @@ fn loop_body(
                     ins(f, W::I32Eqz);
                     taken.unwrap()
                 };
-                ins(f, W::BrIf(0));
+                ins_hinted(f, true, W::BrIf(0));
                 Some(target)
             }
         }
@@ -117,14 +119,23 @@ pub(super) fn body(
     max_output: usize,
 ) -> Result<Function, ProcedureCompileError> {
     let loop_plan = plan.bounded.as_ref().unwrap();
-    let mut f = initialize(procedure.blocks.iter().any(|block| {
-        block.instructions.iter().any(|instruction| {
-            matches!(
-                instruction.operation,
-                Operation::StoreMemory { .. } | Operation::StringStore { .. }
-            )
-        })
-    }));
+    let vregs = VirtualRegisters::collect(
+        procedure
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter().map(|i| i.operation)),
+    )?;
+    let mut f = initialize_with_vregs(
+        procedure.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.operation,
+                    Operation::StoreMemory { .. } | Operation::StringStore { .. }
+                )
+            })
+        }),
+        &vregs,
+    );
     // QUOTA is an unused i32 padding local in the common procedure ABI.
     load(&mut f, memory::OFFSET + memory::INLINE_GRANT, false);
     set(&mut f, QUOTA);
@@ -136,18 +147,21 @@ pub(super) fn body(
     set(&mut f, QUOTA);
     ins(&mut f, W::End);
     ins(&mut f, W::Block(BlockType::Empty)); // common exit
+    vregs.emit_prologue(&mut f, procedure.entry);
     for _ in 1..plan.order.len() {
         ins(&mut f, W::Block(BlockType::Empty));
     }
     for (position, &index) in plan.order.iter().enumerate() {
         let remaining = (plan.order.len() - position - 1) as u32;
         if index == loop_plan.blocks[0] {
-            loop_body(&mut f, procedure, plan, position, remaining, max_output)?;
+            loop_body(
+                &mut f, &vregs, procedure, plan, position, remaining, max_output,
+            )?;
         } else {
             let block = &procedure.blocks[index];
             for (prefix, instruction) in block.instructions.iter().enumerate() {
                 guard(&mut f, instruction.address, remaining, prefix);
-                instruction_body(&mut f, instruction.operation, |f| {
+                instruction_body(&mut f, &vregs, instruction.operation, |f| {
                     refused(f, instruction.address, remaining, prefix)
                 });
                 if f.byte_len() > max_output {

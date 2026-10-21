@@ -109,6 +109,53 @@ impl Block {
 }
 
 const ENTRY_HINT_CAPACITY: usize = 512;
+const MAX_BLOCK_BYTES: usize = 128;
+const VREG_CAPACITY: usize = 128;
+const VREG_PROBE: usize = 8;
+
+/// A self-modified 32-bit immediate or displacement slot in RAM mapped as a
+/// virtual register bound to a cached basic-block instruction operand.
+#[derive(Clone, Copy)]
+struct VirtualRegister {
+    address: u32,
+    value: u32,
+    block_index: u16,
+    insn_pos: u8,
+    is_displacement: bool,
+    template_offset: u8,
+}
+impl VirtualRegister {
+    const EMPTY: Self = Self {
+        address: u32::MAX,
+        value: 0,
+        block_index: 0,
+        insn_pos: 0,
+        is_displacement: false,
+        template_offset: 0,
+    };
+}
+
+/// Cold byte template and 32-bit operand-slot offsets for a cached basic block.
+/// Kept off the hot `Block` table so `size_of::<Block>() == 168` stays intact.
+#[derive(Clone, Copy)]
+struct BlockTemplate {
+    bytes: [u8; MAX_BLOCK_BYTES],
+    insn_offset: [u8; BLOCK_INSTRUCTIONS],
+    disp32_offset: [u8; BLOCK_INSTRUCTIONS],
+    imm32_offset: [u8; BLOCK_INSTRUCTIONS],
+    disp_vreg: [u8; BLOCK_INSTRUCTIONS],
+    imm_vreg: [u8; BLOCK_INSTRUCTIONS],
+}
+impl BlockTemplate {
+    const EMPTY: Self = Self {
+        bytes: [0; MAX_BLOCK_BYTES],
+        insn_offset: [0; BLOCK_INSTRUCTIONS],
+        disp32_offset: [u8::MAX; BLOCK_INSTRUCTIONS],
+        imm32_offset: [u8::MAX; BLOCK_INSTRUCTIONS],
+        disp_vreg: [u8::MAX; BLOCK_INSTRUCTIONS],
+        imm_vreg: [u8::MAX; BLOCK_INSTRUCTIONS],
+    };
+}
 
 #[derive(Clone, Copy)]
 struct EntryHint {
@@ -147,6 +194,12 @@ pub(super) struct Cache {
     entries: Box<[Option<Entry>; CAPACITY]>,
     /// Basic blocks for batched execution, reserved once at setup.
     blocks: Box<[Block; BLOCK_CAPACITY]>,
+    /// Cold templates and 32-bit operand slot metadata per block.
+    templates: Box<[BlockTemplate; BLOCK_CAPACITY]>,
+    /// Mapped virtual registers for self-modified 32-bit operand slots.
+    vregs: Box<[VirtualRegister; VREG_CAPACITY]>,
+    /// Bitmask of `(address >> 12) & 63` pages holding bound virtual registers.
+    vreg_page_mask: u64,
     /// Cold decoded forms, indexed by block slot and instruction position.
     fallback: Box<[Instruction]>,
     prepared_entries: Option<PreparedEntries>,
@@ -177,6 +230,15 @@ impl Default for Cache {
                 .into_boxed_slice()
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("the vector has BLOCK_CAPACITY blocks")),
+            templates: alloc::vec![BlockTemplate::EMPTY; BLOCK_CAPACITY]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("the vector has BLOCK_CAPACITY templates")),
+            vregs: alloc::vec![VirtualRegister::EMPTY; VREG_CAPACITY]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("the vector has VREG_CAPACITY vregs")),
+            vreg_page_mask: 0,
             fallback: alloc::vec![Instruction::UNSUPPORTED; BLOCK_CAPACITY * BLOCK_INSTRUCTIONS]
                 .into_boxed_slice(),
             prepared_entries: None,
@@ -205,6 +267,9 @@ impl Cache {
     pub fn clear(&mut self) {
         self.entries.fill(None);
         self.blocks.fill(Block::EMPTY);
+        self.templates.fill(BlockTemplate::EMPTY);
+        self.vregs.fill(VirtualRegister::EMPTY);
+        self.vreg_page_mask = 0;
         self.context = None;
         self.key = None;
         self.code32 = false;
@@ -373,6 +438,241 @@ impl Cache {
 }
 
 impl Cache {
+    #[inline]
+    fn vreg_hash(address: u32) -> usize {
+        (((address >> 2) ^ (address >> 5) ^ (address >> 11)) as usize) & (VREG_CAPACITY - 1)
+    }
+
+    #[inline(always)]
+    fn write_vreg(&mut self, address: u32, value: u32) {
+        if self.vreg_page_mask & (1u64 << ((address >> 12) & 63)) != 0 {
+            self.write_vreg_slow(address, value);
+        }
+    }
+
+    #[cold]
+    fn write_vreg_slow(&mut self, address: u32, value: u32) {
+        let base = Self::vreg_hash(address);
+        for step in 0..VREG_PROBE {
+            let slot = (base + step) & (VREG_CAPACITY - 1);
+            let vreg = self.vregs[slot];
+            if vreg.address != address {
+                continue;
+            }
+            self.vregs[slot].value = value;
+            let b_idx = usize::from(vreg.block_index);
+            let pos = usize::from(vreg.insn_pos);
+            let off = usize::from(vreg.template_offset);
+            let block = &mut self.blocks[b_idx];
+            let template = &mut self.templates[b_idx];
+            let expected_off = if vreg.is_displacement {
+                template.disp32_offset[pos]
+            } else {
+                template.imm32_offset[pos]
+            };
+            if usize::from(block.count) <= pos
+                || expected_off != vreg.template_offset
+                || block.address.wrapping_add(u32::from(vreg.template_offset)) != address
+                || off + 4 > usize::from(block.length)
+            {
+                continue;
+            }
+            if vreg.is_displacement {
+                block.instructions[pos].set_displacement(value);
+            } else {
+                block.instructions[pos].set_immediate(value);
+            }
+            template.bytes[off..off + 4].copy_from_slice(&value.to_le_bytes());
+            if let Some(profile) = &self.profile {
+                let insn_start = usize::from(template.insn_offset[pos]);
+                let insn_len = usize::from(block.instructions[pos].length());
+                if insn_start + insn_len <= usize::from(block.length) {
+                    let tier = profile.classify(
+                        block.address.wrapping_add(insn_start as u32),
+                        block.code32,
+                        &template.bytes[insn_start..insn_start + insn_len],
+                    );
+                    block.instructions[pos].set_tier(tier);
+                }
+            }
+        }
+    }
+
+    fn bind_vreg(
+        &mut self,
+        address: u32,
+        value: u32,
+        block_index: usize,
+        insn_pos: u8,
+        is_displacement: bool,
+        template_offset: u8,
+    ) -> u8 {
+        self.vreg_page_mask |= 1u64 << ((address >> 12) & 63);
+        let existing = if is_displacement {
+            self.templates[block_index].disp_vreg[usize::from(insn_pos)]
+        } else {
+            self.templates[block_index].imm_vreg[usize::from(insn_pos)]
+        };
+        if existing != u8::MAX {
+            let slot = usize::from(existing);
+            let vreg = &mut self.vregs[slot];
+            if vreg.address == address
+                && usize::from(vreg.block_index) == block_index
+                && vreg.insn_pos == insn_pos
+                && vreg.is_displacement == is_displacement
+            {
+                vreg.value = value;
+                vreg.template_offset = template_offset;
+                return existing;
+            }
+        }
+        let base = Self::vreg_hash(address);
+        let mut free_slot = None;
+        for step in 0..VREG_PROBE {
+            let slot = (base + step) & (VREG_CAPACITY - 1);
+            let vreg = &mut self.vregs[slot];
+            if vreg.address == address
+                && usize::from(vreg.block_index) == block_index
+                && vreg.insn_pos == insn_pos
+                && vreg.is_displacement == is_displacement
+            {
+                vreg.value = value;
+                vreg.template_offset = template_offset;
+                return slot as u8;
+            }
+            if vreg.address == u32::MAX && free_slot.is_none() {
+                free_slot = Some(slot);
+            }
+        }
+        let target = free_slot
+            .unwrap_or((base + (address as usize & (VREG_PROBE - 1))) & (VREG_CAPACITY - 1));
+        self.vregs[target] = VirtualRegister {
+            address,
+            value,
+            block_index: block_index as u16,
+            insn_pos,
+            is_displacement,
+            template_offset,
+        };
+        target as u8
+    }
+
+    /// Revalidate a block whose code-page generation advanced. If either no
+    /// bytes in this block changed or only 32-bit displacement/immediate slots
+    /// changed, bind/update their virtual registers and refresh `check` without
+    /// flushing the block or re-decoding instructions.
+    #[cold]
+    fn revalidate_block<B: CpuBus>(&mut self, index: usize, bus: &B) -> bool {
+        let block = self.blocks[index];
+        let len = usize::from(block.length);
+        if len == 0 || len > MAX_BLOCK_BYTES {
+            return false;
+        }
+        let Some(live) = bus.code_bytes(block.address, block.length) else {
+            return false;
+        };
+        if live.len() < len {
+            return false;
+        }
+        let live = &live[..len];
+        if live == &self.templates[index].bytes[..len] {
+            let Some(new_check) = bus.code_check(block.address, block.length) else {
+                return false;
+            };
+            self.blocks[index].check = new_check;
+            return true;
+        }
+        if block.count == 0 {
+            return false;
+        }
+        let count = usize::from(block.count);
+        for pos in 0..count {
+            let disp_off = self.templates[index].disp32_offset[pos];
+            if disp_off != u8::MAX {
+                let off = usize::from(disp_off);
+                if off + 4 <= len && live[off..off + 4] != self.templates[index].bytes[off..off + 4]
+                {
+                    let val = u32::from_le_bytes([
+                        live[off],
+                        live[off + 1],
+                        live[off + 2],
+                        live[off + 3],
+                    ]);
+                    let vreg_idx = self.bind_vreg(
+                        block.address.wrapping_add(u32::from(disp_off)),
+                        val,
+                        index,
+                        pos as u8,
+                        true,
+                        disp_off,
+                    );
+                    self.templates[index].disp_vreg[pos] = vreg_idx;
+                    self.blocks[index].instructions[pos].set_displacement(val);
+                    self.templates[index].bytes[off..off + 4].copy_from_slice(&live[off..off + 4]);
+                }
+            }
+            let imm_off = self.templates[index].imm32_offset[pos];
+            if imm_off != u8::MAX {
+                let off = usize::from(imm_off);
+                if off + 4 <= len && live[off..off + 4] != self.templates[index].bytes[off..off + 4]
+                {
+                    let val = u32::from_le_bytes([
+                        live[off],
+                        live[off + 1],
+                        live[off + 2],
+                        live[off + 3],
+                    ]);
+                    let vreg_idx = self.bind_vreg(
+                        block.address.wrapping_add(u32::from(imm_off)),
+                        val,
+                        index,
+                        pos as u8,
+                        false,
+                        imm_off,
+                    );
+                    self.templates[index].imm_vreg[pos] = vreg_idx;
+                    self.blocks[index].instructions[pos].set_immediate(val);
+                    self.templates[index].bytes[off..off + 4].copy_from_slice(&live[off..off + 4]);
+                }
+            }
+            if let Some(profile) = &self.profile {
+                let insn_start = usize::from(self.templates[index].insn_offset[pos]);
+                let insn_len = usize::from(self.blocks[index].instructions[pos].length());
+                if insn_start + insn_len <= len {
+                    let tier = profile.classify(
+                        block.address.wrapping_add(insn_start as u32),
+                        block.code32,
+                        &self.templates[index].bytes[insn_start..insn_start + insn_len],
+                    );
+                    self.blocks[index].instructions[pos].set_tier(tier);
+                }
+            }
+        }
+        if live != &self.templates[index].bytes[..len] {
+            return false;
+        }
+        let Some(new_check) = bus.code_check(block.address, block.length) else {
+            return false;
+        };
+        self.blocks[index].check = new_check;
+        true
+    }
+
+    #[cold]
+    fn revalidate_in_batch<B: CpuBus>(
+        &mut self,
+        index: usize,
+        bus: &B,
+        check: &mut CodeCheck,
+    ) -> bool {
+        if self.revalidate_block(index, bus) {
+            *check = self.blocks[index].check;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Find or decode the block starting at `ip`, validated against the current
     /// CS window and code generations. None when no batchable block starts there.
     #[inline]
@@ -383,16 +683,25 @@ impl Cache {
         let address = window.address(ip, 1)?;
         let index = ((address ^ (address >> 10)) as usize) & (BLOCK_CAPACITY - 1);
         let block = &self.blocks[index];
-        if block.address == address && block.code32 == self.code32 && bus.code_valid(&block.check) {
-            if block.count == 0 {
-                return None;
-            }
-            if window.address(ip, block.length).is_some() {
-                #[cfg(feature = "profiling")]
-                {
-                    self.stats.block_hits += 1;
+        if block.address == address && block.code32 == self.code32 {
+            let (count, length) = (block.count, block.length);
+            let valid = if bus.code_valid(&block.check) {
+                true
+            } else {
+                (count == 0 || window.address(ip, length).is_some())
+                    && self.revalidate_block(index, bus)
+            };
+            if valid {
+                if count == 0 {
+                    return None;
                 }
-                return Some(index);
+                if window.address(ip, length).is_some() {
+                    #[cfg(feature = "profiling")]
+                    {
+                        self.stats.block_hits += 1;
+                    }
+                    return Some(index);
+                }
             }
         }
         self.build_block(window, ip, address, index, bus)
@@ -417,6 +726,20 @@ impl Cache {
                 u64::from(slot.address == address && !bus.code_valid(&slot.check));
         }
         let bytes = bus.code_bytes(address, u8::MAX)?;
+        let old_template = self.templates[index];
+        for v in old_template
+            .disp_vreg
+            .into_iter()
+            .chain(old_template.imm_vreg)
+        {
+            if v != u8::MAX {
+                let v_idx = usize::from(v);
+                if usize::from(self.vregs[v_idx].block_index) == index {
+                    self.vregs[v_idx] = VirtualRegister::EMPTY;
+                }
+            }
+        }
+        let mut template = BlockTemplate::EMPTY;
         let mut block = Block {
             address,
             code32: self.code32,
@@ -475,8 +798,16 @@ impl Cache {
                     &bytes[offset..end],
                 ));
             }
+            template.insn_offset[position] = offset as u8;
             if prepared.is_fallback() {
                 self.fallback[index * BLOCK_INSTRUCTIONS + position] = instruction;
+            } else {
+                if instruction.disp32_offset != u8::MAX {
+                    template.disp32_offset[position] = offset as u8 + instruction.disp32_offset;
+                }
+                if instruction.imm32_offset != u8::MAX {
+                    template.imm32_offset[position] = offset as u8 + instruction.imm32_offset;
+                }
             }
             block.instructions[position] = prepared;
             block.count += 1;
@@ -499,7 +830,12 @@ impl Cache {
         } else {
             offset
         } as u8;
+        let len = usize::from(block.length);
+        if len <= MAX_BLOCK_BYTES {
+            template.bytes[..len].copy_from_slice(&bytes[..len]);
+        }
         block.check = bus.code_check(address, block.length)?;
+        self.templates[index] = template;
         self.blocks[index] = block;
         (block.count != 0).then_some(index)
     }
@@ -795,6 +1131,8 @@ pub(super) struct Instruction {
     dword: bool,
     width: u8,
     branch32: bool,
+    disp32_offset: u8,
+    imm32_offset: u8,
     operation: Operation,
 }
 
@@ -1158,6 +1496,9 @@ impl Cpu {
                 .unwrap_or_else(|_| unreachable!("the vector has ENTRY_HINT_CAPACITY hints")),
         });
         self.decode_cache.blocks.fill(Block::EMPTY);
+        self.decode_cache.templates.fill(BlockTemplate::EMPTY);
+        self.decode_cache.vregs.fill(VirtualRegister::EMPTY);
+        self.decode_cache.vreg_page_mask = 0;
         self.decode_cache.prepared_entries = entries;
         Ok(())
     }
@@ -1353,7 +1694,7 @@ impl Cpu {
             {
                 break;
             }
-            let Some((index, count, check)) = self.batch_block(code, bus) else {
+            let Some((index, count, mut check)) = self.batch_block(code, bus) else {
                 break;
             };
             if stop_at_prepared && completed != 0 && self.decode_cache.blocks[index].prepared_entry
@@ -1386,8 +1727,15 @@ impl Cpu {
                 }
                 completed += 1;
                 // A taken branch, a repeated string or the budget ends the run;
-                // a store may have rewritten the rest of the block.
-                if completed == budget || self.registers.ip != next || !bus.code_valid(&check) {
+                // a store to the same code page revalidates via virtual registers
+                // before flushing the remaining instructions in this block.
+                if completed == budget
+                    || self.registers.ip != next
+                    || (!bus.code_valid(&check)
+                        && !self
+                            .decode_cache
+                            .revalidate_in_batch(index, bus, &mut check))
+                {
                     continue 'blocks;
                 }
             }
@@ -1809,7 +2157,10 @@ impl Cpu {
                 self.registers.set(Gpr16::decode(code), value as u16)
             }
             Place::Register(code) => self.registers.set_byte(code, value as u8),
-            Place::Ram(address) if width == 4 => bus.write_u32(address, value).expect(PLAIN_RAM),
+            Place::Ram(address) if width == 4 => {
+                bus.write_u32(address, value).expect(PLAIN_RAM);
+                self.decode_cache.write_vreg(address, value);
+            }
             Place::Ram(address) if width == 2 => {
                 bus.write_u16(address, value as u16).expect(PLAIN_RAM)
             }
@@ -1872,6 +2223,8 @@ impl Cpu {
 struct Reader<'a> {
     bytes: &'a [u8],
     position: usize,
+    disp32_offset: u8,
+    imm32_offset: u8,
 }
 impl Reader<'_> {
     fn byte(&mut self) -> Option<u8> {
@@ -1890,12 +2243,22 @@ impl Reader<'_> {
             self.byte()?,
         ]))
     }
+    fn disp32(&mut self) -> Option<u32> {
+        self.disp32_offset = self.position as u8;
+        self.dword()
+    }
     fn immediate_width(&mut self, width: u8) -> Option<u32> {
         match width {
             4 => self.dword(),
             2 => self.word().map(u32::from),
             _ => self.byte().map(u32::from),
         }
+    }
+    fn immediate_data(&mut self, width: u8) -> Option<u32> {
+        if width == 4 {
+            self.imm32_offset = self.position as u8;
+        }
+        self.immediate_width(width)
     }
     fn target(
         &mut self,
@@ -1914,7 +2277,7 @@ impl Reader<'_> {
                 let base = sib & 7;
                 let index = (sib >> 3) & 7;
                 let (base, displacement, stack) = if base == 5 && mode == 0 {
-                    (NO_REGISTER, self.dword()?, false)
+                    (NO_REGISTER, self.disp32()?, false)
                 } else {
                     (base, 0, matches!(base, 4 | 5))
                 };
@@ -1926,7 +2289,7 @@ impl Reader<'_> {
                     stack,
                 )
             } else if code == 5 && mode == 0 {
-                (NO_REGISTER, NO_REGISTER, 0, self.dword()?, false)
+                (NO_REGISTER, NO_REGISTER, 0, self.disp32()?, false)
             } else {
                 (code, NO_REGISTER, 0, 0, code == 5)
             }
@@ -1956,7 +2319,7 @@ impl Reader<'_> {
         };
         displacement = displacement.wrapping_add(match mode {
             1 => self.byte()? as i8 as i32 as u32,
-            2 if address32 => self.dword()?,
+            2 if address32 => self.disp32()?,
             2 => u32::from(self.word()?),
             _ => 0,
         });
@@ -1982,6 +2345,8 @@ impl Instruction {
         dword: false,
         width: 1,
         branch32: true,
+        disp32_offset: u8::MAX,
+        imm32_offset: u8::MAX,
         operation: Operation::Unsupported,
     };
 
@@ -2009,7 +2374,12 @@ impl Instruction {
     /// Prefixes as in the reference step; operand size does not affect the
     /// batched forms. Repeat prefixes are left to the reference path.
     fn decode_x87(bytes: &[u8], code32: bool) -> Option<Self> {
-        let mut r = Reader { bytes, position: 0 };
+        let mut r = Reader {
+            bytes,
+            position: 0,
+            disp32_offset: u8::MAX,
+            imm32_offset: u8::MAX,
+        };
         let mut address32 = code32;
         let mut segment = None;
         let opcode = loop {
@@ -2044,12 +2414,21 @@ impl Instruction {
             dword: false,
             width: 1,
             branch32: code32,
+            // A patched disp32 updates the prepared displacement in place;
+            // no 387 form has an immediate.
+            disp32_offset: r.disp32_offset,
+            imm32_offset: r.imm32_offset,
             operation: Operation::X87 { x87, target },
         })
     }
 
     fn decode_mode(bytes: &[u8], code32: bool) -> Option<Self> {
-        let mut r = Reader { bytes, position: 0 };
+        let mut r = Reader {
+            bytes,
+            position: 0,
+            disp32_offset: u8::MAX,
+            imm32_offset: u8::MAX,
+        };
         let mut operand32 = code32;
         let mut address32 = code32;
         let mut segment = None;
@@ -2090,6 +2469,8 @@ impl Instruction {
                 dword: width == 4,
                 width,
                 branch32: code32,
+                disp32_offset: u8::MAX,
+                imm32_offset: u8::MAX,
                 operation: Operation::String {
                     kind: opcode & 0xFE,
                     width,
@@ -2119,7 +2500,7 @@ impl Instruction {
                     }
                     0xC6 | 0xC7 if register == 0 => Operation::Move {
                         target,
-                        source: Value::Immediate(r.immediate_width(if dword {
+                        source: Value::Immediate(r.immediate_data(if dword {
                             if operand32 { 4 } else { 2 }
                         } else {
                             1
@@ -2131,7 +2512,7 @@ impl Instruction {
                             read_length = Some(r.position as u8);
                         }
                         let source = match opcode {
-                            0x80 | 0x81 => Value::Immediate(r.immediate_width(if dword {
+                            0x80 | 0x81 => Value::Immediate(r.immediate_data(if dword {
                                 if operand32 { 4 } else { 2 }
                             } else {
                                 1
@@ -2155,7 +2536,7 @@ impl Instruction {
                 let (target, source) = if code & 7 >= 4 {
                     (
                         Target::Register(0),
-                        Value::Immediate(r.immediate_width(if dword {
+                        Value::Immediate(r.immediate_data(if dword {
                             if operand32 { 4 } else { 2 }
                         } else {
                             1
@@ -2216,7 +2597,7 @@ impl Instruction {
             }
             0xA0..=0xA3 => {
                 let displacement = if address32 {
-                    r.dword()?
+                    r.disp32()?
                 } else {
                     u32::from(r.word()?)
                 };
@@ -2237,7 +2618,7 @@ impl Instruction {
             }
             0xA8 | 0xA9 => Operation::Alu {
                 target: Target::Register(0),
-                source: Value::Immediate(r.immediate_width(if dword {
+                source: Value::Immediate(r.immediate_data(if dword {
                     if operand32 { 4 } else { 2 }
                 } else {
                     1
@@ -2249,7 +2630,7 @@ impl Instruction {
                 dword = opcode >= 0xB8;
                 Operation::Move {
                     target: Target::Register(opcode & 7),
-                    source: Value::Immediate(r.immediate_width(if dword {
+                    source: Value::Immediate(r.immediate_data(if dword {
                         if operand32 { 4 } else { 2 }
                     } else {
                         1
@@ -2415,7 +2796,7 @@ impl Instruction {
                         read_length = Some(r.position as u8);
                         Operation::Alu {
                             target,
-                            source: Value::Immediate(r.immediate_width(if dword {
+                            source: Value::Immediate(r.immediate_data(if dword {
                                 if operand32 { 4 } else { 2 }
                             } else {
                                 1
@@ -2463,6 +2844,8 @@ impl Instruction {
             dword: width == 4,
             width,
             branch32,
+            disp32_offset: r.disp32_offset,
+            imm32_offset: r.imm32_offset,
             operation,
         })
     }
@@ -3583,6 +3966,95 @@ mod tests {
             cpu.registers.ip = 0;
             cpu.step(&mut bus).unwrap();
             assert_eq!(cpu.registers.get32(Gpr32::Eax), 2);
+        }
+    }
+
+    #[test]
+    fn self_modifying_immediates_and_displacements_map_to_virtual_registers_without_flushing_blocks()
+     {
+        let mut bus = Flat {
+            ram: [0x90; 0x200],
+            generation: 0,
+        };
+        // Block at 0x00:
+        //   0x00: 89 1D 0E 00 00 00   mov [0x0E], ebx  (patches imm32 of add ebp, imm32)
+        //   0x06: 89 0D 14 00 00 00   mov [0x14], ecx  (patches disp32 of mov eax, [edx + disp32])
+        //   0x0C: 81 C5 78 56 34 12   add ebp, 0x12345678  (imm32 at 0x0E)
+        //   0x12: 8B 82 78 56 34 12   mov eax, [edx + 0x12345678]  (disp32 at 0x14)
+        let code = [
+            0x89, 0x1D, 0x0E, 0x00, 0x00, 0x00, // mov [0x0E], ebx
+            0x89, 0x0D, 0x14, 0x00, 0x00, 0x00, // mov [0x14], ecx
+            0x81, 0xC5, 0x78, 0x56, 0x34, 0x12, // add ebp, 0x12345678
+            0x8B, 0x82, 0x78, 0x56, 0x34, 0x12, // mov eax, [edx + 0x12345678]
+        ];
+        bus.ram[..code.len()].copy_from_slice(&code);
+        bus.ram[0x80..0x84].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        bus.ram[0x84..0x88].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let mut cpu = prepared_cpu();
+        cpu.registers.set32(Gpr32::Ebp, 10);
+        cpu.registers.set32(Gpr32::Edx, 0);
+        cpu.registers.set32(Gpr32::Ebx, 25);
+        cpu.registers.set32(Gpr32::Ecx, 0x80);
+
+        // First run: decodes the block once, binds 0x0E and 0x14 as virtual registers,
+        // and executes all 4 instructions in a single basic-block pass without flushing.
+        assert_eq!(cpu.interpret_batch(&mut bus, 4, |_| 4), 4);
+        assert_eq!(cpu.registers.ip, 0x18);
+        assert_eq!(cpu.registers.get32(Gpr32::Ebp), 35);
+        assert_eq!(cpu.registers.get32(Gpr32::Eax), 0xCAFE_BABE);
+
+        // Second run with new self-modified values: zero allocations, zero re-decodes.
+        cpu.registers.ip = 0;
+        cpu.registers.set32(Gpr32::Ebx, 100);
+        cpu.registers.set32(Gpr32::Ecx, 0x84);
+        let info = allocation_counter::measure(|| {
+            assert_eq!(cpu.interpret_batch(&mut bus, 4, |_| 4), 4);
+        });
+        assert_eq!(info.count_total, 0);
+        assert_eq!(cpu.registers.ip, 0x18);
+        assert_eq!(cpu.registers.get32(Gpr32::Ebp), 135);
+        assert_eq!(cpu.registers.get32(Gpr32::Eax), 0xDEAD_BEEF);
+        #[cfg(feature = "profiling")]
+        {
+            assert_eq!(cpu.decode_cache.stats.block_misses, 1);
+            assert_eq!(cpu.decode_cache.stats.block_stale, 0);
+            assert_eq!(cpu.decode_cache.stats.block_hits, 1);
+        }
+    }
+
+    #[test]
+    fn self_modified_x87_displacements_map_to_virtual_registers() {
+        let mut bus = Flat {
+            ram: [0x90; 0x200],
+            generation: 0,
+        };
+        let code = [
+            0x89, 0x0D, 0x08, 0x00, 0x00, 0x00, // mov [0x08], ecx (patches the FLD disp32)
+            0xD9, 0x05, 0x78, 0x56, 0x34, 0x12, // fld dword [0x12345678]
+            0xD9, 0x1D, 0x90, 0x00, 0x00, 0x00, // fstp dword [0x90]
+        ];
+        bus.ram[..code.len()].copy_from_slice(&code);
+        bus.ram[0x80..0x84].copy_from_slice(&1.5f32.to_le_bytes());
+        bus.ram[0x84..0x88].copy_from_slice(&2.5f32.to_le_bytes());
+        let mut cpu = prepared_cpu().with_x87();
+        for (source, value) in [(0x80, 1.5f32), (0x84, 2.5)] {
+            cpu.registers.ip = 0;
+            cpu.registers.set32(Gpr32::Ecx, source);
+            let info = allocation_counter::measure(|| {
+                assert_eq!(cpu.interpret_batch(&mut bus, 3, |_| 3), 3);
+            });
+            if source == 0x84 {
+                assert_eq!(info.count_total, 0);
+            }
+            assert_eq!(cpu.registers.ip, 0x12);
+            assert_eq!(bus.ram[0x90..0x94], value.to_le_bytes());
+        }
+        #[cfg(feature = "profiling")]
+        {
+            assert_eq!(cpu.decode_cache.stats.block_misses, 1);
+            assert_eq!(cpu.decode_cache.stats.block_stale, 0);
+            assert_eq!(cpu.decode_cache.stats.block_hits, 1);
         }
     }
 }

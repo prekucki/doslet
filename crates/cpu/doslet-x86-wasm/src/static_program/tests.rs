@@ -460,6 +460,10 @@ fn encoding(op: Operation) -> Vec<u8> {
             out.push(if word == 0 { 0xb0 } else { 0xb8 } + register_code(target));
             immediate(&mut out, v);
         }
+        Operation::Move {
+            source: Source::VirtualRegister(_),
+            ..
+        } => unreachable!("test source"),
         Operation::Alu {
             kind,
             target,
@@ -496,6 +500,7 @@ fn encoding(op: Operation) -> Vec<u8> {
                     ]);
                     immediate(&mut out, v);
                 }
+                Source::VirtualRegister(_) => unreachable!("test source"),
             }
         }
         Operation::Inc(r) | Operation::Dec(r) => out.extend_from_slice(&[

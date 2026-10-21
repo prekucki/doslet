@@ -353,7 +353,7 @@ fn copy_loop(f: &mut Function, kernel: CopyKernel) {
     c(f, 1);
     ins(f, W::I32Sub);
     ins(f, W::LocalTee(REMAINING));
-    ins(f, W::BrIf(0));
+    ins_hinted(f, true, W::BrIf(0));
     ins(f, W::End);
     for (field, local) in [(m::DEVICE_WRITES, COUNT), (m::DEVICE_CHANGES, CHANGES)] {
         get(f, FRAME);

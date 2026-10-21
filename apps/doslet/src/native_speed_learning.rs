@@ -420,7 +420,7 @@ fn trace(
             if node.count == 0 {
                 node.code = code;
             }
-            node.changed |= node.code != code;
+            node.changed |= !same_code(key.1, &node.code, &code);
             node.count += 1;
             node.irq |= in_irq;
         }
@@ -450,12 +450,17 @@ fn settled_labels(profile: &Profile) -> BTreeMap<Key, [u8; 15]> {
         })
         .collect()
 }
+fn same_code(wide: bool, a: &[u8; 15], b: &[u8; 15]) -> bool {
+    a == b || (wide && doslet_x86::translation::same_template32(a, b))
+}
 fn already_coloured(trace: &Trace, known: &BTreeMap<Key, [u8; 15]>) -> bool {
     !trace.nodes.is_empty()
-        && trace
-            .nodes
-            .iter()
-            .all(|(key, node)| !node.changed && known.get(key) == Some(&node.code))
+        && trace.nodes.iter().all(|(key, node)| {
+            !node.changed
+                && known
+                    .get(key)
+                    .is_some_and(|known_code| same_code(key.1, known_code, &node.code))
+        })
 }
 #[cfg(test)]
 fn profile_pair(
@@ -507,7 +512,7 @@ fn merge_traces(a: Trace, b: Trace) -> BTreeMap<Key, Node> {
         if second.changed
             || a.nodes
                 .get(&key)
-                .is_some_and(|n| n.changed || n.code != second.code)
+                .is_some_and(|n| n.changed || !same_code(key.1, &n.code, &second.code))
         {
             continue;
         }
@@ -527,7 +532,7 @@ fn merge_traces(a: Trace, b: Trace) -> BTreeMap<Key, Node> {
         let Some(first) = a.nodes.get(&key) else {
             continue;
         };
-        if first.changed || second.changed || first.code != second.code {
+        if first.changed || second.changed || !same_code(key.1, &first.code, &second.code) {
             continue;
         }
         let first = first.count;
@@ -549,7 +554,7 @@ fn merge_traces(a: Trace, b: Trace) -> BTreeMap<Key, Node> {
             && !node.changed
             && b.nodes
                 .get(&key)
-                .is_none_or(|n| !n.changed && n.code == node.code)
+                .is_none_or(|n| !n.changed && same_code(key.1, &n.code, &node.code))
         {
             nodes.insert(
                 key,

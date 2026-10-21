@@ -588,6 +588,14 @@ fn decode_node(
     graph: &StaticCfg<'_>,
     binding: &DosFlatBindingPlan<'_>,
 ) -> Result<Instruction, LoweringError> {
+    decode_node_with_offsets(node, graph, binding).map(|(instruction, _, _)| instruction)
+}
+
+fn decode_node_with_offsets(
+    node: &InstructionNode,
+    graph: &StaticCfg<'_>,
+    binding: &DosFlatBindingPlan<'_>,
+) -> Result<(Instruction, iced_x86::ConstantOffsets, u32), LoweringError> {
     let object = graph
         .image()
         .object(node.address.object_number)
@@ -641,7 +649,8 @@ fn decode_node(
     if instruction.is_invalid() || instruction.len() != usize::from(node.byte_len) {
         return Err(LoweringError::ChangedInstructionEncoding(node.address));
     }
-    Ok(instruction)
+    let offsets = decoder.get_constant_offsets(&instruction);
+    Ok((instruction, offsets, ip))
 }
 
 fn lower_instruction(
@@ -651,16 +660,47 @@ fn lower_instruction(
     binding: &DosFlatBindingPlan<'_>,
     direct_memory: bool,
 ) -> Lowered {
+    lower_instruction_with_virtual_registers(
+        instruction,
+        &iced_x86::ConstantOffsets::default(),
+        0,
+        node,
+        graph,
+        binding,
+        direct_memory,
+        &mutable_sources::VirtualRegisters::default(),
+    )
+}
+
+fn lower_instruction_with_virtual_registers(
+    instruction: &Instruction,
+    offsets: &iced_x86::ConstantOffsets,
+    ip: u32,
+    node: &InstructionNode,
+    graph: &StaticCfg<'_>,
+    binding: &DosFlatBindingPlan<'_>,
+    direct_memory: bool,
+    virtual_registers: &mutable_sources::VirtualRegisters,
+) -> Lowered {
     if instruction.has_lock_prefix()
         || instruction.has_rep_prefix()
         || instruction.has_repne_prefix()
     {
         return Lowered::Fallback;
     }
-    if let Some(operation) = register_operation(instruction) {
+    let vreg_eligible = direct_memory && node.bitness == DefaultBitness::Bits32 && ip >= 0x500;
+    let disp_vreg =
+        (vreg_eligible && offsets.has_displacement() && offsets.displacement_size() == 4)
+            .then(|| ip.wrapping_add(offsets.displacement_offset() as u32))
+            .filter(|&slot| slot >= 0x500 && virtual_registers.intersects_slot(slot));
+    let imm_vreg = (vreg_eligible && offsets.has_immediate() && offsets.immediate_size() == 4)
+        .then(|| ip.wrapping_add(offsets.immediate_offset() as u32))
+        .filter(|&slot| slot >= 0x500 && virtual_registers.intersects_slot(slot));
+
+    if let Some(operation) = register_operation_with_vreg(instruction, disp_vreg, imm_vreg) {
         return Lowered::Operation(operation);
     }
-    if direct_memory && let Some(operation) = stack_operation(instruction) {
+    if direct_memory && let Some(operation) = stack_operation_with_vreg(instruction, imm_vreg) {
         return Lowered::Operation(operation);
     }
     if direct_memory && let Some(operation) = string_operation(instruction) {
@@ -672,7 +712,7 @@ fn lower_instruction(
         && instruction.op1_kind() == OpKind::Memory
         && let (Some(target), Some(address)) = (
             register(instruction.op0_register()),
-            memory_address(instruction),
+            memory_address_with_vreg(instruction, disp_vreg),
         )
     {
         let width = match instruction.memory_size().size() {
@@ -722,7 +762,7 @@ fn lower_instruction(
         && instruction.op1_kind() == OpKind::Memory
         && let (Some(target), Some(address)) = (
             register(instruction.op0_register()),
-            memory_address(instruction),
+            memory_address_with_vreg(instruction, disp_vreg),
         )
     {
         return Lowered::Operation(Operation::LoadMemory { target, address });
@@ -740,14 +780,19 @@ fn lower_instruction(
         };
         let source = match instruction.op1_kind() {
             OpKind::Register => register(instruction.op1_register()).map(Source::Register),
+            OpKind::Immediate32 if width == Some(Width::Dword) && imm_vreg.is_some() => {
+                imm_vreg.map(Source::VirtualRegister)
+            }
             OpKind::Immediate8 | OpKind::Immediate16 | OpKind::Immediate32 => {
                 width.map(|width| Source::Immediate(instruction.immediate(1) as u32 & width.mask()))
             }
             _ => None,
         };
-        if let (Some(width), Some(source), Some(address)) =
-            (width, source, memory_address(instruction))
-        {
+        if let (Some(width), Some(source), Some(address)) = (
+            width,
+            source,
+            memory_address_with_vreg(instruction, disp_vreg),
+        ) {
             return Lowered::Operation(Operation::StoreMemory {
                 address,
                 width,
@@ -755,17 +800,21 @@ fn lower_instruction(
             });
         }
     }
-    if direct_memory && let Some(operation) = memory_alu_operation(instruction) {
+    if direct_memory
+        && let Some(operation) = memory_alu_operation_with_vreg(instruction, disp_vreg, imm_vreg)
+    {
         return Lowered::Operation(operation);
     }
-    if direct_memory && let Some(operation) = memory_update_operation(instruction) {
+    if direct_memory
+        && let Some(operation) = memory_update_operation_with_vreg(instruction, disp_vreg, imm_vreg)
+    {
         return Lowered::Operation(operation);
     }
     if direct_memory
         && matches!(instruction.mnemonic(), Mnemonic::Mul | Mnemonic::Imul)
         && instruction.op_count() == 1
         && instruction.op0_kind() == OpKind::Memory
-        && let Some(address) = memory_address(instruction)
+        && let Some(address) = memory_address_with_vreg(instruction, disp_vreg)
     {
         let width = match instruction.memory_size().size() {
             1 => Some(Width::Byte),
@@ -788,7 +837,7 @@ fn lower_instruction(
         && instruction.op1_kind() == OpKind::Memory
         && let (Some(target), Some(address)) = (
             register(instruction.op0_register()),
-            memory_address(instruction),
+            memory_address_with_vreg(instruction, disp_vreg),
         )
         && matches!(target.width(), Width::Word | Width::Dword)
         && instruction.memory_size().size() == (target.width().bits() / 8) as usize
@@ -796,8 +845,9 @@ fn lower_instruction(
         let source = if instruction.op_count() == 2 {
             Some(Source::Register(target))
         } else {
-            operand_source(instruction, 2, target.width())
-                .filter(|source| matches!(source, Source::Immediate(_)))
+            operand_source_with_vreg(instruction, 2, target.width(), imm_vreg).filter(|source| {
+                matches!(source, Source::Immediate(_) | Source::VirtualRegister(_))
+            })
         };
         if let Some(source) = source {
             return Lowered::Operation(Operation::SignedMultiplyMemory {
@@ -896,7 +946,15 @@ fn string_operation(instruction: &Instruction) -> Option<Operation> {
     }
 }
 
+#[cfg(test)]
 fn stack_operation(instruction: &Instruction) -> Option<Operation> {
+    stack_operation_with_vreg(instruction, None)
+}
+
+fn stack_operation_with_vreg(
+    instruction: &Instruction,
+    imm_vreg: Option<u32>,
+) -> Option<Operation> {
     if instruction.op_count() != 1 {
         return None;
     }
@@ -917,6 +975,9 @@ fn stack_operation(instruction: &Instruction) -> Option<Operation> {
                         return None;
                     }
                     Source::Register(source)
+                }
+                OpKind::Immediate32 if width == Width::Dword && imm_vreg.is_some() => {
+                    Source::VirtualRegister(imm_vreg?)
                 }
                 OpKind::Immediate16
                 | OpKind::Immediate32
@@ -939,10 +1000,11 @@ fn stack_operation(instruction: &Instruction) -> Option<Operation> {
     }
 }
 
-fn memory_address(
+fn memory_address_with_vreg(
     instruction: &Instruction,
+    disp_vreg: Option<u32>,
 ) -> Option<doslet_x86_wasm::static_program::memory::MemoryAddress> {
-    use doslet_x86_wasm::static_program::memory::{MemoryAddress, Segment};
+    use doslet_x86_wasm::static_program::memory::{MemoryAddress, Segment, VIRTUAL_DISPLACEMENT};
     use iced_x86::Register as R;
     let full = |value: R| -> Option<Option<Register>> {
         Some(match value {
@@ -974,11 +1036,17 @@ fn memory_address(
     let address16 = base.is_gpr16()
         || index.is_gpr16()
         || base == R::None && index == R::None && instruction.memory_displ_size() == 2;
+    let mut scale = instruction.memory_index_scale() as u8;
+    let mut displacement = instruction.memory_displacement32();
+    if !address16 && let Some(slot) = disp_vreg {
+        scale |= VIRTUAL_DISPLACEMENT;
+        displacement = slot;
+    }
     Some(MemoryAddress {
         base: full(base)?,
         index: full(index)?,
-        scale: instruction.memory_index_scale() as u8,
-        displacement: instruction.memory_displacement32(),
+        scale,
+        displacement,
         address16,
         segment,
     })
@@ -991,6 +1059,14 @@ fn extension_widths(target: Width, source: Width) -> bool {
 }
 
 fn register_operation(instruction: &Instruction) -> Option<Operation> {
+    register_operation_with_vreg(instruction, None, None)
+}
+
+fn register_operation_with_vreg(
+    instruction: &Instruction,
+    disp_vreg: Option<u32>,
+    imm_vreg: Option<u32>,
+) -> Option<Operation> {
     if let Some(operation) = shift_operation(instruction) {
         return Some(operation);
     }
@@ -1012,12 +1088,12 @@ fn register_operation(instruction: &Instruction) -> Option<Operation> {
         && let Some(target) = register(instruction.op0_register())
         && matches!(target.width(), Width::Word | Width::Dword)
     {
-        let source = operand_source(instruction, 1, target.width())?;
+        let source = operand_source_with_vreg(instruction, 1, target.width(), None)?;
         let (left, right) = if instruction.op_count() == 2 {
             (Source::Register(target), source)
         } else {
-            let immediate = operand_source(instruction, 2, target.width())?;
-            if !matches!(immediate, Source::Immediate(_)) {
+            let immediate = operand_source_with_vreg(instruction, 2, target.width(), imm_vreg)?;
+            if !matches!(immediate, Source::Immediate(_) | Source::VirtualRegister(_)) {
                 return None;
             }
             (source, immediate)
@@ -1074,7 +1150,7 @@ fn register_operation(instruction: &Instruction) -> Option<Operation> {
             }
             Some(Operation::Lea {
                 target,
-                address: memory_address(instruction)?,
+                address: memory_address_with_vreg(instruction, disp_vreg)?,
             })
         }
         Mnemonic::Inc => unary(Operation::Inc),
@@ -1095,6 +1171,9 @@ fn register_operation(instruction: &Instruction) -> Option<Operation> {
             let target = target()?;
             let source = match instruction.op1_kind() {
                 OpKind::Register => Source::Register(register(instruction.op1_register())?),
+                OpKind::Immediate32 if target.width() == Width::Dword && imm_vreg.is_some() => {
+                    Source::VirtualRegister(imm_vreg?)
+                }
                 OpKind::Immediate8
                 | OpKind::Immediate16
                 | OpKind::Immediate32
@@ -1133,12 +1212,16 @@ fn alu_kind(mnemonic: Mnemonic) -> Option<Alu> {
     })
 }
 
-fn memory_alu_operation(instruction: &Instruction) -> Option<Operation> {
+fn memory_alu_operation_with_vreg(
+    instruction: &Instruction,
+    disp_vreg: Option<u32>,
+    imm_vreg: Option<u32>,
+) -> Option<Operation> {
     if instruction.op_count() != 2 {
         return None;
     }
     let kind = alu_kind(instruction.mnemonic())?;
-    let address = memory_address(instruction)?;
+    let address = memory_address_with_vreg(instruction, disp_vreg)?;
     if instruction.op0_kind() == OpKind::Register && instruction.op1_kind() == OpKind::Memory {
         return Some(Operation::AluMemory {
             kind,
@@ -1155,7 +1238,7 @@ fn memory_alu_operation(instruction: &Instruction) -> Option<Operation> {
         4 => Width::Dword,
         _ => return None,
     };
-    let source = memory_source(instruction, width)?;
+    let source = memory_source_with_vreg(instruction, width, imm_vreg)?;
     Some(Operation::CompareMemory {
         test: kind == Alu::Test,
         address,
@@ -1164,11 +1247,20 @@ fn memory_alu_operation(instruction: &Instruction) -> Option<Operation> {
     })
 }
 
-fn memory_source(instruction: &Instruction, width: Width) -> Option<Source> {
-    operand_source(instruction, 1, width)
+fn memory_source_with_vreg(
+    instruction: &Instruction,
+    width: Width,
+    imm_vreg: Option<u32>,
+) -> Option<Source> {
+    operand_source_with_vreg(instruction, 1, width, imm_vreg)
 }
 
-fn operand_source(instruction: &Instruction, operand: u32, width: Width) -> Option<Source> {
+fn operand_source_with_vreg(
+    instruction: &Instruction,
+    operand: u32,
+    width: Width,
+    imm_vreg: Option<u32>,
+) -> Option<Source> {
     Some(match instruction.op_kind(operand) {
         OpKind::Register => {
             let source = register(instruction.op_register(operand))?;
@@ -1176,6 +1268,9 @@ fn operand_source(instruction: &Instruction, operand: u32, width: Width) -> Opti
                 return None;
             }
             Source::Register(source)
+        }
+        OpKind::Immediate32 if width == Width::Dword && imm_vreg.is_some() => {
+            Source::VirtualRegister(imm_vreg?)
         }
         OpKind::Immediate8
         | OpKind::Immediate16
@@ -1188,11 +1283,15 @@ fn operand_source(instruction: &Instruction, operand: u32, width: Width) -> Opti
     })
 }
 
-fn memory_update_operation(instruction: &Instruction) -> Option<Operation> {
+fn memory_update_operation_with_vreg(
+    instruction: &Instruction,
+    disp_vreg: Option<u32>,
+    imm_vreg: Option<u32>,
+) -> Option<Operation> {
     if instruction.op0_kind() != OpKind::Memory {
         return None;
     }
-    let address = memory_address(instruction)?;
+    let address = memory_address_with_vreg(instruction, disp_vreg)?;
     let width = match instruction.memory_size().size() {
         1 => Width::Byte,
         2 => Width::Word,
@@ -1224,7 +1323,7 @@ fn memory_update_operation(instruction: &Instruction) -> Option<Operation> {
         kind,
         address,
         width,
-        source: memory_source(instruction, width)?,
+        source: memory_source_with_vreg(instruction, width, imm_vreg)?,
     })
 }
 

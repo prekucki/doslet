@@ -222,8 +222,9 @@ Linux and BSD these follow the XDG Base Directory specification; relative
 
 | Contents | Linux / BSD default | macOS | Windows |
 | --- | --- | --- | --- |
-| Profiles saved from the configurator | `$XDG_CONFIG_HOME/doslet/profiles` (`~/.config/doslet/profiles`) | `~/Library/Application Support/doslet/profiles` | `%APPDATA%\doslet\profiles` |
-| Named save stores | `$XDG_DATA_HOME/doslet/saves/<name>` (`~/.local/share/doslet/saves/<name>`) | `~/Library/Application Support/doslet/saves/<name>` | `%LOCALAPPDATA%\doslet\saves\<name>` |
+| Global host settings & custom presets | `$XDG_CONFIG_HOME/doslet/settings.toml` (`~/.config/doslet/settings.toml`) | `~/Library/Application Support/doslet/settings.toml` | `%APPDATA%\doslet\settings.toml` |
+| Game launch profiles | `$XDG_CONFIG_HOME/doslet/profiles` (`~/.config/doslet/profiles`) | `~/Library/Application Support/doslet/profiles` | `%APPDATA%\doslet\profiles` |
+| Named save stores (`overlay.redb` & `autosave.state.gz`) | `$XDG_DATA_HOME/doslet/saves/<name>` (`~/.local/share/doslet/saves/<name>`) | `~/Library/Application Support/doslet/saves/<name>` | `%LOCALAPPDATA%\doslet\saves\<name>` |
 | Save export/import file | `$XDG_DATA_HOME/doslet/exports` | `~/Library/Application Support/doslet/exports` | `%LOCALAPPDATA%\doslet\exports` |
 | Speed-tier labels and their **Save as** files | `$XDG_CACHE_HOME/doslet/speed-tiers` (`~/.cache/doslet/speed-tiers`) | `~/Library/Caches/doslet/speed-tiers` | `%LOCALAPPDATA%\doslet\cache\speed-tiers` |
 | Dynamic-core profiles, one per executable | `$XDG_CACHE_HOME/doslet/core-profiles` | `~/Library/Caches/doslet/core-profiles` | `%LOCALAPPDATA%\doslet\cache\core-profiles` |
@@ -251,19 +252,27 @@ Wasmtime version, configuration and CPU. Each records a SHA-256 of its contents;
 a mismatch, or code Wasmtime rejects, is compiled again. Only one compilation per
 module is kept.
 
-## Profiles
+## Global settings, hardware presets and game profiles
 
-The Profile page imports version-1 or version-2 TOML into the draft and exports
-version 2. Native **Import file…** resolves native paths relative to the profile.
-Browser import retains named host bindings and path text for editing; selecting
-local resources establishes the browser bindings. Profiles describe settings;
-they do not embed game files, ISO contents, ROMs or saves.
+Global host defaults live in `settings.toml` (configured from **Settings** in the
+library sidebar) and cover host audio mixer (`system` or `application`), master
+volume, MIDI output port/synthesizer, controller/gamepad deadzone, display
+scaling/filter, interface language (`auto`, `en`, `pl`), and the default
+hardware preset (`386sx-16`, `386dx-33`, `486dx2-66`, `pentium-133`, or custom
+`[presets.<id>]` entries).
 
-This version-2 example uses a native installation and separate persistent store:
+Game profiles under `profiles/` can select a hardware `preset` and declare
+additional entrypoints (`[[game.actions]]`, such as `SETUP.EXE` or
+`SETSOUND.EXE`) that share the same persistent `overlay.redb` save store on
+drive `C:`.
+
+This version-2 example uses a native installation, a hardware preset, a setup
+action, and a separate persistent store:
 
 ```toml
 version = 2
 name = "My DOS game"
+preset = "486dx2-66"
 
 [machine]
 platform = "pc-at"

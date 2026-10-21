@@ -76,16 +76,17 @@ pub(super) fn dialog(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     .spacing(14);
     let mut body = column![card_content(controls.into())].spacing(14);
     if draft.mode == Mode::Tiers {
-        body = body.push(card_content(
-            column![
+        body =
+            body.push(card_content(
+                column![
                 section_title("Automatic speed tiers"),
                 text("Applies fast execution to game work and throttled clocks to busy-wait loops.")
                     .size(12)
                     .color(MUTED),
             ]
-            .spacing(8)
-            .into(),
-        ));
+                .spacing(8)
+                .into(),
+            ));
     } else {
         let mut speed = column![
             section_title(if draft.mode == Mode::Adaptive {

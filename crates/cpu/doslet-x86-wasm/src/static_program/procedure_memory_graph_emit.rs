@@ -1,7 +1,7 @@
 //! Forward structured edges keep all architectural state in the same locals.
 
 use super::procedure_memory_emit::{
-    COMPLETED, EXIT_STATUS, PC, finish, initialize, instruction_body,
+    COMPLETED, EXIT_STATUS, PC, VirtualRegisters, finish, initialize_with_vregs, instruction_body,
 };
 use super::*;
 use crate::static_program::procedure_memory::{
@@ -52,15 +52,25 @@ pub(in crate::static_program) fn body(
     if plan.bounded.is_some() {
         return bounded::body(procedure, plan, max_output);
     }
-    let mut f = initialize(procedure.blocks.iter().any(|block| {
-        block.instructions.iter().any(|instruction| {
-            matches!(
-                instruction.operation,
-                Operation::StoreMemory { .. } | Operation::StringStore { .. }
-            )
-        })
-    }));
+    let vregs = VirtualRegisters::collect(
+        procedure
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter().map(|i| i.operation)),
+    )?;
+    let mut f = initialize_with_vregs(
+        procedure.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.operation,
+                    Operation::StoreMemory { .. } | Operation::StringStore { .. }
+                )
+            })
+        }),
+        &vregs,
+    );
     ins(&mut f, W::Block(BlockType::Empty)); // common exit, outside all CFG labels
+    vregs.emit_prologue(&mut f, procedure.entry);
     for _ in 1..plan.order.len() {
         ins(&mut f, W::Block(BlockType::Empty));
     }
@@ -68,7 +78,7 @@ pub(in crate::static_program) fn body(
         let block = &procedure.blocks[index];
         let remaining_blocks = (plan.order.len() - position - 1) as u32;
         for (prefix, instruction) in block.instructions.iter().enumerate() {
-            instruction_body(&mut f, instruction.operation, |f| {
+            instruction_body(&mut f, &vregs, instruction.operation, |f| {
                 refused(f, instruction.address, remaining_blocks, prefix)
             });
             if f.byte_len() > max_output {

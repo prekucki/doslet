@@ -388,6 +388,7 @@ fn encode(op: Operation) -> Vec<u8> {
                         b.extend(v.to_le_bytes())
                     }
                 }
+                Source::VirtualRegister(_) => panic!("fixture source"),
             }
         }
         Operation::AluMemory {

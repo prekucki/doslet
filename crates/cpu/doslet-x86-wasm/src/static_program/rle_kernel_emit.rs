@@ -107,9 +107,9 @@ pub(in crate::static_program) fn body(
     header(&mut f, 0);
     c(&mut f, RleCall::VERSION);
     ins(&mut f, W::I32Ne);
-    ins(&mut f, W::BrIf(0));
+    ins_hinted(&mut f, false, W::BrIf(0));
     header(&mut f, 15);
-    ins(&mut f, W::BrIf(0));
+    ins_hinted(&mut f, false, W::BrIf(0));
     for (word, local) in [
         (1, SOURCE),
         (2, DESTINATION),
@@ -144,7 +144,7 @@ pub(in crate::static_program) fn body(
     get(&mut f, OUTPUT);
     header(&mut f, 8);
     ins(&mut f, W::I32GeU);
-    ins(&mut f, W::BrIf(1));
+    ins_hinted(&mut f, false, W::BrIf(1));
     source_byte(&mut f);
     set(&mut f, TOKEN);
     get(&mut f, TOKEN);

@@ -5,7 +5,7 @@ use crate::{
 use alloc::{borrow::Cow, vec::Vec};
 use doslet_x86::translation::{Operation as Op, Source};
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, CustomSection, ElementSection, Elements, EntityType,
+    BlockType, CodeSection, ConstExpr, CustomSection, ElementSection, Elements, Encode, EntityType,
     ExportKind, ExportSection, Function, FunctionSection, GlobalType, ImportSection,
     Instruction as W, MemArg, MemoryType, Module, RefType, TableSection, TableType, TypeSection,
     ValType,
@@ -494,6 +494,23 @@ pub fn module(t: &Translation) -> Vec<u8> {
     ins(&mut run, W::Unreachable);
     ins(&mut run, W::End);
     code.function(&run);
+    let mut compilation_hints_data = Vec::new();
+    (n + 2).encode(&mut compilation_hints_data);
+    for func_idx in 1..=n + 2 {
+        func_idx.encode(&mut compilation_hints_data);
+        compilation_hints_data.extend_from_slice(&[
+            1,
+            0,
+            1,
+            crate::static_program::procedure_memory::EAGER_OPTIMIZED_COMPILATION_HINT,
+        ]);
+    }
+    m.section(&CustomSection {
+        name: Cow::Borrowed(
+            crate::static_program::procedure_memory::COMPILATION_HINTS_SECTION_NAME,
+        ),
+        data: Cow::Borrowed(&compilation_hints_data),
+    });
     m.section(&code);
     m.section(&CustomSection {
         name: Cow::Borrowed("doslet.profile"),

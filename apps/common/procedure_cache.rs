@@ -9,8 +9,13 @@ use doslet_aot::{
     wasm::memory_procedures::{MemoryProcedureLimits, PreparedMemoryProcedures},
 };
 use doslet_executable::{LeImage, LeLimits};
-use doslet_x86_wasm::static_program::procedure_memory::{
-    ProcedureCompileOptions, ProcedureGraphProgram, ProcedureTerminatorKind, bundle,
+use doslet_x86_wasm::static_program::{
+    Operation, Source,
+    memory::{MemoryAddress, VIRTUAL_DISPLACEMENT},
+    procedure_memory::{
+        ProcedureCompileOptions, ProcedureGraphFunction, ProcedureGraphProgram,
+        ProcedureTerminatorKind, bundle,
+    },
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -178,7 +183,31 @@ pub fn build(
                 .object_binding(address.object_number)
                 .and_then(|o| o.linear_base.checked_add(address.offset))
                 .ok_or("linear source overflow")?;
-            sources.push(json!({"linear":linear,"bytes":bytes}));
+            let mut cursor = 0usize;
+            for slot in instruction_virtual_slots(function, linear)
+                .into_iter()
+                .flatten()
+            {
+                if slot > linear
+                    && let Ok(off) = usize::try_from(slot - linear)
+                    && off >= cursor
+                    && off + 4 <= bytes.len()
+                {
+                    if off > cursor {
+                        sources.push(json!({
+                            "linear": linear + cursor as u32,
+                            "bytes": &bytes[cursor..off],
+                        }));
+                    }
+                    cursor = off + 4;
+                }
+            }
+            if cursor < bytes.len() {
+                sources.push(json!({
+                    "linear": linear + cursor as u32,
+                    "bytes": &bytes[cursor..],
+                }));
+            }
         }
         let kernel = compiled
             .semantic_kernel(function.id)
@@ -247,4 +276,55 @@ pub fn build(
         bytes: bundle::append(compiled.wasm(), &metadata)?,
         entries,
     })
+}
+
+fn instruction_virtual_slots(function: &ProcedureGraphFunction, linear: u32) -> [Option<u32>; 2] {
+    let addr_slot = |address: MemoryAddress| {
+        (!address.address16 && address.scale & VIRTUAL_DISPLACEMENT != 0)
+            .then_some(address.displacement)
+    };
+    let src_slot = |source: Source| match source {
+        Source::VirtualRegister(slot) => Some(slot),
+        _ => None,
+    };
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if instruction.address.offset != linear {
+                continue;
+            }
+            let mut slots = match instruction.operation {
+                Operation::Move { source, .. }
+                | Operation::Alu { source, .. }
+                | Operation::Push { source, .. }
+                | Operation::WideMultiply { source, .. } => [src_slot(source), None],
+                Operation::SignedMultiply { left, right, .. } => [src_slot(left), src_slot(right)],
+                Operation::Lea { address, .. }
+                | Operation::LoadMemory { address, .. }
+                | Operation::ExtendMemory { address, .. }
+                | Operation::AluMemory { address, .. }
+                | Operation::UnaryMemory { address, .. }
+                | Operation::WideMultiplyMemory { address, .. } => [addr_slot(address), None],
+                Operation::StoreMemory {
+                    address, source, ..
+                }
+                | Operation::CompareMemory {
+                    address, source, ..
+                }
+                | Operation::AluMemoryStore {
+                    address, source, ..
+                }
+                | Operation::SignedMultiplyMemory {
+                    address, source, ..
+                } => [addr_slot(address), src_slot(source)],
+                _ => [None, None],
+            };
+            if let [Some(a), Some(b)] = slots
+                && a > b
+            {
+                slots = [Some(b), Some(a)];
+            }
+            return slots;
+        }
+    }
+    [None, None]
 }

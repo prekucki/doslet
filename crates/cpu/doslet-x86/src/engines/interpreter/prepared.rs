@@ -69,6 +69,14 @@ impl Prepared {
         self.handler == 0
     }
 
+    pub(super) fn set_immediate(&mut self, immediate: u32) {
+        self.immediate = immediate;
+    }
+
+    pub(super) fn set_displacement(&mut self, displacement: u32) {
+        self.displacement = displacement;
+    }
+
     pub(super) fn new(i: Instruction) -> Self {
         let mut p = Self {
             length: i.length,

@@ -35,7 +35,11 @@ impl ExecutionProfile {
             return 2;
         };
         let l = &self.labels[i];
-        if !bytes.is_empty() && bytes.len() <= 15 && bytes == &l.bytes[..bytes.len()] {
+        if !bytes.is_empty()
+            && bytes.len() <= 15
+            && (bytes == &l.bytes[..bytes.len()]
+                || (wide && crate::translation::same_template32(&l.bytes, bytes)))
+        {
             l.tier
         } else {
             2

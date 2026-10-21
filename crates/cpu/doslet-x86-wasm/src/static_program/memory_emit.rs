@@ -68,7 +68,7 @@ fn memory_size(f: &mut Function) {
 /// the surrounding preflight conditionals; no state is committed by a check.
 fn require(f: &mut Function, depth: u32) {
     ins(f, W::I32Eqz);
-    ins(f, W::BrIf(depth));
+    ins_hinted(f, false, W::BrIf(depth));
 }
 
 fn contains(f: &mut Function, base: u32, length: u32, bytes: u32) {
@@ -529,7 +529,7 @@ fn preflight_store(f: &mut Function, bytes: u32, depth: u32) {
     set(f, LAST_PAGE);
     preflight_page(f, FIRST_PAGE, depth);
     distinct_last_page(f);
-    ins(f, W::If(BlockType::Empty));
+    ins_hinted(f, false, W::If(BlockType::Empty));
     preflight_page(f, LAST_PAGE, depth + 1);
     ins(f, W::End);
 }
@@ -747,7 +747,7 @@ fn store_value(f: &mut Function, width: Width, value: impl FnOnce(&mut Function)
     // each physical page once before the next region checks its source proof.
     increment_generation(f, FIRST_PAGE);
     distinct_last_page(f);
-    ins(f, W::If(BlockType::Empty));
+    ins_hinted(f, false, W::If(BlockType::Empty));
     increment_generation(f, LAST_PAGE);
     ins(f, W::End);
     get(f, FRAME);
@@ -777,6 +777,58 @@ pub(super) fn procedure_store_memory(f: &mut Function, width: Width, value: Sour
 /// The actual operand must still pass its own checks at its precise boundary.
 pub(super) fn procedure_initialize(f: &mut Function) {
     device_write::initialize(f);
+}
+
+/// Load each virtual register once in the procedure prologue from ordinary RAM
+/// after a single descriptor/bounds preflight. Inside the body, each slot is a
+/// WASM `i32` local (`local.get`) with zero per-iteration memory overhead.
+pub(super) fn procedure_virtual_registers(
+    f: &mut Function,
+    vregs: &[u32],
+    local_base: u32,
+    refused: impl FnOnce(&mut Function),
+) {
+    if vregs.is_empty() {
+        return;
+    }
+    preflight_with(
+        f,
+        |f| {
+            preflight_descriptor(f);
+            descriptor(f, m::RAM_BASE);
+            c(f, 0x500);
+            ins(f, W::I32GeU);
+            require(f, 0);
+            descriptor_wide(f, m::RAM_BASE);
+            descriptor_wide(f, m::RAM_LENGTH);
+            ins(f, W::I64Add);
+            wide(f, 1u64 << 32);
+            ins(f, W::I64LeU);
+            require(f, 0);
+            table_bounds(f, m::RAM_POINTER, m::RAM_LENGTH, 1);
+            require(f, 0);
+            for &addr in vregs {
+                c(f, addr);
+                set(f, LINEAR);
+                contains(f, m::RAM_BASE, m::RAM_LENGTH, 4);
+                excludes(f, m::RAM_EXCLUDED_START, m::RAM_EXCLUDED_LENGTH, 4);
+                ins(f, W::I32And);
+                excludes(f, m::DEVICE_START, m::DEVICE_LENGTH, 4);
+                ins(f, W::I32And);
+                require(f, 0);
+            }
+        },
+        refused,
+    );
+    for (i, &addr) in vregs.iter().enumerate() {
+        descriptor(f, m::RAM_POINTER);
+        c(f, addr);
+        descriptor(f, m::RAM_BASE);
+        ins(f, W::I32Sub);
+        ins(f, W::I32Add);
+        ins(f, W::I32Load(arg(0, false)));
+        set(f, local_base + i as u32);
+    }
 }
 
 /// The enclosing compiler supplies a precise prefix refusal; ordinary region

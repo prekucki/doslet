@@ -37,12 +37,15 @@
 //! allocations are infallible but bounded by these hard limits and by checking
 //! output growth after each scalar operation and before appending each body.
 
-use super::{Operation, Register, ShiftCount, Source, Width, emit};
-use alloc::{string::String, vec::Vec};
+use super::{
+    Operation, Register, ShiftCount, Source, Width,
+    emit::{self, Function},
+};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::fmt::Write;
 use wasm_encoder::{
-    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction as W, Module,
-    Section, TypeSection, ValType,
+    CodeSection, CustomSection, Encode, ExportKind, ExportSection, FunctionSection,
+    Instruction as W, Module, Section, TypeSection, ValType,
 };
 
 pub const MAX_PROCEDURES: usize = 4096;
@@ -415,6 +418,7 @@ fn validate_source(width: Width, source: Source) -> Result<(), ProcedureOperatio
             return Err(ProcedureOperationError::ImmediateOutOfRange);
         }
         Source::Immediate(_) => {}
+        Source::VirtualRegister(_) => return Err(ProcedureOperationError::Unsupported),
     }
     Ok(())
 }
@@ -555,7 +559,7 @@ fn append_body(
         .and_then(|n| n.checked_add(f.byte_len()))
         .filter(|&n| n <= max_output)
         .ok_or(ProcedureCompileError::OutputTooLarge)?;
-    code.function(f);
+    code.function(f.wasm());
     Ok(())
 }
 fn module(
@@ -601,17 +605,41 @@ fn module(
         wrapper.instruction(&W::End);
         append_body(&mut code, &wrapper, checked.options.max_output_bytes)?;
     }
+    let defined_count = code.len();
+    let compilation_hints_data = if defined_count == 0 {
+        Vec::new()
+    } else {
+        let mut data = reserved(5 + defined_count as usize * 9)?;
+        defined_count.encode(&mut data);
+        for func_idx in 0..defined_count {
+            func_idx.encode(&mut data);
+            data.extend_from_slice(&[
+                1,
+                0,
+                1,
+                super::procedure_memory::EAGER_OPTIMIZED_COMPILATION_HINT,
+            ]);
+        }
+        data
+    };
     // The metadata upper bound covers names, indices, counts and section sizes.
     let header_capacity = metadata
         .len()
-        .checked_mul(40)
-        .and_then(|n| n.checked_add(128))
+        .checked_mul(64)
+        .and_then(|n| n.checked_add(192))
         .ok_or(ProcedureCompileError::OutputTooLarge)?;
     let mut bytes = reserved(header_capacity)?;
     bytes.extend_from_slice(&Module::HEADER);
     types.append_to(&mut bytes);
     functions.append_to(&mut bytes);
     exports.append_to(&mut bytes);
+    if !compilation_hints_data.is_empty() {
+        CustomSection {
+            name: Cow::Borrowed(super::procedure_memory::COMPILATION_HINTS_SECTION_NAME),
+            data: Cow::Borrowed(&compilation_hints_data),
+        }
+        .append_to(&mut bytes);
+    }
     let payload = code
         .byte_len()
         .checked_add(leb_len(code.len() as usize))

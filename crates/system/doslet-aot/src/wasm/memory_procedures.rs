@@ -7,7 +7,10 @@
 //! structured-loop shape in the CPU compiler. This is frozen-image planning,
 //! not a live-code proof, a source of permanent speed tiers or a device scheduler.
 
-use super::{Budget, Lowered, LoweringError, decode_node, lower_instruction};
+use super::{
+    Budget, Lowered, LoweringError, decode_node, decode_node_with_offsets, lower_instruction,
+    lower_instruction_with_virtual_registers,
+};
 use crate::{
     DefaultBitness, ObjectAddress,
     binding::DosFlatBindingPlan,
@@ -149,6 +152,11 @@ impl PreparedMemoryProcedures {
             return Err(MemoryProcedureError::InputLimit);
         }
         let mut budget = Budget(limits.max_owned_bytes);
+        let virtual_registers = if computations {
+            super::mutable_sources::discover_virtual_registers(graph, binding, &mut budget)?
+        } else {
+            super::mutable_sources::VirtualRegisters::default()
+        };
         let loop_root = |edge: &crate::cfg::CfgEdge| {
             limits.max_work_per_call.is_some()
                 && edge.kind == EdgeKind::Branch
@@ -209,15 +217,17 @@ impl PreparedMemoryProcedures {
             // from a subsequent finite computation. Discover its ordinary
             // continuation from decoded control flow, never from addresses
             // supplied by a game-specific list.
-            for node in graph.nodes() {
+            for (index, node) in graph.nodes().iter().enumerate() {
                 if node.bitness != DefaultBitness::Bits32 {
                     continue;
                 }
                 let decoded = decode_node(node, graph, binding)?;
-                if !matches!(
-                    lower_instruction(&decoded, node, graph, binding, true),
-                    Lowered::Fallback | Lowered::Call { .. }
-                ) {
+                if !virtual_registers.is_code_writer(index)
+                    && !matches!(
+                        lower_instruction(&decoded, node, graph, binding, true),
+                        Lowered::Fallback | Lowered::Call { .. }
+                    )
+                {
                     continue;
                 }
                 let start = graph
@@ -317,10 +327,20 @@ impl PreparedMemoryProcedures {
                     rejection = Some((node.address, reason));
                     break;
                 }
-                let decoded = decode_node(node, graph, binding)?;
-                let mut lowered = lower_instruction(&decoded, node, graph, binding, true);
+                let (decoded, offsets, ip) = decode_node_with_offsets(node, graph, binding)?;
+                let mut lowered = lower_instruction_with_virtual_registers(
+                    &decoded,
+                    &offsets,
+                    ip,
+                    node,
+                    graph,
+                    binding,
+                    true,
+                    &virtual_registers,
+                );
                 if computations
                     && ((loop_fragment && node.address < entry)
+                        || virtual_registers.is_code_writer(index)
                         || matches!(lowered, Lowered::Fallback | Lowered::Call { .. }))
                 {
                     lowered = Lowered::Fallback;

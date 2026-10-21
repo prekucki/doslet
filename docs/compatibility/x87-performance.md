@@ -136,6 +136,10 @@ with the same test before the variants existed. Dedicated prepared handlers
 (instead of the cold decoded-instruction array) contributed about 0.3 ns/step
 of the batched results; the fast paths about 1.4 ns/step.
 
+On 2026-10-21 the user played Quake interactively in the desktop application
+with this change and reported that it runs much better than before. That is a
+user report, not a recorded gameplay run with measurements.
+
 ### Real-mode loops
 
 `x87_loop_microbenchmark` runs COM loops whose data lies on its own 4-KiB page,
