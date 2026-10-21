@@ -58,6 +58,8 @@ struct State {
     silence: bool,
     reset: Option<Message>,
     stop: bool,
+    /// Generation of the statistics: only reset() starts a new one, so a
+    /// send that completes after a pause still counts.
     epoch: u64,
     error: Option<String>,
     sent: u64,
@@ -97,7 +99,6 @@ impl State {
         self.queue.clear();
         self.clock = None;
         self.last_nanos = None;
-        self.epoch = self.epoch.wrapping_add(1);
         self.silence = true;
     }
     fn push(&mut self, nanos: u64, bytes: &[u8]) -> Result<(), String> {
@@ -225,6 +226,7 @@ impl Output {
         let mut state = self.shared.state.lock().unwrap();
         state.cancel();
         state.reset = Some(Message::new(message));
+        state.epoch = state.epoch.wrapping_add(1);
         state.sent = 0;
         state.late = 0;
         state.max_late = Duration::ZERO;
@@ -407,7 +409,8 @@ mod tests {
         state.push(200, &[0x90, 60, 100]).unwrap();
         let epoch = state.epoch;
         state.cancel();
-        assert_ne!(state.epoch, epoch);
+        // A pause still counts a send already in progress.
+        assert_eq!(state.epoch, epoch);
         assert!(state.queue.is_empty());
         assert!(matches!(state.next(start), Action::Silence));
         // Replay waits for the new clock, so a pause cannot accumulate wall time.
