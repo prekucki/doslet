@@ -242,10 +242,10 @@ over its lifetime. After exhaustion, `auto` pauses the game and attempts CPAL;
 resume after the notice confirms the switch. Explicit `pulse` reports failure
 without switching backends. `cpal` selects the previous path directly.
 
-Choose **Audio → Playback → Mixer** on Linux, or pass `--audio-mixer application|system`.
+Choose **Audio → Playback → Mixer** on Linux or macOS, or pass `--audio-mixer application|system`.
 **Internal** is the default and combines sources inside Doslet. **System
 (experimental)** sends three independent stereo float streams to the
-PulseAudio-compatible server: **Sound Blaster PCM** at the guest DSP rate,
+PulseAudio-compatible server on Linux or CoreAudio `DefaultOutput` units on macOS: **Sound Blaster PCM** at the guest DSP rate,
 **AdLib / OPL FM** at 48 kHz, and **MIDI synthesizer** at 48 kHz.
 PCM is decoded and converted to float without application-side resampling.
 The existing FM and MIDI engines retain their internal rate conversion.
@@ -342,12 +342,12 @@ interfaces; disabled interfaces are hidden. MIDI turns green for new notes and
 amber for other traffic. The spectrum measures local output, excluding external
 MIDI sound. Click to open **Audio**:
 
-- **Playback** selects internal or Linux system mixing, local output
+- **Playback** selects internal or system mixing (Linux and macOS), local output
   volume, synthesizer/MIDI port, game format and external receiver format.
   MIDI routing controls appear only when MPU-401 is enabled in the active
   machine. Internal volume applies to local PCM, FM and synthesized MIDI; external MIDI
   devices retain their own volume. CM-32L synthesis follows the selected game
-  format; a GM synth translates MT-32 input to GM. Changing the Linux mixer
+  format; a GM synth translates MT-32 input to GM. Changing the mixer
   pauses the game. Use the toolbar to resume after closing the panel.
 - **Hardware** keeps Revert and Apply in a fixed footer and edits a draft: SB16 with OPL3, MPU-401 MIDI, IRQ and DMA.
   SB16 and OPL3 share their enable switch. Ports are currently fixed (SB16 220h,

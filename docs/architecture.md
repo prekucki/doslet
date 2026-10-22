@@ -335,7 +335,7 @@ and consumed-frame counters measure submission, ahead of audible playback.
 Underrun telemetry samples server intervals every 100 ms and may miss shorter
 gaps. Recovery allows three attempts per output lifetime, including connections
 that succeed briefly. `auto` can then pause and replace the output with CPAL.
-Linux `--audio-mixer system` selects three Rust protocol outputs: Sound Blaster
+Linux and macOS `--audio-mixer system` selects three independent outputs (Rust PulseAudio protocol streams on Linux; CoreAudio `DefaultOutput` AudioUnits on macOS): Sound Blaster
 PCM at the DSP rate, FM at 48 kHz, and locally rendered MIDI at 48 kHz.
 Application mixing remains the default. Optional bounded host-only source taps
 preserve timestamped PCM and FM before their legacy mix; these queues are not

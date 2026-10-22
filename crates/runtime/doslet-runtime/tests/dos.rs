@@ -272,19 +272,29 @@ fn exec_overlay_runs_a_preloaded_mz_without_a_new_process() {
 
 #[test]
 fn mz_environment_describes_configured_sound_blaster_and_keeps_program_trailer() {
-    for (sb16, mpu401, irq, dma8, dma16, expected) in [
-        (true, true, 7, 1, 5, Some("BLASTER=A220 I7 D1 H5 T6 P330")),
-        (true, false, 5, 3, 6, Some("BLASTER=A220 I5 D3 H6 T6")),
-        (false, true, 7, 1, 5, None),
+    use doslet_config::SoundCard;
+    for (sound_card, mpu401, irq, dma8, dma16, expected) in [
+        (
+            SoundCard::Sb16,
+            true,
+            7,
+            1,
+            5,
+            Some("BLASTER=A220 I7 D1 H5 T6 P330"),
+        ),
+        (SoundCard::Sb16, false, 5, 3, 6, Some("BLASTER=A220 I5 D3 H6 T6")),
+        (SoundCard::Sb, true, 7, 1, 5, Some("BLASTER=A220 I7 D1 T3")),
+        (SoundCard::Adlib, true, 7, 1, 5, None),
+        (SoundCard::None, true, 7, 1, 5, None),
     ] {
         let config = doslet_config::HardwareConfig {
-            sb16,
             mpu401,
             sb_irq: irq,
             sb_dma8: dma8,
             sb_dma16: dma16,
             ..Default::default()
-        };
+        }
+        .with_sound_card(sound_card);
         let session =
             Session::from_mz_stub_named_configured(&relocated_mz(), b"C:\\SYNTH.EXE", config)
                 .unwrap();

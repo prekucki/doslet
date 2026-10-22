@@ -468,7 +468,11 @@ impl Cli {
             self.launch.hardware.cpu_mhz = mhz;
         }
         self.launch.hardware.x87 &= !self.no_x87;
-        self.launch.hardware.sb16 &= !self.no_sb16;
+        if self.no_sb16 {
+            self.launch
+                .hardware
+                .set_sound_card(doslet_config::SoundCard::None);
+        }
         self.launch.hardware.mpu401 &= !self.no_mpu401;
         self.launch
             .hardware

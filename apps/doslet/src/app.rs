@@ -161,7 +161,7 @@ pub enum Message {
     RefreshMidi,
     AudioVolume(u8),
     MidiSelected(String),
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     AudioMixerSelected(crate::audio::Mixer),
     MidiModeSelected(Mode),
     MidiOutputModeSelected(Mode),
@@ -1085,7 +1085,7 @@ impl Doslet {
                     }
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Message::AudioMixerSelected(mixer) => {
                 if let Err(error) = self.select_audio_mixer(mixer) {
                     self.notice = Some(format!("Audio mixer: {error}"));
@@ -2509,7 +2509,7 @@ impl Doslet {
             audio.set_volume(self.audio_volume);
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn select_audio_mixer(&mut self, mixer: crate::audio::Mixer) -> Result<(), String> {
         if self.audio_deferred {
             self.audio_mixer = mixer;
@@ -3079,7 +3079,7 @@ impl Doslet {
             notice: self.notice.clone(),
             midi_choices: self.midi_choices.clone(),
             midi_choice: self.midi_choice.clone(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             audio_mixer: self.audio_mixer,
             midi_mode: self.midi_mode,
             midi_output_mode: self.midi_output_mode,
@@ -3265,6 +3265,33 @@ mod tests {
         );
         let mut app = Doslet::new();
         app.audio_backend = Backend::Pulse;
+        app.session.start();
+        app.select_audio_mixer(Mixer::System).unwrap();
+        assert_eq!(app.session.status(), SessionStatus::Paused);
+        assert_eq!(app.audio_mixer, Mixer::System);
+        assert_eq!(app.audio.as_ref().unwrap().mixer(), Mixer::System);
+        app.audio.as_ref().unwrap().check().unwrap();
+
+        app.midi_choice = "CM-32L / MT-32".into();
+        assert!(app.select_audio_mixer(Mixer::Application).is_err());
+        assert_eq!(app.audio_mixer, Mixer::System);
+        assert_eq!(app.audio.as_ref().unwrap().mixer(), Mixer::System);
+        assert_eq!(app.session.status(), SessionStatus::Paused);
+        app.audio_engine.check().unwrap();
+
+        app.midi_choice = "Rust synth".into();
+        app.select_audio_mixer(Mixer::Application).unwrap();
+        assert_eq!(app.audio_mixer, Mixer::Application);
+        assert_eq!(app.audio.as_ref().unwrap().mixer(), Mixer::Application);
+        assert_eq!(app.session.status(), SessionStatus::Paused);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mixer_selection_prepares_outputs_and_rolls_back_failed_switch() {
+        use crate::audio::{Backend, Mixer};
+        let mut app = Doslet::new();
+        app.audio_backend = Backend::Cpal;
         app.session.start();
         app.select_audio_mixer(Mixer::System).unwrap();
         assert_eq!(app.session.status(), SessionStatus::Paused);

@@ -4,7 +4,7 @@ extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
 use core::fmt;
 pub mod hardware;
-pub use hardware::{AudioHardware, HardwareConfig, HardwareError, KeyboardMode};
+pub use hardware::{AudioHardware, HardwareConfig, HardwareError, KeyboardMode, SoundCard};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WritePolicy {
@@ -269,7 +269,11 @@ impl HardwarePreset {
         hardware.cpu_mhz = self.cpu_mhz;
         hardware.memory_mib = self.memory_mib;
         hardware.x87 = self.x87;
-        hardware.sb16 = self.sb16;
+        hardware.set_sound_card(if self.sb16 {
+            SoundCard::Sb16
+        } else {
+            SoundCard::None
+        });
         hardware.mpu401 = self.mpu401;
         *cpu_mode = Some(self.cpu_mode);
     }
@@ -749,17 +753,39 @@ impl MachineSpec {
         ] {
             io.push(ResourceClaim { owner, first, last });
         }
-        if self.hardware.sb16 {
-            io.push(ResourceClaim {
-                owner: "OPL3",
-                first: 0x388,
-                last: 0x38b,
-            });
-            io.push(ResourceClaim {
-                owner: "SB16",
-                first: 0x220,
-                last: 0x22f,
-            });
+        match self.hardware.sound() {
+            SoundCard::None => {}
+            SoundCard::Adlib => {
+                io.push(ResourceClaim {
+                    owner: "AdLib",
+                    first: 0x388,
+                    last: 0x389,
+                });
+            }
+            SoundCard::Sb => {
+                io.push(ResourceClaim {
+                    owner: "OPL2",
+                    first: 0x388,
+                    last: 0x389,
+                });
+                io.push(ResourceClaim {
+                    owner: "Sound Blaster",
+                    first: 0x220,
+                    last: 0x22f,
+                });
+            }
+            SoundCard::Sb16 => {
+                io.push(ResourceClaim {
+                    owner: "OPL3",
+                    first: 0x388,
+                    last: 0x38b,
+                });
+                io.push(ResourceClaim {
+                    owner: "SB16",
+                    first: 0x220,
+                    last: 0x22f,
+                });
+            }
         }
         if self.hardware.mpu401 {
             io.push(ResourceClaim {

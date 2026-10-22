@@ -51,7 +51,9 @@ pub enum Edit {
     CpuMhz(u16),
     X87(bool),
     Dpmi(doslet_config::DpmiHost),
+    #[allow(dead_code, reason = "Used by configurator and app tests")]
     Sb16(bool),
+    SoundCard(doslet_config::SoundCard),
     Mpu(bool),
     Irq(u8),
     Dma8(u8),
@@ -133,6 +135,7 @@ impl Edit {
             self,
             Self::ApplyAudio
                 | Self::Sb16(_)
+                | Self::SoundCard(_)
                 | Self::Mpu(_)
                 | Self::Irq(_)
                 | Self::Dma8(_)
@@ -271,7 +274,12 @@ impl ConfiguratorState {
             Edit::CpuMhz(v) => self.draft.hardware.cpu_mhz = *v,
             Edit::X87(v) => self.draft.hardware.x87 = *v,
             Edit::Dpmi(v) => self.draft.dpmi = Some(*v),
-            Edit::Sb16(v) => self.draft.hardware.sb16 = *v,
+            Edit::Sb16(v) => self.draft.hardware.set_sound_card(if *v {
+                doslet_config::SoundCard::Sb16
+            } else {
+                doslet_config::SoundCard::None
+            }),
+            Edit::SoundCard(v) => self.draft.hardware.set_sound_card(*v),
             Edit::Mpu(v) => self.draft.hardware.mpu401 = *v,
             Edit::Irq(v) => self.draft.hardware.sb_irq = *v,
             Edit::Dma8(v) => self.draft.hardware.sb_dma8 = *v,
@@ -513,48 +521,78 @@ impl ConfiguratorState {
                     );
             }
             Page::Sound => {
-                body = body.push(
-                    row![
-                        checkbox(h.sb16)
-                            .label("Sound Blaster 16")
-                            .size(16)
-                            .text_size(14)
-                            .on_toggle(Edit::Sb16),
-                        space::horizontal(),
-                        text("220h").size(12).color(MUTED),
-                    ]
-                    .align_y(iced::Center),
-                );
-                if h.sb16 {
-                    body = body.push(
-                        row![
-                            field(
-                                "IRQ",
-                                pick_list(&[5u8, 7][..], Some(h.sb_irq), Edit::Irq)
-                                    .width(Fill)
-                                    .text_size(14)
-                                    .padding(8)
-                                    .into()
-                            ),
-                            field(
-                                "8-bit DMA",
-                                pick_list(&[0u8, 1, 3][..], Some(h.sb_dma8), Edit::Dma8)
-                                    .width(Fill)
-                                    .text_size(14)
-                                    .padding(8)
-                                    .into()
-                            ),
-                            field(
-                                "16-bit DMA",
-                                pick_list(&[5u8, 6, 7][..], Some(h.sb_dma16), Edit::Dma16)
-                                    .width(Fill)
-                                    .text_size(14)
-                                    .padding(8)
-                                    .into()
-                            ),
-                        ]
-                        .spacing(12),
-                    );
+                let sound = h.sound();
+                body = body.push(field(
+                    "Sound card",
+                    pick_list(
+                        &doslet_config::SoundCard::ALL[..],
+                        Some(sound),
+                        Edit::SoundCard,
+                    )
+                    .width(Fill)
+                    .text_size(14)
+                    .padding(8)
+                    .into(),
+                ));
+                match sound {
+                    doslet_config::SoundCard::None => {}
+                    doslet_config::SoundCard::Adlib => {
+                        body = body.push(text("I/O port 388h · OPL2 FM").size(12).color(MUTED));
+                    }
+                    doslet_config::SoundCard::Sb => {
+                        body = body.push(
+                            row![
+                                field(
+                                    "IRQ",
+                                    pick_list(&[5u8, 7][..], Some(h.sb_irq), Edit::Irq)
+                                        .width(Fill)
+                                        .text_size(14)
+                                        .padding(8)
+                                        .into()
+                                ),
+                                field(
+                                    "8-bit DMA",
+                                    pick_list(&[0u8, 1, 3][..], Some(h.sb_dma8), Edit::Dma8)
+                                        .width(Fill)
+                                        .text_size(14)
+                                        .padding(8)
+                                        .into()
+                                ),
+                            ]
+                            .spacing(12),
+                        );
+                    }
+                    doslet_config::SoundCard::Sb16 => {
+                        body = body.push(
+                            row![
+                                field(
+                                    "IRQ",
+                                    pick_list(&[5u8, 7][..], Some(h.sb_irq), Edit::Irq)
+                                        .width(Fill)
+                                        .text_size(14)
+                                        .padding(8)
+                                        .into()
+                                ),
+                                field(
+                                    "8-bit DMA",
+                                    pick_list(&[0u8, 1, 3][..], Some(h.sb_dma8), Edit::Dma8)
+                                        .width(Fill)
+                                        .text_size(14)
+                                        .padding(8)
+                                        .into()
+                                ),
+                                field(
+                                    "16-bit DMA",
+                                    pick_list(&[5u8, 6, 7][..], Some(h.sb_dma16), Edit::Dma16)
+                                        .width(Fill)
+                                        .text_size(14)
+                                        .padding(8)
+                                        .into()
+                                ),
+                            ]
+                            .spacing(12),
+                        );
+                    }
                 }
                 body = body.push(rule::horizontal(1)).push(
                     row![
@@ -924,15 +962,28 @@ impl ConfiguratorState {
                             text(format!("{:04X}–{:04X}", c.first, c.last)).size(13)
                         ]);
                     }
-                    if h.sb16 {
-                        body = body.push(rule::horizontal(1)).push(
-                            text(format!(
-                                "Sound Blaster · IRQ {} · DMA {} / {}",
-                                h.sb_irq, h.sb_dma8, h.sb_dma16
-                            ))
-                            .size(12)
-                            .color(MUTED),
-                        );
+                    match h.sound() {
+                        doslet_config::SoundCard::None | doslet_config::SoundCard::Adlib => {}
+                        doslet_config::SoundCard::Sb => {
+                            body = body.push(rule::horizontal(1)).push(
+                                text(format!(
+                                    "Sound Blaster · IRQ {} · DMA {}",
+                                    h.sb_irq, h.sb_dma8
+                                ))
+                                .size(12)
+                                .color(MUTED),
+                            );
+                        }
+                        doslet_config::SoundCard::Sb16 => {
+                            body = body.push(rule::horizontal(1)).push(
+                                text(format!(
+                                    "Sound Blaster 16 · IRQ {} · DMA {} / {}",
+                                    h.sb_irq, h.sb_dma8, h.sb_dma16
+                                ))
+                                .size(12)
+                                .color(MUTED),
+                            );
+                        }
                     }
                 }
                 Err(e) => body = body.push(text(e.to_string()).size(13)),

@@ -47,6 +47,7 @@ pub struct Diagnostics {
 #[derive(Debug)]
 pub struct Dsp {
     diagnostics: Diagnostics,
+    sb16: bool,
     reset: bool,
     reply: [u8; 2],
     reply_len: u8,
@@ -57,6 +58,7 @@ pub struct Dsp {
     speaker: bool,
     sample_rate: u32,
     input_rate: u16,
+    block_length: u32,
     dma_parameters: [u8; 3],
     dma_parameter_len: usize,
     playback: Option<Playback>,
@@ -67,8 +69,23 @@ pub struct Dsp {
 }
 impl Default for Dsp {
     fn default() -> Self {
+        Self::new(true)
+    }
+}
+impl Dsp {
+    pub const fn new(sb16: bool) -> Self {
         Self {
-            diagnostics: Diagnostics::default(),
+            diagnostics: Diagnostics {
+                resets: 0,
+                commands: 0,
+                last_command: 0,
+                dma_requests: 0,
+                last_dma_command: 0,
+                dma_units: 0,
+                block_irq_deadlines: 0,
+                block_irq_deadline_misses: 0,
+            },
+            sb16,
             reset: false,
             reply: [0; 2],
             reply_len: 0,
@@ -76,9 +93,10 @@ impl Default for Dsp {
             parameter: None,
             rate_high: None,
             test: 0,
-            speaker: true, // SB16 DAC output is always enabled; legacy speaker gating is absent.
+            speaker: true,
             sample_rate: 22050,
             input_rate: 22050,
+            block_length: 1,
             dma_parameters: [0; 3],
             dma_parameter_len: 0,
             playback: None,
@@ -88,13 +106,11 @@ impl Default for Dsp {
             irq16: false,
         }
     }
-}
-impl Dsp {
     pub fn write_reset(&mut self, value: u8) {
         if value & 1 != 0 {
             let mut diagnostics = self.diagnostics;
             diagnostics.resets += 1;
-            *self = Self::default();
+            *self = Self::new(self.sb16);
             self.diagnostics = diagnostics;
             self.reset = true;
         } else if self.reset {
@@ -250,17 +266,34 @@ impl Dsp {
                         self.parameter = Some(command);
                     }
                 }
-                0x14 | 0x1C => {
-                    // Legacy 8-bit DMA playback commands carry a 16-bit
-                    // transfer length. The PC DMA path is not connected to
-                    // this DSP yet, so consume the command cleanly without
-                    // claiming to produce audio or an IRQ.
+                0x14 | 0x48 => {
                     self.dma_parameters[self.dma_parameter_len] = value;
                     self.dma_parameter_len += 1;
                     if self.dma_parameter_len < 2 {
                         self.parameter = Some(command);
                     } else {
+                        let [low, high, _] = self.dma_parameters;
+                        let length = u32::from(u16::from_le_bytes([low, high])) + 1;
                         self.dma_parameter_len = 0;
+                        if command == 0x48 {
+                            self.block_length = length;
+                        } else {
+                            let format = Format {
+                                word: false,
+                                stereo: false,
+                                signed: false,
+                            };
+                            self.playback = Some(Playback {
+                                format,
+                                length,
+                                remaining: length,
+                                auto_init: false,
+                                paused: false,
+                                previous_block_acknowledged: None,
+                            });
+                            self.left = None;
+                            self.configured_format = Some(format);
+                        }
                     }
                 }
                 0xE0 => self.response(&[!value]),
@@ -287,38 +320,84 @@ impl Dsp {
         } else {
             self.diagnostics.commands += 1;
             self.diagnostics.last_command = value;
-            if matches!(value, 0xB0..=0xB7 | 0xC0..=0xC7 | 0x14 | 0x1C) {
+            if matches!(
+                value,
+                0xB0..=0xB7 | 0xC0..=0xC7 | 0x14 | 0x1C | 0x90 | 0x91
+            ) {
                 self.diagnostics.dma_requests += 1;
                 self.diagnostics.last_dma_command = value;
             }
             match value {
-                0xB0..=0xB7 | 0xC0..=0xC7 => {
+                0xB0..=0xB7 | 0xC0..=0xC7 if self.sb16 => {
                     self.parameter = Some(value);
                     self.dma_parameter_len = 0;
                 }
-                0x14 | 0x1C => {
+                0x14 | 0x48 => {
                     self.parameter = Some(value);
                     self.dma_parameter_len = 0;
                 }
-                0xD0 | 0xD5 => {
+                0x1C | 0x90 | 0x91 => {
+                    let format = Format {
+                        word: false,
+                        stereo: false,
+                        signed: false,
+                    };
+                    let length = self.block_length;
+                    self.playback = Some(Playback {
+                        format,
+                        length,
+                        remaining: length,
+                        auto_init: value != 0x91,
+                        paused: false,
+                        previous_block_acknowledged: None,
+                    });
+                    self.left = None;
+                    self.configured_format = Some(format);
+                }
+                0xD0 => {
                     if let Some(state) = &mut self.playback {
                         state.paused = true;
                     }
                 }
-                0xD4 | 0xD6 => {
+                0xD5 if self.sb16 => {
+                    if let Some(state) = &mut self.playback {
+                        state.paused = true;
+                    }
+                }
+                0xD4 => {
                     if let Some(state) = &mut self.playback {
                         state.paused = false;
                     }
                 }
-                0xD9 | 0xDA => {
+                0xD6 if self.sb16 => {
+                    if let Some(state) = &mut self.playback {
+                        state.paused = false;
+                    }
+                }
+                0xDA => {
                     if let Some(state) = &mut self.playback {
                         state.auto_init = false;
                     }
                 }
-                0xE0 | 0xE4 | 0x40 | 0x41 | 0x42 => self.parameter = Some(value),
-                0xE1 => self.response(&[4, 5]),
+                0xD9 if self.sb16 => {
+                    if let Some(state) = &mut self.playback {
+                        state.auto_init = false;
+                    }
+                }
+                0xE0 | 0xE4 | 0x40 => self.parameter = Some(value),
+                0x41 | 0x42 if self.sb16 => self.parameter = Some(value),
+                0xE1 => self.response(if self.sb16 { &[4, 5] } else { &[2, 1] }),
                 0xE8 => self.response(&[self.test]),
-                0xD1 | 0xD3 => {} // Legacy speaker on/off commands have no effect on SB16.
+                0xD1 => {
+                    if !self.sb16 {
+                        self.speaker = true;
+                    }
+                }
+                0xD3 => {
+                    if !self.sb16 {
+                        self.speaker = false;
+                    }
+                }
                 0xD8 => self.response(&[if self.speaker { 0xFF } else { 0 }]),
                 _ => return Err(DspError::UnsupportedCommand(value)),
             }
@@ -549,6 +628,36 @@ mod tests {
             dsp.accept_sample(0).unwrap();
         }
         assert_eq!(dsp.playback_format(), None);
+    }
+    #[test]
+    fn sb2_dsp_reports_version_201_gates_speaker_and_plays_8bit_dma() {
+        let mut dsp = Dsp::new(false);
+        dsp.write_command(0xE1).unwrap();
+        assert_eq!(dsp.read_data(), 2);
+        assert_eq!(dsp.read_data(), 1);
+        dsp.write_command(0xD3).unwrap();
+        assert!(!dsp.speaker_enabled());
+        dsp.write_command(0xD1).unwrap();
+        assert!(dsp.speaker_enabled());
+        assert_eq!(
+            dsp.write_command(0xB6),
+            Err(DspError::UnsupportedCommand(0xB6))
+        );
+        for byte in [0x14, 1, 0] {
+            dsp.write_command(byte).unwrap();
+        }
+        assert_eq!(dsp.accept_sample(192).unwrap().frame, Some([16384; 2]));
+        let done = dsp.accept_sample(64).unwrap();
+        assert_eq!(done.frame, Some([-16384; 2]));
+        assert!(done.raised_irq);
+        assert_eq!(dsp.playback_format(), None);
+        for byte in [0x48, 1, 0, 0x1C] {
+            dsp.write_command(byte).unwrap();
+        }
+        assert_eq!(dsp.frames_until_block_irq(), Some(2));
+        dsp.accept_sample(128).unwrap();
+        assert!(dsp.accept_sample(128).unwrap().raised_irq);
+        assert_eq!(dsp.frames_until_block_irq(), Some(2));
     }
 }
 

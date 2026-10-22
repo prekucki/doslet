@@ -54,6 +54,7 @@ message ConfigHardwareConfig {
   uint32 sb_dma16 = 8;
   ConfigKeyboardMode keyboard = 9;
   bool gameport = 10;
+  optional uint32 sound_card = 11;
 }
 
 message ConfigKeyboardMode {
@@ -169,6 +170,8 @@ message SbDspDsp {
   optional sint32 left = 16;
   bool irq8 = 17;
   bool irq16 = 18;
+  optional uint32 block_length = 19;
+  optional bool sb2 = 20;
 }
 
 message MpuQueue {

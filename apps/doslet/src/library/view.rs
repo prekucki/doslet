@@ -1369,10 +1369,19 @@ fn game_config_card<'a>(library: &'a Library, game: &'a Game) -> Element<'a, Mes
                 row(mem_buttons).spacing(8).wrap().vertical_spacing(8),
             ]
             .spacing(6),
+            column![
+                text("Sound Card").size(12).color(MUTED),
+                pick_list(
+                    &doslet_config::SoundCard::ALL[..],
+                    Some(game.spec.hardware.sound()),
+                    |v| Message::GameConfig(GameEdit::SoundCard(v)),
+                )
+                .width(220)
+                .text_size(13)
+                .padding([7, 10]),
+            ]
+            .spacing(6),
             row![
-                checkbox(game.spec.hardware.sb16)
-                    .label("Sound Blaster 16")
-                    .on_toggle(|v| Message::GameConfig(GameEdit::Sb16(v))),
                 checkbox(game.spec.hardware.mpu401)
                     .label("MPU-401 MIDI")
                     .on_toggle(|v| Message::GameConfig(GameEdit::Mpu401(v))),

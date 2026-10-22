@@ -88,7 +88,7 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "cpal")]
     pub audio_backend: crate::audio::Backend,
 
-    /// Mixer; experimental system mixing selects PulseAudio on Linux
+    /// Mixer; experimental system mixing uses PulseAudio on Linux and CoreAudio on macOS
     #[arg(long, value_enum, default_value = "application")]
     pub audio_mixer: crate::audio::Mixer,
 

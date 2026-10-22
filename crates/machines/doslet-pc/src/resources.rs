@@ -163,9 +163,11 @@ impl Routes {
             }
         }
         this.fallback(0x3CD, Endpoint::Probe);
-        // Pro Audio Spectrum audio-filter register. Some AdLib drivers clear
-        // it before probing OPL; this machine has no PAS card to receive it.
-        this.fallback(0xB8A, Endpoint::Probe);
+        // Pro Audio Spectrum audio-filter and interrupt-mask registers. Some
+        // AdLib drivers probe them beside OPL; this machine has no PAS card.
+        for port in [0xB8A, 0xB8B] {
+            this.fallback(port, Endpoint::Probe);
+        }
         for port in 0..=15 {
             this.claim_port(
                 DeviceId::Motherboard,
@@ -238,34 +240,81 @@ impl Routes {
         for channel in [2, 4] {
             this.claim_dma(DeviceId::Motherboard, channel)?;
         }
-        if config.sb16 {
-            for port in (0x220..=0x223).chain(0x228..=0x229).chain(0x388..=0x38B) {
-                this.claim_port(
-                    DeviceId::Sb16,
-                    port,
-                    Some(Endpoint::Opl),
-                    Some(Endpoint::Opl),
-                )?;
+        match config.sound() {
+            doslet_config::SoundCard::None => {}
+            doslet_config::SoundCard::Adlib => {
+                for port in (0x220..=0x22F).chain(0x38A..=0x38B) {
+                    this.fallback(port, Endpoint::Probe);
+                }
+                for port in 0x388..=0x389 {
+                    this.claim_port(
+                        DeviceId::Sb16,
+                        port,
+                        Some(Endpoint::Opl),
+                        Some(Endpoint::Opl),
+                    )?;
+                }
             }
-            for (port, endpoint, write) in [
-                (0x224, Endpoint::MixerIndex, true),
-                (0x225, Endpoint::MixerData, true),
-                (0x226, Endpoint::DspReset, true),
-                (0x22A, Endpoint::DspData, false),
-                (0x22C, Endpoint::DspCommand, true),
-                (0x22E, Endpoint::DspStatus, false),
-                (0x22F, Endpoint::DspWordAck, false),
-            ] {
-                this.claim_port(
-                    DeviceId::Sb16,
-                    port,
-                    Some(endpoint),
-                    if write { Some(endpoint) } else { None },
-                )?;
+            doslet_config::SoundCard::Sb => {
+                for port in (0x222..=0x225)
+                    .chain(core::iter::once(0x22F))
+                    .chain(0x38A..=0x38B)
+                {
+                    this.fallback(port, Endpoint::Probe);
+                }
+                for port in (0x220..=0x221).chain(0x228..=0x229).chain(0x388..=0x389) {
+                    this.claim_port(
+                        DeviceId::Sb16,
+                        port,
+                        Some(Endpoint::Opl),
+                        Some(Endpoint::Opl),
+                    )?;
+                }
+                for (port, endpoint, write) in [
+                    (0x226, Endpoint::DspReset, true),
+                    (0x22A, Endpoint::DspData, false),
+                    (0x22C, Endpoint::DspCommand, true),
+                    (0x22E, Endpoint::DspStatus, false),
+                ] {
+                    this.claim_port(
+                        DeviceId::Sb16,
+                        port,
+                        Some(endpoint),
+                        if write { Some(endpoint) } else { None },
+                    )?;
+                }
+                this.claim_irq(DeviceId::Sb16, config.sb_irq)?;
+                this.claim_dma(DeviceId::Sb16, config.sb_dma8)?;
             }
-            this.claim_irq(DeviceId::Sb16, config.sb_irq)?;
-            this.claim_dma(DeviceId::Sb16, config.sb_dma8)?;
-            this.claim_dma(DeviceId::Sb16, config.sb_dma16)?;
+            doslet_config::SoundCard::Sb16 => {
+                for port in (0x220..=0x223).chain(0x228..=0x229).chain(0x388..=0x38B) {
+                    this.claim_port(
+                        DeviceId::Sb16,
+                        port,
+                        Some(Endpoint::Opl),
+                        Some(Endpoint::Opl),
+                    )?;
+                }
+                for (port, endpoint, write) in [
+                    (0x224, Endpoint::MixerIndex, true),
+                    (0x225, Endpoint::MixerData, true),
+                    (0x226, Endpoint::DspReset, true),
+                    (0x22A, Endpoint::DspData, false),
+                    (0x22C, Endpoint::DspCommand, true),
+                    (0x22E, Endpoint::DspStatus, false),
+                    (0x22F, Endpoint::DspWordAck, false),
+                ] {
+                    this.claim_port(
+                        DeviceId::Sb16,
+                        port,
+                        Some(endpoint),
+                        if write { Some(endpoint) } else { None },
+                    )?;
+                }
+                this.claim_irq(DeviceId::Sb16, config.sb_irq)?;
+                this.claim_dma(DeviceId::Sb16, config.sb_dma8)?;
+                this.claim_dma(DeviceId::Sb16, config.sb_dma16)?;
+            }
         }
         if config.mpu401 {
             this.claim_port(

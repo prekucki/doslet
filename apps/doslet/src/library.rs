@@ -504,7 +504,9 @@ pub enum GameEdit {
     CpuMhz(u16),
     CpuMode(CpuMode),
     MemoryMib(u8),
+    #[allow(dead_code, reason = "Backwards-compatible toggle")]
     Sb16(bool),
+    SoundCard(doslet_config::SoundCard),
     Mpu401(bool),
     GameMidi(String),
     Gameport(bool),
@@ -807,7 +809,12 @@ impl Library {
             GameEdit::CpuMhz(mhz) => game.spec.hardware.cpu_mhz = mhz.clamp(1, 1000),
             GameEdit::CpuMode(mode) => game.spec.cpu_mode = Some(mode),
             GameEdit::MemoryMib(mib) => game.spec.hardware.memory_mib = mib,
-            GameEdit::Sb16(v) => game.spec.hardware.sb16 = v,
+            GameEdit::Sb16(v) => game.spec.hardware.set_sound_card(if v {
+                doslet_config::SoundCard::Sb16
+            } else {
+                doslet_config::SoundCard::None
+            }),
+            GameEdit::SoundCard(v) => game.spec.hardware.set_sound_card(v),
             GameEdit::Mpu401(v) => game.spec.hardware.mpu401 = v,
             GameEdit::GameMidi(v) => game.spec.output.game_midi = v,
             GameEdit::Gameport(v) => game.spec.hardware.gameport = v,

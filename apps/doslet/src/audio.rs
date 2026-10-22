@@ -2,6 +2,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "linux")]
 mod pulse;
 
@@ -92,12 +94,16 @@ pub struct Output {
     writer: Writer,
 }
 enum Stream {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     System {
         _outputs: [Box<Output>; 3],
     },
     Cpal {
         _stream: cpal::Stream,
+    },
+    #[cfg(target_os = "macos")]
+    CoreAudio {
+        _driver: macos::Driver,
     },
     #[cfg(target_os = "linux")]
     Pulse {
@@ -112,6 +118,8 @@ pub struct Writer {
     secondary: Option<Box<Writer>>,
     fm: Option<Box<Writer>>,
     pub rate: u32,
+    #[cfg(target_os = "macos")]
+    macos: Option<Arc<macos::Control>>,
     #[cfg(target_os = "linux")]
     pulse: Option<Arc<pulse::Control>>,
 }
@@ -139,8 +147,26 @@ impl Output {
                     writer,
                 });
             }
-            #[cfg(not(target_os = "linux"))]
-            return Err("System mixing is available only on Linux".into());
+            #[cfg(target_os = "macos")]
+            {
+                if backend == Backend::Pulse {
+                    return Err("PulseAudio output is available only on Linux".into());
+                }
+                let pcm = macos::deferred_at_rate("Doslet — Sound Blaster PCM", 22050);
+                let fm = macos::deferred_at_rate("Doslet — AdLib / OPL FM", 48000);
+                let midi = macos::deferred_at_rate("Doslet — MIDI", 48000);
+                let mut writer = midi.writer();
+                writer.secondary = Some(Box::new(pcm.writer()));
+                writer.fm = Some(Box::new(fm.writer()));
+                return Ok(Self {
+                    _stream: Stream::System {
+                        _outputs: [Box::new(pcm), Box::new(midi), Box::new(fm)],
+                    },
+                    writer,
+                });
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            return Err("System mixing is available only on Linux and macOS".into());
         }
         #[cfg(target_os = "linux")]
         if backend != Backend::Cpal {
@@ -213,6 +239,8 @@ impl Output {
                 secondary: None,
                 fm: None,
                 rate,
+                #[cfg(target_os = "macos")]
+                macos: None,
                 #[cfg(target_os = "linux")]
                 pulse: None,
             },
@@ -278,6 +306,8 @@ impl Writer {
                 waker: None,
             })),
             rate,
+            #[cfg(target_os = "macos")]
+            macos: None,
             #[cfg(target_os = "linux")]
             pulse: None,
         }
@@ -383,6 +413,11 @@ impl Writer {
         if let Some(waker) = waker {
             waker.wake();
         }
+        #[cfg(target_os = "macos")]
+        if let Some(control) = &self.macos {
+            control.ensure_started()?;
+            control.wake();
+        }
         #[cfg(target_os = "linux")]
         if let Some(control) = &self.pulse {
             control.ensure_started()?;
@@ -406,6 +441,10 @@ impl Writer {
         if let Some(waker) = waker {
             waker.wake();
         }
+        #[cfg(target_os = "macos")]
+        if let Some(control) = &self.macos {
+            control.wake();
+        }
         #[cfg(target_os = "linux")]
         if let Some(control) = &self.pulse {
             control.wake();
@@ -427,9 +466,14 @@ impl Writer {
         q.peak = 0.0;
         q.spectrum.reset();
         q.generation += 1;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let generation = q.generation;
         drop(q);
+        #[cfg(target_os = "macos")]
+        if let Some(control) = &self.macos {
+            control.wake();
+            control.wait_for(generation)?;
+        }
         #[cfg(target_os = "linux")]
         if let Some(control) = &self.pulse {
             control.wake();

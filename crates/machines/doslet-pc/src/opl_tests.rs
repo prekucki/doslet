@@ -91,9 +91,12 @@ fn absent_pas_filter_probe_does_not_touch_opl_bank_one_or_hide_other_ports() {
     // Deliberately leave OPL bank one pointing at NEW before the PAS probe.
     m.bus.write_port_u8(0x38A, 5).unwrap();
     m.bus.write_port_u8(0x38B, 1).unwrap();
-    m.bus.write_port_u8(0xB8A, 0).unwrap();
-    assert_eq!(m.bus.read_port_u8(0xB8A), Ok(0xFF));
+    for port in [0xB8A, 0xB8B] {
+        m.bus.write_port_u8(port, 0).unwrap();
+        assert_eq!(m.bus.read_port_u8(port), Ok(0xFF));
+    }
     assert!(m.bus.write_port_u8(0xB89, 0).is_err());
+    assert!(m.bus.write_port_u8(0xB8C, 0).is_err());
     // Actual OPL timer detection remains available following the PAS write.
     write(&mut m, 2, 0xFF);
     write(&mut m, 4, 1);
@@ -222,4 +225,35 @@ fn fm_idle_batches_match_single_steps_and_queue_overflow_is_explicit() {
         }
     }
     assert_eq!(result, Err(MachineError::AudioQueueFull));
+}
+
+#[test]
+fn adlib_and_sb_modes_distinguish_opl2_from_opl3_and_route_8bit_dma() {
+    let mut adlib = PcMachine::from_config(
+        doslet_config::HardwareConfig::default().with_sound_card(doslet_config::SoundCard::Adlib),
+    )
+    .unwrap();
+    assert_eq!(adlib.audio_status().irq, None);
+    assert_eq!(adlib.audio_status().dma8, None);
+    assert_eq!(adlib.audio_status().dma16, None);
+    assert_eq!(adlib.bus.read_port_u8(0x388), Ok(0x06));
+    assert_eq!(adlib.bus.read_port_u8(0x38A), Ok(0xFF));
+    assert_eq!(adlib.bus.read_port_u8(0x226), Ok(0xFF));
+    write(&mut adlib, 2, 0xFF);
+    write(&mut adlib, 4, 0x21);
+    adlib.advance_hardware_steps(660).unwrap();
+    assert_eq!(adlib.bus.read_port_u8(0x388), Ok(0xC6));
+
+    let mut sb = PcMachine::from_config(
+        doslet_config::HardwareConfig::default().with_sound_card(doslet_config::SoundCard::Sb),
+    )
+    .unwrap();
+    assert_eq!(sb.audio_status().irq, Some(7));
+    assert_eq!(sb.audio_status().dma8, Some(1));
+    assert_eq!(sb.audio_status().dma16, None);
+    assert_eq!(sb.bus.read_port_u8(0x220), Ok(0x06));
+    assert_eq!(sb.bus.read_port_u8(0x224), Ok(0xFF));
+    sb.bus.write_port_u8(0x22C, 0xE1).unwrap();
+    assert_eq!(sb.bus.read_port_u8(0x22A), Ok(2));
+    assert_eq!(sb.bus.read_port_u8(0x22A), Ok(1));
 }

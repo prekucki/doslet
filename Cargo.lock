@@ -1272,6 +1272,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "console_error_panic_hook",
+ "coreaudio-rs",
  "cpal",
  "doslet-aot",
  "doslet-apple-midi",

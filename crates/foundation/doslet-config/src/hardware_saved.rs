@@ -27,29 +27,52 @@ pub struct ConfigHardwareConfig {
     keyboard: Option<<KeyboardMode as State>::Wire>,
     #[prost(bool, tag = "10")]
     gameport: bool,
+    #[prost(uint32, optional, tag = "11")]
+    sound_card: Option<u32>,
 }
 impl State for HardwareConfig {
     type Wire = ConfigHardwareConfig;
     fn save(&self) -> Self::Wire {
+        let sound_card = self.sound();
         Self::Wire {
             cpu_mhz: u32::from(self.cpu_mhz),
             memory_mib: u32::from(self.memory_mib),
             x87: self.x87,
-            sb16: self.sb16,
+            sb16: sound_card != SoundCard::None,
             mpu401: self.mpu401,
             sb_irq: u32::from(self.sb_irq),
             sb_dma8: u32::from(self.sb_dma8),
             sb_dma16: u32::from(self.sb_dma16),
             keyboard: Some(State::save(&self.keyboard)),
             gameport: self.gameport,
+            sound_card: match sound_card {
+                SoundCard::Adlib => Some(1),
+                SoundCard::Sb => Some(2),
+                SoundCard::None | SoundCard::Sb16 => None,
+            },
         }
     }
     fn load(w: Self::Wire) -> Result<Self, InvalidState> {
+        let sound_card = match w.sound_card {
+            None => {
+                if w.sb16 {
+                    SoundCard::Sb16
+                } else {
+                    SoundCard::None
+                }
+            }
+            Some(0) => SoundCard::None,
+            Some(1) => SoundCard::Adlib,
+            Some(2) => SoundCard::Sb,
+            Some(3) => SoundCard::Sb16,
+            Some(_) => return Err(InvalidState("ConfigHardwareConfig.sound_card")),
+        };
         let value = Self {
             cpu_mhz: doslet_state::narrow(w.cpu_mhz, "ConfigHardwareConfig.cpu_mhz")?,
             memory_mib: doslet_state::narrow(w.memory_mib, "ConfigHardwareConfig.memory_mib")?,
             x87: w.x87,
-            sb16: w.sb16,
+            sb16: sound_card != SoundCard::None,
+            sound_card,
             mpu401: w.mpu401,
             sb_irq: doslet_state::narrow(w.sb_irq, "ConfigHardwareConfig.sb_irq")?,
             sb_dma8: doslet_state::narrow(w.sb_dma8, "ConfigHardwareConfig.sb_dma8")?,
