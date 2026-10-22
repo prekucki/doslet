@@ -497,6 +497,13 @@ impl Vga {
             25_175_000
         }
     }
+    /// Vertical refresh in millihertz: pixel clock over the whole raster,
+    /// including blanking. The raster geometry is fixed per emulated mode
+    /// (not read from the CRTC registers): about 70.09 Hz for text and mode
+    /// 13h, 59.94 Hz for 640×480.
+    pub fn refresh_millihertz(&self) -> u32 {
+        (u64::from(self.pixel_clock_hz()) * 1000 / u64::from(self.raster_total())) as u32
+    }
     /// Selected input-status port and exact guest-nanosecond deadline of the
     /// next vertical-retrace bit transition. This is a query without read side
     /// effects. Actual bus status reads reset the attribute index/data latch;
@@ -633,6 +640,17 @@ impl Vga {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn refresh_rate_follows_the_mode_clock_and_raster() {
+        let mut vga = super::Vga::default();
+        vga.set_mode_3h();
+        assert_eq!(vga.refresh_millihertz(), 70_086);
+        vga.set_mode_13h();
+        assert_eq!(vga.refresh_millihertz(), 70_086);
+        vga.set_vbe_101h(false);
+        assert_eq!(vga.refresh_millihertz(), 59_940);
+    }
+
+    #[test]
     fn status_read_resets_attribute_latch_and_dac_round_trips_all_components() {
         let mut vga = super::Vga::default();
         vga.write_port(0x3C0, 0x10);
@@ -672,6 +690,7 @@ mod tests {
         assert_eq!(vga.mode(), super::VideoMode::Text3);
         assert_eq!(vga.bank(), 0);
         assert_eq!(vga.pixel_clock_hz(), 28_322_000);
+        assert_eq!(vga.refresh_millihertz(), 70_086);
         assert_eq!(vga.input_status_port(), 0x3DA);
         assert_eq!(vga.read_port(0x3CC), Some(0x67));
         assert_eq!(vga.raster_ticks, 0);

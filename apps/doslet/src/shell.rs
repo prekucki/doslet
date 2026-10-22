@@ -210,7 +210,14 @@ impl Shell {
             Message::Game(app::Message::LibraryReady) => {
                 self.game = None;
                 self.library.refresh_autosaves();
-                Task::none()
+                // The library has no full screen controls; never leave the
+                // window stuck in the mode the game used. Leave full screen
+                // only after the library was presented, not in the same frame.
+                crate::presentation::after(crate::presentation::LEAVE_FULLSCREEN_DELAY, ())
+                    .then(|()| crate::presentation::set_fullscreen(false))
+            }
+            Message::Game(message @ (app::Message::ReturnToLibrary | app::Message::ShutDown)) => {
+                self.leave_game(message)
             }
             Message::Game(message) => {
                 let Some(game) = &mut self.game else {
@@ -226,13 +233,39 @@ impl Shell {
                     self.exited = false;
                 } else if settled && !self.exited {
                     self.exited = true;
-                    let leave = game.update(app::Message::ReturnToLibrary);
-                    return Task::batch([task, leave.map(Message::Game)]);
+                    return Task::batch([task, self.leave_game(app::Message::ReturnToLibrary)]);
                 }
                 task
             }
             Message::CloseRequested(id) => iced::window::close(id),
         }
+    }
+
+    /// Leaves the game for the library. Full screen only makes sense in a
+    /// game, so the window leaves it first, in the same order as the exit
+    /// button (bars, then windowed mode), and the library follows after.
+    fn leave_game(&mut self, message: app::Message) -> Task<Message> {
+        use crate::presentation::{LEAVE_FULLSCREEN_DELAY, SizingMessage, after};
+        let Some(game) = &mut self.game else {
+            return Task::none();
+        };
+        let sizing = &game.display_sizing;
+        if sizing.fullscreen || sizing.leaving_fullscreen() {
+            let exit = if sizing.fullscreen {
+                game.update(app::Message::DisplaySizing(SizingMessage::Fullscreen(
+                    false,
+                )))
+                .map(Message::Game)
+            } else {
+                Task::none()
+            };
+            // Retried until the exit has settled; then the library follows.
+            return Task::batch([
+                exit,
+                after(LEAVE_FULLSCREEN_DELAY * 3, Message::Game(message)),
+            ]);
+        }
+        game.update(message).map(Message::Game)
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -303,8 +336,16 @@ mod tests {
 
     /// A library window already showing a game built from `program`.
     fn playing(program: &'static [u8]) -> Shell {
+        playing_with_autosave(program, None)
+    }
+
+    fn playing_with_autosave(
+        program: &'static [u8],
+        autosave: Option<std::path::PathBuf>,
+    ) -> Shell {
         let mut game = desktop::Doslet::with_engine(move || {
             let mut engine = Box::new(app::Doslet::new());
+            engine.autosave_path = autosave;
             engine.session = doslet_runtime::Session::new(program).unwrap().into();
             engine.session.start();
             Ok(engine)
@@ -319,23 +360,35 @@ mod tests {
     /// messages back. Window operations wait for a runtime and are dropped.
     fn run_until(shell: &mut Shell, mut first: Option<Message>, done: impl Fn(&Shell) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
+        // Tasks still waiting, e.g. for a delayed message, are polled again
+        // every round instead of being dropped.
+        let mut streams = Vec::new();
         while !done(shell) {
             assert!(Instant::now() < deadline, "the window did not settle");
             let mut queue = vec![first.take().unwrap_or(Message::Game(app::Message::Tick))];
-            while let Some(message) = queue.pop() {
-                let task = shell.update(message);
-                let Some(mut stream) = iced_runtime::task::into_stream(task) else {
-                    continue;
-                };
-                // Every iced task first yields once to its executor.
-                let mut pending = 0;
-                while pending < 4 {
-                    match stream.next().now_or_never() {
-                        Some(Some(iced_runtime::Action::Output(message))) => queue.push(message),
-                        Some(Some(_)) => {}
-                        Some(None) => break,
-                        None => pending += 1,
+            loop {
+                while let Some(message) = queue.pop() {
+                    if let Some(stream) = iced_runtime::task::into_stream(shell.update(message)) {
+                        streams.push(stream);
                     }
+                }
+                // Every iced task first yields once to its executor.
+                for _ in 0..4 {
+                    streams.retain_mut(|stream| {
+                        loop {
+                            match stream.next().now_or_never() {
+                                Some(Some(iced_runtime::Action::Output(message))) => {
+                                    queue.push(message)
+                                }
+                                Some(Some(_)) => {}
+                                Some(None) => return false,
+                                None => return true,
+                            }
+                        }
+                    });
+                }
+                if queue.is_empty() {
+                    break;
                 }
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -363,6 +416,82 @@ mod tests {
         });
         let leave = Message::Game(app::Message::ReturnToLibrary);
         run_until(&mut shell, Some(leave), |shell| shell.game.is_none());
+    }
+
+    #[test]
+    fn a_full_screen_game_leaves_full_screen_before_the_library_appears() {
+        use crate::presentation::SizingMessage;
+        let mut shell = playing(&[0x40, 0xEB, 0xFD]);
+        run_until(&mut shell, None, |shell| {
+            shell.game.as_ref().unwrap().session.steps() > 0
+        });
+        let native = Message::Game(app::Message::DisplaySizing(SizingMessage::FullscreenStyle(
+            crate::presentation::FullscreenStyle::Native,
+        )));
+        let _ = shell.update(native);
+        let enter = Message::Game(app::Message::DisplaySizing(SizingMessage::Fullscreen(true)));
+        run_until(&mut shell, Some(enter), |shell| {
+            shell.game.as_ref().unwrap().display_sizing.fullscreen
+        });
+        // The game view itself leaves full screen; the library appears only
+        // after the window has settled as windowed.
+        let left_in_game = std::cell::Cell::new(false);
+        let settled_before_library = std::cell::Cell::new(false);
+        run_until(
+            &mut shell,
+            Some(Message::Game(app::Message::ShutDown)),
+            |shell| match &shell.game {
+                Some(game) => {
+                    let sizing = &game.display_sizing;
+                    let leaving = sizing.leaving_fullscreen();
+                    left_in_game.set(left_in_game.get() || leaving);
+                    settled_before_library.set(!sizing.fullscreen && !leaving);
+                    false
+                }
+                None => true,
+            },
+        );
+        assert!(
+            left_in_game.get(),
+            "the game view must leave full screen itself"
+        );
+        assert!(
+            settled_before_library.get(),
+            "the library appeared while leaving"
+        );
+    }
+
+    #[test]
+    fn back_keeps_a_suspended_state_and_shut_down_discards_it() {
+        let dir = std::env::temp_dir().join(format!("doslet-shut-down-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let autosave = dir.join("game.autosave.state.gz");
+        for (message, resumable) in [
+            (app::Message::ReturnToLibrary, true),
+            (app::Message::ShutDown, false),
+        ] {
+            std::fs::write(&autosave, b"stale").unwrap();
+            let mut shell = playing_with_autosave(&[0x40, 0xEB, 0xFD], Some(autosave.clone()));
+            run_until(&mut shell, None, |shell| {
+                shell.game.as_ref().unwrap().session.steps() > 0
+            });
+            run_until(&mut shell, Some(Message::Game(message.clone())), |shell| {
+                shell.game.is_none()
+            });
+            let saved = std::fs::read(&autosave).ok();
+            if resumable {
+                assert!(
+                    saved.is_some_and(|bytes| bytes != b"stale"),
+                    "{message:?} must replace the suspended state"
+                );
+            } else {
+                assert!(
+                    saved.is_none(),
+                    "{message:?} must not leave a state to resume"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `cargo test -p doslet --bin doslet game_toolbar_screenshot -- --ignored`

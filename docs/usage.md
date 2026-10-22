@@ -71,7 +71,8 @@ as `--dpmi off` or `--no-audio`, apply to every game it starts.
 is running, commits pending disk writes and saves a paused RAM snapshot
 (`autosave.state.gz`) so **Resume** continues where you left off. Leaving the
 game by quitting to DOS returns to the library and removes `autosave.state.gz`
-while keeping persistent disk saves in `overlay.redb`.
+while keeping persistent disk saves in `overlay.redb`. **Shut down** (the power
+icon) does the same without quitting to DOS first.
 **Rescan profiles** reloads the directories. Profiles that fail to parse are
 skipped with a warning in the terminal. When no profiles are installed yet, the
 library offers a button to launch the built-in test demo or open global settings.
@@ -403,14 +404,64 @@ presentation resumes with the latest image instead of replaying queued frames.
 Click the monitor icon to open **Display**, then choose scaling and filtering.
 The adjacent fixed-width label reports the guest mode: **80×25 VGA text**,
 **320×200×8 VGA** or **640×480×8 SVGA**. Graphics depth is in bits per pixel;
-the label does not depend on window scaling or display filters. MDA, CGA and
+the label does not depend on window scaling or display filters. The top line
+of **Display** adds the guest refresh rate and the frame rate, for example
+`320 × 200 · 70.1 Hz · 35 fps`. The refresh rate follows the emulated mode's
+pixel clock and fixed raster timing (about 70.1 Hz for text and mode 13h,
+59.9 Hz for 640×480); it is not read from the CRTC registers. The frame rate
+counts new guest pictures per second and drops to 0 when the guest is paused
+or draws nothing new. MDA, CGA and
 EGA modes are not currently implemented.
 **Pixel perfect** selects the largest whole-number zoom that fits the available
 display area, measured in physical pixels, including on HiDPI displays. It does
 not resize the window. A 320×200 frame can become 640×400 or 960×600; a 640×480
 frame can become 1280×960. The raw raster proportions are preserved, including
 720×400 text. If even 1× does not fit, the display scrolls. **Fit** fills the
-available area at 4:3 proportions and permits fractional scaling.
+available area and permits fractional scaling.
+
+**Screen shape** applies to **Fit window** only; with **Pixel perfect** it is
+disabled because whole pixels keep the raw raster proportions. **4:3** is the
+CRT proportion. **16:9** stretches the whole picture evenly to a wide area.
+**16:9 smart** also fills 16:9 but keeps the centre close to 4:3 and widens
+only the edges, so text and sprites in the middle look less distorted. Mouse
+input follows the picture. The selected shape is remembered while you switch
+to Pixel perfect and back.
+
+The **Full screen** icon next to Pause and Restart in the toolbar switches the
+window (or, in the browser, the page) to full screen and back. It does not
+change the scaling or shape, so Pixel perfect picks a larger whole-number zoom
+and Fit fills the screen. In full screen the toolbar and status footer are
+replaced by a thin strip at the top with the same icons: **Back to library**,
+**Pause/Resume**, **Restart**, **Display**, **Exit full screen** and **Shut
+down**. Errors still appear below the picture. F11 is passed to the guest and
+does not toggle full screen. Full screen belongs to the game: leaving for the
+library first leaves full screen and only then shows the library.
+
+On the desktop, **Full screen** in **Display** chooses how the window covers the
+screen (change it in a window):
+
+- **Borderless window** (default) maximizes the window without its frame. The
+  compositor never switches modes, so desktop panels may stay visible. This
+  avoids a COSMIC compositor crash seen when leaving its full screen mode.
+- **Native** uses the compositor's full screen. Leaving it restores the toolbar
+  first, then presents no new frames for one second, and only then returns the
+  window to normal size. The mouse is released and the cursor stays visible
+  while this happens.
+
+A game started from the library can be left two ways. **‹ Library** (the back
+arrow in full screen) suspends the machine; the library offers to resume it
+where you left off. **Shut down** (power icon) is like switching the PC off: it
+returns to the library without keeping a suspended state, so the next launch
+starts the game afresh and you do not need to find the game's own way back to
+DOS. Disk writes that the profile persists are kept either way; temporary
+overlay changes still ask you to export or discard them first. Outside the
+library the power icon closes Doslet.
+If the host leaves full screen by itself (for example Esc
+in the browser), use **Exit full screen** once to restore the toolbar.
+
+Filters and screen shape combine: the filter is applied first, then the picture
+is stretched to the chosen shape. 16:9 smart is drawn on the GPU with any
+filter.
 
 The filter selector in the same panel works on desktop and in the
 browser, including while paused:
@@ -425,13 +476,16 @@ browser, including while paused:
   change the appearance of small fonts.
 - **xBRZ (GPU)** is available on desktop and in the browser. Its shader smooths pixel-art edges at
   the selected display size, including fractional scales, without CPU upscaling.
+- **RAVU-Zoom (GPU)** uses bjin's trained RAVU-Zoom prescaler (the anti-ringing
+  r3 RGB variant) to enlarge to any size. It gives a soft, natural look rather
+  than sharp pixel-art edges, and applies only when the picture is enlarged.
 
 Scaling and filtering are independent. Filters operate on presentation snapshots
 in the UI; guest execution and mouse coordinates still use the original frame.
 Filtered images are cached until the source frame, filter or intermediate zoom
 changes. Sharp Bilinear and HQ2x use CPU preprocessing on both platforms;
-xBRZ runs through the GPU renderer. In the browser it requires WebGPU or WebGL2;
-if the application falls back to Canvas2D, selecting xBRZ shows a notice and
+xBRZ and RAVU-Zoom run through the GPU renderer. In the browser they require
+WebGPU or WebGL2; if the application falls back to Canvas2D, selecting either shows a notice and
 keeps the current filter and image. Their live frame rate has not been benchmarked.
 
 Presentation keeps the previous image visible until the renderer has uploaded

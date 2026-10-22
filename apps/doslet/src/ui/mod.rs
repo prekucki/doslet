@@ -138,6 +138,11 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     if can_run {
         actions = actions.push(icon_button(Icon::Restart, "Restart", Message::Reset, false));
     }
+    actions = actions.push(fullscreen_button(app, 36, 18));
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        actions = actions.push(quit_button(app, 36, 18));
+    }
     #[cfg(target_arch = "wasm32")]
     let actions = actions.push(small_button(
         "Open…",
@@ -204,7 +209,15 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     if !compact_footer {
         bottom = bottom.push(space::horizontal());
     }
-    let mut shell = column![toolbar, viewport(app)].height(Fill).width(Fill);
+    // Full screen swaps the toolbar for a thin strip and hides the footer.
+    let fullscreen = app.display_sizing.fullscreen;
+    let mut shell = if fullscreen {
+        column![fullscreen_strip(app, can_run, icon, label), viewport(app)]
+    } else {
+        column![toolbar, viewport(app)]
+    }
+    .height(Fill)
+    .width(Fill);
     let notice = app
         .session
         .fault()
@@ -289,7 +302,9 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
             .push(details())
             .into()
     };
-    shell = shell.push(container(bottom).padding([5, 16]).width(Fill));
+    if !fullscreen {
+        shell = shell.push(container(bottom).padding([5, 16]).width(Fill));
+    }
     let shell: Element<'_, Message> = shell.into();
     if let Some(kind) = app.workspace.panel {
         let (title, content) = match kind {
@@ -411,14 +426,177 @@ fn video_indicator(app: &Doslet, compact: bool, icon_only: bool) -> Element<'_, 
     .into()
 }
 
+fn fullscreen_button(app: &Doslet, side: u32, glyph: u32) -> Element<'static, Message> {
+    let on = app.display_sizing.fullscreen;
+    icon_button_sized(
+        if on { Icon::Windowed } else { Icon::Fullscreen },
+        if on {
+            "Exit full screen"
+        } else {
+            "Full screen"
+        },
+        Message::DisplaySizing(crate::presentation::SizingMessage::Fullscreen(!on)),
+        false,
+        side,
+        glyph,
+    )
+}
+
+/// Switches the machine off. From the library this returns there without a
+/// suspended state, so no half-finished game waits to be resumed; otherwise
+/// it closes Doslet.
+#[cfg(not(target_arch = "wasm32"))]
+fn quit_button(app: &Doslet, side: u32, glyph: u32) -> Element<'static, Message> {
+    let (label, message) = if app.from_library {
+        ("Shut down (next launch starts afresh)", Message::ShutDown)
+    } else {
+        ("Quit", Message::ExitRequested)
+    };
+    icon_button_sized(Icon::Power, label, message, false, side, glyph)
+}
+
+/// Slim bar shown instead of the toolbar in full screen, with the same
+/// controls as the toolbar so the player can pause, restart, change the
+/// display, leave full screen or quit.
+fn fullscreen_strip(
+    app: &Doslet,
+    can_run: bool,
+    icon: Icon,
+    label: &'static str,
+) -> Element<'static, Message> {
+    const SIDE: u32 = 24;
+    const GLYPH: u32 = 14;
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut left = row![].spacing(2).align_y(iced::Center);
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.from_library {
+        left = left.push(icon_button_sized(
+            Icon::Back,
+            "Back to library (resume later)",
+            Message::ReturnToLibrary,
+            false,
+            SIDE,
+            GLYPH,
+        ));
+    }
+    let mut left = left.push(icon_button_sized(
+        icon,
+        label,
+        if can_run {
+            Message::RunPause
+        } else {
+            Message::Reset
+        },
+        false,
+        SIDE,
+        GLYPH,
+    ));
+    if can_run {
+        left = left.push(icon_button_sized(
+            Icon::Restart,
+            "Restart",
+            Message::Reset,
+            false,
+            SIDE,
+            GLYPH,
+        ));
+    }
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut right = row![
+        icon_button_sized(
+            Icon::Display,
+            "Display settings",
+            Message::Ui(Action::Open(Panel::Display)),
+            false,
+            SIDE,
+            GLYPH,
+        ),
+        fullscreen_button(app, SIDE, GLYPH),
+    ]
+    .spacing(2)
+    .align_y(iced::Center);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        right = right.push(quit_button(app, SIDE, GLYPH));
+    }
+    container(row![left, space::horizontal(), right].align_y(iced::Center))
+        .padding([0, 6])
+        .width(Fill)
+        .into()
+}
+
+/// Desktop only: a browser page can only use the browser's full screen.
+#[cfg(not(target_arch = "wasm32"))]
+fn fullscreen_style_field(app: &Doslet) -> Element<'_, Message> {
+    use crate::presentation::{FullscreenStyle, SizingMessage};
+    let sizing = &app.display_sizing;
+    let style = sizing.fullscreen_style;
+    // Leaving must undo what entering did, so the style is fixed meanwhile.
+    let locked = sizing.fullscreen || sizing.leaving_fullscreen();
+    let choice = |label: &'static str, target: FullscreenStyle| {
+        button(text(label).size(13))
+            .padding([8, 12])
+            .style(move |theme, status| segment(theme, status, style == target))
+            .on_press_maybe((!locked).then_some(Message::DisplaySizing(
+                SizingMessage::FullscreenStyle(target),
+            )))
+    };
+    column![
+        field(
+            "Full screen",
+            row![
+                choice("Borderless window", FullscreenStyle::Borderless),
+                choice("Native", FullscreenStyle::Native),
+            ]
+            .spacing(6)
+            .into()
+        ),
+        text(match style {
+            FullscreenStyle::Borderless => {
+                "Borderless window maximizes the window without its frame. Desktop \
+                 panels may stay visible, but the compositor never switches modes."
+            }
+            FullscreenStyle::Native => {
+                "Native uses the compositor's full screen. On exit the picture \
+                 pauses for a second before the window mode changes."
+            }
+        })
+        .size(12)
+        .color(MUTED),
+    ]
+    .spacing(6)
+    .into()
+}
+
 fn display_panel(app: &Doslet) -> Element<'_, Message> {
-    use crate::presentation::{DisplayFilter, SizingMessage};
+    use crate::presentation::{DisplayFilter, ScreenShape, SizingMessage};
     let perfect = app.display_sizing.pixel_perfect;
+    let shape = app.display_sizing.shape;
+    let shape_button = |label: &'static str, target: ScreenShape| {
+        button(text(label).size(13))
+            .padding([8, 12])
+            .style(move |theme, status| segment(theme, status, shape == target))
+            // Pixel perfect keeps the raw raster proportions, so the shape
+            // only applies to Fit.
+            .on_press_maybe(
+                (!perfect).then_some(Message::DisplaySizing(SizingMessage::Shape(target))),
+            )
+    };
     let dimensions = app.display.dimensions().map_or_else(
         || "No video output".into(),
-        |size| format!("{} × {}", size.width as u32, size.height as u32),
+        |size| {
+            let mut line = format!("{} × {}", size.width as u32, size.height as u32);
+            if app.video_refresh_mhz != 0 {
+                line += &format!(" · {:.1} Hz", f64::from(app.video_refresh_mhz) / 1000.0);
+            }
+            if let Some(fps) = app.display_sizing.fps() {
+                line += &format!(" · {fps:.0} fps");
+            }
+            line
+        },
     );
-    column![
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut panel = column![
         text(dimensions).size(13).color(MUTED),
         field(
             "Scaling",
@@ -431,7 +609,7 @@ fn display_panel(app: &Doslet) -> Element<'_, Message> {
                             .dimensions()
                             .map(|_| Message::DisplaySizing(SizingMessage::PixelPerfect))
                     ),
-                button(text("Fit").size(13))
+                button(text("Fit window").size(13))
                     .padding([8, 12])
                     .style(move |theme, status| segment(theme, status, !perfect))
                     .on_press(Message::DisplaySizing(SizingMessage::Fit)),
@@ -440,23 +618,60 @@ fn display_panel(app: &Doslet) -> Element<'_, Message> {
             .into()
         ),
         field(
+            "Screen shape",
+            row![
+                shape_button("4:3", ScreenShape::Standard),
+                shape_button("16:9", ScreenShape::Wide),
+                shape_button("16:9 smart", ScreenShape::Stretch),
+            ]
+            .spacing(6)
+            .into()
+        ),
+    ]
+    .spacing(18);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        panel = panel.push(fullscreen_style_field(app));
+    }
+    panel
+        .push(field(
             "Filter",
             pick_list(
                 DisplayFilter::ALL,
                 Some(app.display_sizing.filter),
-                |filter| Message::DisplaySizing(SizingMessage::Filter(filter))
+                |filter| Message::DisplaySizing(SizingMessage::Filter(filter)),
             )
             .padding(8)
             .text_size(14)
             .width(Fill)
-            .into()
-        ),
-        text("Pixel perfect preserves whole pixels. Fit uses 4:3 proportions.")
+            .into(),
+        ))
+        .push(
+            text(if perfect {
+                "Pixel perfect shows whole pixels at the original proportions, so the \
+             screen shape is not used. Choose Fit window to change it."
+            } else {
+                match shape {
+                    ScreenShape::Standard => "4:3 is the proportion of a CRT monitor.",
+                    ScreenShape::Wide => "16:9 stretches the whole picture evenly.",
+                    ScreenShape::Stretch => {
+                        "16:9 smart keeps the centre near 4:3 and stretches only the \
+                     edges. The mouse follows the picture."
+                    }
+                }
+            })
             .size(12)
             .color(MUTED),
-    ]
-    .spacing(18)
-    .into()
+        )
+        .push(
+            text(
+                "The filter is applied first; the screen shape is then applied to the \
+                 filtered picture, so they combine.",
+            )
+            .size(12)
+            .color(MUTED),
+        )
+        .into()
 }
 
 fn details_panel(app: &Doslet) -> Element<'_, Message> {
@@ -657,6 +872,12 @@ enum Icon {
     Input,
     Display,
     Info,
+    Fullscreen,
+    Windowed,
+    #[cfg(not(target_arch = "wasm32"))]
+    Power,
+    #[cfg(not(target_arch = "wasm32"))]
+    Back,
 }
 
 impl Icon {
@@ -672,6 +893,12 @@ impl Icon {
             Self::Input => include_bytes!("icons/input.svg"),
             Self::Display => include_bytes!("icons/display.svg"),
             Self::Info => include_bytes!("icons/info.svg"),
+            Self::Fullscreen => include_bytes!("icons/fullscreen.svg"),
+            Self::Windowed => include_bytes!("icons/windowed.svg"),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Power => include_bytes!("icons/power.svg"),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Back => include_bytes!("icons/back.svg"),
         }
     }
 }
@@ -682,16 +909,27 @@ fn icon_button(
     message: Message,
     prominent: bool,
 ) -> Element<'static, Message> {
+    icon_button_sized(icon, label, message, prominent, 36, 18)
+}
+
+fn icon_button_sized(
+    icon: Icon,
+    label: &'static str,
+    message: Message,
+    prominent: bool,
+    side: u32,
+    glyph: u32,
+) -> Element<'static, Message> {
     let icon = svg(svg::Handle::from_memory(icon.bytes()))
-        .width(18)
-        .height(18)
+        .width(glyph)
+        .height(glyph)
         .style(move |_, _| svg::Style {
             color: Some(if prominent { INK } else { FOREGROUND }),
         });
     tooltip(
         button(container(icon).center_x(Fill).center_y(Fill))
-            .width(36)
-            .height(36)
+            .width(side)
+            .height(side)
             .padding(0)
             .style(if prominent { primary } else { ghost })
             .on_press(message),
@@ -709,8 +947,10 @@ fn viewport(app: &Doslet) -> Element<'_, Message> {
         let handle = frame.image.clone();
         let pixels = frame.source_size;
         let sampling = frame.filter.sampling();
+        let stretched = app.display_sizing.stretched();
         let (pointer_width, pointer_height) = app.pointer_dimensions();
-        let cursor = if app.hide_host_cursor() {
+        // Keep the host cursor visible while the window leaves full screen.
+        let cursor = if app.hide_host_cursor() && !app.display_sizing.leaving_fullscreen() {
             iced::mouse::Interaction::Hidden
         } else {
             iced::mouse::Interaction::None
@@ -724,8 +964,25 @@ fn viewport(app: &Doslet) -> Element<'_, Message> {
                 .width(width)
                 .height(height)
                 .into();
-            let pixels = if frame.filter == crate::presentation::DisplayFilter::Xbrz {
-                iced::widget::shader(crate::xbrz::Frame(handle.clone()))
+            let filter = frame.filter;
+            let pixels = if filter == crate::presentation::DisplayFilter::Ravu {
+                iced::widget::shader(crate::ravu::Frame {
+                    image: handle.clone(),
+                    warp: stretched,
+                })
+                .width(width)
+                .height(height)
+                .into()
+            } else if filter == crate::presentation::DisplayFilter::Xbrz || stretched {
+                let program = if filter == crate::presentation::DisplayFilter::Xbrz {
+                    crate::xbrz::Frame::xbrz(handle.clone(), stretched)
+                } else {
+                    crate::xbrz::Frame::stretch(
+                        handle.clone(),
+                        sampling == iced::widget::image::FilterMethod::Linear,
+                    )
+                };
+                iced::widget::shader(program)
                     .width(width)
                     .height(height)
                     .into()
@@ -737,8 +994,15 @@ fn viewport(app: &Doslet) -> Element<'_, Message> {
                     .interaction(cursor)
                     .on_move(move |position| {
                         Message::PointerMoved(
-                            (position.x / width * f32::from(pointer_width))
-                                .clamp(0.0, f32::from(pointer_width - 1))
+                            ({
+                                let fraction = position.x / width;
+                                if stretched {
+                                    crate::presentation::stretch_source(fraction)
+                                } else {
+                                    fraction
+                                }
+                            } * f32::from(pointer_width))
+                            .clamp(0.0, f32::from(pointer_width - 1))
                                 as u16,
                             (position.y / height * f32::from(pointer_height))
                                 .clamp(0.0, f32::from(pointer_height - 1))

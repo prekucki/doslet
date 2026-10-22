@@ -718,6 +718,9 @@ impl WorkerEngine {
     pub fn video_mode_label(&self) -> String {
         self.session.video_mode_label().to_string()
     }
+    pub fn video_refresh_millihertz(&self) -> u32 {
+        self.session.video_refresh_millihertz()
+    }
     pub fn idle_nanos(&self) -> f64 {
         self.session
             .idle_loop_stats()

@@ -55,6 +55,66 @@ pub fn fit_size(available: Size, aspect_ratio: f32) -> Size {
     }
 }
 
+/// Shape of the picture inside the display area when not pixel perfect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScreenShape {
+    /// 4:3, as on a CRT.
+    #[default]
+    Standard,
+    /// 16:9 with the whole picture stretched evenly.
+    Wide,
+    /// 16:9 with the centre near 4:3 proportions and stretched edges.
+    Stretch,
+}
+
+impl ScreenShape {
+    pub fn aspect_ratio(self) -> f32 {
+        match self {
+            Self::Standard => 4.0 / 3.0,
+            Self::Wide | Self::Stretch => 16.0 / 9.0,
+        }
+    }
+}
+
+/// How the game window covers the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FullscreenStyle {
+    /// A maximized window without decorations. The compositor never switches
+    /// the window into its full screen mode, which avoids compositor bugs on
+    /// leaving it (COSMIC crashed there); panels may stay visible.
+    Borderless,
+    /// The compositor's full screen mode. Leaving it first restores the bars,
+    /// then stops presenting frames for a second before the window mode
+    /// changes.
+    Native,
+}
+
+impl Default for FullscreenStyle {
+    fn default() -> Self {
+        // A browser page has no decorations or maximize state to use.
+        if cfg!(target_arch = "wasm32") {
+            Self::Native
+        } else {
+            Self::Borderless
+        }
+    }
+}
+
+/// Maps a horizontal position on the stretched display (0..1) to the source
+/// image (0..1). The display position is `0.5 + 0.75 d + d^3` for source offset
+/// `d` from the centre, so the centre keeps 4:3 proportions (slope 0.75 of a
+/// 16:9 display) and the edges are stretched up to 2x that. The same curve is
+/// inverted in `xbrz.wgsl`; keep both in step.
+pub fn stretch_source(fraction: f32) -> f32 {
+    let t = fraction.clamp(0.0, 1.0) - 0.5;
+    let m = t.abs();
+    let mut d = m;
+    for _ in 0..8 {
+        d -= (d * (0.75 + d * d) - m) / (0.75 + 3.0 * d * d);
+    }
+    0.5 + d.copysign(t)
+}
+
 /// Use whole physical pixels, even when the host uses fractional DPI scaling.
 /// Small viewports retain 1x and scroll instead of discarding guest pixels.
 pub fn pixel_perfect_size(available: Size, pixels: Size, scale_factor: f32) -> Size {
@@ -68,9 +128,58 @@ pub fn pixel_perfect_size(available: Size, pixels: Size, scale_factor: f32) -> S
     )
 }
 
+/// Counts distinct guest pictures presented per second. A paused or idle
+/// guest shows 0, even while the UI itself still redraws.
+#[derive(Default)]
+struct FrameMeter {
+    last: Option<iced_runtime::core::image::Id>,
+    start: Option<web_time::Instant>,
+    frames: u32,
+    fps: Option<f32>,
+}
+
+impl FrameMeter {
+    fn observe(&mut self, image: Option<&Handle>, now: web_time::Instant) {
+        let id = image.map(Handle::id);
+        if id.is_some() && id != self.last {
+            self.frames += 1;
+            self.last = id;
+        }
+        let start = *self.start.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(start);
+        if elapsed >= std::time::Duration::from_secs(1) {
+            self.fps = Some(self.frames as f32 / elapsed.as_secs_f32());
+            self.frames = 0;
+            self.start = Some(now);
+        }
+    }
+
+    /// Frames per second, or 0 once nothing was observed for two seconds.
+    fn fps(&self, now: web_time::Instant) -> Option<f32> {
+        let stale = self.start.is_some_and(|start| {
+            now.saturating_duration_since(start) >= std::time::Duration::from_secs(2)
+        });
+        if stale { Some(0.0) } else { self.fps }
+    }
+}
+
 pub struct DisplaySizing {
     pub pixel_perfect: bool,
+    pub shape: ScreenShape,
+    /// Whether the window is in full screen; hides the toolbar and footer.
+    pub fullscreen: bool,
+    /// Style for the next full screen request.
+    pub fullscreen_style: FullscreenStyle,
+    /// Style of the current full screen, so leaving undoes what entering did.
+    active_style: FullscreenStyle,
+    /// Whether a borderless full screen found the window maximized.
+    was_maximized: bool,
+    /// Between the exit request and the window settling as windowed.
+    leaving: bool,
+    /// No frames are presented while a native full screen is about to end.
+    frozen: bool,
     pub filter: DisplayFilter,
+    frames: FrameMeter,
     viewport: Size,
     scale_factor: f32,
     filtered: filter::FilterCache,
@@ -83,7 +192,15 @@ impl Default for DisplaySizing {
     fn default() -> Self {
         Self {
             pixel_perfect: false,
+            shape: ScreenShape::default(),
+            fullscreen: false,
+            fullscreen_style: FullscreenStyle::default(),
+            active_style: FullscreenStyle::default(),
+            was_maximized: false,
+            leaving: false,
+            frozen: false,
             filter: DisplayFilter::default(),
+            frames: FrameMeter::default(),
             viewport: Size::ZERO,
             scale_factor: 1.0,
             filtered: filter::FilterCache::default(),
@@ -98,6 +215,19 @@ impl Default for DisplaySizing {
 pub enum SizingMessage {
     PixelPerfect,
     Fit,
+    Shape(ScreenShape),
+    /// Request full screen or windowed mode.
+    Fullscreen(bool),
+    #[cfg(not(target_arch = "wasm32"))]
+    FullscreenStyle(FullscreenStyle),
+    /// Native exit: stop presenting frames once the bars were drawn again.
+    FreezeFrames,
+    /// Native exit: leave the compositor's full screen mode.
+    ApplyFullscreen(bool),
+    /// Borderless entry found the window in this maximized state.
+    WasMaximized(bool),
+    /// The window had time to settle after leaving full screen.
+    FullscreenSettled,
     Filter(DisplayFilter),
     Viewport(Size),
     ScaleFactor(f32),
@@ -109,8 +239,30 @@ impl DisplaySizing {
         if self.pixel_perfect {
             pixel_perfect_size(available, pixels, self.scale_factor)
         } else {
-            fit_size(available, 4.0 / 3.0)
+            fit_size(available, self.shape.aspect_ratio())
         }
+    }
+
+    /// The window is still leaving full screen: the host cursor must stay
+    /// visible and nothing may switch the view underneath it.
+    pub fn leaving_fullscreen(&self) -> bool {
+        self.leaving
+    }
+
+    /// New guest pictures shown per second, once a second has been measured.
+    pub fn fps(&self) -> Option<f32> {
+        self.frames.fps(web_time::Instant::now())
+    }
+
+    /// Frames must not be presented: a native full screen is about to end.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn frames_frozen(&self) -> bool {
+        self.frozen
+    }
+
+    /// True when the picture needs the non-linear horizontal warp.
+    pub fn stretched(&self) -> bool {
+        !self.pixel_perfect && self.shape == ScreenShape::Stretch
     }
 
     pub fn image(&self) -> Option<&PreparedFrame> {
@@ -130,6 +282,8 @@ impl DisplaySizing {
             self.scale_factor =
                 web_sys::window().map_or(1.0, |window| window.device_pixel_ratio()) as f32;
         }
+        self.frames
+            .observe(frame.image.as_ref(), web_time::Instant::now());
         let target = frame.dimensions().map(|pixels| {
             let logical = self.image_size(self.viewport, pixels);
             Size::new(
@@ -209,6 +363,74 @@ impl DisplaySizing {
                 self.uploads.retry();
                 self.pixel_perfect = false;
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            SizingMessage::FullscreenStyle(style) => {
+                // Leaving must undo what entering did; switch styles only
+                // in a window.
+                if !self.fullscreen && !self.leaving {
+                    self.fullscreen_style = style;
+                }
+            }
+            SizingMessage::Fullscreen(true) => {
+                if !self.fullscreen {
+                    self.fullscreen = true;
+                    self.leaving = false;
+                    self.frozen = false;
+                    self.active_style = self.fullscreen_style;
+                    task = match self.active_style {
+                        FullscreenStyle::Native => set_fullscreen(true),
+                        FullscreenStyle::Borderless => enter_borderless(),
+                    };
+                }
+            }
+            SizingMessage::Fullscreen(false) => {
+                if self.fullscreen {
+                    self.fullscreen = false;
+                    match self.active_style {
+                        FullscreenStyle::Borderless => {
+                            task = leave_borderless(self.was_maximized);
+                        }
+                        FullscreenStyle::Native => {
+                            // Restore the toolbar and footer first, then stop
+                            // presenting frames, and only then leave the
+                            // compositor's full screen mode. Changing the
+                            // layout and the window mode together crashed the
+                            // COSMIC compositor on exit.
+                            self.leaving = true;
+                            task = after(LEAVE_FULLSCREEN_DELAY, SizingMessage::FreezeFrames);
+                        }
+                    }
+                }
+            }
+            SizingMessage::FreezeFrames => {
+                if self.leaving && !self.fullscreen {
+                    self.frozen = true;
+                    task = after(NATIVE_EXIT_FREEZE, SizingMessage::ApplyFullscreen(false));
+                }
+            }
+            SizingMessage::ApplyFullscreen(on) => {
+                // The player may have toggled again during the delay.
+                if self.fullscreen == on && (on || self.leaving) {
+                    task = set_fullscreen(on);
+                    if !on {
+                        task = iced::Task::batch([
+                            task,
+                            after(LEAVE_FULLSCREEN_DELAY, SizingMessage::FullscreenSettled),
+                        ]);
+                    }
+                }
+            }
+            SizingMessage::FullscreenSettled => {
+                if !self.fullscreen {
+                    self.leaving = false;
+                    self.frozen = false;
+                }
+            }
+            SizingMessage::WasMaximized(maximized) => self.was_maximized = maximized,
+            SizingMessage::Shape(shape) => {
+                self.uploads.retry();
+                self.shape = shape;
+            }
             SizingMessage::Filter(filter) => {
                 self.uploads.retry();
                 self.filter = filter;
@@ -239,6 +461,70 @@ impl DisplaySizing {
         }
         iced::Task::batch([task, self.refresh(frame)])
     }
+}
+
+/// Time to present the restored layout before the window leaves full screen,
+/// and again for the windowed mode to settle afterwards.
+pub const LEAVE_FULLSCREEN_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long a native full screen presents no frames before it ends.
+pub const NATIVE_EXIT_FREEZE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Borderless full screen: drop the decorations and maximize, remembering
+/// whether the window was maximized already.
+fn enter_borderless() -> iced::Task<SizingMessage> {
+    use iced::window;
+    window::latest().and_then(|id| {
+        window::is_maximized(id).then(move |maximized| {
+            iced::Task::batch([
+                iced::Task::done(SizingMessage::WasMaximized(maximized)),
+                window::toggle_decorations(id),
+                window::maximize(id, true),
+            ])
+        })
+    })
+}
+
+fn leave_borderless(maximized: bool) -> iced::Task<SizingMessage> {
+    use iced::window;
+    window::latest().and_then(move |id| {
+        iced::Task::batch([
+            window::toggle_decorations(id),
+            window::maximize(id, maximized),
+        ])
+    })
+}
+
+/// Deliver `message` after `delay` without blocking iced's executor.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn after<T: Send + 'static>(delay: std::time::Duration, message: T) -> iced::Task<T> {
+    let (sender, receiver) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let _ = sender.send(message);
+    });
+    iced::Task::future(async move { receiver.await.ok() }).and_then(iced::Task::done)
+}
+
+/// The browser has no compositor issue to wait for; deliver immediately.
+#[cfg(target_arch = "wasm32")]
+pub fn after<T: Send + 'static>(_: std::time::Duration, message: T) -> iced::Task<T> {
+    iced::Task::done(message)
+}
+
+/// Ask the host for full screen or windowed mode, but only when the real
+/// window mode differs, so a stale flag never repeats a mode request.
+pub fn set_fullscreen<T: Send + 'static>(on: bool) -> iced::Task<T> {
+    use iced::window::{self, Mode};
+    window::latest().and_then(move |id| {
+        window::mode(id).then(move |current| {
+            if (current == Mode::Fullscreen) == on {
+                iced::Task::none()
+            } else {
+                window::set_mode(id, if on { Mode::Fullscreen } else { Mode::Windowed })
+            }
+        })
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -322,6 +608,121 @@ mod tests {
         let fitted = fit_size(Size::new(720.0, 400.0), 4.0 / 3.0);
         assert!((fitted.width - 533.3333).abs() < 0.001);
         assert_eq!(fitted.height, 400.0);
+    }
+
+    #[test]
+    fn wide_shapes_use_sixteen_by_nine_and_stretch_warps_only_there() {
+        let frame = frame(640, 480);
+        let pixels = frame.dimensions().unwrap();
+        let available = Size::new(1600.0, 900.0);
+        let mut sizing = DisplaySizing::default();
+        assert!(!sizing.stretched());
+        let _ = sizing.update(SizingMessage::Shape(ScreenShape::Wide), &frame);
+        assert_eq!(sizing.image_size(available, pixels), available);
+        assert!(!sizing.stretched());
+        let _ = sizing.update(SizingMessage::Shape(ScreenShape::Stretch), &frame);
+        assert_eq!(sizing.image_size(available, pixels), available);
+        assert!(sizing.stretched());
+        // Pixel perfect suspends the shape without forgetting it.
+        let _ = sizing.update(SizingMessage::PixelPerfect, &frame);
+        assert!(!sizing.stretched());
+        let _ = sizing.update(SizingMessage::Fit, &frame);
+        assert_eq!(sizing.shape, ScreenShape::Stretch);
+        assert!(sizing.stretched());
+    }
+
+    #[test]
+    fn native_exit_restores_the_bars_then_freezes_frames_then_leaves() {
+        let frame = frame(320, 200);
+        let mut sizing = DisplaySizing::default();
+        let _ = sizing.update(
+            SizingMessage::FullscreenStyle(FullscreenStyle::Native),
+            &frame,
+        );
+        let _ = sizing.update(SizingMessage::Fullscreen(true), &frame);
+        assert!(sizing.fullscreen && !sizing.leaving_fullscreen());
+        // A style change during full screen would break the exit; it waits.
+        let _ = sizing.update(
+            SizingMessage::FullscreenStyle(FullscreenStyle::Borderless),
+            &frame,
+        );
+        assert_eq!(sizing.fullscreen_style, FullscreenStyle::Native);
+        // The bars return at once while frames keep flowing.
+        let _ = sizing.update(SizingMessage::Fullscreen(false), &frame);
+        assert!(!sizing.fullscreen && sizing.leaving_fullscreen());
+        assert!(!sizing.frames_frozen());
+        let _ = sizing.update(SizingMessage::FreezeFrames, &frame);
+        assert!(sizing.frames_frozen());
+        let _ = sizing.update(SizingMessage::ApplyFullscreen(false), &frame);
+        assert!(sizing.frames_frozen() && sizing.leaving_fullscreen());
+        let _ = sizing.update(SizingMessage::FullscreenSettled, &frame);
+        assert!(!sizing.frames_frozen() && !sizing.leaving_fullscreen());
+        // Re-entering during the exit cancels the rest of it.
+        let _ = sizing.update(SizingMessage::Fullscreen(false), &frame);
+        let _ = sizing.update(SizingMessage::Fullscreen(true), &frame);
+        let _ = sizing.update(SizingMessage::Fullscreen(false), &frame);
+        let _ = sizing.update(SizingMessage::Fullscreen(true), &frame);
+        let _ = sizing.update(SizingMessage::FreezeFrames, &frame);
+        assert!(sizing.fullscreen && !sizing.frames_frozen());
+    }
+
+    #[test]
+    fn borderless_full_screen_never_freezes_or_waits() {
+        let frame = frame(320, 200);
+        let mut sizing = DisplaySizing::default();
+        let _ = sizing.update(
+            SizingMessage::FullscreenStyle(FullscreenStyle::Borderless),
+            &frame,
+        );
+        let _ = sizing.update(SizingMessage::Fullscreen(true), &frame);
+        let _ = sizing.update(SizingMessage::WasMaximized(true), &frame);
+        assert!(sizing.fullscreen);
+        let _ = sizing.update(SizingMessage::Fullscreen(false), &frame);
+        assert!(!sizing.fullscreen && !sizing.leaving_fullscreen());
+        let _ = sizing.update(SizingMessage::FreezeFrames, &frame);
+        assert!(!sizing.frames_frozen());
+    }
+
+    #[test]
+    fn frame_meter_counts_new_pictures_and_drops_to_zero_when_idle() {
+        let start = web_time::Instant::now();
+        let at = |ms| start + std::time::Duration::from_millis(ms);
+        let mut meter = FrameMeter::default();
+        let first = Handle::from_rgba(1, 1, vec![0; 4]);
+        meter.observe(Some(&first), at(0));
+        assert_eq!(meter.fps(at(0)), None);
+        // The same handle again is not a new picture.
+        for ms in [100, 200, 300] {
+            meter.observe(Some(&first), at(ms));
+        }
+        for ms in (400..=1000).step_by(100) {
+            meter.observe(Some(&Handle::from_rgba(1, 1, vec![0; 4])), at(ms));
+        }
+        // 1 + 7 new pictures in the first second.
+        assert_eq!(meter.fps(at(1000)), Some(8.0));
+        assert_eq!(meter.fps(at(3100)), Some(0.0));
+    }
+
+    #[test]
+    fn stretch_curve_is_monotonic_symmetric_and_keeps_the_centre_near_4_3() {
+        assert_eq!(stretch_source(0.0), 0.0);
+        assert_eq!(stretch_source(1.0), 1.0);
+        assert_eq!(stretch_source(0.5), 0.5);
+        let mut previous = 0.0;
+        for step in 1..=100 {
+            let x = step as f32 / 100.0;
+            let u = stretch_source(x);
+            assert!(u > previous);
+            assert!((u + stretch_source(1.0 - x) - 1.0).abs() < 1e-5);
+            previous = u;
+        }
+        // Near the centre one display unit covers 1/0.75 source units.
+        let slope = (stretch_source(0.501) - stretch_source(0.499)) / 0.002;
+        assert!((slope - 1.0 / 0.75).abs() < 0.01, "{slope}");
+        // Forward map: 0.5 + 0.75 d + d^3.
+        let u = stretch_source(0.8);
+        let d = u - 0.5;
+        assert!((0.5 + 0.75 * d + d * d * d - 0.8).abs() < 1e-5);
     }
 
     #[test]

@@ -98,6 +98,7 @@ mod procedure_cache;
 mod profile;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod quake_x87;
+mod ravu;
 #[cfg(not(target_arch = "wasm32"))]
 mod shell;
 mod ui;

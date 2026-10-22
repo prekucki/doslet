@@ -687,6 +687,10 @@ impl Session {
     pub fn video_mode(&self) -> doslet_vga::VideoMode {
         self.machine.bus.vga.mode()
     }
+    /// Guest vertical refresh of the current mode, in millihertz.
+    pub fn video_refresh_millihertz(&self) -> u32 {
+        self.machine.bus.vga.refresh_millihertz()
+    }
     /// Register-derived guest mode, independent of host scaling and filters.
     /// Returns small values; formatting is left to the frontend boundary.
     pub fn video_mode_label(&self) -> VideoModeLabel {

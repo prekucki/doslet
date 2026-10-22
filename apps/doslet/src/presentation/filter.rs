@@ -10,15 +10,29 @@ pub enum DisplayFilter {
     SharpBilinear,
     Hq2x,
     Xbrz,
+    Ravu,
 }
 
 impl DisplayFilter {
-    pub const ALL: &[Self] = &[Self::Nearest, Self::SharpBilinear, Self::Hq2x, Self::Xbrz];
+    pub const ALL: &[Self] = &[
+        Self::Nearest,
+        Self::SharpBilinear,
+        Self::Hq2x,
+        Self::Xbrz,
+        Self::Ravu,
+    ];
+
+    /// Drawn by a GPU shader from the guest-sized frame; the browser checks
+    /// that the page did not fall back to Canvas2D.
+    #[cfg(target_arch = "wasm32")]
+    pub fn gpu(self) -> bool {
+        matches!(self, Self::Xbrz | Self::Ravu)
+    }
 
     pub fn sampling(self) -> FilterMethod {
         match self {
             Self::Nearest => FilterMethod::Nearest,
-            Self::Xbrz => FilterMethod::Nearest,
+            Self::Xbrz | Self::Ravu => FilterMethod::Nearest,
             Self::SharpBilinear | Self::Hq2x => FilterMethod::Linear,
         }
     }
@@ -41,6 +55,7 @@ impl std::fmt::Display for DisplayFilter {
             Self::SharpBilinear => "Sharp Bilinear",
             Self::Hq2x => "HQ2x",
             Self::Xbrz => "xBRZ (GPU)",
+            Self::Ravu => "RAVU-Zoom (GPU)",
         })
     }
 }

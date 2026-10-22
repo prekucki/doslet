@@ -156,6 +156,11 @@ pub enum Message {
     ExitRequested,
     /// Leave a game started from the library once its saves are settled.
     ReturnToLibrary,
+    /// Release a captured mouse, e.g. before the window leaves full screen.
+    ReleaseMouse,
+    /// Like switching the PC off: return to the library without keeping a
+    /// suspended state, so the next launch starts the game afresh.
+    ShutDown,
     /// The machine is paused for the library; the window shell drops it.
     LibraryReady,
     RefreshMidi,
@@ -875,11 +880,18 @@ impl Doslet {
             }
             Message::MachinePrepared(result) => self.finish_preparation(result),
             Message::DisplaySizing(message) => {
-                return self
+                let leaving = matches!(message, SizingMessage::Fullscreen(false));
+                let task = self
                     .display_sizing
                     .update(message, &self.display)
                     .map(Message::DisplaySizing);
+                return if leaving {
+                    Task::batch([task, self.release_mouse()])
+                } else {
+                    task
+                };
             }
+            Message::ReleaseMouse => return self.release_mouse(),
             Message::PointerMoved(x, y) => {
                 if self.mouse_capture.is_none()
                     && !self.mouse_capture_pending
@@ -1234,7 +1246,8 @@ impl Doslet {
                 self.save_autosave();
                 return iced::exit();
             }
-            Message::ReturnToLibrary => return self.return_to_library(),
+            Message::ReturnToLibrary => return self.return_to_library(true),
+            Message::ShutDown => return self.return_to_library(false),
             Message::LibraryReady => {}
             Message::Tick => self.tick(),
             Message::GamepadsReady => self.poll_gamepads(),
@@ -1830,7 +1843,7 @@ impl Doslet {
     }
     /// Leaving drops the machine, so it needs Reset's guarantees: committed
     /// saves and no silently discarded temporary changes.
-    fn return_to_library(&mut self) -> Task<Message> {
+    fn return_to_library(&mut self, keep_state: bool) -> Task<Message> {
         if let Some(storage) = &mut self.storage
             && let Err(error) = storage.service(&mut self.session)
         {
@@ -1841,7 +1854,8 @@ impl Doslet {
             self.notice = Some("Saving; return to the library after the commit finishes.".into());
             return Task::none();
         }
-        if self.autosave_path.is_none()
+        // Without a suspended state, temporary disk changes would be lost.
+        if (self.autosave_path.is_none() || !keep_state)
             && self.session.dirty_overlay()
             && !self.launch.persist
             && !self.configurator.discard_changes
@@ -1856,7 +1870,12 @@ impl Doslet {
         self.session.pause();
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
         self.save_core_profile();
-        self.save_autosave();
+        if keep_state {
+            self.save_autosave();
+        } else if let Some(path) = self.autosave_path.take() {
+            // Taking the path also stops the worker from saving on exit.
+            let _ = std::fs::remove_file(path);
+        }
         Task::batch([self.release_mouse(), Task::done(Message::LibraryReady)])
     }
     pub(crate) fn save_core_profile(&self) {
@@ -3079,6 +3098,7 @@ impl Doslet {
             cpu_activity,
             disk_reads: (self.session.epoch(), self.session.disk_read_bytes()),
             video_mode_label: self.session.video_mode_label().to_string(),
+            video_refresh_mhz: self.session.video_refresh_millihertz(),
             audio_volume: self.audio_volume,
             audio_use: self.session.audio_use(),
             memory_usage: self.session.memory_usage(),

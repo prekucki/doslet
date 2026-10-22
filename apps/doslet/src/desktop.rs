@@ -66,6 +66,8 @@ pub struct Snapshot {
     pub cpu_learning_available: bool,
     pub disk_reads: (u64, u64),
     pub video_mode_label: String,
+    /// Guest vertical refresh in millihertz.
+    pub video_refresh_mhz: u32,
     pub audio_volume: u8,
     pub audio_use: doslet_runtime::AudioUse,
     pub memory_usage: doslet_runtime::session::MemoryUsage,
@@ -488,6 +490,7 @@ mod tests {
         let (sender, _receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
         let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
         let mut worker = Worker {
+            pointer: Arc::new(Mutex::new(PendingPointer::default())),
             sender,
             completion_sender,
             sequence: 0,
@@ -500,9 +503,9 @@ mod tests {
             thread: None,
         };
         for _ in 0..COMMAND_CAPACITY {
-            worker.send(Message::PointerMoved(1, 2)).unwrap();
+            worker.send(Message::PointerButton(0, true)).unwrap();
         }
-        assert!(worker.send(Message::PointerMoved(3, 4)).is_err());
+        assert!(worker.send(Message::PointerButton(0, false)).is_err());
         assert!(worker.overflow.load(Ordering::Acquire));
         worker
             .send(Message::MachinePrepared(Err("preparation failed".into())))
@@ -510,6 +513,65 @@ mod tests {
         assert!(matches!(
             completion_receiver.try_recv().unwrap().message,
             Message::MachinePrepared(Err(_))
+        ));
+    }
+
+    #[test]
+    fn pointer_floods_are_coalesced_instead_of_overflowing_the_queue() {
+        let (sender, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
+        let (completion_sender, _completion_receiver) = mpsc::sync_channel(1);
+        let mut worker = Worker {
+            pointer: Arc::new(Mutex::new(PendingPointer::default())),
+            sender,
+            completion_sender,
+            sequence: 0,
+            mailbox: Arc::new(Mailbox::default()),
+            request: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            overflow: Arc::new(AtomicBool::new(false)),
+            exited: Arc::new(AtomicBool::new(false)),
+            signal: wakeup::Signal::default(),
+            thread: None,
+        };
+        let id = iced::window::Id::unique();
+        let motion = |dx, dy| {
+            Message::MouseCapture(id, 7, iced::window::MouseCaptureEvent::Motion { dx, dy })
+        };
+        // A 1000 Hz mouse during a long worker stall.
+        for _ in 0..(COMMAND_CAPACITY * 4) {
+            worker.send(motion(1.0, -0.5)).unwrap();
+            worker.send(Message::PointerMoved(3, 4)).unwrap();
+        }
+        assert!(!worker.overflow.load(Ordering::Acquire));
+        // One wake-up for the whole batch.
+        assert!(matches!(
+            receiver.try_recv().unwrap().message,
+            Message::Tick
+        ));
+        assert!(receiver.try_recv().is_err());
+        let replay: Vec<_> = worker.pointer.lock().unwrap().take_messages().collect();
+        let total = (COMMAND_CAPACITY * 4) as f64;
+        assert!(matches!(
+            replay.as_slice(),
+            [
+                Message::MouseCapture(_, 7, iced::window::MouseCaptureEvent::Motion { dx, dy }),
+                Message::PointerMoved(3, 4),
+            ] if *dx == total && *dy == -total / 2.0
+        ));
+        // A new capture drops the motion of the previous one.
+        worker.send(motion(5.0, 5.0)).unwrap();
+        worker
+            .send(Message::MouseCapture(
+                id,
+                8,
+                iced::window::MouseCaptureEvent::Motion { dx: 1.0, dy: 2.0 },
+            ))
+            .unwrap();
+        let replay: Vec<_> = worker.pointer.lock().unwrap().take_messages().collect();
+        assert!(matches!(
+            replay.as_slice(),
+            [Message::MouseCapture(_, 8, iced::window::MouseCaptureEvent::Motion { dx, dy })]
+                if *dx == 1.0 && *dy == 2.0
         ));
     }
 
@@ -664,7 +726,45 @@ impl Mailbox {
     }
 }
 
+/// Pointer input where only the sum (captured motion) or the latest value
+/// (absolute position) matters. It bypasses the bounded command queue, so a
+/// worker that is busy for a while (AOT installation, disk work) cannot be
+/// flooded by a high-rate mouse and have to pause the machine. Buttons and
+/// keys keep their order in the queue.
+#[derive(Default)]
+struct PendingPointer {
+    motion: Option<(iced::window::Id, u64, f64, f64)>,
+    position: Option<(u16, u16)>,
+}
+impl PendingPointer {
+    fn is_empty(&self) -> bool {
+        self.motion.is_none() && self.position.is_none()
+    }
+    /// Sums captured motion; a different capture replaces stale motion.
+    fn add_motion(&mut self, id: iced::window::Id, generation: u64, dx: f64, dy: f64) {
+        self.motion = Some(match self.motion {
+            Some((old, old_generation, x, y)) if old == id && old_generation == generation => {
+                (id, generation, x + dx, y + dy)
+            }
+            _ => (id, generation, dx, dy),
+        });
+    }
+    /// Messages that replay the pending input; it is cleared.
+    fn take_messages(&mut self) -> impl Iterator<Item = Message> {
+        let pending = std::mem::take(self);
+        let motion = pending.motion.map(|(id, generation, dx, dy)| {
+            Message::MouseCapture(
+                id,
+                generation,
+                iced::window::MouseCaptureEvent::Motion { dx, dy },
+            )
+        });
+        let position = pending.position.map(|(x, y)| Message::PointerMoved(x, y));
+        motion.into_iter().chain(position)
+    }
+}
 struct Worker {
+    pointer: Arc<Mutex<PendingPointer>>,
     sender: mpsc::SyncSender<Command>,
     completion_sender: mpsc::SyncSender<Command>,
     sequence: u64,
@@ -700,6 +800,24 @@ impl Drop for Worker {
     }
 }
 impl Worker {
+    /// Folds pointer input into the pending batch instead of queueing it.
+    fn coalesce(&mut self, apply: impl FnOnce(&mut PendingPointer)) -> u64 {
+        let mut pending = self
+            .pointer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wake = pending.is_empty();
+        apply(&mut pending);
+        drop(pending);
+        // One wake-up per batch; a full queue already keeps the worker busy.
+        if wake {
+            let _ = self.sender.try_send(Command {
+                sequence: self.sequence,
+                message: Message::Tick,
+            });
+        }
+        self.sequence
+    }
     fn spawn(cli: crate::cli::Cli) -> Result<(Self, Snapshot), String> {
         Self::spawn_with(move || crate::app::Doslet::from_cli(cli).map_err(|e| e.to_string()))
     }
@@ -716,6 +834,8 @@ impl Worker {
         let overflow = Arc::new(AtomicBool::new(false));
         let exited = Arc::new(AtomicBool::new(false));
         let signal = wakeup::Signal::default();
+        let pointer = Arc::new(Mutex::new(PendingPointer::default()));
+        let pending_pointer = pointer.clone();
         let (output, refresh, stopping, overflowed, wake) = (
             mailbox.clone(),
             request.clone(),
@@ -750,6 +870,16 @@ impl Worker {
                 let mut last_publish = std::time::Instant::now();
                 while !stopping.load(Ordering::Acquire) {
                     let overflow = overflowed.swap(false, Ordering::AcqRel);
+                    // Coalesced pointer input comes before the queued buttons.
+                    let pointer = pending_pointer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take_messages()
+                        .collect::<Vec<_>>();
+                    for message in pointer {
+                        effects.push(engine.update(message));
+                        refresh.store(true, Ordering::Release);
+                    }
                     if let Ok(command) = completion_receiver.try_recv() {
                         sequence = sequence.max(command.sequence);
                         effects.push(engine.update(command.message));
@@ -834,6 +964,7 @@ impl Worker {
         match ready_rx.recv().map_err(|e| e.to_string())? {
             Ok(snapshot) => Ok((
                 Self {
+                    pointer,
                     sender,
                     completion_sender,
                     sequence: 0,
@@ -854,6 +985,17 @@ impl Worker {
         }
     }
     fn send(&mut self, message: Message) -> Result<u64, &'static str> {
+        match message {
+            Message::MouseCapture(
+                id,
+                generation,
+                iced::window::MouseCaptureEvent::Motion { dx, dy },
+            ) => return Ok(self.coalesce(|p| p.add_motion(id, generation, dx, dy))),
+            Message::PointerMoved(x, y) => {
+                return Ok(self.coalesce(|p| p.position = Some((x, y))));
+            }
+            _ => {}
+        }
         let sequence = self.sequence + 1;
         let sender = if matches!(message, Message::MachinePrepared(_)) {
             &self.completion_sender
@@ -926,10 +1068,21 @@ impl Doslet {
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
         if let Message::DisplaySizing(message) = message {
-            return self
+            let leaving = matches!(
+                message,
+                crate::presentation::SizingMessage::Fullscreen(false)
+            );
+            let task = self
                 .display_sizing
                 .update(message, &self.state.display)
                 .map(Message::DisplaySizing);
+            // The capture lives in the engine; never leave full screen with a
+            // locked or confined pointer.
+            return if leaving {
+                Task::batch([task, Task::done(Message::ReleaseMouse)])
+            } else {
+                task
+            };
         }
         if matches!(message, Message::Tick | Message::GamepadsReady) {
             self.worker.signal.clear();
@@ -1063,9 +1216,16 @@ impl Doslet {
         self.guest_audio.clone()
     }
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        // While a native full screen is about to end, no new frames reach the
+        // UI; the emulation thread keeps running and catches up afterwards.
+        let frames = if self.display_sizing.frames_frozen() {
+            Subscription::none()
+        } else {
             Subscription::run_with(self.worker.signal.clone(), wakeup::Signal::stream)
-                .map(|()| Message::GamepadsReady),
+                .map(|()| Message::GamepadsReady)
+        };
+        Subscription::batch([
+            frames,
             iced::window::close_requests().map(Message::CloseRequested),
             DisplaySizing::subscription().map(Message::DisplaySizing),
             iced::event::listen_with(|event, status, _| {

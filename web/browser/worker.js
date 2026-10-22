@@ -111,7 +111,7 @@ function present(force = false) {
         audioUse: engine.audio_use(), guestPcmRate: engine.guest_pcm_rate(), guestPcmBits: engine.guest_pcm_bits(),
         guestPcmChannels: engine.guest_pcm_channels(),
         midiBytes: engine.midi_bytes(), midiNotes: engine.midi_notes(), midiChannels: engine.midi_channels(), diskReadBytes: engine.disk_read_bytes(),
-        pointerInUse: engine.pointer_in_use(), pointerRelative: engine.pointer_relative_in_use(), memory: JSON.parse(engine.memory_usage()), videoMode: engine.video_mode_label(),
+        pointerInUse: engine.pointer_in_use(), pointerRelative: engine.pointer_relative_in_use(), memory: JSON.parse(engine.memory_usage()), videoMode: engine.video_mode_label(), videoRefresh: engine.video_refresh_millihertz(),
         aotTranslatedSteps: Number(engine.aot_translated_steps()),
         aot: {active: !!aot, ...JSON.parse(aot?.kind === 'procedure-memory' ?
             engine.procedure_aot_diagnostics() : engine.aot_diagnostics())},

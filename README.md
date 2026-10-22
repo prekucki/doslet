@@ -222,6 +222,15 @@ third-party code keep their original copyright notices, and third-party
 libraries keep their own licenses. The vendored iced patches are MIT-licensed;
 see the [vendor notes](vendor/README.md). The `nuked-opl3` dependency is
 [LGPL-2.1-or-later](https://github.com/tgies/nuked-opl3-rs/blob/main/LICENSE).
+The xBRZ shader (`apps/doslet/src/xbrz.wgsl`) is a WGSL port of
+[libretro's xBRZ freescale shader](https://github.com/libretro/slang-shaders/blob/master/edge-smoothing/xbrz/shaders/xbrz-freescale.slang),
+which combines Hyllian's MIT-licensed xBR code with xBRZ code by Zenju under
+GPL-3.0 (no "or later"). Binaries that include it are therefore distributed
+under GPLv3 terms.
+The RAVU-Zoom shader and weight tables in `apps/doslet/src/ravu/` are generated
+from Bin Jin's [mpv-prescalers](https://github.com/bjin/mpv-prescalers)
+(`ravu-zoom-ar-r3-rgb.hook`) by `tools/ravu_to_wgsl.py` and stay under
+[LGPL-3.0-or-later](apps/doslet/src/ravu/COPYING.LESSER).
 The demo program included with Doslet
 is original. The commercial games named above are external test inputs and are
 not distributed with Doslet.

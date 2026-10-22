@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT AND GPL-3.0-only
 // xBRZ freescale, adapted to WGSL for Doslet.
 // https://github.com/libretro/slang-shaders/blob/master/edge-smoothing/xbrz/shaders/xbrz-freescale.slang
 // Corner rules and blend order follow the reference; rotations share one kernel.
@@ -42,6 +43,11 @@
 
 @group(0) @binding(0) var source: texture_2d<f32>;
 override OUTPUT_SRGB: bool = true;
+// Doslet additions: the same pass also presents the plain and bilinear filters
+// with the non-linear 16:9 stretch. SMOOTH selects xBRZ blending.
+override SMOOTH: bool = true;
+override WARP: bool = false;
+override LINEAR: bool = false;
 
 struct Vertex {
     @builtin(position) position: vec4f,
@@ -158,17 +164,40 @@ fn linear_rgb(rgb: vec3f) -> vec3f {
     return select(pow((rgb + vec3f(0.055)) / 1.055, vec3f(2.4)), rgb / 12.92, rgb <= vec3f(0.04045));
 }
 
+// Inverse of x = 0.5 + 0.75 d + d^3 (display position to source offset), by
+// Newton's method. Keep in step with `stretch_source` in presentation.rs.
+fn warp_x(x: f32) -> f32 {
+    let t = clamp(x, 0.0, 1.0) - 0.5;
+    let m = abs(t);
+    var d = m;
+    for (var i = 0; i < 8; i++) {
+        d -= (d * (0.75 + d * d) - m) / (0.75 + 3.0 * d * d);
+    }
+    return 0.5 + sign(t) * d;
+}
+
 @fragment
 fn fs_main(input: Vertex) -> @location(0) vec4f {
-    let location = input.uv * vec2f(textureDimensions(source));
+    var uv = input.uv;
+    if (WARP) { uv.x = warp_x(uv.x); }
+    let location = uv * vec2f(textureDimensions(source));
     // Derivatives are evaluated before any divergent corner decisions. They
     // measure the actual physical viewport, including fractional sizes/HiDPI.
     let scale = vec2f(1.0) / max(fwidth(location), vec2f(0.000001));
     let p = vec2i(floor(location));
     let pos = fract(location) - vec2f(0.5);
     var result = tap(p, vec2i(0), 0u);
+    if (!SMOOTH && LINEAR) {
+        let q = location - vec2f(0.5);
+        let base = vec2i(floor(q));
+        let f = fract(q);
+        result = mix(
+            mix(tap(base, vec2i(0, 0), 0u), tap(base, vec2i(1, 0), 0u), f.x),
+            mix(tap(base, vec2i(0, 1), 0u), tap(base, vec2i(1, 1), 0u), f.x),
+            f.y);
+    }
     // Avoid smoothing at 1:1 or when shrinking either axis.
-    if (all(scale > vec2f(1.0001))) {
+    if (SMOOTH && all(scale > vec2f(1.0001))) {
         let corners = vec4u(corner(p, 0u), corner(p, 1u), corner(p, 2u), corner(p, 3u));
         result = blend_corner(p, 0u, corners, pos, scale, result);
         result = blend_corner(p, 1u, corners, pos, scale, result);

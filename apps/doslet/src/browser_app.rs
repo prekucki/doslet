@@ -132,6 +132,8 @@ pub struct Doslet {
     pub cpu_tiers_available: bool,
     pub(crate) disk_activity: crate::disk_activity::Activity,
     pub video_mode_label: String,
+    /// Guest vertical refresh in millihertz.
+    pub video_refresh_mhz: u32,
     pub audio_volume: u8,
     pub audio_use: doslet_runtime::AudioUse,
     pub memory_usage: doslet_runtime::session::MemoryUsage,
@@ -213,6 +215,7 @@ impl Doslet {
             cpu_activity: None,
             disk_activity: crate::disk_activity::Activity::new(0, 0),
             video_mode_label: "—".into(),
+            video_refresh_mhz: 0,
             audio_volume: 100,
             audio_use: doslet_runtime::AudioUse::default(),
             memory_usage: doslet_runtime::session::MemoryUsage::default(),
@@ -674,16 +677,14 @@ impl Doslet {
                 }
             }
             Message::DisplaySizing(message) => {
-                if matches!(
-                    message,
-                    SizingMessage::Filter(crate::presentation::DisplayFilter::Xbrz)
-                ) && !crate::browser_diagnostics::gpu_canvas_active()
+                if let SizingMessage::Filter(filter) = message
+                    && filter.gpu()
+                    && !crate::browser_diagnostics::gpu_canvas_active()
                 {
-                    log::warn!("xBRZ unavailable: the active renderer is Canvas2D");
-                    self.notice = Some(
-                        "xBRZ requires GPU rendering. Enable browser hardware acceleration and reload the page."
-                            .into(),
-                    );
+                    log::warn!("{filter} unavailable: the active renderer is Canvas2D");
+                    self.notice = Some(format!(
+                        "{filter} requires GPU rendering. Enable browser hardware acceleration and reload the page."
+                    ));
                     return Task::none();
                 }
                 return self
@@ -887,6 +888,7 @@ impl Doslet {
             self.video_mode_label = field(&state, "videoMode")
                 .as_string()
                 .unwrap_or_else(|| "—".into());
+            self.video_refresh_mhz = number(&state, "videoRefresh") as u32;
             self.midi_activity.observe(
                 number(&state, "nanos") as u64,
                 number(&state, "midiBytes") as u64,
