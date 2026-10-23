@@ -294,71 +294,7 @@ impl Cli {
                     spec.game.startup_keys.clear();
                 }
                 if let Some(global) = &self.global_settings {
-                    let has_hw_field = |k: &str| {
-                        document
-                            .get("machine")
-                            .and_then(Item::as_table_like)
-                            .is_some_and(|t| t.contains_key(k))
-                            || document
-                                .get("hardware")
-                                .and_then(Item::as_table_like)
-                                .is_some_and(|t| t.contains_key(k))
-                    };
-                    let target_preset = match &spec.preset {
-                        Some(id) if doslet_config::HardwarePreset::find_builtin(id).is_none() => {
-                            global.find_preset(id)
-                        }
-                        None => global.find_preset(&global.default_preset),
-                        _ => None,
-                    };
-                    if let Some(preset) = target_preset {
-                        let mut base_hw = spec.hardware;
-                        let mut base_mode = spec.cpu_mode;
-                        preset.apply_to(&mut base_hw, &mut base_mode);
-                        if !has_hw_field("cpu_mhz") && !has_hw_field("clock_hz") {
-                            spec.hardware.cpu_mhz = base_hw.cpu_mhz;
-                        }
-                        if !has_hw_field("memory_mib") {
-                            spec.hardware.memory_mib = base_hw.memory_mib;
-                        }
-                        if !has_hw_field("x87") {
-                            spec.hardware.x87 = base_hw.x87;
-                        }
-                        if !has_hw_field("sb16") && document.get("sound").is_none() {
-                            spec.hardware.sb16 = base_hw.sb16;
-                        }
-                        if !has_hw_field("mpu401") && document.get("sound").is_none() {
-                            spec.hardware.mpu401 = base_hw.mpu401;
-                        }
-                        if !has_hw_field("cpu_mode") {
-                            spec.cpu_mode = base_mode;
-                        }
-                    }
-                    let out_table = document.get("output").and_then(Item::as_table_like);
-                    if out_table.and_then(|t| t.get("video_filter")).is_none() {
-                        spec.output.video_filter = global.video_filter;
-                    }
-                    if out_table.and_then(|t| t.get("game_midi")).is_none() {
-                        spec.output.game_midi = global.game_midi.clone();
-                    }
-                    if out_table.and_then(|t| t.get("host_midi")).is_none() {
-                        spec.output.host_midi = global.host_midi.clone();
-                    }
-                    let in_table = document.get("input").and_then(Item::as_table_like);
-                    if in_table.is_none() {
-                        spec.input = global.input.clone();
-                    }
-                    if !has_hw_field("keyboard")
-                        && in_table.and_then(|t| t.get("keyboard")).is_none()
-                    {
-                        spec.hardware.keyboard = global.keyboard;
-                    }
-                    let snd_table = document.get("sound").and_then(Item::as_table_like);
-                    if !has_hw_field("gameport")
-                        && snd_table.and_then(|t| t.get("gameport")).is_none()
-                    {
-                        spec.hardware.gameport |= global.gameport;
-                    }
+                    global.fill_profile_defaults(&mut spec, &document);
                 }
                 if self.learn_speed_tiers {
                     spec.cpu_mode = Some(doslet_config::CpuMode::SpeedTiers);
@@ -418,11 +354,15 @@ impl Cli {
                     } else {
                         MidiMode::Gm
                     }),
-                    output: document
+                    output: (document
                         .get("output")
                         .and_then(Item::as_table_like)
-                        .and_then(|output| output.get("midi_output"))
-                        .map(|_| spec.output.midi_output.clone()),
+                        .is_some_and(|output| output.contains_key("midi_output"))
+                        || self
+                            .global_settings
+                            .as_ref()
+                            .is_some_and(|global| !global.midi_output.is_empty()))
+                    .then(|| spec.output.midi_output.clone()),
                     ..Profile::default()
                 };
                 if !spec.game.executable.is_empty() {
@@ -532,19 +472,20 @@ impl Cli {
             }
         } else if let Some(global) = &self.global_settings {
             let mut spec = doslet_config::MachineSpec::default();
-            if let Some(preset) = global.find_preset(&global.default_preset) {
-                preset.apply_to(&mut spec.hardware, &mut spec.cpu_mode);
-            }
-            spec.output.video_filter = global.video_filter;
-            spec.output.game_midi = global.game_midi.clone();
-            spec.output.host_midi = global.host_midi.clone();
-            spec.input = global.input.clone();
-            spec.hardware.keyboard = global.keyboard;
-            spec.hardware.gameport |= global.gameport;
+            global.fill_profile_defaults(&mut spec, &DocumentMut::new());
             self.launch.hardware = spec.hardware;
             self.launch.machine_spec = Some(spec);
         }
         if let Some(global) = &self.global_settings {
+            // Command-line options and the profile come first.
+            if !self.no_audio {
+                if self.midi_output.is_none() && !global.midi_output.is_empty() {
+                    self.midi_output = Some(global.midi_output.clone());
+                }
+                if self.mt32_rom_dir.is_none() {
+                    self.mt32_rom_dir = global.mt32_rom_dir.as_ref().map(PathBuf::from);
+                }
+            }
             if self.midi_mode.is_none() {
                 self.midi_mode = Some(if global.game_midi.eq_ignore_ascii_case("mt32") {
                     MidiMode::Mt32
@@ -1113,6 +1054,40 @@ pub(crate) mod tests {
         let spec = cli.launch.machine_spec.unwrap();
         assert_eq!(spec.input.mouse_mode, doslet_config::MouseMode::NoCapture);
         assert!(spec.input.hide_cursor);
+    }
+
+    #[test]
+    fn profile_settings_override_global_defaults_one_key_at_a_time() {
+        let fixture = Fixture::new(
+            "version=2\n[game]\nexecutable='../TINY.EXE'\n[input]\nhide_cursor=true\ngameport=false\n[output]\naudio=false\n",
+        );
+        let mut global = crate::global_settings::GlobalSettings {
+            gameport: true,
+            midi_output: "global port".into(),
+            ..Default::default()
+        };
+        global.input.mouse_mode = doslet_config::MouseMode::Capture;
+        let mut cli = fixture.cli(&[]);
+        cli.global_settings = Some(global.clone());
+        let cli = cli.resolve_with_roms(|| None).unwrap();
+        // A global MIDI port no longer re-enables audio the profile turned off.
+        assert!(cli.no_audio);
+        let spec = cli.launch.machine_spec.unwrap();
+        assert_eq!(spec.input.mouse_mode, doslet_config::MouseMode::Capture);
+        assert!(spec.input.hide_cursor && !spec.hardware.gameport);
+
+        let fixture = Fixture::new(
+            "version=2\n[game]\nexecutable='../TINY.EXE'\n[output]\nmidi_output='rust'\n",
+        );
+        let mut cli = fixture.cli(&[]);
+        cli.global_settings = Some(global.clone());
+        let cli = cli.resolve_with_roms(|| None).unwrap();
+        assert_eq!(cli.midi_output.as_deref(), Some("rust"));
+        let fixture = Fixture::new("version=2\n[game]\nexecutable='../TINY.EXE'\n");
+        let mut cli = fixture.cli(&[]);
+        cli.global_settings = Some(global);
+        let cli = cli.resolve_with_roms(|| None).unwrap();
+        assert_eq!(cli.midi_output.as_deref(), Some("global port"));
     }
 
     #[test]

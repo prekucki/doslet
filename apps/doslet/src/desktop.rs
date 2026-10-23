@@ -17,6 +17,12 @@ use crate::wakeup;
 const COMMAND_CAPACITY: usize = 256;
 const REFRESH: Duration = Duration::from_millis(16);
 
+/// Time between published pictures under `output.frame_limit`, or `None` for
+/// the default [`REFRESH`] cap. Guest timing never depends on it.
+fn publish_interval(frame_limit: u16) -> Option<Duration> {
+    (frame_limit != 0).then(|| Duration::from_secs(1) / u32::from(frame_limit))
+}
+
 pub struct Registers {
     pub cs: u16,
     pub ip: u32,
@@ -176,6 +182,33 @@ mod tests {
             s.session.steps() == 0 && s.session.status() == SessionStatus::Ready
         });
         drop(worker); // Joins the owner and drops its resources on that thread.
+    }
+
+    #[test]
+    fn frame_limit_caps_published_pictures_without_slowing_the_guest() {
+        let (worker, _) = Worker::spawn_with(|| {
+            let mut engine = Box::new(crate::app::Doslet::new());
+            engine.session = doslet_runtime::Session::new(&[0x40, 0xEB, 0xFD])
+                .unwrap()
+                .into();
+            engine.configurator.active.output.frame_limit = 20;
+            engine.session.start();
+            Ok(engine)
+        })
+        .unwrap();
+        let start = Instant::now();
+        let (mut packets, mut steps) = (0, 0);
+        while start.elapsed() < Duration::from_millis(500) {
+            // The UI asks for a picture as often as it can.
+            worker.request.store(true, Ordering::Release);
+            if let Some(packet) = worker.mailbox.take() {
+                packets += 1;
+                steps = packet.snapshot.session.steps();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!((1..=12).contains(&packets), "{packets} pictures in 500 ms");
+        assert!(steps > 0);
     }
 
     #[test]
@@ -868,6 +901,8 @@ impl Worker {
                 let mut config_dirty = false;
                 let mut sequence = 0;
                 let mut last_publish = std::time::Instant::now();
+                // With a frame limit, pictures leave on an even schedule.
+                let mut next_publish = last_publish;
                 while !stopping.load(Ordering::Acquire) {
                     let overflow = overflowed.swap(false, Ordering::AcqRel);
                     // Coalesced pointer input comes before the queued buttons.
@@ -929,8 +964,17 @@ impl Worker {
                         refresh.store(true, Ordering::Release);
                         config_dirty = true;
                     }
-                    if refresh.load(Ordering::Acquire) && last_publish.elapsed() >= REFRESH {
+                    let interval = publish_interval(engine.configurator.active.output.frame_limit);
+                    let now = std::time::Instant::now();
+                    let due = match interval {
+                        Some(_) => now >= next_publish,
+                        None => now >= last_publish + REFRESH,
+                    };
+                    if refresh.load(Ordering::Acquire) && due {
                         refresh.store(false, Ordering::Release);
+                        if let Some(interval) = interval {
+                            next_publish = (next_publish + interval).max(now + interval / 2);
+                        }
                         output.publish(Packet {
                             snapshot: engine.snapshot(config_dirty),
                             effects: std::mem::take(&mut effects),
@@ -941,7 +985,11 @@ impl Worker {
                         wake.notify();
                     }
                     // Pace idle/caught-up execution, but let input wake the worker early.
-                    let wait = engine.worker_delay(progressed);
+                    let mut wait = engine.worker_delay(progressed);
+                    if refresh.load(Ordering::Acquire) {
+                        let deadline = interval.map_or(last_publish + REFRESH, |_| next_publish);
+                        wait = wait.min(deadline.saturating_duration_since(now));
+                    }
                     match receiver.recv_timeout(wait) {
                         Ok(Command {
                             message: Message::Tick,
@@ -1036,8 +1084,13 @@ impl std::ops::Deref for Doslet {
 }
 impl Doslet {
     pub fn from_cli(cli: crate::cli::Cli) -> Result<Box<Self>, Box<dyn std::error::Error>> {
+        let global = cli.global_settings.clone();
         let (worker, state) = Worker::spawn(cli)?;
-        Ok(Self::from_worker(worker, state))
+        let mut frontend = Self::from_worker(worker, state);
+        if let Some(global) = &global {
+            frontend.display_sizing.apply_settings(global);
+        }
+        Ok(frontend)
     }
     /// A frontend for an engine built by `boot` on its emulation thread.
     #[cfg(test)]
@@ -1050,7 +1103,8 @@ impl Doslet {
     fn from_worker(worker: Worker, mut state: Snapshot) -> Box<Self> {
         let configurator = state.configurator.take().unwrap();
         let mut display_sizing = DisplaySizing::default();
-        display_sizing.filter = configurator.active.output.video_filter.into();
+        display_sizing.gpu = crate::presentation::hardware_gpu();
+        display_sizing.set_output(&configurator.active.output);
         Box::new(Self {
             disk_activity: crate::disk_activity::Activity::new(
                 state.disk_reads.0,
@@ -1105,8 +1159,8 @@ impl Doslet {
                     }
                     self.configurator = configurator;
                     if self.configurator.active.output.video_filter != previous_filter {
-                        self.display_sizing.filter =
-                            self.configurator.active.output.video_filter.into();
+                        self.display_sizing
+                            .set_output(&self.configurator.active.output);
                     }
                 }
                 self.state = packet.snapshot;

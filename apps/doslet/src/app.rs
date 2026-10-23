@@ -333,7 +333,7 @@ impl Doslet {
         app.audio_deferred = !cli.no_audio;
         if let Some(global) = &cli.global_settings {
             app.audio_volume = global.audio_volume.min(100);
-            app.display_sizing.pixel_perfect = global.scaling.eq_ignore_ascii_case("pixel-perfect");
+            app.display_sizing.apply_settings(global);
         }
         app.gamepads = Some(crate::native_gamepad::NativeGamepads::new());
         app.midi_mode = cli.midi_mode.unwrap_or_default().into();
@@ -378,7 +378,8 @@ impl Doslet {
         machine_spec.output.midi_output = cli.midi_output.clone().unwrap_or_else(|| "rust".into());
         // The settings show the host in effect, including a --dpmi choice.
         machine_spec.dpmi = Some(crate::native_input::dpmi_host(app.launch.dpmi));
-        app.display_sizing.filter = machine_spec.output.video_filter.into();
+        app.display_sizing.gpu = crate::presentation::hardware_gpu();
+        app.display_sizing.set_output(&machine_spec.output);
         app.configurator.set_active(machine_spec);
         if cli.game.is_none() && cli.load_state.is_none() {
             app.init_demo_session()?;
@@ -1605,8 +1606,8 @@ impl Doslet {
                             candidate.spec.name.clone()
                         };
                         self.configurator.set_active(candidate.spec);
-                        self.display_sizing.filter =
-                            self.configurator.active.output.video_filter.into();
+                        self.display_sizing
+                            .set_output(&self.configurator.active.output);
                         self.configurator.open = false;
                         self.workspace.panel = None;
                         self.configurator.message = Some("Machine applied and restarted.".into());

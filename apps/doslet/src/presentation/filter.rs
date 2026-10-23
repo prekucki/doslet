@@ -22,11 +22,9 @@ impl DisplayFilter {
         Self::Ravu,
     ];
 
-    /// Drawn by a GPU shader from the guest-sized frame; the browser checks
-    /// that the page did not fall back to Canvas2D.
-    #[cfg(target_arch = "wasm32")]
-    pub fn gpu(self) -> bool {
-        matches!(self, Self::Xbrz | Self::Ravu)
+    /// Too costly without a hardware GPU; see `VideoFilter::needs_gpu`.
+    pub fn needs_gpu(self) -> bool {
+        !matches!(self, Self::Nearest | Self::SharpBilinear)
     }
 
     pub fn sampling(self) -> FilterMethod {
@@ -44,8 +42,32 @@ impl From<doslet_config::VideoFilter> for DisplayFilter {
             doslet_config::VideoFilter::Nearest => Self::Nearest,
             doslet_config::VideoFilter::SharpBilinear => Self::SharpBilinear,
             doslet_config::VideoFilter::Hq2x => Self::Hq2x,
+            doslet_config::VideoFilter::Xbrz => Self::Xbrz,
+            doslet_config::VideoFilter::Ravu => Self::Ravu,
         }
     }
+}
+
+/// Whether the host has a hardware GPU rather than only a software adapter
+/// such as llvmpipe; without one only simple filters run. Probed once;
+/// `DOSLET_GPU_FILTERS=0` or `=1` overrides it.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn hardware_gpu() -> bool {
+    static GPU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GPU.get_or_init(|| {
+        if let Some(value) = std::env::var_os("DOSLET_GPU_FILTERS") {
+            return value != "0";
+        }
+        use iced::wgpu;
+        let gpu = wgpu::Instance::default()
+            .enumerate_adapters(wgpu::Backends::all())
+            .iter()
+            .any(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu);
+        if !gpu {
+            eprintln!("[INFO doslet] No hardware GPU; only simple filters run");
+        }
+        gpu
+    })
 }
 
 impl std::fmt::Display for DisplayFilter {
@@ -294,5 +316,15 @@ mod tests {
         cache.refresh(Some(&source), DisplayFilter::Hq2x, target);
         cache.refresh(None, DisplayFilter::Hq2x, None);
         assert!(cache.image().is_none());
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod gpu_probe_tests {
+    /// `cargo test -p doslet --bin doslet hardware_gpu_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "enumerates the host's wgpu adapters"]
+    fn hardware_gpu_probe() {
+        println!("hardware GPU: {}", super::hardware_gpu());
     }
 }

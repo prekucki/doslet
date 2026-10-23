@@ -354,10 +354,12 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
             &[
                 "audio",
                 "video_filter",
+                "video_filter_fallback",
                 "game_midi",
                 "host_midi",
                 "midi_output",
                 "rom_binding",
+                "frame_limit",
             ],
             "output.",
         )?;
@@ -366,6 +368,12 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
         }
         if let Some(v) = string(o, "video_filter")? {
             spec.output.video_filter = v.parse::<VideoFilter>()?;
+        }
+        if let Some(v) = string(o, "video_filter_fallback")? {
+            spec.output.video_filter_fallback =
+                Some(v.parse::<VideoFilter>().map_err(
+                    |_| "output.video_filter_fallback must be nearest or sharp-bilinear",
+                )?);
         }
         if let Some(v) = string(o, "game_midi")? {
             spec.output.game_midi = v;
@@ -377,6 +385,12 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
             spec.output.midi_output = v;
         }
         spec.output.rom_binding = string(o, "rom_binding")?;
+        if let Some(v) = o.get("frame_limit") {
+            spec.output.frame_limit = v
+                .as_integer()
+                .and_then(|v| u16::try_from(v).ok())
+                .ok_or("output.frame_limit must be an integer")?;
+        }
     }
     if let Some(info) = section(t, "info")? {
         spec.info = game_info(info)?;
@@ -722,11 +736,17 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
     }
     d["output"]["audio"] = value(spec.output.audio);
     d["output"]["video_filter"] = value(spec.output.video_filter.as_str());
+    if let Some(fallback) = spec.output.video_filter_fallback {
+        d["output"]["video_filter_fallback"] = value(fallback.as_str());
+    }
     d["output"]["game_midi"] = value(&spec.output.game_midi);
     d["output"]["host_midi"] = value(&spec.output.host_midi);
     d["output"]["midi_output"] = value(&spec.output.midi_output);
     if let Some(v) = &spec.output.rom_binding {
         d["output"]["rom_binding"] = value(v);
+    }
+    if spec.output.frame_limit != 0 {
+        d["output"]["frame_limit"] = value(i64::from(spec.output.frame_limit));
     }
     d["game"]["executable"] = value(&spec.game.executable);
     d["game"]["working_directory"] = value(&spec.game.working_directory);
@@ -835,11 +855,7 @@ mod tests {
     use super::*;
     #[test]
     fn video_filter_round_trips_and_rejects_unknown_values() {
-        for filter in [
-            VideoFilter::Nearest,
-            VideoFilter::SharpBilinear,
-            VideoFilter::Hq2x,
-        ] {
+        for filter in VideoFilter::ALL {
             let profile = format!("version=2\n[output]\nvideo_filter='{}'\n", filter.as_str());
             let spec = parse_machine_profile(&profile).unwrap();
             assert_eq!(spec.output.video_filter, filter);
@@ -863,6 +879,22 @@ mod tests {
                 parse_machine_profile(&format!("version=2\n[output]\nvideo_filter={value}"))
                     .is_err()
             );
+        }
+        let spec = parse_machine_profile(
+            "version=2\n[output]\nvideo_filter='ravu'\nvideo_filter_fallback='nearest'\n",
+        )
+        .unwrap();
+        assert_eq!(spec.output.filter(true), VideoFilter::Ravu);
+        assert_eq!(spec.output.filter(false), VideoFilter::Nearest);
+        let reloaded = parse_machine_profile(&export_machine_profile(&spec)).unwrap();
+        assert_eq!(reloaded.output, spec.output);
+        // Without a fallback Sharp Bilinear stands in, also for CPU HQ2x.
+        for filter in ["xbrz", "hq2x"] {
+            let profile = format!("version=2\n[output]\nvideo_filter='{filter}'\n");
+            let spec = parse_machine_profile(&profile).unwrap();
+            assert_eq!(spec.output.filter(false), VideoFilter::SharpBilinear);
+            let profile = format!("version=2\n[output]\nvideo_filter_fallback='{filter}'\n");
+            assert!(parse_machine_profile(&profile).is_err());
         }
     }
     #[test]
