@@ -746,6 +746,33 @@ fn fistp_writes_each_integer_width_and_unmasked_invalid_does_not_store_or_pop() 
     assert_eq!(&bus.ram[0x200..0x202], &[0xAA; 2]);
     assert_eq!(cpu.fpu.as_ref().unwrap().st0(), Ok(32768.0));
 }
+#[test]
+fn int3_and_into_enter_their_real_mode_vectors() {
+    let mut bus = TestBus::new(&[]);
+    bus.ram[0x10000..0x10003].copy_from_slice(&[0xCC, 0xCE, 0xCE]); // INT3; INTO; INTO.
+    for (vector, handler) in [(3u32, 0x0100u16), (4, 0x0200)] {
+        bus.write_u16(vector * 4, handler).unwrap();
+        bus.write_u16(vector * 4 + 2, 0).unwrap();
+    }
+    let mut cpu = Cpu::default();
+    cpu.registers.cs = 0x1000;
+    cpu.registers.ss = 0x300;
+    cpu.registers.set(Gpr16::Sp, 0x100);
+    cpu.step(&mut bus).unwrap();
+    assert_eq!((cpu.registers.cs, cpu.registers.ip), (0, 0x0100));
+    assert_eq!(bus.read_u16(0x30FA).unwrap(), 1); // Return IP after INT3.
+    // Return; INTO without OF continues, with OF enters vector 4.
+    cpu.registers.cs = 0x1000;
+    cpu.registers.ip = 1;
+    cpu.registers.set(Gpr16::Sp, 0x100);
+    cpu.step(&mut bus).unwrap();
+    assert_eq!((cpu.registers.cs, cpu.registers.ip), (0x1000, 2));
+    cpu.flags |= flags::OVERFLOW;
+    cpu.step(&mut bus).unwrap();
+    assert_eq!((cpu.registers.cs, cpu.registers.ip), (0, 0x0200));
+    assert_eq!(bus.read_u16(0x30FA).unwrap(), 3);
+}
+
 impl TestBus {
     fn new(code: &[u8]) -> Self {
         let mut ram = vec![0; 1024 * 1024].into_boxed_slice();

@@ -234,7 +234,8 @@ arithmetic for comparisons. See the [x87 performance report](compatibility/x87-p
 Dword ENTER builds bounded nested stack frames and BSF/BSR support both operand
 widths, including their defined zero flag. BT/BTS/BTR/BTC take an immediate or a
 register bit offset. With a memory operand, a register offset is signed and may
-select another word or dword than the addressed one.
+select another word or dword than the addressed one. INT3 and INTO enter
+vectors 3 and 4 like INT n; INTO only with OF set.
 
 CPU segment translation produces an unmasked linear address; machine A20 wiring
 controls address bit 20. The default PC has 16 MiB of RAM, with A20 initially
@@ -673,8 +674,29 @@ and PRN) are not open. Because files are numbered up to 100, PSP:32h/34h
 describe a 101-entry JFT at 0080:0070, as after INT 21h/67h. The PSP's own 20
 entries at 18h are kept equal for older readers. States saved before these
 tables existed restore without them.
-The runtime still owns one process; EXEC/AL=00, child-process restoration and
-handle inheritance remain unsupported.
+EXEC/AL=00 (4B00h) runs a child process while its parent waits inside that
+INT 21h, up to four nested levels. The child is a COM or MZ program from C:,
+or the DOS stub of an LE/LX program, loaded into the largest free block. The
+child's PSP gets:
+
+- the caller's command tail and FCBs;
+- a copy of the environment the caller names, or of the parent's, with the
+  program's full path appended;
+- the parent's PSP and the INT 22h–24h vectors;
+- a 20-entry JFT in its own PSP. Handles past 19 work but are not recorded
+  there.
+
+The child inherits its parent's handles except those opened with bit 7 of the
+open mode set (no inheritance). Closing an inherited handle leaves the parent's
+open. A child terminates through 4Ch, INT 20h or the divide-error abort, which
+closes the files only it used, frees every block it owned and restores INT
+22h–24h. Its parent then resumes with CF clear, and 4Dh returns the exit code
+once. If the child entered the DPMI host, the host forgets that client, so a
+later program can enter again. A protected-mode 4Ch takes the same path. 4Bh
+AL=01h (load without running), the INT 22h–24h handlers themselves and 31h
+(keep resident) are not implemented. EXEC from a protected-mode client with a
+zero environment segment reads a selector at PSP:2Ch, so such callers must
+pass a segment.
 
 The native desktop and headless runners optionally accept GDB remote TCP
 connections through `--gdb IP:PORT`. Desktop also has a Session-panel toggle;
@@ -762,8 +784,10 @@ reports no IPX driver (AL=00h).
 Further DOS services for DJGPP programs:
 
 - INT 21h/60h (TRUENAME) qualifies a path lexically, without requiring the file:
-  `c:dir/../x` becomes `C:\X`. Wildcards, other drives and names over the
-  128-byte buffer return error 3.
+  `c:dir/../x` becomes `C:\X`. In the last component, `*` fills the rest of
+  its 8.3 field with `?`, as in DOS: `*.pak` becomes `C:\DIR\????????.PAK`.
+  Wildcards in directories, other drives and names over the 128-byte buffer
+  return error 3.
 - IOCTL 4409h reports C: as local (DX=0000h) and an MSCDEX drive as remote
   (bit 12). Other drives return error 0Fh.
 - 5D06h has no swappable data area to return and fails with error 1.
@@ -800,7 +824,13 @@ INT 1Ch user hook and sends PIC EOI through guest instructions while preserving
 AX. IRQs 2–15, apart from IRQ 12, whose vector holds the mouse driver's wrapper,
 start at default handlers in guest code. These send EOI (also to the slave PIC
 for IRQs 8–15) and return, as a BIOS's do. An unclaimed IRQ therefore never
-runs vector 0000:0000. Modified shims execute as guest code. INT 1Ah/AH=02h reads hours, minutes,
+runs vector 0000:0000. Vectors 1–7 return at once. Vector 0 is DOS's
+divide-error handler: it prints "Divide overflow" and ends the program with
+code 0, as MS-DOS aborts through the default INT 23h. A divide error changes
+nothing but IP, so the CPU delivers it as interrupt 0 in every mode, even
+without precise faults: through the IVT, or through the IDT in protected mode.
+A program's own INT 0 handler, such as Turbo Pascal's runtime error 200,
+therefore runs. Modified shims execute as guest code. INT 1Ah/AH=02h reads hours, minutes,
 seconds and the daylight-saving flag from the installed CMOS registers, returning
 CF set while its update-in-progress bit is set. The initial clock uses BCD and
 24-hour format; RTC ticking and format conversion remain pending.

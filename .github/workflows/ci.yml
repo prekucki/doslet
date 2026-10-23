@@ -60,7 +60,8 @@ jobs:
           cargo fmt --check
           cargo fmt --manifest-path tools/v86-build/Cargo.toml --check
 
-      - name: Install native audio build dependencies
+      - name: Install native build dependencies
+        # ALSA for cpal and midir; libudev for gilrs gamepad discovery.
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libudev-dev pkg-config clang

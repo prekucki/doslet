@@ -3,8 +3,8 @@ use super::*;
 use doslet_state::InvalidState;
 use prost::Message;
 
-/// Version 4 adds the DPMI host's records.
-const VERSION: u32 = 4;
+/// Version 4 adds the DPMI host's records; version 5, DOS processes.
+const VERSION: u32 = 5;
 const MODEL: u32 = 1;
 const MAX_BYTES: usize = 1024 * 1024 * 1024;
 

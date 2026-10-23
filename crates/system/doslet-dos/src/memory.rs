@@ -167,6 +167,33 @@ impl MemoryArena {
         }
         Ok(())
     }
+    /// The largest free block, in paragraphs.
+    pub fn largest_free(&self) -> u16 {
+        self.blocks[..self.len]
+            .iter()
+            .filter(|block| block.owner == 0)
+            .map(|block| block.paragraphs)
+            .max()
+            .unwrap_or(0)
+    }
+    /// Hand an allocated block to another owner, as EXEC does for a child.
+    pub fn set_owner(&mut self, segment: u16, owner: u16) -> Result<(), MemoryFailure> {
+        let index = self.find(segment)?;
+        self.blocks[index].owner = owner;
+        Ok(())
+    }
+    /// Free every block of a terminated process.
+    pub fn free_owned(&mut self, owner: u16) {
+        let mut index = 0;
+        while owner != 0 && index < self.len {
+            if self.blocks[index].owner == owner {
+                let _ = self.free(self.blocks[index].segment);
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+    }
     pub fn first_mcb(&self) -> u16 {
         self.blocks[0].segment - 1
     }
@@ -179,6 +206,23 @@ impl MemoryArena {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_terminated_process_releases_every_block_it_owns() {
+        let mut arena = MemoryArena::new(0x1000, 0x1100, 0xA000);
+        let largest = arena.largest_free();
+        assert_eq!(largest, 0xA000 - 0x1100 - 1);
+        let environment = arena.allocate(4, 0x1000).unwrap();
+        let child = arena.allocate(arena.largest_free(), 0x1000).unwrap();
+        arena.resize(child, 0x200).unwrap();
+        arena.set_owner(environment, child).unwrap();
+        arena.set_owner(child, child).unwrap();
+        let extra = arena.allocate(0x10, child).unwrap();
+        assert!(extra > child);
+        arena.free_owned(child);
+        assert_eq!(arena.largest_free(), largest);
+        assert_eq!(arena.stats().allocated_blocks, 1);
+        assert!(arena.set_owner(child, 0x1000).is_err());
+    }
     #[test]
     fn stats_follow_allocations_frees_and_mcb_overhead() {
         let mut arena = MemoryArena::new(0x1000, 0x2000, 0xA000);

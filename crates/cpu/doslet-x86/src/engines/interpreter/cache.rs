@@ -2509,6 +2509,8 @@ impl Instruction {
             dword: false,
             width: 1,
             branch32: code32,
+            // A patched disp32 updates the prepared displacement in place;
+            // no 387 form has an immediate.
             disp32_offset: r.disp32_offset,
             imm32_offset: r.imm32_offset,
             operation: Operation::X87 { x87, target },

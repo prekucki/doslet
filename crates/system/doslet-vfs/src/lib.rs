@@ -3,6 +3,8 @@
 extern crate alloc;
 use doslet_storage::StorageError;
 pub const HANDLE_COUNT: usize = 96;
+/// Nested DOS EXEC levels whose parents keep their handles.
+pub const MAX_PROCESS_DEPTH: usize = 4;
 pub const NAME_BYTES: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MountId(pub u8);
@@ -86,15 +88,21 @@ pub struct OpenFile {
     pub mode: u8,
 }
 /// DOS handle aliases point to one open description, including its shared offset.
+/// Each process has its own handles; a child's start as its parent's
+/// inheritable ones, and the parents' wait on a stack while it runs.
 pub struct HandleTable {
     handles: [Option<u8>; HANDLE_COUNT],
     descriptions: [Option<OpenFile>; HANDLE_COUNT],
+    parents: [[Option<u8>; HANDLE_COUNT]; MAX_PROCESS_DEPTH],
+    depth: usize,
 }
 impl Default for HandleTable {
     fn default() -> Self {
         Self {
             handles: [None; HANDLE_COUNT],
             descriptions: [None; HANDLE_COUNT],
+            parents: [[None; HANDLE_COUNT]; MAX_PROCESS_DEPTH],
+            depth: 0,
         }
     }
 }
@@ -131,20 +139,65 @@ impl HandleTable {
     pub fn description(&self, index: usize) -> Option<&OpenFile> {
         self.descriptions.get(index)?.as_ref()
     }
-    /// Handles sharing one open description.
+    /// Handles of every process sharing one open description.
     pub fn references(&self, index: usize) -> u16 {
-        self.handles
-            .iter()
+        core::iter::once(&self.handles)
+            .chain(&self.parents[..self.depth])
+            .flatten()
             .filter(|desc| desc.map(usize::from) == Some(index))
             .count() as u16
+    }
+    fn referenced(&self, desc: u8) -> bool {
+        core::iter::once(&self.handles)
+            .chain(&self.parents[..self.depth])
+            .any(|handles| handles.contains(&Some(desc)))
     }
     pub fn close(&mut self, handle: u16) -> Result<(), u16> {
         let slot = handle.checked_sub(5).ok_or(6u16)? as usize;
         let desc = self.handles.get_mut(slot).ok_or(6u16)?.take().ok_or(6u16)?;
-        if !self.handles.contains(&Some(desc)) {
+        if !self.referenced(desc) {
             self.descriptions[desc as usize] = None;
         }
         Ok(())
+    }
+    /// Processes waiting for a child, outermost first.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+    /// EXEC: the parent's handles wait, and the child gets the inheritable
+    /// ones; open mode bit 7 marks the others. Error 8 past the depth limit.
+    pub fn begin_child(&mut self) -> Result<(), u16> {
+        if self.depth == MAX_PROCESS_DEPTH {
+            return Err(8);
+        }
+        self.parents[self.depth] = self.handles;
+        self.depth += 1;
+        for slot in &mut self.handles {
+            if slot.is_some_and(|desc| {
+                self.descriptions[usize::from(desc)].is_some_and(|file| file.mode & 0x80 != 0)
+            }) {
+                *slot = None;
+            }
+        }
+        Ok(())
+    }
+    /// The child terminated: its handles close and the parent's return.
+    /// `closed` receives each open description no process uses any more.
+    pub fn end_child(&mut self, mut closed: impl FnMut(OpenFile)) {
+        if self.depth == 0 {
+            return;
+        }
+        let child = self.handles;
+        self.depth -= 1;
+        self.handles = self.parents[self.depth];
+        self.parents[self.depth] = [None; HANDLE_COUNT];
+        for desc in child.into_iter().flatten() {
+            if !self.referenced(desc)
+                && let Some(file) = self.descriptions[usize::from(desc)].take()
+            {
+                closed(file);
+            }
+        }
     }
     pub fn duplicate(&mut self, handle: u16) -> Result<u16, u16> {
         self.get(handle)?;
@@ -172,6 +225,8 @@ impl HandleTable {
     pub fn clear(&mut self) {
         self.handles.fill(None);
         self.descriptions.fill(None);
+        self.parents = [[None; HANDLE_COUNT]; MAX_PROCESS_DEPTH];
+        self.depth = 0;
     }
     pub fn any_open(&self, mount: MountId, node: NodeId) -> bool {
         self.descriptions
@@ -209,6 +264,62 @@ mod tests {
         assert_eq!(handles.get(d), Err(6));
         assert_eq!(handles.description(index), None);
         assert_eq!(handles.description_index(d), None);
+    }
+
+    #[test]
+    fn children_inherit_handles_and_close_only_their_own() {
+        let file = |node, mode| OpenFile {
+            mount: MountId(0),
+            node: NodeId(node),
+            position: 0,
+            mode,
+        };
+        let mut handles = HandleTable::default();
+        let shared = handles.open(file(1, 0)).unwrap();
+        let private = handles.open(file(2, 0x80)).unwrap();
+        let index = handles.description_index(shared).unwrap();
+        handles.begin_child().unwrap();
+        assert_eq!(handles.depth(), 1);
+        assert_eq!(handles.get(private), Err(6));
+        assert_eq!(handles.references(index), 2);
+        // The child's own file takes the free slot; closing the inherited
+        // handle leaves the parent's open.
+        assert_eq!(handles.open(file(3, 0)).unwrap(), private);
+        handles.close(shared).unwrap();
+        assert_eq!(handles.references(index), 1);
+        assert!(handles.description(index).is_some());
+        let mut closed = alloc::vec::Vec::new();
+        handles.end_child(|file| closed.push(file.node));
+        assert_eq!(closed, [NodeId(3)]);
+        assert_eq!(handles.depth(), 0);
+        assert_eq!(handles.get(shared).unwrap().node, NodeId(1));
+        assert_eq!(handles.get(private).unwrap().node, NodeId(2));
+        for _ in 0..MAX_PROCESS_DEPTH {
+            handles.begin_child().unwrap();
+        }
+        assert_eq!(handles.begin_child(), Err(8));
+    }
+
+    #[cfg(feature = "save-state")]
+    #[test]
+    fn waiting_parents_survive_portable_states() {
+        use doslet_state::State;
+        let mut handles = HandleTable::default();
+        let parent = handles
+            .open(OpenFile {
+                mount: MountId(0),
+                node: NodeId(7),
+                position: 3,
+                mode: 0,
+            })
+            .unwrap();
+        handles.begin_child().unwrap();
+        handles.close(parent).unwrap();
+        let mut restored = HandleTable::load(handles.save()).unwrap();
+        assert_eq!(restored.depth(), 1);
+        assert_eq!(restored.get(parent), Err(6));
+        restored.end_child(|_| panic!("the parent still uses its file"));
+        assert_eq!(restored.get(parent).unwrap().position, 3);
     }
 }
 

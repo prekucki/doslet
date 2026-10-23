@@ -112,12 +112,13 @@ pub fn install<B: MemoryBus>(bus: &mut B, psp: u16) -> Result<(), BusError> {
             ..SftEntry::default()
         },
     )?;
+    let base = real_address(psp, 0);
+    bus.write_u16(base + 0x32, JFT_SIZE)?;
+    write_far(bus, base + 0x34, (SEGMENT, JFT))?;
     for handle in 0..JFT_SIZE {
         set_handle(bus, psp, handle, (handle < 3).then_some(0))?;
     }
-    let base = real_address(psp, 0);
-    bus.write_u16(base + 0x32, JFT_SIZE)?;
-    write_far(bus, base + 0x34, (SEGMENT, JFT))
+    Ok(())
 }
 
 /// List of Lists fields fixed only after launch setup.
@@ -130,19 +131,38 @@ pub fn set_system<B: MemoryBus>(
     bus.write_u8(address(LIST_OF_LISTS + 0x21), lastdrive)
 }
 
-/// Point a handle at an SFT entry, or mark it closed. The PSP's own 20
-/// entries are kept too, for readers that predate the JFT pointer.
+/// Point a handle of the process at `psp` at an SFT entry, or mark it
+/// closed, in the JFT its PSP names at 32h/34h. The root process's JFT lies
+/// in the kernel data, and its PSP's own 20 entries are kept too, for readers
+/// that predate the pointer. Handles past a JFT's size are not recorded.
 pub fn set_handle<B: MemoryBus>(
     bus: &mut B,
     psp: u16,
     handle: u16,
     entry: Option<usize>,
 ) -> Result<(), BusError> {
-    assert!(handle < JFT_SIZE && entry.is_none_or(|entry| entry < SFT_ENTRIES));
+    assert!(entry.is_none_or(|entry| entry < SFT_ENTRIES));
     let value = entry.map_or(CLOSED, |entry| entry as u8);
-    bus.write_u8(address(JFT + handle), value)?;
-    if handle < PSP_JFT_SIZE {
+    let base = real_address(psp, 0);
+    let size = bus.read_u16(base + 0x32)?;
+    let (offset, segment) = (bus.read_u16(base + 0x34)?, bus.read_u16(base + 0x36)?);
+    if handle < size {
+        bus.write_u8(real_address(segment, offset.wrapping_add(handle)), value)?;
+    }
+    if (segment, offset) != (psp, 0x18) && handle < PSP_JFT_SIZE {
         bus.write_u8(real_address(psp, 0x18 + handle), value)?;
+    }
+    Ok(())
+}
+
+/// A child process's JFT: the 20 entries in its own PSP, with CON on
+/// handles 0-2 and everything else closed until its handles are published.
+pub fn install_child<B: MemoryBus>(bus: &mut B, psp: u16) -> Result<(), BusError> {
+    let base = real_address(psp, 0);
+    bus.write_u16(base + 0x32, PSP_JFT_SIZE)?;
+    write_far(bus, base + 0x34, (psp, 0x18))?;
+    for handle in 0..u32::from(PSP_JFT_SIZE) {
+        bus.write_u8(base + 0x18 + handle, if handle < 3 { 0 } else { CLOSED })?;
     }
     Ok(())
 }

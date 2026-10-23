@@ -1609,6 +1609,12 @@ impl Cpu {
                 let vector = decode::fetch(&mut self.registers, bus)?;
                 self.interrupt(bus, vector)?;
             }
+            0xCC => self.interrupt(bus, 3)?,
+            0xCE => {
+                if self.flags & flags::OVERFLOW != 0 {
+                    self.interrupt(bus, 4)?;
+                }
+            }
             0xCF => {
                 self.registers.ip = u32::from(self.pop(bus)?);
                 let selector = self.pop(bus)?;
