@@ -639,29 +639,45 @@ fn display_panel(app: &Doslet) -> Element<'_, Message> {
     panel
         .push(field(
             "Filter",
-            pick_list(
-                DisplayFilter::ALL,
-                Some(app.display_sizing.filter),
-                |filter| Message::DisplaySizing(SizingMessage::Filter(filter)),
-            )
-            .padding(8)
-            .text_size(14)
-            .width(Fill)
-            .into(),
+            if perfect {
+                // Pixel perfect only enlarges whole pixels.
+                text("None in pixel perfect").size(14).color(MUTED).into()
+            } else {
+                pick_list(
+                    DisplayFilter::ALL,
+                    Some(app.display_sizing.filter),
+                    |filter| Message::DisplaySizing(SizingMessage::Filter(filter)),
+                )
+                .padding(8)
+                .text_size(14)
+                .width(Fill)
+                .into()
+            },
         ))
         .push(
             text(if perfect {
-                "Pixel perfect shows whole pixels at the original proportions, so the \
-             screen shape is not used. Choose Fit window to change it."
+                "Pixel perfect only enlarges whole pixels at the original proportions: no \
+             filter and no screen shape. Choose Fit window to use them."
+                    .to_owned()
+            } else if app.display_sizing.filter.needs_gpu() && !app.display_sizing.gpu {
+                format!(
+                    "No hardware GPU: {} is shown instead of {}.",
+                    app.display_sizing.active_filter(),
+                    app.display_sizing.filter
+                )
             } else {
                 match shape {
                     ScreenShape::Standard => "4:3 is the proportion of a CRT monitor.",
                     ScreenShape::Wide => "16:9 stretches the whole picture evenly.",
+                    ScreenShape::Stretch if !app.display_sizing.gpu => {
+                        "16:9 smart needs a hardware GPU; the picture is stretched evenly."
+                    }
                     ScreenShape::Stretch => {
                         "16:9 smart keeps the centre near 4:3 and stretches only the \
                      edges. The mouse follows the picture."
                     }
                 }
+                .to_owned()
             })
             .size(12)
             .color(MUTED),

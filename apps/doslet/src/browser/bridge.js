@@ -277,7 +277,8 @@ export class Browser {
             if (saves) fields.seedBuffer = saves;
             await this.call('apply-machine',fields,saves ? [saves] : []);
             this.bundleSession = {program,tierProfile,aot,bundleRuntime:!!bundle.bundleRuntime,startupKeys};
-            if (bundle.displayFilter) this.events.push({kind:'bundle-display',filter:bundle.displayFilter});
+            if (bundle.displayFilter) this.events.push({kind:'bundle-display',filter:bundle.displayFilter,
+                fallback:bundle.displayFilterFallback});
             window.dispatchEvent(new CustomEvent('doslet-bundle-status',{detail:{ready:true}}));
         } finally { this.bundleLaunching = false; }
     }

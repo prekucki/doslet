@@ -504,6 +504,9 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
     let base_identity = hex_bytes(&browser_session.drive_base_identity());
     let mut manifest = json!({"version":1,"profile":"game.toml","zip":"game.zip","executable":executable,"executableSha256":identity,"bundleRuntime":true});
     manifest["displayFilter"] = json!(spec.output.video_filter.as_str());
+    if let Some(fallback) = spec.output.video_filter_fallback {
+        manifest["displayFilterFallback"] = json!(fallback.as_str());
+    }
     if !spec.game.startup_keys.is_empty() {
         manifest["startupKeys"] = json!(&spec.game.startup_keys);
     }

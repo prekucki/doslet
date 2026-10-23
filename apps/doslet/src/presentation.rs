@@ -7,6 +7,8 @@ use iced_runtime::image::{self, Allocation, Error};
 mod filter;
 mod upload;
 pub use filter::DisplayFilter;
+#[cfg(not(target_arch = "wasm32"))]
+pub use filter::hardware_gpu;
 pub use upload::PreparedFrame;
 
 // Logical pixels keep the UI usable independently of the monitor's DPI.
@@ -247,8 +249,13 @@ pub struct DisplaySizing {
     leaving: bool,
     /// No frames are presented while a native full screen is about to end.
     frozen: bool,
+    /// The chosen filter; [`Self::active_filter`] is the one drawn.
     pub filter: DisplayFilter,
     pub frame_rate: FrameRate,
+    /// Simple filter drawn instead of a costly one without a hardware GPU.
+    pub fallback: DisplayFilter,
+    /// Whether GPU filters and the 16:9 smart warp run on a hardware GPU.
+    pub gpu: bool,
     frames: FrameMeter,
     viewport: Size,
     scale_factor: f32,
@@ -271,6 +278,8 @@ impl Default for DisplaySizing {
             frozen: false,
             filter: DisplayFilter::default(),
             frame_rate: FrameRate::default(),
+            fallback: DisplayFilter::default(),
+            gpu: true,
             frames: FrameMeter::default(),
             viewport: Size::ZERO,
             scale_factor: 1.0,
@@ -334,7 +343,41 @@ impl DisplaySizing {
 
     /// True when the picture needs the non-linear horizontal warp.
     pub fn stretched(&self) -> bool {
-        !self.pixel_perfect && self.shape == ScreenShape::Stretch
+        // Without a GPU the picture is stretched evenly, as 16:9.
+        !self.pixel_perfect && self.shape == ScreenShape::Stretch && self.gpu
+    }
+
+    /// Size, screen shape and full screen style from the global settings.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_settings(&mut self, global: &crate::global_settings::GlobalSettings) {
+        self.pixel_perfect = global.scaling == "pixel-perfect";
+        self.shape = match global.shape.as_str() {
+            "16:9" => ScreenShape::Wide,
+            "16:9-smart" => ScreenShape::Stretch,
+            _ => ScreenShape::Standard,
+        };
+        self.fullscreen_style = match global.fullscreen.as_str() {
+            "native" => FullscreenStyle::Native,
+            _ => FullscreenStyle::Borderless,
+        };
+    }
+
+    /// Takes the filter and its fallback from a machine's output settings.
+    pub fn set_output(&mut self, output: &doslet_config::OutputRouting) {
+        self.filter = output.video_filter.into();
+        self.fallback = output.filter(false).into();
+    }
+
+    /// The filter drawn: none in pixel perfect, which only enlarges whole
+    /// pixels, and a simple fallback for costly filters without a GPU.
+    pub fn active_filter(&self) -> DisplayFilter {
+        if self.pixel_perfect {
+            DisplayFilter::Nearest
+        } else if self.filter.needs_gpu() && !self.gpu {
+            self.fallback
+        } else {
+            self.filter
+        }
     }
 
     pub fn image(&self) -> Option<&PreparedFrame> {
@@ -363,8 +406,8 @@ impl DisplaySizing {
                 logical.height * self.scale_factor,
             )
         });
-        self.filtered
-            .refresh(frame.image.as_ref(), self.filter, target);
+        let filter = self.active_filter();
+        self.filtered.refresh(frame.image.as_ref(), filter, target);
         #[cfg(target_arch = "wasm32")]
         {
             // WGPU on WASM uploads raster textures when they are first drawn.
@@ -377,7 +420,7 @@ impl DisplaySizing {
                         image: image.clone(),
                         generation: frame.generation,
                         source_size,
-                        filter: self.filter,
+                        filter,
                     })
             });
             return iced::Task::none();
@@ -393,7 +436,7 @@ impl DisplaySizing {
                             image: image.clone(),
                             generation: frame.generation,
                             source_size,
-                            filter: self.filter,
+                            filter,
                         })
                 }));
             self.start_upload()
@@ -702,6 +745,36 @@ mod tests {
         let _ = sizing.update(SizingMessage::Fit, &frame);
         assert_eq!(sizing.shape, ScreenShape::Stretch);
         assert!(sizing.stretched());
+    }
+
+    #[test]
+    fn pixel_perfect_draws_no_filter_and_gpu_filters_fall_back_without_a_gpu() {
+        let frame = frame(320, 200);
+        let mut sizing = DisplaySizing::default();
+        let output: doslet_config::OutputRouting = doslet_config::OutputRouting {
+            video_filter: doslet_config::VideoFilter::Ravu,
+            ..Default::default()
+        };
+        sizing.set_output(&output);
+        assert_eq!(sizing.active_filter(), DisplayFilter::Ravu);
+        let _ = sizing.update(SizingMessage::PixelPerfect, &frame);
+        assert_eq!(sizing.active_filter(), DisplayFilter::Nearest);
+        let _ = sizing.update(SizingMessage::Fit, &frame);
+        sizing.gpu = false;
+        assert_eq!(sizing.active_filter(), DisplayFilter::SharpBilinear);
+        sizing.set_output(&doslet_config::OutputRouting {
+            video_filter_fallback: Some(doslet_config::VideoFilter::Nearest),
+            ..output
+        });
+        assert_eq!(sizing.active_filter(), DisplayFilter::Nearest);
+        // HQ2x is too costly as well; simple filters never change, and 16:9
+        // smart becomes an even stretch.
+        let _ = sizing.update(SizingMessage::Filter(DisplayFilter::Hq2x), &frame);
+        assert_eq!(sizing.active_filter(), DisplayFilter::Nearest);
+        let _ = sizing.update(SizingMessage::Filter(DisplayFilter::SharpBilinear), &frame);
+        assert_eq!(sizing.active_filter(), DisplayFilter::SharpBilinear);
+        let _ = sizing.update(SizingMessage::Shape(ScreenShape::Stretch), &frame);
+        assert!(!sizing.stretched());
     }
 
     #[test]

@@ -681,7 +681,7 @@ impl Doslet {
             }
             Message::DisplaySizing(message) => {
                 if let SizingMessage::Filter(filter) = message
-                    && filter.gpu()
+                    && filter.needs_gpu()
                     && !crate::browser_diagnostics::gpu_canvas_active()
                 {
                     log::warn!("{filter} unavailable: the active renderer is Canvas2D");
@@ -971,7 +971,16 @@ impl Doslet {
                 if let Some(filter) = field(&event, "filter").as_string()
                     && let Ok(filter) = filter.parse::<doslet_config::VideoFilter>()
                 {
-                    self.display_sizing.filter = filter.into();
+                    let output = doslet_config::OutputRouting {
+                        video_filter: filter,
+                        video_filter_fallback: field(&event, "fallback")
+                            .as_string()
+                            .and_then(|v| v.parse::<doslet_config::VideoFilter>().ok())
+                            .filter(|v| !v.needs_gpu()),
+                        ..Default::default()
+                    };
+                    self.display_sizing.gpu = crate::browser_diagnostics::gpu_canvas_active();
+                    self.display_sizing.set_output(&output);
                 }
             }
             Some("storage-policy") => {
@@ -1028,7 +1037,9 @@ impl Doslet {
                 self.session.graphics = None;
                 self.configurator
                     .set_active(self.configurator.draft.clone());
-                self.display_sizing.filter = self.configurator.active.output.video_filter.into();
+                self.display_sizing.gpu = crate::browser_diagnostics::gpu_canvas_active();
+                self.display_sizing
+                    .set_output(&self.configurator.active.output);
                 self.configurator.message = Some("Machine applied and restarted.".into());
             }
             Some("machine-failed") => {

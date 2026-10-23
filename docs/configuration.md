@@ -16,9 +16,22 @@ hover over an icon to see its action. **Info** opens diagnostics and provides
 access to **Audio…** and **Settings…**. The monitor icon opens **Display**, with
 **Pixel perfect / Fit** scaling and **Nearest / Sharp Bilinear / HQ2x** filtering.
 Set `video_filter = "sharp-bilinear"` under `[output]` in a native or browser
-game profile. Supported values are `nearest`, `sharp-bilinear`, and `hq2x`;
-omitting the field selects `nearest`. The display menu can change the filter
+game profile. Supported values are `nearest`, `sharp-bilinear`, `hq2x`, and the
+GPU filters `xbrz` and `ravu`; omitting the field selects the global default
+(`nearest` without one). Without a hardware GPU only the simple filters run: a
+browser that fell back to Canvas2D, or a native host whose only wgpu adapter is
+a software renderer such as llvmpipe (`DOSLET_GPU_FILTERS=0` or `=1` overrides
+the native check). HQ2x, xBRZ and RAVU-Zoom are then replaced by
+`video_filter_fallback` (`nearest` or `sharp-bilinear`, default
+`sharp-bilinear`), and 16:9 smart stretches the picture evenly. Pixel perfect never
+filters: it only enlarges whole pixels. The display menu can change the filter
 while the game is running.
+`frame_limit` under `[output]` caps how many guest pictures per second the native
+window shows, evenly spaced (10–240, or 0 for no additional cap). The live
+**Frame rate** control also limits presentation; the lower rate wins. It saves
+host CPU and GPU time for games that draw fewer frames than the display
+refreshes, such as 35 for Rise of the Triad. Guest timing does not depend on it,
+and browser builds ignore it.
 The CPU indicator shows the target speed and recent activity; hover for its
 breakdown or click for diagnostics. The video indicator reports register-derived
 guest geometry and depth, such as `320×240×8 VGA`, using the current scanout
@@ -256,10 +269,20 @@ module is kept.
 
 Global host defaults live in `settings.toml` (configured from **Settings** in the
 library sidebar) and cover host audio mixer (`system` or `application`), master
-volume, MIDI output port/synthesizer, controller/gamepad deadzone, display
-scaling/filter, interface language (`auto`, `en`, `pl`), and the default
-hardware preset (`386sx-16`, `386dx-33`, `486dx2-66`, `pentium-133`, or custom
-`[presets.<id>]` entries).
+volume, MIDI output port/synthesizer and formats, MT-32 ROM folder, the DPMI host
+(`[machine] dpmi`), default SB16 IRQ/DMA (`[sound]`), keyboard, mouse and
+gamepad input, scaling filter, frame limit, size (`fit` or `pixel-perfect`),
+screen shape (`4:3`, `16:9`, `16:9-smart`) and full screen style (`borderless`
+or `native`) under `[display]`, interface language (`auto`, `en`, `pl`), and the
+default hardware preset (`386sx-16`, `386dx-33`, `486dx2-66`, `pentium-133`, or
+custom `[presets.<id>]` entries).
+
+A game profile overrides these one key at a time: every key it leaves out comes
+from the global settings, or for the clock, speed mode, memory, x87 and sound
+cards from its `preset` (the global default preset when it names none). Options
+given on the command line come before both. The library's **Configure…** window
+writes only the keys set to something other than **Default**, and keeps the
+profile's comments and layout.
 
 Game profiles under `profiles/` can select a hardware `preset` and declare
 additional entrypoints (`[[game.actions]]`, such as `SETUP.EXE` or
@@ -307,7 +330,9 @@ button_2 = 1
 
 [output]
 audio = true
-video_filter = "sharp-bilinear"
+video_filter = "xbrz"
+video_filter_fallback = "nearest"
+frame_limit = 35
 game_midi = "gm"
 host_midi = "gm"
 midi_output = "rust"

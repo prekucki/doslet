@@ -124,20 +124,41 @@ impl Default for InputSettings {
 pub struct OutputRouting {
     pub audio: bool,
     pub video_filter: VideoFilter,
+    /// Simple filter shown instead of `video_filter` without a hardware GPU;
+    /// `None` uses [`VideoFilter::fallback`].
+    pub video_filter_fallback: Option<VideoFilter>,
     pub game_midi: String,
     pub host_midi: String,
     pub midi_output: String,
     pub rom_binding: Option<String>,
+    /// Most guest pictures per second the host window shows; 0 for no limit.
+    /// Guest timing never depends on it.
+    pub frame_limit: u16,
+}
+impl OutputRouting {
+    pub const FRAME_LIMITS: core::ops::RangeInclusive<u16> = 10..=240;
+    /// The filter to show: `video_filter`, or its simple fallback without a
+    /// hardware GPU.
+    pub fn filter(&self, gpu: bool) -> VideoFilter {
+        if self.video_filter.needs_gpu() && !gpu {
+            self.video_filter_fallback
+                .unwrap_or(self.video_filter.fallback())
+        } else {
+            self.video_filter
+        }
+    }
 }
 impl Default for OutputRouting {
     fn default() -> Self {
         Self {
             audio: true,
             video_filter: VideoFilter::Nearest,
+            video_filter_fallback: None,
             game_midi: "gm".into(),
             host_midi: "gm".into(),
             midi_output: "rust".into(),
             rom_binding: None,
+            frame_limit: 0,
         }
     }
 }
@@ -147,13 +168,39 @@ pub enum VideoFilter {
     Nearest,
     SharpBilinear,
     Hq2x,
+    /// GPU shader.
+    Xbrz,
+    /// GPU shader.
+    Ravu,
 }
 impl VideoFilter {
+    pub const ALL: [Self; 5] = [
+        Self::Nearest,
+        Self::SharpBilinear,
+        Self::Hq2x,
+        Self::Xbrz,
+        Self::Ravu,
+    ];
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Nearest => "nearest",
             Self::SharpBilinear => "sharp-bilinear",
             Self::Hq2x => "hq2x",
+            Self::Xbrz => "xbrz",
+            Self::Ravu => "ravu",
+        }
+    }
+    /// Too costly without a hardware GPU: the GPU shaders, and HQ2x, whose
+    /// CPU pass a host without a GPU cannot spare. A simple filter stands in.
+    pub const fn needs_gpu(self) -> bool {
+        !matches!(self, Self::Nearest | Self::SharpBilinear)
+    }
+    /// The simple filter used when a profile names no fallback.
+    pub const fn fallback(self) -> Self {
+        if self.needs_gpu() {
+            Self::SharpBilinear
+        } else {
+            self
         }
     }
 }
@@ -164,7 +211,9 @@ impl core::str::FromStr for VideoFilter {
             "nearest" => Ok(Self::Nearest),
             "sharp-bilinear" => Ok(Self::SharpBilinear),
             "hq2x" => Ok(Self::Hq2x),
-            _ => Err("output.video_filter must be nearest, sharp-bilinear, or hq2x"),
+            "xbrz" => Ok(Self::Xbrz),
+            "ravu" => Ok(Self::Ravu),
+            _ => Err("output.video_filter must be nearest, sharp-bilinear, hq2x, xbrz or ravu"),
         }
     }
 }
@@ -551,6 +600,24 @@ impl MachineSpec {
                     "MIDI dialect must be gm or mt32",
                 ));
             }
+        }
+        if self
+            .output
+            .video_filter_fallback
+            .is_some_and(VideoFilter::needs_gpu)
+        {
+            return Err(ConfigError::new(
+                "output.video_filter_fallback",
+                "must be nearest or sharp-bilinear",
+            ));
+        }
+        if self.output.frame_limit != 0
+            && !OutputRouting::FRAME_LIMITS.contains(&self.output.frame_limit)
+        {
+            return Err(ConfigError::new(
+                "output.frame_limit",
+                "must be 0 for no limit or 10 to 240",
+            ));
         }
         if self.output.midi_output.is_empty() {
             return Err(ConfigError::new("output.midi_output", "must not be empty"));

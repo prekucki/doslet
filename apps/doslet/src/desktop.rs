@@ -15,6 +15,21 @@ use crate::wakeup;
 
 const COMMAND_CAPACITY: usize = 256;
 
+/// Apply the profile's frame cap to the live presentation rate. Neither
+/// setting changes guest timing, input or audio.
+fn publish_interval(
+    rate: FrameRate,
+    guest_millihertz: u32,
+    frame_limit: u16,
+) -> std::time::Duration {
+    let requested = rate.interval(guest_millihertz);
+    if frame_limit == 0 {
+        requested
+    } else {
+        requested.max(std::time::Duration::from_secs(1) / u32::from(frame_limit))
+    }
+}
+
 pub struct Registers {
     pub cs: u16,
     pub ip: u32,
@@ -200,6 +215,49 @@ mod tests {
             s.session.steps() == 0 && s.session.status() == SessionStatus::Ready
         });
         drop(worker); // Joins the owner and drops its resources on that thread.
+    }
+
+    #[test]
+    fn frame_limit_caps_published_pictures_without_slowing_the_guest() {
+        let (worker, _) = Worker::spawn_with(|| {
+            let mut engine = Box::new(crate::app::Doslet::new());
+            engine.session = doslet_runtime::Session::new(&[0x40, 0xEB, 0xFD])
+                .unwrap()
+                .into();
+            engine.configurator.active.output.frame_limit = 20;
+            engine.session.start();
+            Ok(engine)
+        })
+        .unwrap();
+        let start = Instant::now();
+        let (mut packets, mut steps) = (0, 0);
+        while start.elapsed() < Duration::from_millis(500) {
+            // The UI asks for a picture as often as it can.
+            worker.request.store(true, Ordering::Release);
+            if let Some(packet) = worker.mailbox.take() {
+                packets += 1;
+                steps = packet.snapshot.session.steps();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!((1..=12).contains(&packets), "{packets} pictures in 500 ms");
+        assert!(steps > 0);
+    }
+
+    #[test]
+    fn profile_cap_and_live_rate_use_the_slower_presentation_interval() {
+        assert_eq!(
+            publish_interval(FrameRate::Limit(60), 70_000, 35),
+            Duration::from_secs(1) / 35
+        );
+        assert_eq!(
+            publish_interval(FrameRate::Limit(30), 70_000, 70),
+            Duration::from_secs(1) / 30
+        );
+        assert_eq!(
+            publish_interval(FrameRate::Guest, 70_000, 0),
+            FrameRate::Guest.interval(70_000)
+        );
     }
 
     #[test]
@@ -914,8 +972,11 @@ impl Worker {
                 let mut sequence = 0;
                 // The ready snapshot covers the first interval.
                 let mut next_publish = std::time::Instant::now()
-                    + FrameRate::from_code(rate.load(Ordering::Relaxed))
-                        .interval(engine.session.video_refresh_millihertz());
+                    + publish_interval(
+                        FrameRate::from_code(rate.load(Ordering::Relaxed)),
+                        engine.session.video_refresh_millihertz(),
+                        engine.configurator.active.output.frame_limit,
+                    );
                 let mut sample_started = std::time::Instant::now();
                 let mut sample_busy = std::time::Duration::ZERO;
                 let mut sample_steps = engine.session.steps();
@@ -990,8 +1051,11 @@ impl Worker {
                         refresh.store(false, Ordering::Release);
                         // Deadlines keep the average rate; a late or idle
                         // stretch restarts the schedule instead of bursting.
-                        let interval = FrameRate::from_code(rate.load(Ordering::Relaxed))
-                            .interval(engine.session.video_refresh_millihertz());
+                        let interval = publish_interval(
+                            FrameRate::from_code(rate.load(Ordering::Relaxed)),
+                            engine.session.video_refresh_millihertz(),
+                            engine.configurator.active.output.frame_limit,
+                        );
                         next_publish = if now - next_publish < interval {
                             next_publish + interval
                         } else {
@@ -1006,7 +1070,10 @@ impl Worker {
                         wake.notify();
                     }
                     // Pace idle/caught-up execution, but let input wake the worker early.
-                    let wait = engine.worker_delay(progressed);
+                    let mut wait = engine.worker_delay(progressed);
+                    if refresh.load(Ordering::Acquire) {
+                        wait = wait.min(next_publish.saturating_duration_since(now));
+                    }
                     sample_busy += turn_started.elapsed();
                     match receiver.recv_timeout(wait) {
                         Ok(Command {
@@ -1138,8 +1205,13 @@ impl std::ops::Deref for Doslet {
 }
 impl Doslet {
     pub fn from_cli(cli: crate::cli::Cli) -> Result<Box<Self>, Box<dyn std::error::Error>> {
+        let global = cli.global_settings.clone();
         let (worker, state) = Worker::spawn(cli)?;
-        Ok(Self::from_worker(worker, state))
+        let mut frontend = Self::from_worker(worker, state);
+        if let Some(global) = &global {
+            frontend.display_sizing.apply_settings(global);
+        }
+        Ok(frontend)
     }
     /// A frontend for an engine built by `boot` on its emulation thread.
     #[cfg(test)]
@@ -1152,7 +1224,8 @@ impl Doslet {
     fn from_worker(worker: Worker, mut state: Snapshot) -> Box<Self> {
         let configurator = state.configurator.take().unwrap();
         let mut display_sizing = DisplaySizing::default();
-        display_sizing.filter = configurator.active.output.video_filter.into();
+        display_sizing.gpu = crate::presentation::hardware_gpu();
+        display_sizing.set_output(&configurator.active.output);
         Box::new(Self {
             disk_activity: crate::disk_activity::Activity::new(
                 state.disk_reads.0,
@@ -1210,8 +1283,8 @@ impl Doslet {
                     }
                     self.configurator = configurator;
                     if self.configurator.active.output.video_filter != previous_filter {
-                        self.display_sizing.filter =
-                            self.configurator.active.output.video_filter.into();
+                        self.display_sizing
+                            .set_output(&self.configurator.active.output);
                     }
                 }
                 self.state = packet.snapshot;

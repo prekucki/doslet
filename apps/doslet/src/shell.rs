@@ -6,7 +6,7 @@ use doslet_runtime::SessionStatus;
 use iced::{Element, Subscription, Task, Theme};
 use std::{
     ffi::OsString,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -70,14 +70,8 @@ impl Shell {
                 crate::audio::Mixer::Application
             };
         }
-        if !cli.no_audio {
-            if cli.midi_output.is_none() && !g.midi_output.is_empty() {
-                cli.midi_output = Some(g.midi_output.clone());
-            }
-            if cli.mt32_rom_dir.is_none() {
-                cli.mt32_rom_dir = g.mt32_rom_dir.as_ref().map(PathBuf::from);
-            }
-        }
+        // MIDI output and ROMs come from the profile first; `profile.rs`
+        // falls back to these global settings.
         cli.global_settings = Some(g.clone());
     }
 

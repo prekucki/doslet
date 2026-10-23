@@ -47,20 +47,45 @@ library of the launch profiles in the
 profile directory to your own profile folder keeps relative cover and drive
 paths working. Each version-2 profile becomes a card with its `[info]` cover,
 release year and genre:
-- **Sidebar.** Filters all games, one genre, or opens **Settings** (`settings.toml`
-  for global host audio mixer, MIDI output, gamepad deadzone, display scaling,
-  interface language, and default/custom hardware presets).
+- **Sidebar.** Filters all games, one genre, or opens **Settings**
+  (`settings.toml`), the defaults every game starts from. It has the same
+  sections as a game's configuration window — Machine (default preset, DPMI
+  host), Hardware presets, Sound & MIDI, Mouse & input, Display (filter, frame
+  limit, size, screen shape, full screen style) and Interface (language) — and
+  saves each change at once. Built-in presets are fixed; **Copy** makes an
+  editable custom preset.
 - **Search.** Matches titles, developers, publishers, genres and program names.
 - **Game page.** Clicking a card opens it, with the cover over a blurred
   backdrop, primary launch actions (**Play** / **Resume**, **Restart**, and
-  configured `[[game.actions]]` entrypoints such as **Setup**), and three tabs:
+  configured `[[game.actions]]` entrypoints such as **Setup**), **Configure…**,
+  and two tabs:
   - **Overview** — description and game metadata.
   - **Drive C: & State** — paused RAM snapshot status (`autosave.state.gz`), a
     VFS Drive `C:` browser with **All files (VFS)** vs **Changes only** modes,
     color-coded overlay status (`+ Created`, `~ Modified`, `→ Renamed`,
     `− Deleted`, `Base`), inline hex/ASCII file preview, and **Reset C: changes**.
-  - **Configuration** — per-game hardware preset, CPU clock/mode, RAM, SB16,
-    MPU-401, Gameport, Drive `C:` / CD-ROM `D:` paths, and entrypoints.
+- **Configure….** Opens the game configuration window over the page, or over
+  the whole window when it is smaller than 1000×700. It edits the profile's TOML
+  in place, keeping comments; **Save to profile** validates and writes it,
+  **Cancel** or Esc drops it. Every setting offers **Default · value**, which
+  leaves the key out so the game follows Settings or its hardware preset.
+  Sections:
+  - **Programs** — name, executable, arguments, working directory, startup keys
+    and other programs (`[[game.actions]]`) with their label, executable and
+    arguments. **Choose from C:…** lists the EXE, COM and BAT files on drive C:.
+  - **Machine** — hardware preset (choosing one returns the clock, speed mode,
+    memory, x87 and sound cards to the preset), CPU clock and speed mode, x87,
+    RAM and the DPMI host.
+  - **Sound & MIDI** — audio output, SB16 with IRQ/DMA, MPU-401, game and
+    device MIDI formats, and the MIDI output.
+  - **Mouse & input** — mouse capture (automatic, always, never), hiding the
+    system cursor, keyboard delivery, and the gameport with controller, dead
+    zone, axes and buttons.
+  - **Display** — scaling filter and frame limit.
+  - **Drives** — drive C: as the game will see it (folder or ZIP, its path and
+    whether it exists, the write policy and save store), either the
+    executable's folder or a source set in the profile, and the CD-ROM `D:`
+    image.
 - **Placeholders.** Profiles without a cover get a colored card with the game's
   initials.
 
@@ -432,6 +457,8 @@ It only limits presentation; guest timing, input and audio stay unchanged, so a
 70 Hz game at 60 fps skips some pictures but runs at the same speed. The
 setting lasts for the session. MDA, CGA and
 EGA modes are not currently implemented.
+On native builds, `[output].frame_limit` in the game profile or global settings
+can impose a lower cap than the live **Frame rate** control.
 **Pixel perfect** selects the largest whole-number zoom that fits the available
 display area, measured in physical pixels, including on HiDPI displays. It does
 not resize the window. A 320×200 frame can become 640×400 or 960×600; a 640×480
@@ -479,9 +506,11 @@ library the power icon closes Doslet.
 If the host leaves full screen by itself (for example Esc
 in the browser), use **Exit full screen** once to restore the toolbar.
 
-Filters and screen shape combine: the filter is applied first, then the picture
-is stretched to the chosen shape. 16:9 smart is drawn on the GPU with any
-filter.
+Filters and screen shape combine in **Fit window**: the filter is applied first,
+then the picture is stretched to the chosen shape. 16:9 smart is drawn on the
+GPU with any filter; without a hardware GPU it stretches evenly, like 16:9.
+**Pixel perfect** uses no filter and no shape: it only enlarges whole pixels, so
+the filter selector is off there.
 
 The filter selector in the same panel works on desktop and in the
 browser, including while paused:
@@ -506,7 +535,11 @@ Filtered images are cached until the source frame, filter or intermediate zoom
 changes. Sharp Bilinear and HQ2x use CPU preprocessing on both platforms;
 xBRZ and RAVU-Zoom run through the GPU renderer. In the browser they require
 WebGPU or WebGL2; if the application falls back to Canvas2D, selecting either shows a notice and
-keeps the current filter and image. Their live frame rate has not been benchmarked.
+keeps the current filter and image. Without a hardware GPU (Canvas2D, or only a
+software wgpu adapter natively) only Nearest and Sharp Bilinear run: HQ2x, xBRZ
+and RAVU-Zoom named by a profile or Settings are replaced by the profile's
+`video_filter_fallback` (Sharp Bilinear by default), and the Display panel says
+so. Their live frame rate has not been benchmarked.
 
 Presentation keeps the previous image visible until the renderer has uploaded
 its replacement. At most one upload is in progress; subsequent frames replace

@@ -3,8 +3,8 @@
 use crate::global_settings::GlobalSettings;
 use crate::machine_profile;
 use doslet_config::{
-    CpuMode, GameAction, GameInfo, HardwarePreset, KeyboardMode, MachineSpec, MouseMode,
-    SourceKind, VideoFilter,
+    CpuMode, DpmiHost, GameAction, GameInfo, KeyboardMode, MachineSpec, MouseMode, SourceKind,
+    VideoFilter,
 };
 use iced::widget::image::Handle;
 use iced::{Color, Subscription, Task};
@@ -16,7 +16,10 @@ use std::{
 };
 use toml_edit::{DocumentMut, Item};
 
+mod config;
 mod view;
+
+pub use config::{ConfigPage, ConfigWindow, GameEdit, Setting};
 
 const MAX_PROFILE_BYTES: usize = 1024 * 1024;
 const MAX_COVER_BYTES: usize = 16 * 1024 * 1024;
@@ -30,7 +33,6 @@ pub enum GameTab {
     #[default]
     Overview,
     VfsAndState,
-    Configuration,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -479,9 +481,31 @@ impl Filter {
     }
 }
 
-#[allow(dead_code)]
+/// Sections of the global settings page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsPage {
+    #[default]
+    Machine,
+    Presets,
+    Sound,
+    Input,
+    Display,
+    Interface,
+}
+impl SettingsPage {
+    pub const ALL: [Self; 6] = [
+        Self::Machine,
+        Self::Presets,
+        Self::Sound,
+        Self::Input,
+        Self::Display,
+        Self::Interface,
+    ];
+}
+
 #[derive(Clone, Debug)]
 pub enum GlobalEdit {
+    Page(SettingsPage),
     Language(String),
     AudioEnabled(bool),
     AudioVolume(u8),
@@ -491,43 +515,43 @@ pub enum GlobalEdit {
     GameMidi(String),
     HostMidi(String),
     Mt32RomDir(String),
+    Dpmi(DpmiHost),
+    SbIrq(u8),
+    SbDma8(u8),
+    SbDma16(u8),
     Keyboard(KeyboardMode),
     Gameport(bool),
     MouseMode(MouseMode),
     HideCursor(bool),
     PadIndex(u8),
+    PadId(String),
     Deadzone(u8),
+    AxisX(u8),
+    AxisY(u8),
+    Button1(u8),
+    Button2(u8),
     VideoFilter(VideoFilter),
+    VideoFilterFallback(Option<VideoFilter>),
+    FrameLimit(u16),
     Scaling(String),
-    Aspect(String),
+    Shape(String),
+    Fullscreen(String),
     DefaultPreset(String),
-    NewPresetName(String),
-    NewPresetMhz(u16),
-    NewPresetMode(CpuMode),
-    NewPresetMemory(u8),
-    AddPreset,
+    /// A custom preset copied from this one, or from the default.
+    NewPreset(Option<String>),
     RemovePreset(String),
+    Preset(String, PresetEdit),
 }
 
 #[derive(Clone, Debug)]
-pub enum GameEdit {
-    Toggle,
-    Preset(String),
+pub enum PresetEdit {
+    Name(String),
     CpuMhz(u16),
     CpuMode(CpuMode),
-    MemoryMib(u8),
+    Memory(u8),
+    X87(bool),
     Sb16(bool),
     Mpu401(bool),
-    GameMidi(String),
-    Gameport(bool),
-    Executable(String),
-    DriveCSource(String),
-    DriveDSource(String),
-    NewActionName(String),
-    NewActionExe(String),
-    AddAction,
-    RemoveAction(usize),
-    Save,
 }
 
 /// Decoded art: the cover for cards and pages, and a tiny blurred copy that
@@ -685,16 +709,13 @@ pub struct Library {
     pub global: GlobalSettings,
     pub midi_choices: Vec<String>,
     pub game_tab: GameTab,
+    /// The open configuration window of the selected game.
+    pub config: Option<ConfigWindow>,
     pub vfs_mode: VfsViewMode,
     pub vfs_dir: String,
     pub confirm_reset_overlay: bool,
     pub selected_save_file: Option<usize>,
-    pub new_action_name: String,
-    pub new_action_exe: String,
-    pub new_preset_name: String,
-    pub new_preset_mhz: u16,
-    pub new_preset_mode: CpuMode,
-    pub new_preset_memory: u8,
+    pub settings_page: SettingsPage,
 }
 impl Library {
     pub fn discover() -> Self {
@@ -710,16 +731,12 @@ impl Library {
             global: GlobalSettings::load_from_disk(),
             midi_choices: discover_midi_choices(),
             game_tab: GameTab::Overview,
+            config: None,
             vfs_mode: VfsViewMode::AllFiles,
             vfs_dir: String::new(),
             confirm_reset_overlay: false,
             selected_save_file: None,
-            new_action_name: String::new(),
-            new_action_exe: String::new(),
-            new_preset_name: String::new(),
-            new_preset_mhz: 66,
-            new_preset_mode: CpuMode::Adaptive,
-            new_preset_memory: 16,
+            settings_page: SettingsPage::Machine,
         }
     }
     pub fn refresh_autosaves(&mut self) {
@@ -765,86 +782,89 @@ impl Library {
         }))
     }
     fn edit_global(&mut self, edit: GlobalEdit) {
+        let previous = self.global.clone();
+        let g = &mut self.global;
         match edit {
-            GlobalEdit::Language(v) => self.global.language = v,
-            GlobalEdit::AudioEnabled(v) => self.global.audio_enabled = v,
-            GlobalEdit::AudioVolume(v) => self.global.audio_volume = v.min(100),
-            GlobalEdit::AudioMixer(v) => self.global.audio_mixer = v,
-            GlobalEdit::MidiOutput(v) => self.global.midi_output = v,
+            GlobalEdit::Page(page) => {
+                self.settings_page = page;
+                return;
+            }
             GlobalEdit::RefreshMidiPorts => {
                 self.midi_choices = discover_midi_choices();
                 return;
             }
-            GlobalEdit::GameMidi(v) => self.global.game_midi = v,
-            GlobalEdit::HostMidi(v) => self.global.host_midi = v,
-            GlobalEdit::Mt32RomDir(v) => {
-                self.global.mt32_rom_dir = (!v.trim().is_empty()).then_some(v);
-            }
-            GlobalEdit::Keyboard(v) => self.global.keyboard = v,
-            GlobalEdit::Gameport(v) => self.global.gameport = v,
-            GlobalEdit::MouseMode(v) => self.global.input.mouse_mode = v,
-            GlobalEdit::HideCursor(v) => self.global.input.hide_cursor = v,
-            GlobalEdit::PadIndex(v) => self.global.input.pad_index = v,
-            GlobalEdit::Deadzone(v) => self.global.input.deadzone_percent = v.min(95),
-            GlobalEdit::VideoFilter(v) => self.global.video_filter = v,
-            GlobalEdit::Scaling(v) => self.global.scaling = v,
-            GlobalEdit::Aspect(v) => self.global.aspect = v,
-            GlobalEdit::DefaultPreset(v) => self.global.default_preset = v,
-            GlobalEdit::NewPresetName(v) => {
-                self.new_preset_name = v;
-                return;
-            }
-            GlobalEdit::NewPresetMhz(v) => {
-                self.new_preset_mhz = v.clamp(1, 1000);
-                return;
-            }
-            GlobalEdit::NewPresetMode(v) => {
-                self.new_preset_mode = v;
-                return;
-            }
-            GlobalEdit::NewPresetMemory(v) => {
-                self.new_preset_memory = v;
-                return;
-            }
-            GlobalEdit::AddPreset => {
-                let name = self.new_preset_name.trim().to_owned();
-                if name.is_empty() {
-                    self.notice = Some("Enter a preset name (e.g. Fast 486).".into());
-                    return;
-                }
-                let id: String = name
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '-'
-                        }
-                    })
-                    .collect();
-                let preset = HardwarePreset {
-                    id: id.clone(),
-                    name,
-                    cpu_mhz: self.new_preset_mhz,
-                    cpu_mode: self.new_preset_mode,
-                    memory_mib: self.new_preset_memory,
-                    x87: true,
-                    sb16: true,
-                    mpu401: true,
-                };
-                if let Some(existing) = self.global.presets.iter_mut().find(|p| p.id == id) {
-                    *existing = preset;
-                } else {
-                    self.global.presets.push(preset);
-                }
-                self.new_preset_name.clear();
+            GlobalEdit::Language(v) => g.language = v,
+            GlobalEdit::AudioEnabled(v) => g.audio_enabled = v,
+            GlobalEdit::AudioVolume(v) => g.audio_volume = v.min(100),
+            GlobalEdit::AudioMixer(v) => g.audio_mixer = v,
+            GlobalEdit::MidiOutput(v) => g.midi_output = v,
+            GlobalEdit::GameMidi(v) => g.game_midi = v,
+            GlobalEdit::HostMidi(v) => g.host_midi = v,
+            GlobalEdit::Mt32RomDir(v) => g.mt32_rom_dir = (!v.trim().is_empty()).then_some(v),
+            GlobalEdit::Dpmi(v) => g.dpmi = v,
+            GlobalEdit::SbIrq(v) => g.sb_irq = v,
+            GlobalEdit::SbDma8(v) => g.sb_dma8 = v,
+            GlobalEdit::SbDma16(v) => g.sb_dma16 = v,
+            GlobalEdit::Keyboard(v) => g.keyboard = v,
+            GlobalEdit::Gameport(v) => g.gameport = v,
+            GlobalEdit::MouseMode(v) => g.input.mouse_mode = v,
+            GlobalEdit::HideCursor(v) => g.input.hide_cursor = v,
+            GlobalEdit::PadIndex(v) => g.input.pad_index = v,
+            GlobalEdit::PadId(v) => g.input.pad_id = (!v.trim().is_empty()).then_some(v),
+            GlobalEdit::Deadzone(v) => g.input.deadzone_percent = v.min(95),
+            GlobalEdit::AxisX(v) => g.input.axis_x = v,
+            GlobalEdit::AxisY(v) => g.input.axis_y = v,
+            GlobalEdit::Button1(v) => g.input.button_1 = v,
+            GlobalEdit::Button2(v) => g.input.button_2 = v,
+            GlobalEdit::VideoFilter(v) => g.video_filter = v,
+            GlobalEdit::VideoFilterFallback(v) => g.video_filter_fallback = v,
+            GlobalEdit::FrameLimit(v) => g.frame_limit = v,
+            GlobalEdit::Scaling(v) => g.scaling = v,
+            GlobalEdit::Shape(v) => g.shape = v,
+            GlobalEdit::Fullscreen(v) => g.fullscreen = v,
+            GlobalEdit::DefaultPreset(v) => g.default_preset = v,
+            GlobalEdit::NewPreset(source) => {
+                let source = source.unwrap_or_else(|| g.default_preset.clone());
+                let mut preset = g
+                    .find_preset(&source)
+                    .or_else(|| g.all_presets().into_iter().next())
+                    .expect("built-in presets exist");
+                let number = (1..)
+                    .find(|n| g.find_preset(&format!("custom-{n}")).is_none())
+                    .expect("a free preset number");
+                preset.id = format!("custom-{number}");
+                preset.name = format!("{} (copy)", preset.name);
+                g.presets.push(preset);
             }
             GlobalEdit::RemovePreset(id) => {
-                self.global.presets.retain(|p| p.id != id);
-                if self.global.default_preset == id {
-                    self.global.default_preset = "486dx2-66".into();
+                g.presets.retain(|p| p.id != id);
+                if g.find_preset(&g.default_preset).is_none() {
+                    g.default_preset = GlobalSettings::default().default_preset;
                 }
             }
+            GlobalEdit::Preset(id, edit) => {
+                let Some(preset) = g.presets.iter_mut().find(|p| p.id == id) else {
+                    return;
+                };
+                match edit {
+                    PresetEdit::Name(v) => preset.name = v,
+                    PresetEdit::CpuMhz(v) => preset.cpu_mhz = v.clamp(1, 1000),
+                    PresetEdit::CpuMode(v) => preset.cpu_mode = v,
+                    PresetEdit::Memory(v) => preset.memory_mib = v,
+                    PresetEdit::X87(v) => preset.x87 = v,
+                    PresetEdit::Sb16(v) => preset.sb16 = v,
+                    PresetEdit::Mpu401(v) => preset.mpu401 = v,
+                }
+            }
+        }
+        // Every game inherits these, so they must form a valid machine.
+        let mut probe = MachineSpec::default();
+        self.global
+            .fill_profile_defaults(&mut probe, &DocumentMut::new());
+        if let Err(error) = probe.resolve() {
+            self.global = previous;
+            self.notice = Some(format!("Not applied: {error}"));
+            return;
         }
         if let Err(error) = self.global.save_to_disk() {
             self.notice = Some(format!("Cannot save global settings: {error}"));
@@ -854,183 +874,52 @@ impl Library {
         let Some(index) = self.selected else {
             return;
         };
-        let Some(game) = self.games.get_mut(index) else {
-            return;
-        };
         match edit {
-            GameEdit::Toggle => {
-                self.game_tab = if self.game_tab == GameTab::Configuration {
-                    GameTab::Overview
-                } else {
-                    GameTab::Configuration
-                };
-            }
-            GameEdit::Preset(id) => {
-                if id.is_empty() || id == "default" {
-                    game.spec.preset = None;
-                    if let Some(p) = self.global.find_preset(&self.global.default_preset) {
-                        p.apply_to(&mut game.spec.hardware, &mut game.spec.cpu_mode);
-                    }
-                } else {
-                    game.spec.preset = Some(id.clone());
-                    if let Some(p) = self
-                        .global
-                        .find_preset(&id)
-                        .or_else(|| HardwarePreset::find_builtin(&id))
-                    {
-                        p.apply_to(&mut game.spec.hardware, &mut game.spec.cpu_mode);
-                    }
-                }
-            }
-            GameEdit::CpuMhz(mhz) => game.spec.hardware.cpu_mhz = mhz.clamp(1, 1000),
-            GameEdit::CpuMode(mode) => game.spec.cpu_mode = Some(mode),
-            GameEdit::MemoryMib(mib) => game.spec.hardware.memory_mib = mib,
-            GameEdit::Sb16(v) => game.spec.hardware.sb16 = v,
-            GameEdit::Mpu401(v) => game.spec.hardware.mpu401 = v,
-            GameEdit::GameMidi(v) => game.spec.output.game_midi = v,
-            GameEdit::Gameport(v) => game.spec.hardware.gameport = v,
-            GameEdit::Executable(v) => game.spec.game.executable = v,
-            GameEdit::DriveCSource(v) => {
-                let kind = if v.to_ascii_lowercase().ends_with(".zip") {
-                    SourceKind::BrowserZip
-                } else {
-                    SourceKind::NativeDirectory
-                };
-                if let Some(mount) = game.spec.mounts.iter_mut().find(|m| m.letter == b'C') {
-                    if let Some(b) = game
-                        .spec
-                        .host
-                        .bindings
-                        .iter_mut()
-                        .find(|b| b.id == mount.source)
-                    {
-                        b.location = v;
-                        b.kind = if kind == SourceKind::BrowserZip {
-                            doslet_config::BindingKind::BrowserZip
-                        } else {
-                            doslet_config::BindingKind::NativeDirectory
-                        };
-                    } else {
-                        mount.source = v;
-                    }
-                    mount.kind = kind;
-                } else {
-                    game.spec.mounts.push(doslet_config::MountSpec {
-                        letter: b'C',
-                        kind,
-                        source: v,
-                        policy: doslet_config::WritePolicy::Persistent,
-                        store: None,
-                    });
-                }
-            }
-            GameEdit::DriveDSource(v) => {
-                if v.trim().is_empty() {
-                    game.spec.mounts.retain(|m| m.letter != b'D');
-                } else if let Some(mount) = game.spec.mounts.iter_mut().find(|m| m.letter == b'D') {
-                    if let Some(b) = game
-                        .spec
-                        .host
-                        .bindings
-                        .iter_mut()
-                        .find(|b| b.id == mount.source)
-                    {
-                        b.location = v;
-                        b.kind = doslet_config::BindingKind::LocalIso;
-                    } else {
-                        mount.source = v;
-                    }
-                    mount.kind = SourceKind::LocalIso;
-                } else {
-                    game.spec.mounts.push(doslet_config::MountSpec {
-                        letter: b'D',
-                        kind: SourceKind::LocalIso,
-                        source: v,
-                        policy: doslet_config::WritePolicy::ReadOnly,
-                        store: None,
-                    });
-                }
-            }
-            GameEdit::NewActionName(v) => self.new_action_name = v,
-            GameEdit::NewActionExe(v) => self.new_action_exe = v,
-            GameEdit::AddAction => {
-                let mut exe = self.new_action_exe.trim().to_owned();
-                if exe.is_empty() {
-                    self.notice = Some("Enter an executable name (e.g. SETUP.EXE).".into());
+            GameEdit::Open => {
+                let Some(game) = self.games.get(index) else {
                     return;
-                }
-                if let Some(mount) = game
-                    .spec
-                    .mounts
-                    .iter()
-                    .find(|mount| mount.letter == b'C' && mount.kind == SourceKind::BrowserZip)
-                {
-                    let base = game.profile.parent().unwrap_or(Path::new("."));
-                    let path = base.join(game.spec.binding(&mount.source));
-                    let selected = crate::native_zip::read(&path)
-                        .map_err(|error| error.to_string())
-                        .and_then(|archive| crate::native_zip::select(&archive, Some(&exe)));
-                    match selected {
-                        Ok(program) => exe = program,
-                        Err(error) => {
-                            self.notice = Some(error);
-                            return;
-                        }
-                    }
-                }
-                let name = if self.new_action_name.trim().is_empty() {
-                    exe.clone()
-                } else {
-                    self.new_action_name.trim().to_owned()
                 };
-                let id: String = name
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '-'
-                        }
-                    })
-                    .collect();
-                if game.spec.game.actions.iter().any(|action| action.id == id) {
-                    self.notice = Some("An entrypoint with this label already exists.".into());
-                    return;
-                }
-                game.spec.game.actions.push(GameAction {
-                    id,
-                    name,
-                    executable: exe,
-                    arguments: Vec::new(),
-                });
-                game.actions = game.spec.game.actions.clone();
-                self.new_action_name.clear();
-                self.new_action_exe.clear();
-            }
-            GameEdit::RemoveAction(action_idx) => {
-                if action_idx < game.spec.game.actions.len() {
-                    game.spec.game.actions.remove(action_idx);
-                    game.actions = game.spec.game.actions.clone();
+                match ConfigWindow::open(game, &self.global) {
+                    Ok(window) => self.config = Some(window),
+                    Err(error) => self.notice = Some(error),
                 }
             }
-            GameEdit::Save => {
-                if let Err(error) = game.spec.resolve() {
-                    self.notice = Some(format!("Cannot save configuration: {error}"));
-                    return;
-                }
-                let text = machine_profile::export_machine_profile(&game.spec);
-                match std::fs::write(&game.profile, text) {
-                    Ok(()) => {
-                        game.actions = game.spec.game.actions.clone();
-                        self.notice = Some(format!("Saved configuration for {}.", game.name));
-                    }
-                    Err(error) => {
-                        self.notice =
-                            Some(format!("Cannot save {}: {error}", game.profile.display()));
-                    }
+            GameEdit::Cancel => self.config = None,
+            GameEdit::Save => self.save_config(index),
+            edit => {
+                if let Some(window) = &mut self.config {
+                    window.edit(edit, &self.global);
                 }
             }
         }
+    }
+    /// Writes the edited profile and reloads the game from it.
+    fn save_config(&mut self, index: usize) {
+        let (Some(window), Some(game)) = (self.config.as_mut(), self.games.get_mut(index)) else {
+            return;
+        };
+        if window.problem.is_some() {
+            return;
+        }
+        if let Err(error) = std::fs::write(window.profile(), window.text()) {
+            window.problem = Some(format!(
+                "Cannot save {}: {error}",
+                window.profile().display()
+            ));
+            return;
+        }
+        match Game::load(&game.profile) {
+            Ok(mut fresh) => {
+                fresh.art = game.art.take();
+                *game = fresh;
+            }
+            Err(error) => {
+                window.problem = Some(format!("Saved, but cannot reload the profile: {error}"));
+                return;
+            }
+        }
+        self.notice = Some(format!("Saved configuration for {}.", game.name));
+        self.config = None;
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
         use iced::keyboard::{Event, Key, key::Named};
@@ -1039,6 +928,7 @@ impl Library {
                 self.search = text;
                 self.selected = None;
                 self.game_tab = GameTab::Overview;
+                self.config = None;
                 self.selected_save_file = None;
                 if self.filter == Filter::Settings {
                     self.filter = Filter::All;
@@ -1048,11 +938,13 @@ impl Library {
                 self.filter = filter;
                 self.selected = None;
                 self.game_tab = GameTab::Overview;
+                self.config = None;
                 self.selected_save_file = None;
             }
             Message::Open(index) => {
                 self.selected = Some(index).filter(|&i| i < self.games.len());
                 self.game_tab = GameTab::Overview;
+                self.config = None;
                 self.vfs_dir.clear();
                 self.confirm_reset_overlay = false;
                 self.selected_save_file = None;
@@ -1061,6 +953,7 @@ impl Library {
             Message::Back => {
                 self.selected = None;
                 self.game_tab = GameTab::Overview;
+                self.config = None;
                 self.vfs_dir.clear();
                 self.confirm_reset_overlay = false;
                 self.selected_save_file = None;
@@ -1145,6 +1038,7 @@ impl Library {
                 self.games = scan(&self.directories);
                 self.selected = None;
                 self.game_tab = GameTab::Overview;
+                self.config = None;
                 self.vfs_dir.clear();
                 self.confirm_reset_overlay = false;
                 self.selected_save_file = None;
@@ -1153,17 +1047,18 @@ impl Library {
             Message::Rescan => {}
             Message::Key(Event::KeyPressed { key, .. }) => match (key, self.selected) {
                 (Key::Named(Named::Escape), Some(_)) => {
-                    if self.selected_save_file.is_some() {
+                    if self.config.is_some() {
+                        self.config = None;
+                    } else if self.selected_save_file.is_some() {
                         self.selected_save_file = None;
                     } else if self.game_tab != GameTab::Overview {
                         self.game_tab = GameTab::Overview;
+                        self.config = None;
                     } else {
                         self.selected = None;
                     }
                 }
-                (Key::Named(Named::Enter), Some(index))
-                    if self.game_tab != GameTab::Configuration =>
-                {
+                (Key::Named(Named::Enter), Some(index)) if self.config.is_none() => {
                     return Task::done(Message::Launch(index));
                 }
                 _ => {}
@@ -1183,6 +1078,7 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use doslet_config::{HardwarePreset, WritePolicy};
 
     struct Directory(PathBuf);
     impl Directory {
@@ -1205,31 +1101,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the user's local ROTT archive"]
-    fn rott_entrypoint_editor_checks_archive_programs() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut library = Library::discover();
-        library.games = vec![Game::load(&root.join("games/ROTT.toml")).unwrap()];
-        library.selected = Some(0);
-        library.new_action_name = "Wrong setup".into();
-        library.new_action_exe = "SETSOUND.EXE".into();
-        library.edit_game(GameEdit::AddAction);
-        assert!(library.notice.as_deref().unwrap().contains("SNDSETUP.EXE"));
-        assert_eq!(library.games[0].actions.len(), 1);
-
-        library.new_action_name = "Another setup".into();
-        library.new_action_exe = "sndsetup.exe".into();
-        library.edit_game(GameEdit::AddAction);
-        assert_eq!(library.games[0].actions[1].executable, "SNDSETUP.EXE");
-    }
-
-    #[test]
     fn profiles_become_sorted_cards_with_their_info() {
         let dir = Directory::new();
         let write = |name: &str, text: &str| std::fs::write(dir.0.join(name), text).unwrap();
         write(
             "b.toml",
-            "version=2\nname='Zeta'\n[info]\nreleased=1994\ngenres=['Action']\ndescription='Text.'\n[game]\nexecutable='dir/ZETA.EXE'\n[[game.actions]]\nid='setup'\nname='Setup'\nexecutable='dir/SETUP.EXE'\n[[drives]]\nletter='C'\nkind='zip'\nsource='zeta.zip'\n",
+            "version=2\nname='Zeta'\n[info]\nreleased=1994\ngenres=['Action']\ndescription='Text.'\n[game]\nexecutable='dir/ZETA.EXE'\n[[game.actions]]\nid='setup'\nname='Setup'\nexecutable='dir/SETUP.EXE'\n[output]\nframe_limit=35\n[[drives]]\nletter='C'\nkind='zip'\nsource='zeta.zip'\n",
         );
         write(
             "a.toml",
@@ -1244,6 +1121,7 @@ mod tests {
         assert_eq!(zeta.program, "ZETA.EXE");
         assert_eq!(zeta.actions.len(), 1);
         assert_eq!(zeta.actions[0].name, "Setup");
+        assert_eq!(zeta.spec.output.frame_limit, 35);
         assert_eq!(zeta.drive.as_deref(), Some("ZIP archive · zeta.zip"));
         assert_eq!(zeta.caption(), "1994 · Action");
         assert_eq!(zeta.info.description.as_deref(), Some("Text."));
@@ -1251,6 +1129,229 @@ mod tests {
         let action = Filter::Genre("Action".into());
         assert!(zeta.matches("act", &Filter::All) && zeta.matches("", &action));
         assert!(!zeta.matches("alpha", &Filter::All) && !games[0].matches("", &action));
+    }
+
+    fn library_with(dir: &Directory, profile: &str) -> Library {
+        std::fs::write(dir.0.join("game.toml"), profile).unwrap();
+        let directories = vec![dir.0.clone()];
+        Library {
+            games: scan(&directories),
+            directories,
+            search: String::new(),
+            filter: Filter::All,
+            selected: Some(0),
+            notice: None,
+            starting: None,
+            global: GlobalSettings::default(),
+            midi_choices: vec!["rust".into()],
+            game_tab: GameTab::Overview,
+            config: None,
+            vfs_mode: VfsViewMode::AllFiles,
+            vfs_dir: String::new(),
+            confirm_reset_overlay: false,
+            selected_save_file: None,
+            settings_page: SettingsPage::Machine,
+        }
+    }
+
+    fn escape() -> Message {
+        use iced::keyboard::{Event, Key, Location, Modifiers, key};
+        Message::Key(Event::KeyPressed {
+            key: Key::Named(key::Named::Escape),
+            modified_key: Key::Named(key::Named::Escape),
+            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+            location: Location::Standard,
+            modifiers: Modifiers::default(),
+            text: None,
+            repeat: false,
+        })
+    }
+
+    fn config(library: &mut Library, edit: GameEdit) {
+        let _ = library.update(Message::GameConfig(edit));
+    }
+
+    #[test]
+    fn configuration_window_edits_the_profile_in_place_until_saved() {
+        let dir = Directory::new();
+        let profile = "# Keep this comment.\nversion=2\nname='Game'\n[game]\nexecutable='GAME.EXE'\n[input]\n# Why auto.\nmouse_mode = 'auto'\nkeyboard='at'\n";
+        let mut library = library_with(&dir, profile);
+        config(&mut library, GameEdit::Open);
+        config(
+            &mut library,
+            GameEdit::Set(Setting::MouseMode, "no-capture".into()),
+        );
+        config(&mut library, GameEdit::Arguments("-nosound  /x ".into()));
+        assert_eq!(library.config.as_ref().unwrap().arguments, "-nosound  /x ");
+        assert!(library.config.as_ref().unwrap().changed());
+        let _ = library.update(escape());
+        assert!(library.config.is_none());
+        assert_eq!(library.selected, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("game.toml")).unwrap(),
+            profile
+        );
+
+        config(&mut library, GameEdit::Open);
+        config(
+            &mut library,
+            GameEdit::Set(Setting::MouseMode, "capture".into()),
+        );
+        config(&mut library, GameEdit::Unset(Setting::Keyboard));
+        config(&mut library, GameEdit::Arguments("-nosound  /x".into()));
+        config(&mut library, GameEdit::Save);
+        assert!(library.config.is_none());
+        let text = std::fs::read_to_string(dir.0.join("game.toml")).unwrap();
+        assert!(text.starts_with("# Keep this comment.\n"), "{text}");
+        assert!(text.contains("mouse_mode = \"capture\""), "{text}");
+        assert!(!text.contains("keyboard"), "{text}");
+        assert!(!text.contains("hide_cursor"), "{text}");
+        let saved = &library.games[0].spec;
+        assert_eq!(saved.input.mouse_mode, MouseMode::Capture);
+        assert_eq!(saved.game.arguments, ["-nosound", "/x"]);
+    }
+
+    #[test]
+    fn defaults_follow_global_settings_and_presets() {
+        let dir = Directory::new();
+        let mut library = library_with(
+            &dir,
+            "version=2\nname='Game'\nmachine = { cpu_mhz = 200 }\n[game]\nexecutable='GAME.EXE'\n",
+        );
+        library.global.input.mouse_mode = MouseMode::NoCapture;
+        library.global.keyboard = KeyboardMode::At;
+        config(&mut library, GameEdit::Open);
+        let window = library.config.as_ref().unwrap();
+        assert!(!window.is_set(Setting::MouseMode));
+        assert_eq!(window.effective.input.mouse_mode, MouseMode::NoCapture);
+        assert_eq!(window.effective.hardware.keyboard, KeyboardMode::At);
+        assert_eq!(window.effective.hardware.cpu_mhz, 200);
+        assert_eq!(window.defaults.hardware.cpu_mhz, 66);
+        // A preset replaces the clock the profile set.
+        config(
+            &mut library,
+            GameEdit::Set(Setting::Preset, "386sx-16".into()),
+        );
+        let window = library.config.as_ref().unwrap();
+        assert!(!window.is_set(Setting::CpuMhz));
+        assert_eq!(window.effective.hardware.cpu_mhz, 16);
+        assert_eq!(window.effective.hardware.memory_mib, 4);
+        config(&mut library, GameEdit::Save);
+        let text = std::fs::read_to_string(dir.0.join("game.toml")).unwrap();
+        assert!(
+            text.contains("preset = \"386sx-16\"") && !text.contains("cpu_mhz"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn programs_and_drives_are_edited_in_the_profile() {
+        let dir = Directory::new();
+        std::fs::create_dir_all(dir.0.join("game/sub")).unwrap();
+        for file in [
+            "game/GAME.EXE",
+            "game/Setup.exe",
+            "game/sub/TOOL.COM",
+            "game/README.TXT",
+        ] {
+            std::fs::write(dir.0.join(file), b"MZ").unwrap();
+        }
+        let mut library = library_with(
+            &dir,
+            "version=2\nname='Game'\n[game]\nexecutable='game/GAME.EXE'\n",
+        );
+        config(&mut library, GameEdit::Open);
+        let window = library.config.as_ref().unwrap();
+        let c = window.drive_c.as_ref().unwrap();
+        assert!(!c.explicit && c.exists && c.path.ends_with("game"));
+        assert_eq!(
+            window.programs,
+            ["game/GAME.EXE", "game/Setup.exe", "game/sub/TOOL.COM"]
+        );
+        config(&mut library, GameEdit::AddAction);
+        assert!(library.config.as_ref().unwrap().problem.is_some());
+        config(&mut library, GameEdit::ActionName(0, "Setup".into()));
+        config(
+            &mut library,
+            GameEdit::ActionExecutable(0, "game/Setup.exe".into()),
+        );
+        config(&mut library, GameEdit::ActionArguments(0, "/quick".into()));
+        config(&mut library, GameEdit::DriveC(true));
+        config(
+            &mut library,
+            GameEdit::DriveCPolicy(WritePolicy::Persistent),
+        );
+        assert!(library.config.as_ref().unwrap().problem.is_some());
+        config(&mut library, GameEdit::DriveCStore("game-saves".into()));
+        config(&mut library, GameEdit::DriveDSource("disc.iso".into()));
+        let window = library.config.as_ref().unwrap();
+        assert_eq!(window.problem, None);
+        let c = window.drive_c.as_ref().unwrap();
+        assert!(c.explicit && c.policy == WritePolicy::Persistent && c.store.is_some());
+        assert_eq!(window.drive_d.as_ref().map(|d| d.1), Some(false));
+        config(&mut library, GameEdit::Save);
+        let game = &library.games[0];
+        assert_eq!(game.actions.len(), 1);
+        assert_eq!(game.actions[0].executable, "game/Setup.exe");
+        assert_eq!(game.actions[0].arguments, ["/quick"]);
+        let c = game.spec.mounts.iter().find(|m| m.letter == b'C').unwrap();
+        assert_eq!(
+            (c.source.as_str(), c.store.as_deref()),
+            ("game", Some("game-saves"))
+        );
+
+        config(&mut library, GameEdit::Open);
+        config(&mut library, GameEdit::RemoveAction(0));
+        config(&mut library, GameEdit::DriveC(false));
+        config(&mut library, GameEdit::DriveDSource(String::new()));
+        config(&mut library, GameEdit::Save);
+        let text = std::fs::read_to_string(dir.0.join("game.toml")).unwrap();
+        assert!(
+            !text.contains("drives") && !text.contains("actions"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn global_settings_reject_invalid_machines_and_edit_custom_presets() {
+        let dir = Directory::new();
+        let mut library = library_with(&dir, "version=2\n[game]\nexecutable='GAME.EXE'\n");
+        let edit = |library: &mut Library, edit| {
+            let _ = library.update(Message::Global(edit));
+        };
+        // Saving writes the user's settings file, so stay in memory here.
+        library.global.input.axis_x = 0;
+        edit(&mut library, GlobalEdit::AxisY(0));
+        assert_eq!(library.global.input.axis_y, 1);
+        assert!(
+            library
+                .notice
+                .as_deref()
+                .unwrap()
+                .starts_with("Not applied")
+        );
+        edit(&mut library, GlobalEdit::Page(SettingsPage::Presets));
+        assert_eq!(library.settings_page, SettingsPage::Presets);
+    }
+
+    #[test]
+    fn configuration_window_refuses_to_save_an_invalid_machine() {
+        let dir = Directory::new();
+        let profile = "version=2\nname='Game'\n[game]\nexecutable='GAME.EXE'\n";
+        let mut library = library_with(&dir, profile);
+        config(&mut library, GameEdit::Open);
+        config(&mut library, GameEdit::Set(Setting::AxisY, 0.into()));
+        assert!(library.config.as_ref().unwrap().problem.is_some());
+        config(&mut library, GameEdit::Save);
+        assert!(library.config.is_some());
+        config(&mut library, GameEdit::Unset(Setting::AxisY));
+        config(&mut library, GameEdit::WorkingDirectory("GAME".into()));
+        assert!(library.config.as_ref().unwrap().problem.is_some());
+        config(&mut library, GameEdit::Save);
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("game.toml")).unwrap(),
+            profile
+        );
     }
 
     #[test]
@@ -1287,16 +1388,12 @@ mod tests {
             global: GlobalSettings::default(),
             midi_choices: vec!["rust".into()],
             game_tab: GameTab::Overview,
+            config: None,
             vfs_mode: VfsViewMode::AllFiles,
             vfs_dir: String::new(),
             confirm_reset_overlay: false,
             selected_save_file: None,
-            new_action_name: String::new(),
-            new_action_exe: String::new(),
-            new_preset_name: String::new(),
-            new_preset_mhz: 66,
-            new_preset_mode: CpuMode::Adaptive,
-            new_preset_memory: 16,
+            settings_page: SettingsPage::Machine,
         };
         assert!(!library.is_empty(), "no profiles in ./games");
         for game in &mut library.games {
@@ -1361,7 +1458,31 @@ mod tests {
         }
         library.selected = covered;
         shoot(&library, "page-narrow", Size::new(760.0, 560.0), None);
+        if let Some(index) = covered {
+            library.config =
+                Some(ConfigWindow::open(&library.games[index], &library.global).unwrap());
+            for page in ConfigPage::ALL {
+                library.config.as_mut().unwrap().page = page;
+                shoot(&library, &format!("config-{page:?}"), wide, None);
+            }
+            library.config.as_mut().unwrap().page = ConfigPage::Input;
+            shoot(&library, "config-narrow", Size::new(640.0, 560.0), None);
+            library.config = None;
+        }
         library.selected = None;
+        library.filter = Filter::Settings;
+        library.global.presets.push(HardwarePreset {
+            id: "custom-1".into(),
+            name: "Fast 486".into(),
+            ..HardwarePreset::find_builtin("486dx2-66").unwrap()
+        });
+        for page in SettingsPage::ALL {
+            library.settings_page = page;
+            shoot(&library, &format!("settings-{page:?}"), wide, None);
+        }
+        shoot(&library, "settings-narrow", Size::new(760.0, 560.0), None);
+        library.filter = Filter::All;
+        library.global = GlobalSettings::default();
         // The first card's art spans about (283, 120)–(565, 278); its Play
         // button sits in the bottom-right corner of the hover layer.
         let mut click = |position: Point| {
