@@ -77,6 +77,72 @@ impl Default for WorkerEngine {
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl WorkerEngine {
+    /// This worker contains the pinned v86 CPU and synchronous browser JIT host.
+    pub fn supports_v86(&self) -> bool {
+        cfg!(all(feature = "v86", target_arch = "wasm32"))
+    }
+    pub fn v86_enabled(&self) -> bool {
+        self.session.v86_enabled()
+    }
+    /// Call after installing a machine, so the previous CPU owner is released.
+    pub fn enable_v86(&mut self) -> Result<(), String> {
+        if !self.supports_v86() {
+            return Err("This browser runtime was built without v86".into());
+        }
+        self.session.enable_v86(&[])?;
+        self.session
+            .set_v86_host_clock(true)
+            .map_err(str::to_owned)?;
+        self.adaptive_cpu = false;
+        Ok(())
+    }
+    pub fn advance_v86_host_time(&mut self, target_nanos: f64) -> Result<f64, String> {
+        if !target_nanos.is_finite() || target_nanos < 0.0 {
+            return Err("Invalid guest clock target".into());
+        }
+        self.session
+            .advance_v86_host_time(target_nanos as u64)
+            .map(|elapsed| elapsed as f64)
+            .map_err(|error| error.to_string())
+    }
+    /// Catch up device time only when no pending IRQ must first reach the CPU.
+    pub fn v86_clock_catchup_ready(&self) -> bool {
+        self.session.v86_enabled()
+            && self.session.debug_cpu().accepts_maskable_interrupt()
+            && !self.session.debug_irq_pending()
+    }
+    /// HLT with IF set cannot execute guest code until an interrupt arrives.
+    /// JS may park CPU work while advancing host-time devices on a timer.
+    pub fn v86_halted_waiting_for_irq(&self) -> bool {
+        self.session.v86_enabled()
+            && self.session.cpu_halted()
+            && self.session.debug_cpu().accepts_maskable_interrupt()
+            && !self.session.debug_irq_pending()
+    }
+    pub fn v86_async_waiting(&self) -> bool {
+        self.session.v86_enabled()
+            && !self.session.debug_irq_pending()
+            && (self.v86_halted_waiting_for_irq()
+                || self.session.v86_ram_wait_parked()
+                || self.session.v86_input_poll_parked())
+    }
+    pub fn v86_diagnostics(&mut self) -> String {
+        match self.session.v86_statistics() {
+            Some(stats) => serde_json::json!({"enabled":true,"steps":stats.steps,
+                "jitEntries":stats.jit_entries,"compiledModules":stats.compiled_modules,
+                "runCalls":stats.run_calls,"softwareInterrupts":stats.software_interrupts,
+                "contextImports":stats.context_imports,"error":self.session.v86_last_error(),
+                "irqPending":self.session.debug_irq_pending(),
+                "acceptsIrq":self.session.debug_cpu().accepts_maskable_interrupt(),
+                "halted":self.session.debug_cpu().is_halted(),
+                "ramWaitParked":self.session.v86_ram_wait_parked(),
+                "inputPollParked":self.session.v86_input_poll_parked(),
+                "vgaPollActive":self.session.v86_vga_poll_active(),
+                "mpuPollActive":self.session.v86_mpu_poll_active()})
+            .to_string(),
+            None => "{\"enabled\":false}".into(),
+        }
+    }
     pub fn keyboard_mode(&self) -> String {
         match self.session.hardware_config().keyboard {
             doslet_config::KeyboardMode::At => "at",
@@ -131,7 +197,9 @@ impl WorkerEngine {
         self.session.host_cpu_limit()
     }
     pub fn cpu_mode(&self) -> String {
-        if self.tiers_active {
+        if self.session.v86_enabled() {
+            "v86"
+        } else if self.tiers_active {
             "tiers"
         } else if self.adaptive_cpu {
             "adaptive"
@@ -141,6 +209,11 @@ impl WorkerEngine {
         .into()
     }
     pub fn set_cpu_settings(&mut self, mode: &str, mhz: u16) -> Result<(), String> {
+        if self.session.v86_enabled() {
+            return Err(
+                "v86 uses its browser host clock; alternate CPU modes are unavailable".into(),
+            );
+        }
         let adaptive = match mode {
             "fixed" => false,
             "adaptive" => true,
@@ -164,6 +237,11 @@ impl WorkerEngine {
         Ok(())
     }
     pub fn set_tier_settings(&mut self, hot: u16, cold: u16, grey: u16) -> Result<(), String> {
+        if self.session.v86_enabled() {
+            return Err(
+                "v86 uses its browser host clock; alternate CPU modes are unavailable".into(),
+            );
+        }
         if hot > 1000 || !(1..=1000).contains(&cold) || !(1..=1000).contains(&grey) {
             return Err("Speed-tier rates must be 1..1000 MHz".into());
         }
@@ -210,6 +288,11 @@ impl WorkerEngine {
         Ok(())
     }
     pub fn set_cpu_mhz(&mut self, mhz: u16) -> Result<(), String> {
+        if self.session.v86_enabled() {
+            return Err(
+                "v86 uses its browser host clock; alternate CPU modes are unavailable".into(),
+            );
+        }
         self.session.set_cpu_mhz(mhz).map_err(|e| e.to_string())?;
         self.active_spec.hardware.cpu_mhz = mhz;
         Ok(())
@@ -583,6 +666,11 @@ impl WorkerEngine {
     /// Configured pacing and idle policies stay active; grants yield to them
     /// whenever they observe execution.
     pub fn install_aot(&mut self, profile: &[u8]) -> Result<(), String> {
+        if self.session.v86_enabled() {
+            return Err(
+                "v86 uses its browser host clock; alternate CPU modes are unavailable".into(),
+            );
+        }
         self.session.install(profile)
     }
     pub fn aot_begin(&mut self) {

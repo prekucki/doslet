@@ -122,19 +122,28 @@ def main():
                 assert not startup["errors"], startup
                 assert startup["gpu"] != args.software, startup
                 print("Renderer: " + json.dumps(startup), flush=True)
-                click(driver, 980, 28)
+                click(driver, 984, 20)  # Play the original color-bars demo.
                 time.sleep(1)
                 height = driver.script("return innerHeight;")
-                click(driver, 790, height - 25)
+                click(driver, 930, height - 25)
                 time.sleep(0.5)
+                click(driver, 700, height // 2)
+                driver.call("WebDriver:PerformActions", {"actions": [{
+                    "type": "wheel", "id": "scroll", "actions": [{
+                        "type": "scroll", "x": 600, "y": height // 2,
+                        "deltaX": 0, "deltaY": 150, "duration": 100,
+                    }],
+                }]})
+                time.sleep(0.3)
+                screenshot(driver, f"browser-xbrz-{mode}-panel.png")
                 if args.software:
                     sample = driver.script("return Array.from(document.querySelector('canvas').getContext('2d').getImageData(200,180,8,8).data);")
                     assert any(sample[index] for index in range(len(sample)) if index % 4 != 3)
-                click(driver, 560, height // 2 + 74)
+                click(driver, 560, height // 2)
                 time.sleep(0.3)
                 screenshot(driver, f"browser-xbrz-{mode}-options.png")
-                # iced opens this menu upward; xBRZ is its final row.
-                click(driver, 430, height // 2 + 39)
+                # xBRZ is the fourth of five filter rows.
+                click(driver, 430, height // 2 + 136)
                 time.sleep(1)
                 screenshot(driver, f"browser-xbrz-{mode}-selected.png")
                 if not args.software:
@@ -146,7 +155,7 @@ def main():
                 else:
                     state = driver.script("return xbrzTest;")
                     assert not state["errors"] and state["draws"] == 0, state
-                    assert any("xBRZ unavailable" in warning for warning in state["warnings"]), state
+                    assert any("xBRZ" in warning and "unavailable" in warning for warning in state["warnings"]), state
                     # The notice changes viewport height. Dismiss it before
                     # comparing the same on-screen sample at the original size.
                     click(driver, 772, height // 2 - 124)
@@ -157,8 +166,8 @@ def main():
                     assert after == sample, "Canvas2D fallback must retain the guest image"
                     print("Canvas2D: xBRZ rejected with notice, previous image preserved", flush=True)
                 # Return to Nearest, then force a redraw by resizing the viewport.
-                click(driver, 560, height // 2 + 74)
-                click(driver, 430, height // 2 - 63)
+                click(driver, 560, height // 2)
+                click(driver, 430, height // 2 + 30)
                 time.sleep(0.4)
                 draws = driver.script("return xbrzTest.draws;")
                 driver.call("WebDriver:SetWindowRect", {"width": 1000, "height": 800})

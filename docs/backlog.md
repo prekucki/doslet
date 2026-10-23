@@ -1,5 +1,34 @@
 # Future work
 
+## Known bugs
+
+### Gameport timing differs between CPU backends
+
+Status: open. Reported on native ROTT with v86; the user reports that the same
+controls work with AOT.
+
+With the gameport enabled and `JoystickEnabled 1` in ROTT's saved `CONFIG.ROT`,
+arrow keys can have no effect in the menu or game. Keyboard IRQs and scan codes
+still arrive. ROTT reads keyboard direction first, then lets joystick
+deflection overwrite it. A headless menu comparison using the saved overlay
+reproduced the failure; changing only `JoystickEnabled` to `0` restored menu
+navigation.
+
+Both backends use the same gameport device, but advance its clock differently.
+ROTT's joystick calibration counts polling-loop iterations. The interaction
+with v86's host clock is the suspected timing cause; equivalent axis readings
+and stability across backends have not yet been measured.
+
+Workaround: disable the joystick in ROTT's **Options → Controls**, or disable
+the gameport in the Doslet profile. The separate crash on reading disabled
+port `201h` is fixed: reads return `FFh` and writes are ignored. That fix does
+not resolve timing with the gameport enabled.
+
+Next: compare axis polling counts and reported neutral position on both
+backends, then verify stable neutral and directional input in ROTT with the
+gameport enabled. See the [v86 keyboard and gameport diagnostics](compatibility/v86-core.md)
+for the saved-overlay comparison and its validation limits.
+
 ## Procedure AOT: delayed interrupts and external waits
 
 The proposed procedure-level WASM backend executes small computational pieces
@@ -32,12 +61,11 @@ Keep the current synthesis/timing tests and the allocation regression test as
 acceptance checks. `std` availability and allocation during emulation are
 separate concerns; the latter must stay forbidden in the execution path.
 
-## CPU batching regression test
+## Resolved: CPU batching regression test
 
-`batches_stop_before_if_changes_ports_mmio_and_faults` fails with a batch length
-of 256 where the test expects 1. The same result was reproduced in an isolated
-copy with the OPL integration removed. Determine whether the batching behavior
-or the test's expectation needs correction; FM tests do not resolve this.
+The previously reported batch-length mismatch no longer reproduces. The
+release audit on 2026-10-24 passed this regression both in the workspace suite
+and independently with `dynamic-core` enabled:
 
 ```sh
 cargo test -p doslet-pc --features dynamic-core --locked batches_stop_before_if_changes_ports_mmio_and_faults

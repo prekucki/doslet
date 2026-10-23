@@ -436,7 +436,7 @@ fn callback_maps_real_stack_and_accepts_replacement_return_structure() {
 }
 
 #[test]
-#[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+#[cfg(feature = "v86")]
 #[ignore = "requires tools/v86-build"]
 fn v86_dpmi_callback_can_disable_interrupts_at_client_privilege() {
     extern crate std;
@@ -745,7 +745,7 @@ fn faulting_client(vectors: &[(u8, u32)], client: &[u8]) -> Session {
 const DIVIDE: [u8; 10] = [0xB9, 0, 0, 0, 0, 0xF7, 0xF1, 0x90, 0xEB, 0xFE];
 
 #[test]
-#[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+#[cfg(feature = "v86")]
 #[ignore = "requires tools/v86-build"]
 fn v86_faults_use_dpmi_exception_frames_instead_of_interrupt_reflection() {
     extern crate std;
@@ -814,7 +814,7 @@ fn v86_faults_use_dpmi_exception_frames_instead_of_interrupt_reflection() {
 }
 
 #[test]
-#[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+#[cfg(feature = "v86")]
 #[ignore = "requires tools/v86-build"]
 fn v86_16_bit_exception_handler_copies_its_high_memory_stack() {
     extern crate std;

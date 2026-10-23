@@ -33,6 +33,7 @@ impl ConfigPage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Setting {
     Preset,
+    ExecutionMode,
     CpuMhz,
     CpuMode,
     Memory,
@@ -64,8 +65,9 @@ pub enum Setting {
     Button2,
 }
 impl Setting {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::Preset,
+        Self::ExecutionMode,
         Self::CpuMhz,
         Self::CpuMode,
         Self::Memory,
@@ -110,6 +112,7 @@ impl Setting {
     pub const fn key(self) -> (&'static str, &'static str) {
         match self {
             Self::Preset => ("", "preset"),
+            Self::ExecutionMode => ("game", "mode"),
             Self::CpuMhz => ("machine", "cpu_mhz"),
             Self::CpuMode => ("machine", "cpu_mode"),
             Self::Memory => ("machine", "memory_mib"),

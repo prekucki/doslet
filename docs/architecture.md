@@ -5,10 +5,14 @@ application policy. Libraries live in nested domains, with independent manifests
 and tests. No emulation library depends on iced or accesses a host filesystem.
 
 The optional [v86 CPU/JIT adapter](compatibility/v86-core.md) runs a pinned
-upstream CPU in an isolated WASM instance, with a native Wasmtime host and
-`no_std` wire types. Desktop `--v86` uses it in `Session`, retaining Rust PC
-devices through scoped I/O/MMIO callbacks and one v86-owned RAM backing. Upstream
-`std`, unsafe code and SoftFloat C remain inside that WASM build. The host
+upstream CPU with `no_std` wire types. Desktop `--v86` uses an isolated WASM
+instance hosted by Wasmtime. Its Cargo build precompiles and embeds the core;
+runtime deserialization accepts only that immutable build artifact. Explicit
+module overrides remain validated WASM. Browser `--mode v86` links the pinned CPU into the
+machine Worker WASM and imports that Worker's memory into generated JIT blocks.
+Both retain Rust PC devices through scoped I/O/MMIO callbacks and one v86-owned
+RAM backing. Upstream `std`, unsafe code and SoftFloat C remain in the v86
+execution boundary. The host
 owns ports, mapped device memory and interrupt acknowledgement. Execution
 uses bounded CPU grants and returns at port I/O and software-interrupt/service
 boundaries. By default, `--v86` advances Rust devices from monotonic time
@@ -16,7 +20,8 @@ supplied by the native owner, independently of instruction counts. Runtime
 batches bound both guest work and execution iterations, and clock catch-up
 interleaves pending IRQs with CPU execution. `--v86-instruction-clock` restores
 instruction-based timing and hardware-deadline grants for comparisons.
-The browser continues to use the existing CPU path.
+Browser v86 uses host-clock device slices and bounded CPU grants; the `simple`
+and `aot` website modes retain their existing CPU paths.
 
 The [machine design](design/configurable-machines.md) and its
 [input and overlay extension](design/input-and-write-overlays.md) record the
@@ -26,6 +31,8 @@ routing and transactional save stores. SQL remains a future host adapter.
 See [configuration](configuration.md) for the implemented settings and limits.
 
 TOML launch profiles use a shared native/browser `toml_edit` codec.
+`game.mode` selects `simple`, `aot`, or `v86`, independently of CPU clock policy.
+Explicit backend CLI options override it; omission preserves existing defaults.
 The frontend merges explicit CLI options, resolves host paths and transfers
 mounted file ownership during setup. `Session::configure_launch` accepts DOS
 command-tail and working-directory byte slices before execution; the CPU and
@@ -104,6 +111,8 @@ focus loss, pause and overflow release affected contributors. The independent
 AT keyboard crate implements scan sets 1/2 and guest-time typematic. Its IRQ1
 shim updates the BIOS key ring only when executed through the guest IVT.
 The gameport implements guest-time charge deadlines at port 201h.
+When disabled, port 201h reads as `FFh` and ignores writes so joystick
+detection can time out without terminating the guest.
 
 The native `doslet-emulation` thread creates and exclusively owns the Session,
 execution cache and storage adapter. With a host audio device, `doslet-audio`

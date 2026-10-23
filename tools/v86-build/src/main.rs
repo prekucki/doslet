@@ -1,37 +1,12 @@
 //! Rebuild the pinned upstream CPU and JIT without a Node runtime.
 use boa_engine::{Context, Source};
-use std::{env, error::Error, fs, path::PathBuf, process::Command};
+use std::{env, error::Error, fs, path::PathBuf};
 
-fn checked(command: &mut Command) -> Result<(), Box<dyn Error>> {
-    let status = command.status()?;
-    if !status.success() {
-        return Err(format!("command failed: {command:?}: {status}").into());
-    }
-    Ok(())
-}
+mod module;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<_> = env::args_os().skip(1).collect();
-    // rustc invokes this executable as its linker; preserve upstream's state
-    // area below the global base and expose the table used by generated code.
-    if args.first().is_some_and(|arg| arg == "-flavor") {
-        let sysroot = Command::new("rustc")
-            .args(["--print", "sysroot"])
-            .output()?;
-        let version = Command::new("rustc").args(["-vV"]).output()?;
-        let version = String::from_utf8(version.stdout)?;
-        let host = version
-            .lines()
-            .find_map(|line| line.strip_prefix("host: "))
-            .ok_or("missing rustc host")?;
-        let linker = PathBuf::from(String::from_utf8(sysroot.stdout)?.trim())
-            .join("lib/rustlib")
-            .join(host)
-            .join("bin/rust-lld");
-        let args = args
-            .iter()
-            .filter(|arg| !matches!(arg.to_str(), Some("--stack-first" | "--export-table")));
-        return checked(Command::new(linker).args(args).arg("--no-stack-first"));
+    if module::link_if_requested()? {
+        return Ok(());
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -82,58 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             fs::write(generated.join(name), contents)?;
         }
     }
-    let out = root.join("target/v86");
-    fs::create_dir_all(&out)?;
-    checked(
-        Command::new("clang")
-            .args([
-                "-c",
-                "--target=wasm32",
-                "-O3",
-                "-flto",
-                "-nostdlib",
-                "-fvisibility=hidden",
-                "-ffunction-sections",
-                "-fdata-sections",
-                "-DSOFTFLOAT_FAST_INT64",
-                "-DINLINE_LEVEL=5",
-                "-DSOFTFLOAT_FAST_DIV32TO16",
-                "-DSOFTFLOAT_FAST_DIV64TO32",
-            ])
-            .arg(vendor.join("softfloat/softfloat.c"))
-            .arg("-o")
-            .arg(out.join("softfloat.o")),
-    )?;
-    let linker = env::current_exe()?;
-    checked(
-        Command::new("cargo")
-            .args(["rustc", "--manifest-path"])
-            .arg(vendor.join("Cargo.toml"))
-            .args([
-                "--release",
-                "--locked",
-                "--offline",
-                "--target",
-                "wasm32-unknown-unknown",
-                "--target-dir",
-            ])
-            .arg(out.join("build"))
-            .args(["--", "-C"])
-            .arg(format!("linker={}", linker.display()))
-            .args([
-                "-C",
-                "link-arg=--import-table",
-                "-C",
-                "link-arg=--global-base=4096",
-                "-C",
-            ])
-            .arg(format!("link-arg={}", out.join("softfloat.o").display()))
-            .args(["-C", "target-feature=+bulk-memory,+multivalue,+simd128"]),
-    )?;
-    fs::copy(
-        out.join("build/wasm32-unknown-unknown/release/doslet_v86_module.wasm"),
-        out.join("doslet-v86.wasm"),
-    )?;
-    println!("Built {}", out.join("doslet-v86.wasm").display());
+    let wasm = module::build(&root, &root.join("target/v86"))?;
+    println!("Built {}", wasm.display());
     Ok(())
 }

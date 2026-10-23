@@ -33,6 +33,9 @@ license files with this copy. Verify active FM continuation when updating it.
 ## v86 CPU/JIT
 
 `v86/` contains the pinned upstream Rust CPU, WASM JIT, instruction generators
-and SoftFloat implementation. It builds separately into WASM through
-`tools/v86-build`, without Node tooling. See its [provenance and local
+and SoftFloat implementation. Native Cargo builds compile a separate WASM
+module and embed a Wasmtime-precompiled artifact. Browser builds link the CPU
+into the machine Worker's WASM memory. `tools/v86-build` also exports the
+standalone module and optionally regenerates instruction tables without Node.
+See its [provenance and local
 changes](v86/README.md) and [build/validation instructions](../docs/compatibility/v86-core.md).

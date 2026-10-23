@@ -12,7 +12,10 @@ emulator it covers is not imported.
 
 Doslet changes:
 
-- `Cargo.toml` builds an isolated WASM cdylib, outside the main workspace.
+- `Cargo.toml` builds an isolated WASM cdylib, outside the main workspace,
+  or an `embedded` library linked into the browser Worker. The embedded feature
+  uses the Worker's allocator, shared memory, scoped device callbacks and
+  growable function table; reset/drop clears the retained CPU and JIT state.
 - `rust/doslet.rs` exports initialization, stepping, JIT preparation, segment
   setup and external interrupt delivery. `rust/lib.rs` includes this adapter
   and omits the unused Zstandard module.
@@ -41,7 +44,8 @@ Doslet changes:
 
 The isolated upstream module still uses `std`, unsafe Rust and SoftFloat C.
 Those are compiled into WASM; no upstream raw pointer becomes a native Rust
-pointer. The main workspace's `doslet-v86` wire crate is `no_std`, and the native
+pointer. In the browser, the CPU and devices share the Worker's WASM memory.
+The main workspace's `doslet-v86` wire crate is `no_std`, and the native
 host confines a scoped device borrow to a small unsafe module. This is not a
 conversion of upstream v86 into a generic `no_std` Rust CPU library.
 

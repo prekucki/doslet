@@ -1686,9 +1686,15 @@ version = "0.1.0"
 dependencies = [
  "doslet-bus",
  "doslet-v86",
+ "doslet-v86-module",
  "doslet-x86",
+ "wasm-bindgen",
  "wasmtime",
 ]
+
+[[package]]
+name = "doslet-v86-module"
+version = "0.1.0"
 
 [[package]]
 name = "doslet-vfs"

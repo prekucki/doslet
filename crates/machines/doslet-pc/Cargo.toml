@@ -33,9 +33,9 @@ doslet-i8259.workspace = true
 doslet-i8254.workspace = true
 doslet-i8237.workspace = true
 doslet-vga.workspace = true
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 doslet-v86 = { path = "../../cpu/doslet-v86", optional = true }
 doslet-v86-host = { path = "../../runtime/doslet-v86-host", optional = true }
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 doslet-wasm-aot = { path = "../../cpu/doslet-wasm-aot", optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 allocation-counter = "0.8.1"

@@ -259,6 +259,8 @@ pub struct DisplaySizing {
     pub fallback: DisplayFilter,
     /// Whether GPU filters and the 16:9 smart warp run on a hardware GPU.
     pub gpu: bool,
+    /// Browser renderer capability for the RAVU half-float lookup textures.
+    pub ravu_supported: bool,
     frames: FrameMeter,
     viewport: Size,
     scale_factor: f32,
@@ -285,6 +287,7 @@ impl Default for DisplaySizing {
             crt: false,
             fallback: DisplayFilter::default(),
             gpu: true,
+            ravu_supported: true,
             frames: FrameMeter::default(),
             viewport: Size::ZERO,
             scale_factor: 1.0,
@@ -380,7 +383,9 @@ impl DisplaySizing {
     pub fn active_filter(&self) -> DisplayFilter {
         if self.pixel_perfect {
             DisplayFilter::Nearest
-        } else if self.filter.needs_gpu() && !self.gpu {
+        } else if self.filter.needs_gpu()
+            && (!self.gpu || (self.filter == DisplayFilter::Ravu && !self.ravu_supported))
+        {
             self.fallback
         } else {
             self.filter
@@ -764,6 +769,12 @@ mod tests {
         };
         sizing.set_output(&output);
         assert_eq!(sizing.active_filter(), DisplayFilter::Ravu);
+        sizing.ravu_supported = false;
+        assert_eq!(sizing.active_filter(), DisplayFilter::SharpBilinear);
+        let _ = sizing.update(SizingMessage::Filter(DisplayFilter::Xbrz), &frame);
+        assert_eq!(sizing.active_filter(), DisplayFilter::Xbrz);
+        let _ = sizing.update(SizingMessage::Filter(DisplayFilter::Ravu), &frame);
+        sizing.ravu_supported = true;
         let _ = sizing.update(SizingMessage::PixelPerfect, &frame);
         assert_eq!(sizing.active_filter(), DisplayFilter::Nearest);
         let _ = sizing.update(SizingMessage::Fit, &frame);

@@ -10,7 +10,7 @@ mod recurrence;
 pub use recurrence::RecurrenceMark;
 pub mod resources;
 mod timing;
-#[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+#[cfg(feature = "v86")]
 mod v86;
 mod vga_wait;
 #[cfg(feature = "wasm-procedures")]
@@ -401,7 +401,7 @@ impl PcMachine {
         budget: u32,
         mut observation: Option<&mut StepObservation>,
     ) -> Result<(StepOutcome, u32), MachineError> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         if self.v86_enabled() {
             if OBSERVE {
                 return Err(MachineError::V86(

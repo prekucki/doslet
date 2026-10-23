@@ -1123,7 +1123,7 @@ impl PcMachine {
         replace: bool,
     ) -> Result<(), String> {
         let wasm = !matches!(&module, Module::Interpreter(_));
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         if self.v86_enabled() {
             return Err("v86 owns this session's CPU and RAM".into());
         }
@@ -1407,7 +1407,7 @@ impl PcMachine {
                 })
             }
             Storage::Owned { .. } => None,
-            #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+            #[cfg(feature = "v86")]
             Storage::V86(_) => None,
         };
         if let Some(storage) = owned {

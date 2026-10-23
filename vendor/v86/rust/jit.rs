@@ -32,7 +32,7 @@ impl WasmTableIndex {
 mod unsafe_jit {
     use super::{CachedStateFlags, WasmTableIndex};
 
-    #[link(wasm_import_module = "env")]
+    #[cfg_attr(not(feature = "embedded"), link(wasm_import_module = "env"))]
     extern "C" {
         pub fn codegen_finalize(
             wasm_table_index: WasmTableIndex,
@@ -96,6 +96,15 @@ impl Deref for JitStateRef {
 }
 impl DerefMut for JitStateRef {
     fn deref_mut(&mut self) -> &mut Self::Target { unsafe { self.0.assume_init_mut() } }
+}
+
+pub fn embedded_release() {
+    // Called only after the embedded CPU has stopped and its table is cleared.
+    unsafe { JIT_STATE.try_lock().unwrap().assume_init_drop(); }
+}
+
+pub fn embedded_finalize(index: u16, address: u32, flags: u32) {
+    codegen_finalize_finished(WasmTableIndex(index), address, CachedStateFlags::of_u32(flags));
 }
 
 #[no_mangle]

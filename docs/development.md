@@ -8,6 +8,8 @@ runner and browser CPU acceptance, see [the experimental WASM core](compatibilit
 
 For the separately imported v86 CPU/JIT, its Cargo-only table generator and
 native adapter tests, see [the experimental v86 core](compatibility/v86-core.md).
+For the current branch audit and repeatable release checks, see
+[release readiness](release-readiness.md).
 
 For native desktop/headless remote debugging, RAM patches and mixed 16/32-bit guest
 inspection, see [debugging with GDB](debugging.md).
@@ -96,6 +98,9 @@ wasm-bindgen and Binaryen tools from `mise.toml` before building a site.
 ```sh
 cargo run -p doslet-web --release --locked -- build games/ROTT.toml -o target/rott-site
 cargo run -p doslet-web --release --locked -- serve games/ROTT.toml --port 8080
+cargo run -p doslet-web --release --locked -- build games/ROTT.toml --mode simple -o target/rott-simple
+cargo run -p doslet-web --release --locked -- build games/ROTT.toml --mode aot -o target/rott-aot
+cargo run -p doslet-web --release --locked -- serve games/ROTT.toml --mode v86 --rom-dir ~/.config/dosbox/mt32-roms --port 8080
 ```
 
 Both commands build the release frontend through Trunk. `serve` then starts
@@ -104,6 +109,14 @@ a Rust HTTP server bound to loopback; it prints the localhost URL. Without
 `target/<profile-name>-web`. Existing output directories are never overwritten.
 Use `--web-dist web/dist` to reuse a previously built frontend and `--offline`
 to build without downloading tool dependencies. No Node tooling is involved.
+`--mode simple` packages the interpreter without AOT preparation; `--mode aot`
+requires at least one guarded AOT entry. The existing `--aot auto|required|off`
+remains available when `--mode` is omitted. `--mode v86` builds the Worker with
+the pinned v86 CPU/JIT linked into its Wasm memory; DOS, devices, video and
+audio stay in Doslet. The Worker advances PIT, DMA and IRQ time from the host
+clock and runs bounded CPU grants. AOT and speed-tier profiles are excluded.
+`--web-dist` must point to a frontend built in the selected v86 mode, which is
+identified by `browser/v86-runtime.json`.
 `games/ROTT.toml` sets `[game] startup_keys = "15"`; both native and browser
 frontends queue that text at the first BIOS keyboard wait. The optional
 `--startup-keys` build argument overrides this profile value for one web
@@ -653,7 +666,8 @@ substitute. See [MCP host counters](debugging.md#mcp-host-counters).
 ## Check the work
 
 ```sh
-cargo fmt --all --check
+cargo fmt --check
+cargo fmt --manifest-path tools/v86-build/Cargo.toml --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 RUST_MIN_STACK=8388608 cargo test --workspace --locked
 cargo check -p doslet -p doslet-time -p doslet-executable --target wasm32-unknown-unknown --locked
@@ -661,6 +675,11 @@ cargo check -p doslet-web-worker -p doslet-web-audio --target wasm32-unknown-unk
 cargo run -p doslet-headless --release --locked -- bench --steps 5000000
 cargo run -p doslet-headless --release --locked --example bench_dynamic
 ```
+
+Run the formatting commands from the repository root. `cargo fmt` covers all
+workspace members; `--all` additionally traverses local dependencies, including
+the pinned upstream v86 source whose formatting is preserved. The standalone
+v86 build tool is checked separately.
 
 Native synthesis-worker tests run without an audio device:
 

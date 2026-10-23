@@ -27,15 +27,23 @@ def main():
     parser.add_argument("--aot-off", action="store_true")
     parser.add_argument("--expect-procedure-aot", action="store_true")
     parser.add_argument("--wasm-procedures", type=Path)
+    parser.add_argument("--aot-profile", type=Path)
     parser.add_argument("--observe-seconds", type=float, default=0)
     parser.add_argument("--web-dist", type=Path)
+    parser.add_argument("--mode", choices=["simple", "aot", "v86"])
     parser.add_argument("--speed-tiers", type=Path)
     args = parser.parse_args()
+    if args.mode and (args.aot_off or args.expect_aot or args.wasm_procedures):
+        parser.error("--mode cannot be combined with legacy AOT options")
     command = [str(ROOT / "target/debug/doslet-web"), "serve", str(args.config), "--port", "0", "--offline"]
     if args.web_dist:
         command += ["--web-dist", str(args.web_dist)]
+    if args.mode:
+        command += ["--mode", args.mode]
     if args.speed_tiers:
         command += ["--speed-tiers", str(args.speed_tiers)]
+    if args.aot_profile:
+        command += ["--aot-profile", str(args.aot_profile)]
     if args.expect_aot:
         command += ["--aot", "required"]
     if args.aot_off:
@@ -98,7 +106,12 @@ def main():
                 driver.wait("dosletBundleBridge.state?.steps > 1000", timeout=60)
                 if args.speed_tiers:
                     driver.wait("dosletBundleBridge.state?.cpuMode === 'tiers' && dosletBundleBridge.state.tierRates.length === 3")
-                if args.expect_aot:
+                if args.mode:
+                    driver.wait(f"dosletBundleBridge.state?.cpuCore === {json.dumps(args.mode)}")
+                if args.mode == "v86":
+                    driver.wait("dosletBundleBridge.state?.v86?.jitEntries > 0", timeout=120)
+                    print("v86 generated WASM code executed", flush=True)
+                if args.expect_aot or args.mode == "aot":
                     driver.wait("dosletBundleBridge.state?.aotTranslatedSteps > 0", timeout=120)
                     assert driver.script("return dosletBundleBridge.state.aot.active && dosletBundleBridge.state.aot.installed && dosletBundleBridge.state.aot.grants > 0;")
                     print("Generated AOT code executed", flush=True)
@@ -117,11 +130,13 @@ def main():
                 driver.wait("dosletBundleBridge.state?.status === 1 && dosletBundleBridge.state.steps > 1000", timeout=60)
                 if args.speed_tiers:
                     assert driver.script("return dosletBundleBridge.state.cpuMode === 'tiers' && dosletBundleBridge.state.tierRates.length === 3;")
-                if args.expect_aot:
+                if args.mode == "v86":
+                    driver.wait("dosletBundleBridge.state?.cpuCore === 'v86' && dosletBundleBridge.state.v86?.jitEntries > 0", timeout=120)
+                if args.expect_aot or args.mode == "aot":
                     driver.wait("dosletBundleBridge.state?.aotTranslatedSteps > 0", timeout=120)
                 if args.expect_procedure_aot:
                     driver.wait("dosletBundleBridge.state?.aot?.installed && dosletBundleBridge.state.aot.entries > 0", timeout=120)
-                result = driver.script("return {status:dosletBundleBridge.state.status,steps:dosletBundleBridge.state.steps,aot:dosletBundleBridge.state.aot,fault:dosletBundleBridge.state.fault};")
+                result = driver.script("return {status:dosletBundleBridge.state.status,steps:dosletBundleBridge.state.steps,core:dosletBundleBridge.state.cpuCore,aot:dosletBundleBridge.state.aot,v86:dosletBundleBridge.state.v86,fault:dosletBundleBridge.state.fault};")
                 assert not result["fault"], result
                 print(json.dumps(result), flush=True)
                 print("Rust serve + bundled launch + pause/reset in Firefox: OK", flush=True)

@@ -339,6 +339,10 @@ impl Routes {
                 Some(Endpoint::Gameport),
                 Some(Endpoint::Gameport),
             )?;
+        } else {
+            // Games probe the joystick even when no gameport is installed.
+            // Floating inputs stay high; trigger writes have no effect.
+            this.fallback(0x201, Endpoint::Probe);
         }
         Ok(this)
     }

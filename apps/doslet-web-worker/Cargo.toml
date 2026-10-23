@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
+[features]
+v86 = ["doslet-runtime/v86"]
 [dependencies]
 serde_json = "1"
 doslet-config.workspace = true

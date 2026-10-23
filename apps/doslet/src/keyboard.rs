@@ -1,6 +1,25 @@
 //! Host keys become BIOS scan-code/ASCII pairs; the machine stays in its owner.
 use iced::keyboard::{Event, Key, Modifiers, key::Named};
 
+/// Opt-in native input diagnostics; no formatting or environment reads per
+/// event after the disabled flag has been cached.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn trace(
+    event: &Event,
+    captured: bool,
+    enabled: bool,
+    mode: doslet_config::KeyboardMode,
+    v86: bool,
+) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("DOSLET_TRACE_KEYS").is_some()) {
+        eprintln!(
+            "[INFO doslet] keyboard: captured={captured} enabled={enabled} mode={mode:?} v86={v86} routed={:?} event={event:?}",
+            physical(event)
+        );
+    }
+}
+
 /// Translate the host's physical location into USB HID usages, including releases.
 pub fn physical(event: &Event) -> Option<(u16, bool)> {
     use iced::keyboard::key::{Code, Physical};

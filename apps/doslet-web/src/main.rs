@@ -45,6 +45,8 @@ enum Aot {
     Off,
 }
 
+use doslet_config::ExecutionMode as Mode;
+
 /// Register-code blocks end at every memory access. Below this mean length a
 /// grant costs more than it runs: ROTT averages 2.5 instructions and measured
 /// 2–8% slower than the interpreter, so `--aot auto` skips it.
@@ -78,9 +80,12 @@ struct Args {
     /// Reuse an already built Trunk distribution instead of building it.
     #[arg(long)]
     web_dist: Option<PathBuf>,
-    /// Use cached memory procedures or prepare guarded register code; unsupported code uses fallback.
-    #[arg(long, value_enum, default_value = "auto")]
-    aot: Aot,
+    /// Browser CPU backend: simple, aot or v86 (overrides game.mode).
+    #[arg(long, conflicts_with = "aot")]
+    mode: Option<Mode>,
+    /// Legacy AOT policy override; defaults to auto when game.mode is absent.
+    #[arg(long, value_enum)]
+    aot: Option<Aot>,
     /// Optional observed code profile (DSJ1 or speed-tiers JSON), used for AOT only.
     #[arg(long)]
     aot_profile: Option<PathBuf>,
@@ -339,12 +344,6 @@ fn report(bar: &ProgressBar, text: &str) {
     }
 }
 fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
-    if args.aot == Aot::Off && (args.aot_profile.is_some() || args.wasm_procedures.is_some()) {
-        return Err("--aot-profile and --wasm-procedures cannot be used with --aot off".into());
-    }
-    if args.aot_profile.is_some() && args.wasm_procedures.is_some() {
-        return Err("--aot-profile and --wasm-procedures select different AOT backends".into());
-    }
     let default_output = PathBuf::from("target").join(format!(
         "{}-web",
         args.config
@@ -361,6 +360,38 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
     let base = config.parent().ok_or("profile has no parent")?;
     let mut spec =
         machine_profile::parse_machine_profile(std::str::from_utf8(&read(&config, 1024 * 1024)?)?)?;
+    let mode = args
+        .mode
+        .or_else(|| {
+            args.aot.map(|aot| match aot {
+                Aot::Off => Mode::Simple,
+                Aot::Required | Aot::Auto => Mode::Aot,
+            })
+        })
+        .or(spec.game.mode);
+    let v86 = mode == Some(Mode::V86);
+    let aot = match mode {
+        None => Aot::Auto,
+        Some(Mode::Simple) => Aot::Off,
+        Some(Mode::Aot) => args.aot.unwrap_or(Aot::Required),
+        Some(Mode::V86) => Aot::Off,
+    };
+    if v86
+        && (args.aot_profile.is_some()
+            || args.wasm_procedures.is_some()
+            || args.speed_tiers.is_some())
+    {
+        return Err("--mode v86 cannot be combined with AOT or speed-tier profiles".into());
+    }
+    if aot == Aot::Off && (args.aot_profile.is_some() || args.wasm_procedures.is_some()) {
+        return Err(
+            "--aot-profile and --wasm-procedures cannot be used with simple mode or --aot off"
+                .into(),
+        );
+    }
+    if args.aot_profile.is_some() && args.wasm_procedures.is_some() {
+        return Err("--aot-profile and --wasm-procedures select different AOT backends".into());
+    }
     if !args.startup_keys.is_empty() {
         let keys = args.startup_keys.join("");
         if keys.len() > 15
@@ -534,10 +565,20 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
             ),
         );
     }
-    stage(bar, 2, "Preparing guarded AOT code");
+    stage(
+        bar,
+        2,
+        if v86 {
+            "Preparing v86 backend"
+        } else if aot == Aot::Off {
+            "Selecting interpreter backend"
+        } else {
+            "Preparing guarded AOT code"
+        },
+    );
     // The worker runs bundles with the profile's DPMI host, direct by default.
     let dpmi = spec.dpmi.unwrap_or(doslet_config::DpmiHost::Direct);
-    let procedure_path = if args.aot == Aot::Off || args.aot_profile.is_some() {
+    let procedure_path = if aot == Aot::Off || args.aot_profile.is_some() {
         None
     } else if let Some(path) = &args.wasm_procedures {
         Some(path.clone())
@@ -548,7 +589,7 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
         .as_deref()
         .map(|path| procedures::load(path, &identity, dpmi.as_str()))
         .transpose()?;
-    let prepared = if args.aot == Aot::Off || procedure_bundle.is_some() {
+    let prepared = if aot == Aot::Off || procedure_bundle.is_some() {
         None
     } else if let Some(path) = args.aot_profile.as_ref().or(args.speed_tiers.as_ref()) {
         let profile = read(path, 64 * 1024 * 1024)?;
@@ -577,7 +618,7 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
     } else if let Some((_, translation)) = prepared {
         let blocks = translation.blocks();
         let instructions: usize = blocks.iter().map(|block| block.instructions.len()).sum();
-        if args.aot == Aot::Auto
+        if aot == Aot::Auto
             && args.aot_profile.is_none()
             && instructions < MIN_AUTO_BLOCK_INSTRUCTIONS * blocks.len()
         {
@@ -599,10 +640,11 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
             fs::write(bundle.join("aot.wasm"), wasm)?;
         }
     }
-    if compiled_entries == 0 {
-        if args.aot == Aot::Required {
+    if compiled_entries == 0 && aot != Aot::Off {
+        if aot == Aot::Required {
             return Err(
-                "no supported AOT entries; use --aot auto/off for interpreter fallback".into(),
+                "no supported AOT entries; use --mode simple or --aot auto/off for interpreter fallback"
+                    .into(),
             );
         }
         if !fragmented {
@@ -617,7 +659,21 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
             &format!("AOT: {compiled_entries} entries prepared ({aot_description})."),
         );
     }
+    manifest["mode"] = json!(if v86 {
+        "v86"
+    } else if compiled_entries == 0 {
+        "simple"
+    } else {
+        "aot"
+    });
     stage(bar, 3, "Preparing portable settings and audio");
+    spec.game.mode = Some(if v86 {
+        Mode::V86
+    } else if compiled_entries == 0 {
+        Mode::Simple
+    } else {
+        Mode::Aot
+    });
     spec.game.executable = executable;
     let persistent = matches!(
         spec.mounts[0].policy,
@@ -689,7 +745,15 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
         command
             .current_dir(root.join("web"))
             .env("NO_COLOR", "true")
-            .args(["build", "--release", "--locked"]);
+            .env("DOSLET_WEB_MODE", if v86 { "v86" } else { "standard" })
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "--no-default-features",
+                "--features",
+                "wasm-procedures",
+            ]);
         if args.offline {
             command.arg("--offline");
         }
@@ -719,6 +783,17 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
     };
     if parent.starts_with(&dist) {
         return Err("output cannot be inside the reused web distribution".into());
+    }
+    if v86 {
+        let marker = dist.join("browser/v86-runtime.json");
+        let ready = fs::read(&marker)
+            .ok()
+            .filter(|bytes| bytes.len() <= 1024)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| value["abi"].as_u64() == Some(4));
+        if !ready {
+            return Err("v86 frontend is missing or incompatible; rebuild with --mode v86 without --web-dist".into());
+        }
     }
     let html = String::from_utf8(read(&dist.join("index.html"), 4 * 1024 * 1024)?)?;
     if !html.contains("</body>") {
@@ -859,10 +934,19 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
         staging.0.join("index.html"),
         html.replace("</body>", &(overlay + "</body>")),
     )?;
+    let execution = if v86 {
+        "CPU mode: v86 with Doslet devices.\n".to_owned()
+    } else if compiled_entries == 0 {
+        "CPU mode: simple interpreter.\n".to_owned()
+    } else {
+        format!(
+            "CPU mode: guarded AOT; {compiled_entries} entries ({aot_description}). Live source, context and memory checks must admit each call; unsupported work uses the interpreter. No speedup claim is implied.\n"
+        )
+    };
     fs::write(
         staging.0.join("README.txt"),
         format!(
-            "Doslet: {}\nServe this directory over HTTPS or http://localhost. No backend is required.\nAOT entries: {compiled_entries}; experimental {aot_description}. Live source, context and memory checks must admit each call; unsupported work uses the interpreter. No speedup claim is implied.\nGame media and any explicitly supplied ROMs are included.\n",
+            "Doslet: {}\nServe this directory over HTTPS or http://localhost. No backend is required.\n{execution}Game media and any explicitly supplied ROMs are included.\n",
             spec.name
         ),
     )?;
@@ -930,6 +1014,36 @@ fn run(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_cli_accepts_three_backends_and_rejects_legacy_aot_mix() {
+        for mode in [Mode::Simple, Mode::Aot, Mode::V86] {
+            let name = match mode {
+                Mode::Simple => "simple",
+                Mode::Aot => "aot",
+                Mode::V86 => "v86",
+            };
+            let cli =
+                Cli::try_parse_from(["doslet-web", "build", "game.toml", "--mode", name]).unwrap();
+            let Action::Build(args) = cli.command else {
+                panic!("expected build action")
+            };
+            assert_eq!(args.mode, Some(mode));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "doslet-web",
+                "build",
+                "game.toml",
+                "--mode",
+                "simple",
+                "--aot",
+                "off",
+            ])
+            .is_err()
+        );
+    }
+
     fn web_dist(root: &Path) -> PathBuf {
         let dist = root.join("dist");
         fs::create_dir(&dist).unwrap();
@@ -986,7 +1100,8 @@ mod tests {
             config: root.join("game.toml"),
             output: Some(root.join("site")),
             web_dist: Some(web_dist(root)),
-            aot: Aot::Required,
+            mode: Some(Mode::Aot),
+            aot: Some(Aot::Required),
             aot_profile: None,
             wasm_procedures: Some(root.join("native.wasm")),
             speed_tiers: None,
@@ -998,6 +1113,7 @@ mod tests {
         let site = build(&args, &ProgressBar::hidden()).unwrap();
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(site.join("bundle/launch.json")).unwrap()).unwrap();
+        assert_eq!(manifest["mode"], "aot");
         assert_eq!(manifest["aot"]["kind"], "procedure-memory");
         assert_eq!(manifest["aot"]["module"], "procedures.wasm");
         assert_eq!(manifest["aot"]["moduleSha256"], hash(&module));
@@ -1008,6 +1124,7 @@ mod tests {
         );
         assert!(!site.join("bundle/aot.wasm").exists());
         assert!(!site.join("bundle/aot-profile.bin").exists());
+        args.mode = None;
         args.output = Some(root.join("bad-site"));
         args.aot_profile = Some(root.join("observed.json"));
         assert!(
@@ -1017,7 +1134,7 @@ mod tests {
                 .contains("different AOT backends")
         );
         args.aot_profile = None;
-        args.aot = Aot::Off;
+        args.aot = Some(Aot::Off);
         assert!(
             build(&args, &ProgressBar::hidden())
                 .unwrap_err()
@@ -1025,6 +1142,59 @@ mod tests {
                 .contains("--aot off")
         );
         assert!(!root.join("bad-site").exists());
+
+        args.mode = Some(Mode::Simple);
+        args.wasm_procedures = None;
+        args.output = Some(root.join("simple-site"));
+        let simple = build(&args, &ProgressBar::hidden()).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(simple.join("bundle/launch.json")).unwrap()).unwrap();
+        assert_eq!(manifest["mode"], "simple");
+        assert!(manifest.get("aot").is_none());
+
+        args.mode = Some(Mode::V86);
+        args.output = Some(root.join("v86-site"));
+        assert!(
+            build(&args, &ProgressBar::hidden())
+                .unwrap_err()
+                .to_string()
+                .contains("v86 frontend is missing")
+        );
+        assert!(!root.join("v86-site").exists());
+        fs::create_dir_all(root.join("dist/browser")).unwrap();
+        fs::write(root.join("dist/browser/v86-runtime.json"), r#"{"abi":4}"#).unwrap();
+        let v86_site = build(&args, &ProgressBar::hidden()).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(v86_site.join("bundle/launch.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["mode"], "v86");
+        assert!(manifest.get("aot").is_none());
+
+        // Profile selection and explicit CLI override must reach both the
+        // launch manifest and the portable profile, without a game-specific path.
+        fs::write(
+            &args.config,
+            "version=2\n[game]\nexecutable='media/TEST.COM'\nmode='v86'\n",
+        )
+        .unwrap();
+        args.mode = None;
+        args.aot = None;
+        args.output = Some(root.join("profile-v86-site"));
+        let site = build(&args, &ProgressBar::hidden()).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(site.join("bundle/launch.json")).unwrap()).unwrap();
+        assert_eq!(manifest["mode"], "v86");
+        args.mode = Some(Mode::Simple);
+        args.output = Some(root.join("override-simple-site"));
+        let site = build(&args, &ProgressBar::hidden()).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(site.join("bundle/launch.json")).unwrap()).unwrap();
+        assert_eq!(manifest["mode"], "simple");
+        let spec = machine_profile::parse_machine_profile(
+            &fs::read_to_string(site.join("bundle/game.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec.game.mode, Some(Mode::Simple));
     }
 
     #[test]
@@ -1042,7 +1212,8 @@ mod tests {
             config: repo.join("games/ROTT.toml"),
             output: Some(root.path().join("site")),
             web_dist: Some(web_dist(root.path())),
-            aot: Aot::Required,
+            mode: None,
+            aot: Some(Aot::Required),
             aot_profile: None,
             wasm_procedures: Some(path),
             speed_tiers: None,
@@ -1149,7 +1320,8 @@ mod tests {
             config: root.join("game.toml"),
             output: Some(root.join("site")),
             web_dist: Some(root.join("dist")),
-            aot: Aot::Off,
+            mode: None,
+            aot: Some(Aot::Off),
             aot_profile: None,
             wasm_procedures: None,
             speed_tiers: None,
@@ -1245,7 +1417,8 @@ mod tests {
             config: root.join("game.toml"),
             output: Some(root.join("site")),
             web_dist: Some(root.join("dist")),
-            aot: Aot::Required,
+            mode: None,
+            aot: Some(Aot::Required),
             aot_profile: None,
             wasm_procedures: None,
             speed_tiers: None,
@@ -1267,7 +1440,7 @@ mod tests {
                 .join(format!(".doslet-web-{}", std::process::id()))
                 .exists()
         );
-        args.aot = Aot::Auto;
+        args.aot = Some(Aot::Auto);
         // Cover art must be an image; it is copied beside the bundle profile.
         let profile = fs::read_to_string(root.join("game.toml")).unwrap();
         let with_cover = profile
@@ -1337,7 +1510,7 @@ mod tests {
                 .unwrap();
         assert_eq!(manifest["tierProfile"], "speed-tiers.json");
         assert!(manifest.get("aot").is_none());
-        args.aot = Aot::Required;
+        args.aot = Some(Aot::Required);
         args.output = Some(root.join("required-tier-site"));
         assert!(
             build(&args, &bar)
@@ -1362,7 +1535,7 @@ mod tests {
         assert!(manifest["aot"].get("profile").is_none());
         assert!(!combined.join("bundle/aot-profile.bin").exists());
         // Only explicit requests package register code split into one-instruction pieces.
-        args.aot = Aot::Auto;
+        args.aot = Some(Aot::Auto);
         args.output = Some(root.join("fragmented-site"));
         let fragmented = build(&args, &bar).unwrap();
         let manifest: serde_json::Value =

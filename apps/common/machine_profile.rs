@@ -414,6 +414,7 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
             g,
             &[
                 "executable",
+                "mode",
                 "arguments",
                 "working_directory",
                 "patches",
@@ -423,6 +424,7 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
             "game.",
         )?;
         spec.game.executable = string(g, "executable")?.unwrap_or_default();
+        spec.game.mode = string(g, "mode")?.map(|mode| mode.parse()).transpose()?;
         spec.game.patches = patch_paths(g)?;
         spec.game.startup_keys = startup_keys(g)?;
         if let Some(v) = string(g, "working_directory")? {
@@ -776,6 +778,9 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
         a.push(arg.as_str());
     }
     d["game"]["arguments"] = value(a);
+    if let Some(mode) = spec.game.mode {
+        d["game"]["mode"] = value(mode.as_str());
+    }
     if !spec.game.patches.is_empty() {
         let mut paths = Array::new();
         for path in &spec.game.patches {
@@ -916,6 +921,29 @@ mod tests {
             assert_eq!(spec.output.filter(false), VideoFilter::SharpBilinear);
             let profile = format!("version=2\n[output]\nvideo_filter_fallback='{filter}'\n");
             assert!(parse_machine_profile(&profile).is_err());
+        }
+    }
+    #[test]
+    fn execution_mode_roundtrips_and_rejects_unknown_values() {
+        assert_eq!(parse_machine_profile("version=2").unwrap().game.mode, None);
+        for (text, mode) in [
+            ("simple", ExecutionMode::Simple),
+            ("aot", ExecutionMode::Aot),
+            ("v86", ExecutionMode::V86),
+        ] {
+            let spec =
+                parse_machine_profile(&format!("version=2\n[game]\nmode='{text}'\n")).unwrap();
+            assert_eq!(spec.game.mode, Some(mode));
+            assert_eq!(
+                parse_machine_profile(&export_machine_profile(&spec))
+                    .unwrap()
+                    .game
+                    .mode,
+                Some(mode)
+            );
+        }
+        for value in ["'jit'", "42", "true"] {
+            assert!(parse_machine_profile(&format!("version=2\n[game]\nmode={value}\n")).is_err());
         }
     }
     #[test]

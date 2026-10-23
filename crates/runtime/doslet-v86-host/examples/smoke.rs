@@ -22,11 +22,9 @@ impl PortBus for Devices {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../target/v86/doslet-v86.wasm"
-    );
-    let core = Core::compile(&std::fs::read(path)?)?;
+    let started = std::time::Instant::now();
+    let core = Core::embedded()?;
+    println!("Embedded v86 loaded in {:?}", started.elapsed());
     let mut cpu = core.instantiate(Devices, 0x20_0000)?;
     cpu.write_ram(0x100, &[0x40, 0xe2, 0xfd, 0xf4])?; // INC AX; LOOP; HLT.
     cpu.reset_real_mode(Registers {

@@ -104,7 +104,7 @@ pub(super) struct Host {
 }
 
 impl Host {
-    #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+    #[cfg(feature = "v86")]
     pub(super) fn entered(&self) -> bool {
         self.stats.entered
     }

@@ -1,3 +1,4 @@
+#![cfg(not(target_arch = "wasm32"))]
 use doslet_bus::{BusError, MemoryBus, PortBus};
 use doslet_v86::Registers;
 use doslet_v86_host::{Core, Cpu, Execution};
@@ -43,20 +44,34 @@ impl PortBus for Devices {
 
 fn core() -> &'static Core {
     static CORE: OnceLock<Core> = OnceLock::new();
-    CORE.get_or_init(|| {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../target/v86/doslet-v86.wasm"
-        );
-        Core::compile(&std::fs::read(path).expect(
-            "first run cargo run --manifest-path tools/v86-build/Cargo.toml --release --locked",
-        ))
-        .unwrap()
-    })
+    CORE.get_or_init(|| Core::embedded().unwrap())
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
+fn external_override_validates_wasm_and_rejects_serialized_native_code() {
+    assert!(
+        Core::compile(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/doslet-v86.cwasm"
+        )))
+        .is_err()
+    );
+    let external =
+        Core::compile(include_bytes!(concat!(env!("OUT_DIR"), "/doslet-v86.wasm"))).unwrap();
+    for core in [&external, &Core::compile(&[]).unwrap()] {
+        let mut cpu = core.instantiate(Devices::default(), 0x20_0000).unwrap();
+        cpu.write_ram(0x100, &[0xb8, 0x34, 0x12, 0xf4]).unwrap();
+        cpu.reset_real_mode(Registers {
+            eip: 0x100,
+            ..Registers::default()
+        })
+        .unwrap();
+        assert_eq!(finish(&mut cpu, Execution::Interpreter), 2);
+        assert_eq!(cpu.registers().unwrap().gpr[0], 0x1234);
+    }
+}
+
+#[test]
 fn borrowed_devices_access_the_same_ram_and_expire_after_the_call() {
     use doslet_v86::DeviceRequest;
     struct Borrowed<'a>(&'a mut usize);
@@ -104,7 +119,6 @@ fn borrowed_devices_access_the_same_ram_and_expire_after_the_call() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn machine_grants_include_ordinary_extended_opcodes_but_stop_before_rdtsc() {
     let mut cpu = cpu(&[0xb9, 0, 1, 0x0f, 0xb6, 0xc0, 0xe2, 0xfb, 0xf4]);
     cpu.set_machine_boundaries(true).unwrap();
@@ -122,7 +136,6 @@ fn machine_grants_include_ordinary_extended_opcodes_but_stop_before_rdtsc() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn background_compilation_cannot_reinstall_code_invalidated_by_the_host() {
     let mut cpu = cpu(&[0xb9, 0xff, 0xff, 0x40, 0xe2, 0xfd, 0xeb, 0xf8]);
     cpu.set_machine_boundaries(true).unwrap();
@@ -170,7 +183,6 @@ fn finish(cpu: &mut Cpu<Devices>, execution: Execution) -> u32 {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn executes_real_mode_arithmetic_memory_and_halt() {
     let mut cpu = cpu(&[0xb8, 0x34, 0x12, 0x05, 2, 0, 0xa3, 0, 2, 0xf4]);
     assert_eq!(finish(&mut cpu, Execution::Interpreter), 4);
@@ -180,7 +192,6 @@ fn executes_real_mode_arithmetic_memory_and_halt() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn upstream_jit_really_executes_and_matches_its_interpreter() {
     let program = [0x40, 0xe2, 0xfd, 0xf4];
     let mut reference = cpu(&program);
@@ -201,7 +212,6 @@ fn upstream_jit_really_executes_and_matches_its_interpreter() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn host_code_write_invalidates_the_upstream_jit() {
     let mut compiled = cpu(&[0x40, 0xe2, 0xfd, 0xf4]);
     compiled.prepare_current().unwrap();
@@ -216,7 +226,6 @@ fn host_code_write_invalidates_the_upstream_jit() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn guest_self_modification_invalidates_active_code() {
     // The first instruction changes the loop's INC to DEC in the same page.
     let program = [
@@ -240,7 +249,6 @@ fn guest_self_modification_invalidates_active_code() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn divide_fault_dispatch_counts_match_the_interpreter() {
     let program = [0xb8, 1, 0, 0x31, 0xd2, 0xf7, 0xf2, 0xf4];
     let setup = || {
@@ -267,7 +275,6 @@ fn divide_fault_dispatch_counts_match_the_interpreter() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn ports_reach_the_host_and_bus_errors_stop_execution() {
     let mut cpu = cpu(&[0xba, 0x34, 0x12, 0xec, 0xee, 0xf4]);
     finish(&mut cpu, Execution::Interpreter);
@@ -283,7 +290,6 @@ fn ports_reach_the_host_and_bus_errors_stop_execution() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn independent_instances_do_not_share_cpu_ram_or_jit_state() {
     let mut first = cpu(&[0x40, 0xf4]);
     let mut second = cpu(&[0x48, 0xf4]);
@@ -296,7 +302,6 @@ fn independent_instances_do_not_share_cpu_ram_or_jit_state() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn rep_yields_after_one_element() {
     let mut cpu = cpu(&[0xbf, 0, 4, 0xf3, 0xaa, 0xf4]);
     cpu.run(1, Execution::Interpreter).unwrap(); // MOV DI,400h
@@ -308,7 +313,6 @@ fn rep_yields_after_one_element() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn rep_device_writes_yield_and_comparisons_commit_flags() {
     let mut cpu = cpu(&[0xf3, 0xaa, 0xf4]);
     cpu.reset_real_mode(Registers {
@@ -337,7 +341,6 @@ fn rep_device_writes_yield_and_comparisons_commit_flags() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn external_interrupt_wakes_halt_and_iret_restores_context() {
     let mut cpu = cpu(&[0xf4, 0xf4]);
     assert!(!cpu.inject_interrupt(0x30).unwrap());
@@ -362,7 +365,6 @@ fn external_interrupt_wakes_halt_and_iret_restores_context() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn mov_ss_inhibits_external_interrupt_until_following_instruction() {
     for execution in [Execution::Interpreter, Execution::Jit] {
         let mut cpu = cpu(&[0xb8, 0x00, 0x20, 0x8e, 0xd0, 0xbc, 0x00, 0x80, 0xf4]);
@@ -387,7 +389,6 @@ fn mov_ss_inhibits_external_interrupt_until_following_instruction() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn pop_ss_and_lss_inhibit_external_interrupt_for_one_instruction() {
     for execution in [Execution::Interpreter, Execution::Jit] {
         for pop in [true, false] {
@@ -433,7 +434,6 @@ fn pop_ss_and_lss_inhibit_external_interrupt_for_one_instruction() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn guest_switches_to_protected_code32_and_runs_the_jit() {
     let bootstrap = [
         0x0f, 0x01, 0x16, 0x00, 0x03, 0x0f, 0x20, 0xc0, 0x66, 0x83, 0xc8, 1, 0x0f, 0x22, 0xc0,
@@ -466,7 +466,6 @@ fn guest_switches_to_protected_code32_and_runs_the_jit() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn iret_to_not_present_code_delivers_np_without_consuming_the_return_frame() {
     for execution in [Execution::Interpreter, Execution::Jit] {
         let mut cpu = cpu(&[0xcf]);
@@ -520,7 +519,6 @@ fn iret_to_not_present_code_delivers_np_without_consuming_the_return_frame() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn rejected_iret_selectors_deliver_guest_faults_with_the_original_frame_intact() {
     // selector, descriptor access, table limit, current CPL, target IP,
     // descriptor limit, exception vector, selector error code.
@@ -627,7 +625,6 @@ fn rejected_iret_selectors_deliver_guest_faults_with_the_original_frame_intact()
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn exception_exits_preserve_fault_state_but_deliver_software_and_external_interrupts() {
     let mut cpu = cpu(&[0xfa]); // CLI faults at CPL3, IOPL0.
     cpu.write_ram(
@@ -689,7 +686,6 @@ fn exception_exits_preserve_fault_state_but_deliver_software_and_external_interr
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn pic_ports_belong_to_the_external_bus() {
     let mut cpu = cpu(&[0xb0, 0x20, 0xe6, 0x20, 0xf4]);
     finish(&mut cpu, Execution::Interpreter);
@@ -697,7 +693,6 @@ fn pic_ports_belong_to_the_external_bus() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn x87_executes_in_the_upstream_cpu() {
     let mut cpu = cpu(&[0xd9, 0xe8, 0xd9, 0xe8, 0xde, 0xc1, 0xd9, 0x1e, 0, 4, 0xf4]);
     finish(&mut cpu, Execution::Interpreter);
@@ -705,7 +700,6 @@ fn x87_executes_in_the_upstream_cpu() {
 }
 
 #[test]
-#[ignore = "requires the pinned v86 WASM module built by tools/v86-build"]
 fn real_mode_integer_execution_matches_doslet_step_by_step() {
     use doslet_x86::{Cpu as Reference, Gpr32};
     struct Ram(Vec<u8>);

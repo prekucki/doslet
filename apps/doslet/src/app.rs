@@ -699,6 +699,20 @@ impl Doslet {
         )?)
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if let Message::Keyboard(event) | Message::KeyboardCaptured(event) = &message {
+            let captured = matches!(&message, Message::KeyboardCaptured(_));
+            crate::keyboard::trace(
+                event,
+                captured,
+                !captured
+                    && self.session.status() == SessionStatus::Running
+                    && !self.configurator.open
+                    && self.workspace.panel.is_none()
+                    && !self.configurator.pending,
+                self.configurator.active.hardware.keyboard,
+                self.session.v86_enabled(),
+            );
+        }
         if self.debugger.as_ref().is_some_and(|gdb| gdb.connected())
             && matches!(
                 message,
@@ -4433,7 +4447,6 @@ audio = false
     }
     #[cfg(feature = "v86")]
     #[test]
-    #[ignore = "requires tools/v86-build"]
     fn v86_cli_launch_and_reset_keep_the_selected_core() {
         use clap::Parser;
         let mut app = Doslet::from_cli(crate::cli::Cli::parse_from([
@@ -4441,11 +4454,6 @@ audio = false
             "--v86",
             "--demo",
             "--no-audio",
-            "--v86-module",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../target/v86/doslet-v86.wasm"
-            ),
         ]))
         .unwrap();
         assert!(app.session.v86_enabled());

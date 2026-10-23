@@ -56,12 +56,14 @@ jobs:
           PY
 
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: |
+          cargo fmt --check
+          cargo fmt --manifest-path tools/v86-build/Cargo.toml --check
 
       - name: Install native audio build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev pkg-config
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config clang
 
       - name: Check native code
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -88,4 +90,10 @@ jobs:
 
       - name: Build the browser bundle
         working-directory: web
-        run: trunk build --locked
+        run: trunk build --locked --no-default-features --features wasm-procedures
+
+      - name: Build the v86 browser bundle
+        working-directory: web
+        env:
+          DOSLET_WEB_MODE: v86
+        run: trunk build --locked --no-default-features --features wasm-procedures

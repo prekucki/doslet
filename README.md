@@ -99,10 +99,10 @@ mise install rust
 ```
 
 On Debian or Ubuntu, the desktop app also needs a C toolchain and the ALSA and
-udev headers:
+udev headers, plus Clang with WASM support for the default embedded v86 core:
 
 ```sh
-sudo apt install build-essential pkg-config libasound2-dev libudev-dev
+sudo apt install build-essential pkg-config libasound2-dev libudev-dev clang
 ```
 
 ### On the desktop
@@ -121,6 +121,12 @@ The game's directory becomes drive C:. Click the picture to capture the mouse,
 and press **Ctrl+Esc** to release it. `--help` lists the audio, MIDI, MT-32 and
 machine options.
 
+Set `mode = "simple"`, `"aot"`, or `"v86"` under `[game]` in a launch profile,
+or override it with `--mode`. Native `--v86` is also supported. Cargo builds
+and embeds a precompiled v86 core automatically, so the executable needs no
+external `doslet-v86.wasm`. See [v86 build details](docs/compatibility/v86-core.md)
+and [profile modes](docs/launch-profiles.md#supported-fields).
+
 ### In the browser
 
 ```sh
@@ -137,12 +143,19 @@ Package a game from its TOML profile, or build and serve a quick localhost previ
 ```sh
 cargo run -p doslet-web --release --locked -- build games/ROTT.toml -o target/rott-site
 cargo run -p doslet-web --release --locked -- serve games/ROTT.toml --port 8080
+cargo run -p doslet-web --release --locked -- build games/ROTT.toml --mode simple -o target/rott-simple
+cargo run -p doslet-web --release --locked -- build games/ROTT.toml --mode aot -o target/rott-aot
+cargo run -p doslet-web --release --locked -- serve games/ROTT.toml --mode v86 --rom-dir ~/.config/dosbox/mt32-roms --port 8080
 ```
 
 The Rust CLI shows build progress and prepares experimental guarded AOT WASM
 for supported 32-bit register code. Other code keeps the interpreter. `serve`
 builds first; `--web-dist web/dist` explicitly reuses an existing frontend for
-faster packaging. See [web packaging](docs/development.md#game-web-packages).
+faster packaging. `--mode simple` omits AOT; `--mode aot` requires compiled
+entries. `--mode v86` builds a separate Worker with the v86 CPU/JIT and Doslet's
+Rust devices; it uses host-clock timing and excludes AOT and speed tiers.
+Reused `--web-dist` directories must have been built for v86. See
+[web packaging](docs/development.md#game-web-packages).
 
 ### Without a window
 
@@ -200,16 +213,18 @@ describe these design rules in detail.
 ## Development
 
 ```sh
-cargo fmt --all --check
+cargo fmt --check
+cargo fmt --manifest-path tools/v86-build/Cargo.toml --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 RUST_MIN_STACK=8388608 cargo test --workspace --locked
 cargo check -p doslet -p doslet-time -p doslet-executable --target wasm32-unknown-unknown --locked
 cargo check -p doslet-web-worker -p doslet-web-audio --target wasm32-unknown-unknown --locked
 ```
 
-All tooling is Rust-based: Cargo builds the native app and
-[Trunk](https://trunkrs.dev/) builds the browser app. Builds, tests and CI do
-not use Node.js or npm. The [development guide](docs/development.md) covers
+Cargo builds the native app and [Trunk](https://trunkrs.dev/) builds the browser
+app. The optional v86 core includes SoftFloat C compiled by Clang. Browser
+acceptance scripts use Python's standard library and isolated Firefox.
+Builds, tests and CI do not use Node.js or npm. The [development guide](docs/development.md) covers
 benchmarks, profiling, browser tests and the native JIT.
 
 Bug reports and compatibility notes are welcome. Please include the game and its
@@ -222,6 +237,8 @@ third-party code keep their original copyright notices, and third-party
 libraries keep their own licenses. The vendored iced patches are MIT-licensed;
 see the [vendor notes](vendor/README.md). The `nuked-opl3` dependency is
 [LGPL-2.1-or-later](https://github.com/tgies/nuked-opl3-rs/blob/main/LICENSE).
+The optional v86 core retains its [BSD-2-Clause license](vendor/v86/LICENSE)
+and the SoftFloat notices in its source.
 The xBRZ shader (`apps/doslet/src/xbrz.wgsl`) is a WGSL port of
 [libretro's xBRZ freescale shader](https://github.com/libretro/slang-shaders/blob/master/edge-smoothing/xbrz/shaders/xbrz-freescale.slang),
 which combines Hyllian's MIT-licensed xBR code with xBRZ code by Zenju under

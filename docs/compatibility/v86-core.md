@@ -3,60 +3,108 @@
 Doslet includes the actual CPU and x86-to-WASM JIT from
 [copy/v86, revision cc37f35c43bf14865d74ad76879ecf9410f69eb1](https://github.com/copy/v86/tree/cc37f35c43bf14865d74ad76879ecf9410f69eb1).
 The native `doslet-v86-host` adapter runs that CPU and its generated modules in
-one Wasmtime store. `doslet-v86` defines the `no_std` wire types. This backend
-is separate from Doslet's existing `doslet-x86-wasm` translator.
+one Wasmtime store. The browser adapter links the same pinned CPU into the
+machine Worker WASM and instantiates generated blocks with its memory and
+function table. `doslet-v86` defines the `no_std` wire types. This backend is
+separate from Doslet's existing `doslet-x86-wasm` translator.
 
 Select it on desktop with `doslet --v86 --game GAME.EXE` or
 `doslet --v86 --config games/GAME.toml`. v86 owns CPU execution and RAM;
 Doslet supplies DOS/BIOS services, Rust devices and the iced frontend.
 Port and mapped-memory callbacks reach the existing VGA, MPU-401, PIC,
-PIT and audio devices. No JavaScript runtime is required at execution time.
+PIT and audio devices. Desktop execution needs no JavaScript runtime.
 Synthetic tests establish only the behaviors they exercise; the bounded Quake
 startup observations below do not establish general game compatibility.
 
 ## Build and run
 
 Requirements: the repository's Rust toolchain, `wasm32-unknown-unknown`, and
-Clang with its WASM target. The build uses Cargo, a Rust JavaScript engine (Boa)
-for the imported table-generation algorithms, and Clang for the upstream
-SoftFloat implementation. It does not execute Node, npm, npx or the upstream
-Makefile. The generator is a separate locked Cargo package; it does not add Boa
-to application dependencies.
+Clang with its WASM target. Ordinary Cargo builds compile the checked-in v86
+instruction tables and SoftFloat into WASM, precompile that module with the
+pinned Wasmtime, and embed the native artifact in the application. The build
+uses an isolated Cargo target directory under `OUT_DIR`; native `RUSTFLAGS`
+do not leak into its WASM compilation. Source changes rebuild the artifact.
+No separate module file or compiler is needed on the user's machine.
 
 From the repository root:
 
 ```sh
-cargo run --manifest-path tools/v86-build/Cargo.toml --release --locked
 cargo run -p doslet --release --locked -- --v86 --demo
 cargo run -p doslet --release --locked -- --v86 --config games/Quake.toml
 cargo run -p doslet-v86-host --example smoke --locked --offline
-cargo test -p doslet-v86-host --locked --offline --test core -- --ignored
-cargo test -p doslet-runtime --features v86 --locked --offline --test v86 -- --ignored
+cargo test -p doslet-v86-host --locked --offline --test core
 cargo clippy -p doslet-v86 -p doslet-v86-host --all-targets --locked --offline -- -D warnings
 cargo check -p doslet-v86 --target wasm32-unknown-unknown --locked --offline
 ```
 
-The first command regenerates the checked-in instruction tables and writes
-`target/v86/doslet-v86.wasm`. It runs the isolated upstream compilation through
-Cargo and uses the Rust build tool itself as the linker wrapper. After Cargo
-dependencies are available, append `--offline` to the first command too.
 The desktop's default features include `v86`; builds without default features
-need `--features v86`. The launcher looks for `doslet-v86.wasm` beside the
-executable, then `target/v86/doslet-v86.wasm` relative to the working directory.
-Use `--v86-module PATH` to select another location. A missing module fails
-the launch with the build command.
-The RAM-wait boundary requires module ABI 4. Rebuild the WASM module after
-updating Doslet; older modules are rejected at launch.
+need `--features v86`. The embedded artifact targets the platform's baseline
+CPU features, rather than the build host's extensions. Wasmtime loads it once
+per process; each machine retains independent RAM and device state. Guest x86
+blocks are still generated and compiled at runtime. Precompilation removes
+startup compilation of the emulator itself, not the game's JIT work.
+
+Use `--v86-module PATH` to override the embedded core with raw WASM. This path
+validates and compiles WASM normally; it never deserializes external native
+artifacts. Only immutable bytes produced by this package's build script enter
+the native deserializer. The module must implement ABI 4.
+
+For development, regenerate the checked-in instruction tables and export a
+standalone WASM module with:
+
+```sh
+cargo run --manifest-path tools/v86-build/Cargo.toml --release --locked
+```
+
+This separate locked tool uses Boa for the imported table-generation algorithms
+and writes `target/v86/doslet-v86.wasm`. It uses the same WASM compiler/linker
+helper as the embedded build. Boa is not an application dependency. Neither
+path runs Node, npm, npx or the upstream Makefile.
 The smoke program verifies `INC AX; LOOP; HLT`, including nonzero actual JIT
 entries. It is a synthetic CPU test, not a DOS game launch.
 
-Integration tests are explicitly ignored in an ordinary workspace test run
-because their generated WASM fixture must first be built. The command above
-enables them; a missing fixture is an error, not a silently skipped check.
+For a static website or localhost preview, use the same game profile with
+`doslet-web`:
+
+```sh
+cargo run -p doslet-web --release --locked -- build games/ROTT.toml --mode v86 --rom-dir ~/.config/dosbox/mt32-roms -o target/rott-v86-site
+cargo run -p doslet-web --release --locked -- serve games/ROTT.toml --mode v86 --rom-dir ~/.config/dosbox/mt32-roms --port 8080
+```
+
+Trunk builds the iced frontend without the desktop v86 feature, then its Rust
+post-build hook builds a separate Worker with v86 enabled. The Worker links
+the vendored CPU, generated instruction tables and Clang-built SoftFloat;
+`browser/v86-runtime.json` marks distributions that can be reused with
+`--web-dist`. No Node toolchain is involved. The browser Worker owns one
+machine and one RAM allocation shared by the v86 CPU, DOS services and Rust
+devices. Generated JIT modules import that same memory and run through the
+Worker's function table. Browser device time follows the host clock in bounded
+slices, with CPU execution interleaved around pending IRQs.
+When HLT waits with interrupts enabled, the browser Worker yields its task and
+advances devices on a host timer. It resumes CPU execution after an IRQ is
+pending; no guest instructions are spent polling HLT. Verified RAM and DOS
+keyboard waits also yield the Worker task, then retry after a device-time slice
+so DMA changes and input can wake them. The timer keeps audio and DMA moving
+while the CPU sleeps. These device-time calls also deliver queued host input
+to the AT keyboard, allowing IRQ1 to wake HLT even when IRQ0 is masked.
+The browser v86 diagnostics expose `browserHaltWaits`; it increases when the
+Worker actually yields for HLT. A zero value means this path cannot account
+for a slow section of guest code.
+
+The host and runtime integration tests use the embedded core and run without
+a separate fixture build. Runtime tests cover MIDI, VGA, DPMI, IRQ delivery,
+keyboard input, disabled gameport reads and host-clock scheduling:
+
+```sh
+cargo test -p doslet-runtime --release --locked --features v86 --test v86
+```
+
+Game diagnostics that explicitly open `target/v86/doslet-v86.wasm` remain
+ignored and require the export command above.
 
 ## Ownership and execution
 
-`Core::compile` consumes the module bytes produced by the pinned builder.
+On desktop, `Core::compile` consumes the module bytes produced by the pinned builder.
 It opens no files and can instantiate independent CPUs. Each `Cpu<B>` owns one
 WASM memory and a host bus implementing `doslet_bus::CpuBus`. Ordinary guest
 RAM resides only in that memory. `ram` borrows a view; `write_ram` invalidates
@@ -101,7 +149,7 @@ instructions. `Execution::Interpreter` uses v86's interpreter;
 can request compilation outside ordinary execution. Compiled module counts
 show preparation; `jit_entries` shows actual generated-code execution.
 
-Attached machines compile generated modules on one background worker. The
+Native attached machines compile generated modules on one background worker. The
 worker receives only WASM bytes and the engine; CPU state, devices and RAM
 stay with the emulation owner. At most one job is outstanding, matching v86's
 asynchronous compilation protocol. Until it finishes, v86 interprets the code.
@@ -217,6 +265,43 @@ permits it, including waking HLT. The external machine owns its PIC and timing.
 Unknown host operations fail. A WASM trap or bus failure during execution makes
 that instance unusable; recreate it rather than resuming partially committed
 upstream state.
+
+For native keyboard diagnosis, start the library with
+`DOSLET_TRACE_KEYS=1 ./target/release/doslet`, then launch the affected game.
+The opt-in log records host key events (including typed text), UI capture and
+input gating, the physical-key mapping, v86 acceptance of IRQ1, and bytes read
+from port `60h`. A Down-arrow press normally produces `e0` followed by `50`;
+release produces `e0 d0`. Unset the variable to disable this logging.
+The `local_rott_v86_desktop_keyboard_probe` test exercises iced event dispatch
+and the emulation thread with synthetic key events and records menu frames in
+`target/rott-v86-desktop-*.png`. It does not validate delivery from a physical
+keyboard or the window system. `DOSLET_ROTT_PROFILE` and `DOSLET_ROTT_STATE`
+select an explicit profile and optional input snapshot for that opt-in test;
+the test uses temporary disk writes and does not overwrite the input snapshot.
+`DOSLET_ROTT_STORE` optionally imports the committed overlay from an existing
+save-store directory, opened read-only. `DOSLET_ROTT_MENU_ESCAPES` selects how
+many Escape presses skip startup before the arrow sequence (default: three).
+Check the captured frames: reaching the quit confirmation instead of the menu
+does not test menu navigation. The test's passing assertions establish event
+delivery and absence of a runtime fault, not successful menu movement.
+For a controlled comparison, `DOSLET_ROTT_DISABLE_JOYSTICK=1` changes
+`JoystickEnabled    1` to `0` only in the imported overlay copy. A local ROTT
+run reproduced a stationary menu selection with the saved joystick enabled;
+the same arrow sequence moved the selection after this one setting changed.
+ROTT's `ReadAnyControl` reads the keyboard first, then lets joystick deflection
+overwrite its direction. Its axis calibration uses polling-loop counts, so
+calibration from another execution mode may not suit v86's host-clock timing.
+This comparison establishes the joystick interaction, not accurate gameport
+timing or successful play with a physical controller. Disable the joystick in
+ROTT's Controls menu when using only the keyboard; calibrate it in the active
+execution mode when using a controller.
+Disabling the gameport in the Doslet profile is also supported: reads from
+`201h` return `FFh` and trigger writes are ignored. The runtime regression
+`disabled_gameport_probe_matches_between_v86_and_interpreter` checks that an
+absent-device polling program completes identically on both CPU backends.
+A headless ROTT menu run with a saved overlay and the gameport disabled also
+completed without a port fault; captured frames showed the selection moving
+after synthetic arrow events. This does not validate physical gamepad input.
 
 Wasmtime fuel instrumentation is disabled. The explicit guest instruction
 grant still bounds normal CPU execution, but there is no independent fuel or
@@ -351,5 +436,6 @@ cargo test -p doslet --release --locked --offline local_civ_tempo_diagnostic -- 
 
 The upstream code, licenses and local changes are recorded in
 [vendor/v86](../../vendor/v86/README.md). Its `std`, unsafe Rust and C code stay
-inside the isolated WASM build. Existing emulation crates retain their current
-`no_std` boundaries; the host adapter is native platform code.
+inside the native isolated module or browser Worker WASM. Existing emulation
+crates retain their current `no_std` boundaries; the host adapter is platform
+code.

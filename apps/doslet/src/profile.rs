@@ -8,6 +8,7 @@ use toml_edit::{DocumentMut, Item, TableLike};
 
 #[derive(Default)]
 struct Profile {
+    execution_mode: Option<doslet_config::ExecutionMode>,
     cpu_mhz: Option<u16>,
     name: Option<String>,
     executable: Option<PathBuf>,
@@ -105,13 +106,22 @@ impl Profile {
         if let Some(game) = section(table, "game")? {
             fields(
                 game,
-                &["executable", "arguments", "working_directory", "patches"],
+                &[
+                    "executable",
+                    "arguments",
+                    "working_directory",
+                    "patches",
+                    "mode",
+                ],
                 "game.",
             )?;
             profile.executable = string(game, "executable", "game.")?
                 .map(|value| path(base, value, "game.executable"))
                 .transpose()?;
             profile.working_directory = string(game, "working_directory", "game.")?;
+            profile.execution_mode = string(game, "mode", "game.")?
+                .map(|mode| mode.parse().map_err(str::to_owned))
+                .transpose()?;
             profile.patches = crate::machine_profile::patch_paths(game)?
                 .iter()
                 .map(|p| std::path::absolute(base.join(p)).map_err(|e| e.to_string()))
@@ -268,6 +278,17 @@ impl Cli {
     ) -> Result<Self, Box<dyn Error>> {
         let explicit_drive_mode = self.drive_mode;
         let explicit_cpu_mhz = self.cpu_mhz.is_some();
+        let explicit_v86_conflict = self.dynamic_core
+            || self.wasm_procedures.is_some()
+            || self.learn_speed_tiers
+            || self.speed_tier_profile.is_some()
+            || self.gdb.is_some()
+            || self.adaptive_cpu
+            || self.adaptive_idle
+            || self.analyze_synchronization
+            || self.observe_idle
+            || self.experimental_heroes_menu_idle
+            || self.experimental_heroes_timer_waits;
         if let Some(config) = &self.config {
             let text = std::fs::read_to_string(config)
                 .map_err(|error| format!("Cannot read {}: {error}", config.display()))?;
@@ -339,6 +360,7 @@ impl Cli {
                     }
                 }
                 let mut profile = Profile {
+                    execution_mode: spec.game.mode,
                     name: (!spec.name.is_empty()).then(|| spec.name.clone()),
                     arguments: spec.game.arguments.clone(),
                     patches: spec.game.patches.iter().map(PathBuf::from).collect(),
@@ -441,6 +463,7 @@ impl Cli {
             self.midi_output = self.midi_output.or(profile.output);
             if self.launch.machine_spec.is_none() {
                 let mut spec = doslet_config::MachineSpec::default();
+                spec.game.mode = profile.execution_mode;
                 spec.game.arguments = profile.arguments.clone();
                 spec.game.patches = profile
                     .patches
@@ -531,7 +554,48 @@ impl Cli {
         self.launch.adaptive_cpu = self.adaptive_cpu;
         // The interpreter is the default; the JIT was slower on ROTT gameplay.
         self.launch.no_dynamic_core = !self.dynamic_core;
+        use doslet_config::ExecutionMode;
+        let profile_mode = self.launch.machine_spec.as_ref().and_then(|s| s.game.mode);
+        let selected_mode = self
+            .mode
+            .or(self.v86.then_some(ExecutionMode::V86))
+            .or(self.wasm_procedures.as_ref().map(|_| ExecutionMode::Aot))
+            .or((self.no_aot && !self.dynamic_core).then_some(ExecutionMode::Simple))
+            .or(if self.dynamic_core {
+                None
+            } else {
+                profile_mode
+            });
+        self.mode = selected_mode;
+        self.v86 = selected_mode == Some(ExecutionMode::V86);
+        if !self.v86
+            && (self.v86_module.is_some() || self.v86_host_clock || self.v86_instruction_clock)
+        {
+            return Err(
+                "v86 module/clock options require --v86, --mode v86, or game.mode='v86'".into(),
+            );
+        }
+        match selected_mode {
+            Some(ExecutionMode::Simple) => {
+                if self.wasm_procedures.is_some() {
+                    return Err("simple mode cannot use --wasm-procedures".into());
+                }
+                self.no_aot = true;
+            }
+            Some(ExecutionMode::Aot) => {
+                if self.no_aot {
+                    return Err("aot mode conflicts with --no-aot".into());
+                }
+                if !cfg!(feature = "wasm-procedures") {
+                    return Err("aot mode requires the wasm-procedures Cargo feature".into());
+                }
+            }
+            _ => {}
+        }
         if self.v86 {
+            if explicit_v86_conflict {
+                return Err("v86 mode cannot be combined with another CPU backend, execution analysis, speed-tier profile, or GDB".into());
+            }
             self.launch.v86_host_clock = !self.v86_instruction_clock;
             if self.launch.v86_host_clock && explicit_cpu_mhz {
                 return Err("--cpu-mhz requires --v86-instruction-clock when using v86".into());
@@ -542,14 +606,13 @@ impl Cli {
             self.no_speed_tiers = true;
             self.no_aot = true;
             self.autosave_path = None;
-            self.launch.v86_module = Some(self.v86_module.clone().unwrap_or_else(|| {
-                let beside = std::env::current_exe()
-                    .ok()
-                    .and_then(|path| path.parent().map(|parent| parent.join("doslet-v86.wasm")));
-                beside
-                    .filter(|path| path.is_file())
-                    .unwrap_or_else(|| PathBuf::from("target/v86/doslet-v86.wasm"))
-            }));
+            self.launch.v86 = true;
+            self.launch.v86_module = self.v86_module.clone();
+            self.adaptive_cpu = false;
+            self.launch.adaptive_cpu = false;
+            self.launch.adaptive_idle = false;
+            self.launch.analyze_synchronization = false;
+            self.launch.observe_idle = false;
         }
         let profile_dpmi = self.launch.machine_spec.as_ref().and_then(|s| s.dpmi);
         self.launch.dpmi = crate::native_input::dpmi_mode(
@@ -661,6 +724,7 @@ impl Cli {
         }
         let mut spec = self.launch.machine_spec.take().unwrap_or_default();
         spec.hardware = self.launch.hardware;
+        spec.game.mode = self.mode;
         spec.name = self.profile_name.clone().unwrap_or_default();
         spec.game.executable = self
             .game
@@ -891,6 +955,52 @@ pub(crate) mod tests {
                     .resolve()
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn game_execution_mode_selects_embedded_v86_and_cli_overrides_it() {
+        use doslet_config::ExecutionMode;
+        for version in [1, 2] {
+            let fixture = Fixture::new(&format!(
+                "version={version}\n[game]\nexecutable='../TINY.EXE'\nmode='v86'\n"
+            ));
+            let cli = fixture.cli(&["--no-audio"]).resolve();
+            if cfg!(feature = "v86") {
+                let cli = cli.unwrap();
+                assert!(cli.launch.v86 && cli.launch.v86_host_clock);
+                assert!(cli.launch.v86_module.is_none());
+                assert!(cli.no_aot && cli.no_speed_tiers);
+                let session = crate::native_input::load_game_with_settings(
+                    cli.game.as_ref().unwrap(),
+                    &cli.launch,
+                )
+                .unwrap();
+                assert!(session.v86_enabled());
+            } else {
+                assert!(cli.is_err());
+            }
+            let cli = fixture
+                .cli(&["--no-audio", "--mode", "simple"])
+                .resolve()
+                .unwrap();
+            assert!(!cli.launch.v86 && cli.no_aot);
+            assert_eq!(
+                cli.launch.machine_spec.as_ref().unwrap().game.mode,
+                Some(ExecutionMode::Simple)
+            );
+            if cfg!(feature = "wasm-procedures") {
+                let cli = fixture
+                    .cli(&["--no-audio", "--mode", "aot"])
+                    .resolve()
+                    .unwrap();
+                assert!(!cli.launch.v86 && !cli.no_aot);
+                assert_eq!(
+                    cli.launch.machine_spec.as_ref().unwrap().game.mode,
+                    Some(ExecutionMode::Aot)
+                );
+            }
+            assert!(fixture.cli(&["--gdb", "127.0.0.1:9001"]).resolve().is_err());
         }
     }
     #[test]

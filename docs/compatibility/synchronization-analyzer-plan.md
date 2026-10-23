@@ -222,7 +222,7 @@ not enable the controller implicitly. Run focused tests while developing and
 the repository validation suite at each coherent stage:
 
 ```sh
-cargo fmt --all --check
+cargo fmt --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo test -p doslet-pc --features profiling --locked

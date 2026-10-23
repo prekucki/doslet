@@ -1,6 +1,7 @@
 //! Trunk post-build hook. Rust tools only; no separate JS build system.
 use std::{
     env, fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -141,6 +142,60 @@ fn inject_compilation_hints(wasm: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+/// wasm-bindgen renames the Rust function table. Export a stable alias for
+/// v86's generated functions, distinct from the externref table it also adds.
+fn export_v86_table(wasm: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if wasm.get(..8) != Some(b"\0asm\x01\0\0\0".as_slice()) {
+        return Err("invalid WASM");
+    }
+    let mut out = wasm[..8].to_vec();
+    let mut cursor = 8;
+    let mut found = false;
+    while cursor < wasm.len() {
+        let start = cursor;
+        let id = wasm[cursor];
+        cursor += 1;
+        let len = read_u32_leb(wasm, &mut cursor)? as usize;
+        let end = cursor.checked_add(len).ok_or("section overflow")?;
+        let payload = wasm.get(cursor..end).ok_or("truncated section")?;
+        if id == 7 {
+            let mut sub = 0;
+            let count = read_u32_leb(payload, &mut sub)?;
+            let entries = sub;
+            let mut table = false;
+            for _ in 0..count {
+                let name_len = read_u32_leb(payload, &mut sub)? as usize;
+                sub = sub.checked_add(name_len).ok_or("export overflow")?;
+                let kind = *payload.get(sub).ok_or("truncated export")?;
+                sub += 1;
+                let index = read_u32_leb(payload, &mut sub)?;
+                table |= kind == 1 && index == 0;
+            }
+            if !table {
+                return Err("v86 worker has no exported Rust function table");
+            }
+            let name = b"doslet_v86_table";
+            let mut exports = Vec::new();
+            write_u32_leb(&mut exports, count + 1);
+            exports.extend_from_slice(&payload[entries..]);
+            write_u32_leb(&mut exports, name.len() as u32);
+            exports.extend_from_slice(name);
+            exports.extend_from_slice(&[1, 0]);
+            out.push(7);
+            write_u32_leb(&mut out, exports.len() as u32);
+            out.extend_from_slice(&exports);
+            found = true;
+        } else {
+            out.extend_from_slice(&wasm[start..end]);
+        }
+        cursor = end;
+    }
+    if !found {
+        return Err("v86 worker has no export section");
+    }
+    Ok(out)
+}
+
 fn add_compilation_hints_to_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = fs::read(path)?;
     let updated = inject_compilation_hints(&bytes)?;
@@ -148,7 +203,71 @@ fn add_compilation_hints_to_file(path: &Path) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn v86_exports(
+    directory: &Path,
+    names: &mut std::collections::BTreeSet<String>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            v86_exports(&path, names)?;
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            let source = fs::read_to_string(path)?;
+            for item in source.split("#[no_mangle]").skip(1) {
+                if let Some((_, signature)) = item.split_once("fn ") {
+                    let name = signature.split('(').next().unwrap_or("").trim();
+                    if !name.is_empty()
+                        && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    {
+                        names.insert(name.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "-flavor") {
+        // Reserve v86's fixed register page before globals, stack and heap.
+        let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let sysroot = Command::new(&rustc).args(["--print", "sysroot"]).output()?;
+        let version = Command::new(&rustc).arg("-vV").output()?;
+        let version = String::from_utf8(version.stdout)?;
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .ok_or("missing rustc host")?;
+        let linker = PathBuf::from(String::from_utf8(sysroot.stdout)?.trim())
+            .join("lib/rustlib")
+            .join(host)
+            .join(format!("bin/rust-lld{}", env::consts::EXE_SUFFIX));
+        let mut exports = std::collections::BTreeSet::new();
+        v86_exports(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/v86/rust"),
+            &mut exports,
+        )?;
+        let mut command = Command::new(linker);
+        command
+            .args(
+                args.iter()
+                    .filter(|arg| arg.to_str() != Some("--stack-first")),
+            )
+            .args([
+                "--no-stack-first",
+                "--global-base=4096",
+                "--export-table",
+                "--growable-table",
+            ]);
+        // JIT modules need upstream's C-ABI helpers, not every public Rust
+        // symbol (which would retain unprocessed wasm-bindgen intrinsics).
+        for name in exports {
+            command.arg(format!("--export-if-defined={name}"));
+        }
+        return run(&mut command);
+    }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()?;
@@ -168,9 +287,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "-p",
         "doslet-web-audio",
     ]);
-    run(&mut cargo)?;
+    let v86 = env::var("DOSLET_WEB_MODE").is_ok_and(|mode| mode == "v86");
+    if v86 {
+        // The pinned core's SoftFloat implementation is compiled with Clang;
+        // instruction tables are checked in, so no JavaScript build runtime runs.
+        let object = root.join("target/v86/browser-softfloat.o");
+        fs::create_dir_all(object.parent().unwrap())?;
+        run(
+            Command::new(env::var_os("CLANG").unwrap_or_else(|| "clang".into()))
+                .args([
+                    "-c",
+                    "--target=wasm32",
+                    "-O3",
+                    "-flto",
+                    "-nostdlib",
+                    "-fvisibility=hidden",
+                    "-ffunction-sections",
+                    "-fdata-sections",
+                    "-DSOFTFLOAT_FAST_INT64",
+                    "-DINLINE_LEVEL=5",
+                    "-DSOFTFLOAT_FAST_DIV32TO16",
+                    "-DSOFTFLOAT_FAST_DIV64TO32",
+                ])
+                .arg(root.join("vendor/v86/softfloat/softfloat.c"))
+                .arg("-o")
+                .arg(&object),
+        )?;
+        // Cargo tracks linker arguments, not the contents of a linked object
+        // or this linker wrapper. Make both part of its compilation cache key.
+        let mut inputs = std::collections::hash_map::DefaultHasher::new();
+        fs::read(&object)?.hash(&mut inputs);
+        include_bytes!("main.rs").hash(&mut inputs);
+        let mut worker = Command::new("cargo");
+        worker
+            .current_dir(&root)
+            .args([
+                "rustc",
+                "--locked",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--profile",
+                "web",
+                "-p",
+                "doslet-web-worker",
+                "--features",
+                "v86",
+                "--",
+                "-C",
+            ])
+            .arg(format!("linker={}", env::current_exe()?.display()))
+            .arg("-C")
+            .arg(format!("link-arg={}", object.display()))
+            .args(["-C", "link-arg=--export=doslet_run", "--cfg"])
+            .arg(format!("doslet_build_inputs=\"{:016x}\"", inputs.finish()));
+        run(&mut worker)?;
+        run(Command::new("cargo").current_dir(&root).args([
+            "build",
+            "--locked",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--profile",
+            "web",
+            "-p",
+            "doslet-web-audio",
+        ]))?;
+        fs::write(stage.join("v86-runtime.json"), "{\"abi\":4}\n")?;
+    } else {
+        run(&mut cargo)?;
+    }
     for name in ["doslet_web_worker", "doslet_web_audio"] {
-        let wasm = root.join(format!("target/wasm32-unknown-unknown/web/{name}.wasm"));
+        let mut wasm = root.join(format!("target/wasm32-unknown-unknown/web/{name}.wasm"));
+        if v86 && name == "doslet_web_worker" {
+            let input = root.join("target/v86/browser-bindgen/doslet_web_worker.wasm");
+            fs::create_dir_all(input.parent().unwrap())?;
+            fs::write(&input, export_v86_table(&fs::read(&wasm)?)?)?;
+            wasm = input;
+        }
         run(Command::new("wasm-bindgen")
             .arg(wasm)
             .args(["--target", "web", "--no-typescript", "--out-dir"])
@@ -178,10 +370,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let output = stage.join(format!("{name}_bg.wasm"));
         if env::var("TRUNK_PROFILE").is_ok_and(|profile| profile == "release") {
             println!("{name}: wasm-opt -O3");
-            run(Command::new("wasm-opt")
-                .arg(&output)
-                .args(["-O3", "-o"])
-                .arg(&output))?;
+            let mut optimize = Command::new("wasm-opt");
+            optimize.arg(&output).args(["-O3", "-o"]).arg(&output);
+            if v86 && name == "doslet_web_worker" {
+                optimize.arg("--enable-exception-handling");
+            }
+            run(&mut optimize)?;
         }
         add_compilation_hints_to_file(&output)?;
     }
@@ -197,6 +391,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v86_alias_selects_function_table_and_rejects_missing_table() {
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        // Two exports: Rust's function table 0 and wasm-bindgen externrefs 1.
+        module.extend_from_slice(&[7, 9, 2, 1, b'f', 1, 0, 1, b'e', 1, 1]);
+        let aliased = export_v86_table(&module).unwrap();
+        assert!(aliased.ends_with(b"\x10doslet_v86_table\x01\x00"));
+        assert_eq!(aliased[10], 3);
+        assert!(export_v86_table(b"\0asm\x01\0\0\0").is_err());
+        module[14] = 1;
+        assert!(export_v86_table(&module).is_err());
+    }
 
     #[test]
     fn injects_eager_optimized_compilation_hints_before_code_section_idempotently() {

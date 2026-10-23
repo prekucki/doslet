@@ -1,6 +1,310 @@
-//! Quake, a DJGPP program, through the desktop application's own worker path.
+//! Real-game diagnostics through the desktop application's own worker path.
 use super::*;
 use clap::Parser;
+
+#[test]
+#[cfg(feature = "v86")]
+#[ignore = "requires local ROTT and a headless wgpu adapter; exercises desktop input dispatch"]
+fn local_rott_v86_desktop_keyboard_probe() {
+    use iced::keyboard::{
+        Event, Key, Location, Modifiers,
+        key::{Code, Named, Physical},
+    };
+    use iced::{Font, Pixels, Point, Size};
+    use iced_runtime::core::{clipboard, mouse, renderer};
+    use iced_runtime::user_interface::{Cache, UserInterface};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let profile = std::env::var_os("DOSLET_ROTT_PROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.join("games/ROTT.toml"));
+    let mut app = crate::desktop::Doslet::with_engine(move || {
+        let mut cli = crate::cli::Cli::parse_from([
+            "doslet",
+            "--config",
+            profile.to_str().unwrap(),
+            "--v86",
+            "--no-audio",
+            "--drive-mode",
+            "overlay",
+        ]);
+        cli.load_state = std::env::var_os("DOSLET_ROTT_STATE").map(std::path::PathBuf::from);
+        eprintln!(
+            "ROTT desktop profile={} state={:?}",
+            profile.display(),
+            cli.load_state
+        );
+        let mut engine = Doslet::from_cli(cli).map_err(|e| e.to_string())?;
+        if let Some(store) = std::env::var_os("DOSLET_ROTT_STORE") {
+            let mut payload =
+                crate::native_store_format::read_committed(std::path::Path::new(&store))
+                    .map_err(|error| format!("read-only ROTT store: {error:?}"))?
+                    .ok_or("ROTT store has no committed overlay")?;
+            if std::env::var_os("DOSLET_ROTT_DISABLE_JOYSTICK").is_some() {
+                // Diagnostic only: edit the imported copy, never the user's store.
+                let setting = b"JoystickEnabled    1";
+                let offset = payload
+                    .windows(setting.len())
+                    .position(|bytes| bytes == setting)
+                    .ok_or("ROTT overlay has no enabled joystick setting")?;
+                payload[offset + setting.len() - 1] = b'0';
+            }
+            let mut session = crate::native_zip::load_game_with_settings(
+                engine.source.as_deref().unwrap(),
+                &engine.launch,
+            )
+            .map_err(|error| error.to_string())?;
+            session
+                .import_overlay(&payload)
+                .map_err(|error| format!("ROTT overlay: {error:?}"))?;
+            engine.storage = Some(
+                crate::native_storage::NativeStorage::prepare_mut(&mut session, &engine.launch)
+                    .map_err(|error| error.to_string())?,
+            );
+            session.start();
+            engine.session = session.into();
+        }
+        Ok(engine)
+    });
+    app.from_library = true;
+    let mut renderer = iced::futures::executor::block_on(
+        <iced::Renderer as renderer::Headless>::new(Font::DEFAULT, Pixels(16.0), Some("wgpu")),
+    )
+    .expect("headless renderer");
+    let mut cache = Cache::default();
+    let size = Size::new(960.0, 640.0);
+    let cursor = mouse::Cursor::Available(Point::new(480.0, 320.0));
+    let advance = |app: &mut crate::desktop::Doslet, millis| {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(millis) {
+            let _ = app.update(Message::Tick);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            app.session.status(),
+            SessionStatus::Running,
+            "{:?}",
+            app.session.fault()
+        );
+    };
+    advance(&mut app, 10000);
+    let escapes = std::env::var("DOSLET_ROTT_MENU_ESCAPES")
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(3);
+    for (i, (named, code)) in std::iter::repeat_n((Named::Escape, Code::Escape), escapes)
+        .chain([
+            (Named::ArrowDown, Code::ArrowDown),
+            (Named::ArrowDown, Code::ArrowDown),
+            (Named::ArrowUp, Code::ArrowUp),
+            (Named::ArrowDown, Code::ArrowDown),
+            (Named::ArrowUp, Code::ArrowUp),
+        ])
+        .enumerate()
+    {
+        for pressed in [true, false] {
+            let key = Key::Named(named);
+            let event = if pressed {
+                Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: Physical::Code(code),
+                    location: Location::Standard,
+                    modifiers: Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }
+            } else {
+                Event::KeyReleased {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key: Physical::Code(code),
+                    location: Location::Standard,
+                    modifiers: Modifiers::empty(),
+                }
+            };
+            let mut ui = UserInterface::build(app.view(), size, cache, &mut renderer);
+            let mut messages = Vec::new();
+            let (_, statuses) = ui.update(
+                &[iced::Event::Keyboard(event.clone())],
+                cursor,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            cache = ui.into_cache();
+            eprintln!("desktop key={named:?} pressed={pressed} status={statuses:?}");
+            assert_eq!(
+                statuses,
+                [iced::event::Status::Ignored],
+                "game keys must reach the worker"
+            );
+            for message in messages {
+                let _ = app.update(message);
+            }
+            let _ = app.update(if statuses[0] == iced::event::Status::Ignored {
+                Message::Keyboard(event)
+            } else {
+                Message::KeyboardCaptured(event)
+            });
+            advance(&mut app, if pressed { 150 } else { 650 });
+        }
+        if let Some(iced::widget::image::Handle::Rgba {
+            width,
+            height,
+            pixels,
+            ..
+        }) = &app.display.image
+        {
+            image::RgbaImage::from_raw(*width, *height, pixels.to_vec())
+                .unwrap()
+                .save(root.join(format!("target/rott-v86-desktop-{i}.png")))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "v86")]
+#[ignore = "requires local ROTT; bounded keyboard diagnostic without window or host audio"]
+fn local_rott_v86_keyboard_probe() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let cli = crate::cli::Cli::parse_from([
+                "doslet",
+                "--config",
+                root.join("games/ROTT.toml").to_str().unwrap(),
+                "--v86",
+                "--no-audio",
+                "--drive-mode",
+                "overlay",
+            ])
+            .resolve()
+            .unwrap();
+            let mut app = Doslet::new();
+            app.launch = cli.launch;
+            app.launch.persist = false;
+            app.launch.preload_local_media = true;
+            app.configurator
+                .set_active(app.launch.machine_spec.clone().unwrap());
+            app.init_game_session(cli.game.unwrap()).unwrap();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(8) {
+                let _ = app.worker_tick();
+                assert_eq!(
+                    app.session.status(),
+                    SessionStatus::Running,
+                    "{:?}",
+                    app.session.fault()
+                );
+            }
+            let mut key_state = None;
+            for (usage, make) in [(41, &[0x01][..]), (81, &[0xe0, 0x50]), (20, &[0x10])] {
+                for pressed in [true, false] {
+                    app.session.physical_key(usage, pressed).unwrap();
+                    let mut reads = Vec::new();
+                    for _ in 0..20000 {
+                        let nanos = app.session.emulated_nanos() + 1000;
+                        app.session.advance_v86_host_time(nanos).unwrap();
+                        let pc = app.session.debug_pc();
+                        let mut code = [0; 2];
+                        assert!(app.session.debug_read_memory(pc, &mut code));
+                        let dx = app.session.registers().get(doslet_x86::Gpr16::Dx);
+                        app.session.advance(1);
+                        if code.starts_with(&[0xe4, 0x60])
+                            || (code.first() == Some(&0xec) && dx == 0x60)
+                        {
+                            let ax = app.session.registers().get(doslet_x86::Gpr16::Ax);
+                            reads.push(ax as u8);
+                            if usage == 41 && pressed {
+                                let isr = app
+                                    .session
+                                    .ram_view(pc as usize..pc as usize + 384)
+                                    .unwrap();
+                                // Locate this build's Keystate[ECX] = 1 store in
+                                // the live ISR, without a fixed load address.
+                                let store = isr
+                                    .windows(11)
+                                    .find(|bytes| {
+                                        bytes[..3] == [0xc7, 0x04, 0x8d]
+                                            && bytes[7..] == [1, 0, 0, 0]
+                                    })
+                                    .expect("ROTT keyboard ISR Keystate store");
+                                key_state =
+                                    Some(u32::from_le_bytes(store[3..7].try_into().unwrap())
+                                        as usize);
+                            }
+                        }
+                        assert_eq!(
+                            app.session.status(),
+                            SessionStatus::Running,
+                            "{:?}",
+                            app.session.fault()
+                        );
+                    }
+                    eprintln!(
+                        "ROTT keyboard usage={usage} pressed={pressed} reads={reads:02x?} pc={:x}",
+                        app.session.debug_pc()
+                    );
+                    let mut expected = make.to_vec();
+                    if !pressed {
+                        *expected.last_mut().unwrap() |= 0x80;
+                    }
+                    assert_eq!(reads, expected, "game must read every keyboard byte");
+                }
+            }
+            use iced::keyboard::{
+                Event, Key, Location, Modifiers,
+                key::{Code, Named, Physical},
+            };
+            let base = key_state.unwrap();
+            for (key, code, scan) in [
+                (Named::ArrowDown, Code::ArrowDown, 0x50),
+                (Named::ArrowUp, Code::ArrowUp, 0x48),
+                (Named::ArrowLeft, Code::ArrowLeft, 0x4b),
+                (Named::ArrowRight, Code::ArrowRight, 0x4d),
+            ] {
+                for pressed in [true, false] {
+                    let key = Key::Named(key);
+                    let event = if pressed {
+                        Event::KeyPressed {
+                            key: key.clone(),
+                            modified_key: key,
+                            physical_key: Physical::Code(code),
+                            location: Location::Standard,
+                            modifiers: Modifiers::empty(),
+                            text: None,
+                            repeat: false,
+                        }
+                    } else {
+                        Event::KeyReleased {
+                            key: key.clone(),
+                            modified_key: key,
+                            physical_key: Physical::Code(code),
+                            location: Location::Standard,
+                            modifiers: Modifiers::empty(),
+                        }
+                    };
+                    let _ = app.update(Message::Keyboard(event));
+                    let began = Instant::now();
+                    while began.elapsed() < Duration::from_millis(150) {
+                        let _ = app.worker_tick();
+                    }
+                    let actual = app
+                        .session
+                        .ram_view(base + scan * 4..base + scan * 4 + 4)
+                        .unwrap();
+                    eprintln!(
+                        "ROTT normal worker scan={scan:x} pressed={pressed} Keystate={actual:?}"
+                    );
+                    assert_eq!(actual, u32::from(pressed).to_le_bytes());
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
 
 #[test]
 #[cfg(feature = "v86")]

@@ -1212,6 +1212,48 @@ mod tests {
     }
 
     #[test]
+    fn configuration_window_saves_and_clears_game_execution_mode() {
+        use doslet_config::ExecutionMode;
+        let dir = Directory::new();
+        let mut library = library_with(&dir, "version=2\n[game]\nexecutable='GAME.EXE'\n");
+        for (name, mode) in [
+            ("simple", ExecutionMode::Simple),
+            ("aot", ExecutionMode::Aot),
+            ("v86", ExecutionMode::V86),
+        ] {
+            config(&mut library, GameEdit::Open);
+            config(
+                &mut library,
+                GameEdit::Set(Setting::ExecutionMode, name.into()),
+            );
+            assert_eq!(
+                library.config.as_ref().unwrap().effective.game.mode,
+                Some(mode)
+            );
+            config(&mut library, GameEdit::Save);
+            let text = std::fs::read_to_string(dir.0.join("game.toml")).unwrap();
+            assert_eq!(
+                machine_profile::parse_machine_profile(&text)
+                    .unwrap()
+                    .game
+                    .mode,
+                Some(mode)
+            );
+        }
+        config(&mut library, GameEdit::Open);
+        config(&mut library, GameEdit::Unset(Setting::ExecutionMode));
+        config(&mut library, GameEdit::Save);
+        let text = std::fs::read_to_string(dir.0.join("game.toml")).unwrap();
+        assert_eq!(
+            machine_profile::parse_machine_profile(&text)
+                .unwrap()
+                .game
+                .mode,
+            None
+        );
+    }
+
+    #[test]
     fn sound_card_choice_replaces_legacy_sb16_and_survives_reload() {
         let dir = Directory::new();
         let mut library = library_with(

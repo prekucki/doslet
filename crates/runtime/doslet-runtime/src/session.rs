@@ -194,7 +194,7 @@ pub struct Session {
 impl Session {
     /// Use the isolated v86 CPU/JIT with this session's Rust PC devices.
     pub fn enable_v86(&mut self, module: &[u8]) -> Result<(), alloc::string::String> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.enable_v86(module)?;
             self.set_idle_loops(false);
@@ -207,19 +207,19 @@ impl Session {
             self.set_v86_input_polling(true);
             Ok(())
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             let _ = module;
-            Err("v86 requires the native v86 Cargo feature".into())
+            Err("v86 requires the v86 Cargo feature".into())
         }
     }
 
     pub fn v86_enabled(&self) -> bool {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_enabled()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             false
         }
@@ -257,11 +257,11 @@ impl Session {
 
     /// Host-clock mode never charges device time from instruction counts.
     pub fn set_v86_host_clock(&mut self, enabled: bool) -> Result<(), &'static str> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.set_v86_host_clock(enabled)
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             let _ = enabled;
             Err("host-clock execution requires native v86")
@@ -269,11 +269,11 @@ impl Session {
     }
 
     pub fn v86_host_clock_enabled(&self) -> bool {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_host_clock_enabled()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             false
         }
@@ -281,110 +281,110 @@ impl Session {
 
     /// Toggle exact, idempotent RAM-polling loop parking in host-clock v86.
     pub fn set_v86_ram_waits(&mut self, enabled: bool) {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         self.machine.set_v86_ram_waits(enabled);
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         let _ = enabled;
     }
 
     /// Enabled state and the number of CPU parks at a validated loop head.
     pub fn v86_ram_waits(&self) -> Option<(bool, u64)> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_ram_waits()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             None
         }
     }
 
     pub fn v86_ram_wait_parked(&self) -> bool {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_ram_wait_parked()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             false
         }
     }
 
     pub fn set_v86_vga_polling(&mut self, enabled: bool) {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         self.machine.set_v86_vga_polling(enabled);
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         let _ = enabled;
     }
 
     pub fn v86_vga_polling(&self) -> Option<(bool, u64)> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_vga_polling()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             None
         }
     }
 
     pub fn v86_vga_poll_active(&self) -> bool {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_vga_poll_active()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             false
         }
     }
 
     pub fn v86_vga_poll_wait_nanos(&self) -> Option<u64> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_vga_poll_wait_nanos()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             None
         }
     }
 
     pub fn set_v86_mpu_polling(&mut self, enabled: bool) {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         self.machine.set_v86_mpu_polling(enabled);
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         let _ = enabled;
     }
 
     pub fn v86_mpu_polling(&self) -> Option<(bool, u64)> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_mpu_polling()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             None
         }
     }
 
     pub fn v86_mpu_poll_active(&self) -> bool {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_mpu_poll_active()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             false
         }
     }
 
     pub fn v86_mpu_poll_wait_nanos(&self) -> Option<u64> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_mpu_poll_wait_nanos()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             None
         }
@@ -396,12 +396,19 @@ impl Session {
         if !self.v86_host_clock_enabled() || self.status != SessionStatus::Running {
             return Ok(0);
         }
+        // A halted CPU may never enter advance(). Deliver queued host input
+        // to the devices here too, so a physical key can raise IRQ1 and wake
+        // HLT without relying on an unrelated timer interrupt.
+        self.apply_input();
+        if self.status != SessionStatus::Running {
+            return Ok(0);
+        }
         let elapsed = target_nanos.saturating_sub(self.emulated_nanos());
         Ok(self.machine.debug_advance_device_time(elapsed)?)
     }
 
     pub fn v86_statistics(&mut self) -> Option<V86Statistics> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine
                 .v86_stats()
@@ -420,35 +427,35 @@ impl Session {
                     },
                 )
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             None
         }
     }
 
     pub fn v86_last_error(&self) -> Option<&str> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.v86_last_error()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             None
         }
     }
     pub fn set_v86_profiling(&mut self, enabled: bool) {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         self.machine.set_v86_profiling(enabled);
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         let _ = enabled;
     }
     /// Wait for native code preparation outside execution and timing windows.
     pub fn wait_for_v86_compilation(&mut self) -> Result<(), alloc::string::String> {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         {
             self.machine.wait_for_v86_compilation()
         }
-        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "v86"))]
         {
             Ok(())
         }
@@ -1543,7 +1550,7 @@ impl Session {
                 }
             }
         }
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         self.machine
             .set_v86_exception_exits(self.dpmi.as_ref().is_some_and(|host| host.entered()))?;
         let (outcome, consumed) = if OBSERVE {
@@ -1568,7 +1575,7 @@ impl Session {
         if self.v86_host_clock_enabled() && self.machine.cpu.is_halted() {
             self.timeslice_yielded = true;
         }
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         if self.machine.v86_host_clock_yielded() {
             self.timeslice_yielded = true;
         }

@@ -482,6 +482,16 @@ fn machine<'a>(library: &'a Library, window: &'a ConfigWindow) -> Element<'a, Me
             "Processor",
             column![
                 field(
+                    "Execution mode",
+                    choice(
+                        window,
+                        Setting::ExecutionMode,
+                        "Automatic".into(),
+                        [("simple", "Simple"), ("aot", "AOT"), ("v86", "v86")],
+                    ),
+                ),
+                hint("Applies on the next launch. v86 uses host time; clock and speed mode do not apply."),
+                field(
                     "Clock",
                     column![
                         choice(

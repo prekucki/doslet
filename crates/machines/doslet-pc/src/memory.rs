@@ -113,10 +113,7 @@ impl Ram {
 
     /// Setup-only backing migration. Preserve RAM accounting and replace its
     /// code identity so no decoded/native proof can retain the old owner.
-    #[cfg(any(
-        feature = "wasm-procedures",
-        all(feature = "v86", not(target_arch = "wasm32"))
-    ))]
+    #[cfg(any(feature = "wasm-procedures", feature = "v86"))]
     pub(crate) fn replace_storage(&mut self, storage: storage::Storage) {
         let mapping = self.code_space & u64::from(u32::MAX);
         self.storage = storage;
@@ -166,7 +163,7 @@ impl Ram {
         self.storage.len()
     }
     pub(crate) fn text_revision(&self) -> u64 {
-        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        #[cfg(feature = "v86")]
         if matches!(self.storage, storage::Storage::V86(_)) {
             return self.writes;
         }
@@ -301,7 +298,7 @@ impl Ram {
         };
     }
 
-    #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+    #[cfg(feature = "v86")]
     pub(crate) fn external_execution_complete(&mut self) {
         // v86 owns precise invalidation of its generated code. Native decoder
         // proofs and recurrence observers conservatively lose their old view

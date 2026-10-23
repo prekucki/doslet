@@ -12,8 +12,15 @@ doslet-bus.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wasmtime = { version = "=45.0.3", default-features = false, features = ["cranelift", "runtime", "std"] }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+doslet-v86-module = { path = "../../../vendor/v86", features = ["embedded"] }
+wasm-bindgen = "0.2.129"
+
 [dev-dependencies]
 doslet-x86.workspace = true
+
+[build-dependencies]
+wasmtime = { version = "=45.0.3", default-features = false, features = ["cranelift", "runtime", "std"] }
 
 [lints.rust]
 unsafe_code = "deny"

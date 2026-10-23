@@ -102,6 +102,11 @@ export class Browser {
                 this.queue = [];
                 console.info('Doslet machine ready in Web Worker');
             } else if (data.kind === 'state') {
+                if (data.cpuCore === 'v86' && this.state?.cpuCore !== 'v86')
+                    console.info('Doslet v86 CPU active in browser Worker');
+                if (data.cpuCore === 'v86' && data.v86?.jitEntries > 0 &&
+                    (!this.state?.v86?.jitEntries || data.steps < this.state.steps))
+                    console.info('Doslet v86 executing generated WASM code');
                 if (data.aot?.active && (!this.state?.aot?.active || data.steps < this.state.steps))
                     console.info(`Doslet AOT ready: ${data.aot.entries} guarded entries`);
                 if (data.aot?.translatedSteps > 0 && (!this.state?.aot?.translatedSteps || data.steps < this.state.steps))
@@ -129,7 +134,8 @@ export class Browser {
     applyMachine(profile, program, discardChanges = false) {
         const bundle = this.bundleSession?.program === program ? this.bundleSession : {};
         this.releaseInput(); this.releaseMouse(); this.send({kind:'apply-machine', profile, program, discardChanges,
-            bundleRuntime:bundle.bundleRuntime, tierProfile:bundle.tierProfile, aot:bundle.aot, startupKeys:bundle.startupKeys});
+            bundleRuntime:bundle.bundleRuntime, mode:bundle.mode, tierProfile:bundle.tierProfile,
+            aot:bundle.aot, startupKeys:bundle.startupKeys});
     }
     physicalKey(usage, pressed, enabled=true) {
         if (!pressed) { this.heldKeys.delete(usage); this.suppressedKeys.delete(usage); }
@@ -232,6 +238,10 @@ export class Browser {
             };
             if (!bundle.profile || !bundle.zip || !bundle.executable)
                 throw new Error('Incomplete bundled game manifest');
+            const mode = bundle.mode || (bundle.aot ? 'aot' : 'simple');
+            if (!['simple', 'aot', 'v86'].includes(mode) ||
+                (mode === 'v86' && (bundle.aot || bundle.tierProfile)))
+                throw new Error('Invalid bundled CPU mode');
             const selections = bundle.startupPatch?.selections || [];
             if (!Array.isArray(selections) || selections.length > 16 ||
                 selections.some(value => !/^[1-9]$/.test(value)))
@@ -272,11 +282,11 @@ export class Browser {
             const imported = await this.call('bundle-import',{buffer:zip},[zip]);
             const program = imported.programs.find(value => value === bundle.executable || value.endsWith('/'+bundle.executable));
             if (!program) throw new Error(`${bundle.executable} is missing from the bundled ZIP`);
-            const fields = {profile,program,tierProfile,aot,bundleRuntime:!!bundle.bundleRuntime,
+            const fields = {profile,program,mode,tierProfile,aot,bundleRuntime:!!bundle.bundleRuntime,
                 startupKeys};
             if (saves) fields.seedBuffer = saves;
             await this.call('apply-machine',fields,saves ? [saves] : []);
-            this.bundleSession = {program,tierProfile,aot,bundleRuntime:!!bundle.bundleRuntime,startupKeys};
+            this.bundleSession = {program,mode,tierProfile,aot,bundleRuntime:!!bundle.bundleRuntime,startupKeys};
             if (bundle.displayFilter) this.events.push({kind:'bundle-display',filter:bundle.displayFilter,
                 fallback:bundle.displayFilterFallback});
             window.dispatchEvent(new CustomEvent('doslet-bundle-status',{detail:{ready:true}}));

@@ -39,3 +39,25 @@ pub fn gpu_canvas_active() -> bool {
         .iter()
         .any(|kind| canvas.get_context(kind).ok().flatten().is_some())
 }
+
+/// A ROTT run with RAVU on Chromium WebGL reached a wgpu-core buffer-alignment
+/// panic. Select the configured simple filter on that renderer; Firefox WebGL
+/// and Chromium WebGPU are left eligible for RAVU.
+pub fn chromium_webgl_ravu_unstable() -> bool {
+    use wasm_bindgen::JsCast;
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let chrome = window
+        .navigator()
+        .user_agent()
+        .is_ok_and(|agent| agent.contains("Chrome/") || agent.contains("Chromium/"));
+    if !chrome {
+        return false;
+    }
+    window
+        .document()
+        .and_then(|document| document.query_selector("canvas").ok().flatten())
+        .and_then(|element| element.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+        .is_some_and(|canvas| canvas.get_context("webgl2").ok().flatten().is_some())
+}

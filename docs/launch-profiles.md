@@ -22,6 +22,29 @@ remains unverified.
 
 ## Supported fields
 
+Both profile versions accept a CPU backend in `[game]`:
+
+```toml
+[game]
+mode = "v86"
+```
+
+In the library, open the game's configuration and select **Machine → Processor
+→ Execution mode**. Save the profile to use the selection on the next launch.
+**Default · Automatic** removes the override.
+
+Use `simple` for interpretation, `aot` for guarded ahead-of-time procedures, or
+`v86` for the v86 CPU/JIT with Doslet devices. Desktop `aot` enables automatic
+procedure preparation with interpreter fallback. The web builder's `aot` mode
+requires a usable compiled module and reports failure when none is available.
+Omitting `mode` preserves each launcher's existing automatic selection.
+
+Native `--mode simple|aot|v86` and the web builder's `--mode` override the profile.
+The native `--v86` alias also overrides it. Native v86 uses the embedded,
+precompiled core and host-clock timing by default; no adjacent WASM file is
+required. Its incompatible AOT and speed-tier policies are disabled. These
+backend settings are separate from `machine.cpu_mode`, which controls pacing.
+
 ```toml
 version = 1
 name = "Civilization"

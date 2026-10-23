@@ -13,7 +13,7 @@ run = "cargo test --workspace --locked"
 
 [tasks.check]
 description = "Format and lint all native targets"
-run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets --locked -- -D warnings"]
+run = ["cargo fmt --check", "cargo fmt --manifest-path tools/v86-build/Cargo.toml --check", "cargo clippy --workspace --all-targets --locked -- -D warnings"]
 
 [tasks.build]
 description = "Build the optimized iced desktop application"
@@ -45,11 +45,11 @@ run = "cargo run -p doslet-headless --locked -- demo"
 [tasks.web]
 description = "Serve the iced WebAssembly application"
 dir = "web"
-run = "trunk serve --locked"
+run = "trunk serve --locked --no-default-features --features wasm-procedures"
 env = { NO_COLOR = "true" }
 
 [tasks.web-build]
 description = "Build the WebAssembly application with LLVM and wasm-opt speed optimizations"
 dir = "web"
-run = "trunk build --release --locked"
+run = "trunk build --release --locked --no-default-features --features wasm-procedures"
 env = { NO_COLOR = "true" }

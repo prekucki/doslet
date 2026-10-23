@@ -337,8 +337,38 @@ pub struct GameAction {
     pub arguments: Vec<String>,
 }
 
+/// CPU backend, independent of the machine's clock/pacing policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Simple,
+    Aot,
+    V86,
+}
+impl ExecutionMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::Aot => "aot",
+            Self::V86 => "v86",
+        }
+    }
+}
+impl core::str::FromStr for ExecutionMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "simple" => Ok(Self::Simple),
+            "aot" => Ok(Self::Aot),
+            "v86" => Ok(Self::V86),
+            _ => Err("game.mode must be simple, aot, or v86"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GameSpec {
+    /// None preserves the launcher's existing automatic backend selection.
+    pub mode: Option<ExecutionMode>,
     pub executable: String,
     /// Native patch manifests, resolved relative to the launch profile.
     pub patches: Vec<String>,
@@ -352,6 +382,7 @@ pub struct GameSpec {
 impl Default for GameSpec {
     fn default() -> Self {
         Self {
+            mode: None,
             executable: String::new(),
             patches: Vec::new(),
             arguments: Vec::new(),

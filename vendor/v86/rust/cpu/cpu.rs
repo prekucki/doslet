@@ -33,7 +33,7 @@ mod wasm {
 }
 
 pub mod js {
-    #[link(wasm_import_module = "env")]
+    #[cfg_attr(not(feature = "embedded"), link(wasm_import_module = "env"))]
     extern "C" {
         pub fn cpu_exception_hook(interrupt: i32) -> bool;
         pub fn microtick() -> f64;
@@ -55,7 +55,10 @@ pub mod js {
 
 /// The offset for our generated functions in the wasm table. Every index less than this is
 /// reserved for rustc's indirect functions
+#[cfg(not(feature = "embedded"))]
 pub const WASM_TABLE_OFFSET: u32 = 1024;
+#[cfg(feature = "embedded")]
+pub static mut WASM_TABLE_OFFSET: u32 = 0;
 
 #[derive(Copy, Clone)]
 #[repr(C)]

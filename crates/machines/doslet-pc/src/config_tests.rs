@@ -127,11 +127,16 @@ fn disabled_cards_lose_ports_and_scheduling_and_config_is_validated() {
     };
     let mut m = PcMachine::from_config(config).unwrap();
     for port in [
-        0x224, 0x225, 0x226, 0x22A, 0x22C, 0x22E, 0x22F, 0x330, 0x331, 0x201,
+        0x224, 0x225, 0x226, 0x22A, 0x22C, 0x22E, 0x22F, 0x330, 0x331,
     ] {
         assert!(m.bus.read_port_u8(port).is_err());
         assert!(m.bus.write_port_u8(port, 0).is_err());
     }
+    // An absent joystick never completes an axis measurement or presses a button.
+    assert_eq!(m.bus.read_port_u8(0x201), Ok(0xff));
+    m.bus.write_port_u8(0x201, 0).unwrap();
+    m.bus.guest_nanos += 2_000_000;
+    assert_eq!(m.bus.read_port_u8(0x201), Ok(0xff));
     assert_eq!(m.audio_status().irq, None);
     assert_eq!(m.audio_status().dma8, None);
     assert!(matches!(

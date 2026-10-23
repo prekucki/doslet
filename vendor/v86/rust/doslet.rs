@@ -190,11 +190,26 @@ pub unsafe fn doslet_abi_version() -> u32 { 4 }
 #[no_mangle]
 pub unsafe fn doslet_init(size: u32) -> u32 {
     REPORTED_IRET_FAULT = false;
+    MACHINE_BOUNDARIES = false;
+    WAIT_BOUNDARY = u32::MAX;
+    A20_ENABLED = true;
+    STOPPED_INTERRUPT = 0;
     STOPPED_EXCEPTION = 0;
     EXCEPTION_ERROR = None;
     EXCEPTION_EXITS = false;
     EXTERNAL_INTERRUPT = false;
     INTERRUPT_SHADOW = false;
+    // Embedded workers reuse this module after machine replacement, unlike
+    // standalone hosts which instantiate a fresh module for each CPU.
+    cpu::tsc_offset = 0;
+    cpu::tsc_last_value = 0;
+    cpu::tsc_resolution = u64::MAX;
+    cpu::tsc_number_of_same_readings = 0;
+    cpu::tsc_speed = 1;
+    cpu::in_jit = false;
+    cpu::jit_block_boundary = false;
+    cpu::jit_exit_reason = cpu::JitExitReason::None;
+    #[cfg(debug_assertions)] { cpu::tsc_last_extra = 0; }
     crate::jit::rust_init();
     let base = memory::allocate_memory(size);
     *state::memory_size = size;

@@ -6,11 +6,12 @@ publish = false
 license = "BSD-2-Clause"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["rlib"]
 path = "rust/lib.rs"
 
 [features]
 default = []
+embedded = []
 profiler = []
 
 [profile.release]

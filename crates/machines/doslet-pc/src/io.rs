@@ -86,7 +86,7 @@ impl Default for PcBus {
     }
 }
 impl PcBus {
-    #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+    #[cfg(feature = "v86")]
     pub(crate) fn v86_access(
         &mut self,
         ram: &mut [u8],

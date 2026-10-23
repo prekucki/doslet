@@ -141,17 +141,20 @@ pub struct Cli {
     /// Use the experimental Cranelift JIT; slower than the interpreter on ROTT
     #[arg(long)]
     pub dynamic_core: bool,
+    /// CPU backend (overrides game.mode): simple, aot, or v86
+    #[arg(long, conflicts_with_all = ["v86", "dynamic_core"])]
+    pub mode: Option<doslet_config::ExecutionMode>,
     /// Use the v86 CPU/JIT with Doslet's Rust PC devices (native only)
     #[arg(long, conflicts_with_all = ["dynamic_core", "wasm_procedures", "learn_speed_tiers", "speed_tier_profile", "adaptive_cpu", "adaptive_idle", "analyze_synchronization", "observe_idle", "experimental_heroes_menu_idle", "experimental_heroes_timer_waits", "gdb"])]
     pub v86: bool,
-    /// Path to doslet-v86.wasm (default: beside the executable or target/v86)
-    #[arg(long, requires = "v86", value_name = "WASM")]
+    /// Override the embedded v86 core with a WASM module
+    #[arg(long, value_name = "WASM")]
     pub v86_module: Option<PathBuf>,
     /// Explicitly select the default v86 host clock
-    #[arg(long, requires = "v86", conflicts_with = "cpu_mhz")]
+    #[arg(long, conflicts_with = "cpu_mhz")]
     pub v86_host_clock: bool,
     /// Compare v86 using the configured instruction clock instead of host time
-    #[arg(long, requires = "v86", conflicts_with = "v86_host_clock")]
+    #[arg(long, conflicts_with = "v86_host_clock")]
     pub v86_instruction_clock: bool,
     /// Accepted for older launch commands; the interpreter is now the default
     #[arg(long, hide = true, conflicts_with = "dynamic_core")]
@@ -257,13 +260,28 @@ mod tests {
         for option in ["--dynamic-core", "--learn-speed-tiers", "--observe-idle"] {
             assert!(super::Cli::try_parse_from(["doslet", "--v86", option]).is_err());
         }
-        assert!(super::Cli::try_parse_from(["doslet", "--v86-module", "cpu.wasm"]).is_err());
-        assert!(super::Cli::try_parse_from(["doslet", "--v86-host-clock"]).is_err());
+        assert!(
+            super::Cli::try_parse_from(["doslet", "--v86-module", "cpu.wasm"])
+                .unwrap()
+                .resolve()
+                .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from(["doslet", "--v86-host-clock"])
+                .unwrap()
+                .resolve()
+                .is_err()
+        );
         assert!(
             super::Cli::try_parse_from(["doslet", "--v86", "--v86-host-clock", "--cpu-mhz", "100"])
                 .is_err()
         );
-        assert!(super::Cli::try_parse_from(["doslet", "--v86-instruction-clock"]).is_err());
+        assert!(
+            super::Cli::try_parse_from(["doslet", "--v86-instruction-clock"])
+                .unwrap()
+                .resolve()
+                .is_err()
+        );
         assert!(
             super::Cli::try_parse_from([
                 "doslet",

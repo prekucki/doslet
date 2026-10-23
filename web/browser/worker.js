@@ -3,8 +3,46 @@ import {HostIo} from './io.js';
 import {instantiateWasmCore, instantiateWasmProcedures} from './wasm-core.js';
 
 const wasm = await init();
+const v86Imports = {e: {...wasm, m: wasm.memory}};
+// The v86 CPU is linked into this Worker module. Its generated blocks import
+// the same linear memory and table, so device calls borrow the live guest RAM.
+let v86TableBase = null;
+let v86CompileMs = 0, v86CompileMaxMs = 0, v86CompileCount = 0;
+const v86Table = wasm.doslet_v86_table ?? wasm.__indirect_function_table ?? wasm.__wbindgen_export;
+globalThis.__dosletV86TableBase = () => {
+    if (v86TableBase !== null) return v86TableBase;
+    if (!(v86Table instanceof WebAssembly.Table)) throw new Error('v86 function table is unavailable');
+    v86TableBase = v86Table.length;
+    v86Table.grow(900);
+    return v86TableBase;
+};
+globalThis.__dosletV86Compile = (ptr, len, index) => {
+    const base = globalThis.__dosletV86TableBase();
+    if (!Number.isInteger(ptr) || !Number.isInteger(len) || len <= 0 ||
+        ptr < 0 || ptr + len > wasm.memory.buffer.byteLength ||
+        !Number.isInteger(index) || index < 0 || index >= 900)
+        throw new Error('Invalid v86 generated module');
+    const started = performance.now();
+    const module = new WebAssembly.Module(new Uint8Array(wasm.memory.buffer, ptr, len));
+    const instance = new WebAssembly.Instance(module, v86Imports);
+    const elapsed = performance.now() - started;
+    v86CompileMs += elapsed;
+    v86CompileMaxMs = Math.max(v86CompileMaxMs, elapsed);
+    v86CompileCount++;
+    if (typeof instance.exports.f !== 'function') throw new Error('v86 generated module has no entry');
+    v86Table.set(base + index, instance.exports.f);
+};
+globalThis.__dosletV86Clear = index => {
+    if (v86TableBase === null || !Number.isInteger(index) || index < 0 || index >= 900)
+        throw new Error('Invalid v86 table slot');
+    v86Table.set(v86TableBase + index, null);
+};
+globalThis.__dosletV86Run = (budget, translated, vector) =>
+    vector >= 0 ? wasm.doslet_inject_interrupt(vector) : wasm.doslet_run(budget, translated);
 const engine = new WorkerEngine();
-let aot = null, aotAssets = null;
+let aot = null, aotAssets = null, coreMode = 'simple';
+let v86Diagnostics = null, nextV86Diagnostics = 0;
+let v86HaltWaits = 0;
 async function prepareAot(assets) {
     if (!assets) return null;
     if (assets.kind === 'procedure-memory')
@@ -105,9 +143,17 @@ function drain() {
 function present(force = false) {
     const now = performance.now();
     if (!force && now < nextVideo) return;
+    if (coreMode === 'v86' && now >= nextV86Diagnostics) {
+        v86Diagnostics = JSON.parse(engine.v86_diagnostics());
+        v86Diagnostics.browserCompileMs = v86CompileMs;
+        v86Diagnostics.browserCompileMaxMs = v86CompileMaxMs;
+        v86Diagnostics.browserCompileCount = v86CompileCount;
+        v86Diagnostics.browserHaltWaits = v86HaltWaits;
+        nextV86Diagnostics = now + 1000;
+    } else if (coreMode !== 'v86') v86Diagnostics = null;
     const millihertz = frameRate ? frameRate * 1000 : engine.video_refresh_millihertz() || 60000;
     nextVideo = now + 1e6 / Math.min(Math.max(millihertz, 10000), 240000);
-    const state = {kind: 'state', epoch, status: engine.status(), steps: engine.steps(), cpuMhz: engine.cpu_mhz(), effectiveCpuMhz: engine.effective_cpu_mhz(), hostCpuLimit: engine.host_cpu_limit(), cpuMode: engine.cpu_mode(), tierRates: Array.from(engine.tier_rates()), tierCounts: Array.from(engine.tier_counts(), Number), keyboardMode: engine.keyboard_mode(),
+    const state = {kind: 'state', epoch, status: engine.status(), steps: engine.steps(), cpuCore: coreMode, v86: v86Diagnostics, cpuMhz: engine.cpu_mhz(), effectiveCpuMhz: engine.effective_cpu_mhz(), hostCpuLimit: engine.host_cpu_limit(), cpuMode: engine.cpu_mode(), tierRates: Array.from(engine.tier_rates()), tierCounts: Array.from(engine.tier_counts(), Number), keyboardMode: engine.keyboard_mode(),
         nanos: engine.nanos(), idleNanos: engine.idle_nanos(), waitingForIo:engine.waiting_for_io(), dirty:engine.dirty_overlay(), pendingCommit:engine.pending_commit(), cs: engine.cs(), ip: engine.ip(), ax: engine.ax(),
         cx: engine.cx(), di: engine.di(), fault: engine.fault(), midiMode: engine.midi_mode(),
         midiUpgraded: engine.midi_upgraded(), midiSysex: engine.midi_sysex(),
@@ -161,8 +207,12 @@ self.onmessage = ({data}) => {
         if (data.kind === 'pointer') { engine.pointer_event(data.x,data.y,data.button,data.pressed); return; }
         if (data.kind === 'pointer-relative') { engine.pointer_relative(data.dx,data.dy); return; }
         if (data.kind === 'midi-mode') { engine.set_midi_mode(data.program); syncAudio(audioRunning); present(true); return; }
-        if (data.kind === 'cpu-mhz') { engine.set_cpu_mhz(Number(data.program)); anchor = null; present(true); return; }
+        if (data.kind === 'cpu-mhz') {
+            if (coreMode === 'v86') throw new Error('CPU MHz control is unavailable in v86 mode');
+            engine.set_cpu_mhz(Number(data.program)); anchor = null; present(true); return;
+        }
         if (data.kind === 'cpu-settings') {
+            if (coreMode === 'v86') throw new Error('CPU pacing controls are unavailable in v86 mode');
             const tierMatch = /^tiers:([0-9]+):([0-9]+):([0-9]+)$/.exec(data.program);
             if (tierMatch) {
                 engine.set_tier_settings(...tierMatch.slice(1).map(Number));
@@ -255,6 +305,9 @@ async function hostCommand(data) {
         }
         const discard=data.discardChanges || data.program==='discard' || data.kind==='import-saves';
         if(engine.dirty_overlay() && !discard) throw new Error('Export unsaved changes or enable Discard temporary changes before replacing this session');
+        const nextMode = data.kind === 'apply-machine' ? (data.mode || 'simple') : coreMode;
+        if (!['simple', 'aot', 'v86'].includes(nextMode)) throw new Error('Invalid browser CPU mode');
+        if (nextMode === 'v86' && !engine.supports_v86()) throw new Error('This browser Worker was built without v86');
         const reset=!['apply-machine','start-game'].includes(data.kind);
         const metadata=JSON.parse(reset?engine.prepare_reset():data.kind==='start-game'?engine.prepare_start_game(data.program):engine.prepare_machine(data.profile,data.program||''));
         if(data.kind==='apply-machine' && data.bundleRuntime) engine.prepare_bundle_runtime();
@@ -265,11 +318,16 @@ async function hostCommand(data) {
         if(data.kind==='apply-machine' && data.tierProfile)
             engine.prepare_candidate_tiers(data.tierProfile);
         if(data.kind==='apply-machine') preparedOutput=await prepareOutput(metadata.output);
-        const nextAssets = reset ? aotAssets : (data.aot || null);
+        const nextAssets = nextMode === 'v86' ? null : reset ? aotAssets : (data.aot || null);
         const nextAot = await prepareAot(nextAssets);
         await io.install(prepared);
         prepared=null;
         aot = null; aotAssets = null;
+        if (nextMode === 'v86') {
+            v86CompileMs = v86CompileMaxMs = v86CompileCount = 0;
+            v86HaltWaits = 0;
+            engine.enable_v86();
+        }
         if (nextAot) {
             if (nextAot.kind === 'procedure-memory') {
                 engine.install_procedure_aot(nextAot.metadata, nextAot.call);
@@ -280,6 +338,8 @@ async function hostCommand(data) {
             }
             aotAssets = nextAssets;
         }
+        coreMode = nextMode;
+        nextV86Diagnostics = 0;
         if(data.kind==='apply-machine' && data.seedBuffer && io.namespace && engine.dirty_overlay()) {
             engine.pause();engine.request_save_commit();await io.settled();
             if(engine.pending_commit() || engine.dirty_overlay()) throw new Error('Bundled saves could not be committed');
@@ -327,19 +387,53 @@ function tick() {
             const now = performance.now();
             if (!anchor) anchor = {host: now, guest: engine.nanos()};
             const wallTarget = anchor.guest + (now - anchor.host) * 1_000_000;
-            const target = audioRunning && port ? (clockMode === 'worklet' || audioPort ? played + 80_000_000 : wallTarget + 80_000_000) : wallTarget;
+            let target = coreMode === 'v86' ? wallTarget : audioRunning && port ?
+                (clockMode === 'worklet' || audioPort ? played + 80_000_000 : wallTarget + 80_000_000) : wallTarget;
             let budget = 400_000;
             // Yield at least every ~8 ms of host work, as well as at the finite
             // step limit. Presentation frequency never advances guest devices.
-            while (engine.nanos() < target && budget > 0 && engine.status() === 1 && performance.now() - now < 8) {
+            while ((coreMode === 'v86' || engine.nanos() < target) && budget > 0 &&
+                   engine.status() === 1 && performance.now() - now < 8) {
+                // A fast JIT may execute many guest instructions within this
+                // tick. Refresh the host deadline before the next device slice.
+                if (coreMode === 'v86') {
+                    target = anchor.guest + (performance.now() - anchor.host) * 1_000_000;
+                }
                 if (audioRunning && midiPool.length < 12) break;
+                // v86 uses host time for the PIT, DMA and IRQs. Its Rust host
+                // advances at most one millisecond per call; catch up before
+                // spending another CPU grant when an IRQ can be delivered.
+                if (coreMode === 'v86' && engine.nanos() + 1_000_000 <= target &&
+                    engine.v86_clock_catchup_ready()) {
+                    const before = engine.nanos();
+                    engine.advance_v86_host_time(target);
+                    drain(); io.pump();
+                    if (engine.waiting_for_io()) {anchor = null; break;}
+                    if (engine.nanos() <= before) break;
+                    budget--;
+                    continue;
+                }
+                // HLT has no guest work until an IRQ. Device time is advanced
+                // above; leave the Worker task instead of calling the CPU again.
+                if (coreMode === 'v86' && engine.v86_halted_waiting_for_irq()) {
+                    v86HaltWaits++;
+                    break;
+                }
                 const chunk = Math.min(budget, 10000);
                 if (aot) engine.aot_begin();
                 const completed = aot ? aot.run(chunk) : engine.advance(chunk);
-                budget -= completed; drain();
+                budget -= completed;
+                if (coreMode === 'v86') engine.advance_v86_host_time(target);
+                drain();
                 io.pump();
                 if(engine.waiting_for_io()) {anchor=null;break;}
-                if (!completed || engine.timeslice_yielded()) break;
+                if (!completed) break;
+                // v86 also yields after 128 host/core transitions just to
+                // service the clock. We have advanced devices above: runnable
+                // CPU work can use the rest of this bounded Worker task.
+                // Treating every such yield as idle adds a 4 ms timer delay.
+                if (engine.timeslice_yielded() &&
+                    (coreMode !== 'v86' || engine.v86_async_waiting())) break;
             }
             hostSpeed.busy += performance.now() - now;
             if (audioRunning && port) audioMessage({kind: 'commit', epoch, nanos: engine.nanos()});
@@ -350,7 +444,8 @@ function tick() {
             if (audioRunning && port && (clockMode === 'worklet' || audioPort) && now >= nextPoll) {
                 audioMessage({kind: 'poll', epoch}); nextPoll = now + 20;
             }
-            behind = engine.nanos() < target && !engine.waiting_for_io();
+            behind = (coreMode === 'v86' ? engine.nanos() < target || budget <= 0 || performance.now() - now >= 8 : engine.nanos() < target) &&
+                !engine.waiting_for_io();
             // Adaptive mode caps the rate at host capacity, separately from the
             // user's ceiling. The cap recovers gradually after sustained headroom,
             // so a loading spike does not keep the game slow afterwards.
@@ -374,7 +469,8 @@ function tick() {
             }
         }
         present();
-        if (behind && midiPool.length >= 12) wake.port2.postMessage(null);
+        if (coreMode === 'v86' && engine.status() === 1 && engine.v86_async_waiting()) setTimeout(tick, 4);
+        else if (behind && midiPool.length >= 12) wake.port2.postMessage(null);
         else setTimeout(tick, 4);
     } catch (error) { report(error); setTimeout(tick, 16); }
 }

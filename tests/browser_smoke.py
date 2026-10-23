@@ -66,12 +66,18 @@ class Marionette:
 
 def game_zip(mt32=False, pcm=False):
     # Original fixture: draw color 42, transmit a note, busy-loop indefinitely.
-    program = bytes.fromhex("b81300cd10b800a08ec031ffb900fab02af3aa ba3103 b03fee ba3003 ec b090ee b045ee b064ee ebfe")
+    program = bytes.fromhex("b81300cd10b800a08ec031ffb900fab02af3aa ba3103 b03fee ba3003 ec")
+    message = [0x90, 69, 100]
     if mt32:
         message = [0xf0,0x41,0x10,0x16,0x12,0x20,0,0,*b"MT32 test"]
         message += [(-sum(message[5:])) & 127,0xf7,0x91,69,100]
-        program = bytes.fromhex("b81300cd10b800a08ec031ffb900fab02af3aa ba3103 b03fee ba3003 ec")
-        program += b"".join(bytes([0xb0,byte,0xee]) for byte in message) + bytes.fromhex("ebfe")
+    # Respect the MPU's serial transmitter: a drained host queue does not
+    # imply that another guest byte can be written before the busy bit clears.
+    for byte in message:
+        program += bytes.fromhex("ba3103 ec a840 75fb 4a") + bytes([0xb0, byte, 0xee])
+    # Read relative mouse counters so automatic capture has a real guest
+    # consumer; the bridge releases capture when the guest does not use them.
+    program += bytes.fromhex("31c0 cd33 b80b00 cd33 ebf9")
     if pcm:
         # Original SB16 fixture; keep DAC on without legacy D1 (real SB16 behavior).
         program = bytes.fromhex("b0ff e621 b80020 8ec0 31ff b840c0 b98000 f3ab")
@@ -89,12 +95,14 @@ def game_zip(mt32=False, pcm=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dist', type=Path, default=DIST, help='built Trunk distribution or packaged site')
     parser.add_argument('--prince', action='store_true', help='also run the local, ignored target/prince-game.zip')
     parser.add_argument('--benchmark', action='store_true', help='pair saved baseline and current Worker WASM on the local PRINCE ZIP; no audio/rendering')
     parser.add_argument('--benchmark-baseline', type=Path, default=ROOT / 'target/perf-baseline',
                         help='directory containing reference doslet_web_worker.js and its WASM')
     args = parser.parse_args()
-    bridge_path = next(DIST.glob("snippets/*/src/browser/bridge.js")).relative_to(DIST)
+    dist = args.dist.resolve()
+    bridge_path = next(dist.glob("snippets/*/src/browser/bridge.js")).relative_to(dist)
     page = f"""<!doctype html><html><head><base href="/"></head><body>
     <canvas width="640" height="480"></canvas><button id="capture">Capture mouse</button>
     <script type="module">
@@ -148,7 +156,7 @@ def main():
         def log_message(self, *_args):
             pass
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Handler, directory=str(DIST)))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Handler, directory=str(dist)))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     with socket.socket() as port:
         port.bind(("127.0.0.1", 0))

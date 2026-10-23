@@ -555,6 +555,12 @@ and RAVU-Zoom named by a profile or Settings are replaced by the profile's
 `video_filter_fallback` (Sharp Bilinear by default), and the Display panel says
 so. Their live frame rate has not been benchmarked.
 
+Chromium using WebGL2 substitutes `video_filter_fallback` for RAVU-Zoom and
+shows a notice. The ROTT profile triggered a `wgpu-core` buffer-alignment panic
+with RAVU in Chrome; the same profile with Nearest did not. Firefox did not
+show that panic in the recorded run. Chromium with WebGPU remains eligible for
+RAVU-Zoom.
+
 Presentation keeps the previous image visible until the renderer has uploaded
 its replacement. At most one upload is in progress; subsequent frames replace
 the waiting frame, so a slower renderer does not accumulate a playback queue.

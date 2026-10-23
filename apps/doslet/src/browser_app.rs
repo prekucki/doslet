@@ -681,6 +681,13 @@ impl Doslet {
                 }
             }
             Message::DisplaySizing(message) => {
+                if matches!(
+                    &message,
+                    SizingMessage::Filter(crate::presentation::DisplayFilter::Ravu)
+                ) && !self.display_sizing.ravu_supported
+                {
+                    self.notice = Some("RAVU is unavailable on this Chromium WebGL renderer; the configured simple filter is shown instead.".into());
+                }
                 if let SizingMessage::Filter(filter) = message
                     && filter.needs_gpu()
                     && !crate::browser_diagnostics::gpu_canvas_active()
@@ -981,7 +988,17 @@ impl Doslet {
                         ..Default::default()
                     };
                     self.display_sizing.gpu = crate::browser_diagnostics::gpu_canvas_active();
+                    self.display_sizing.ravu_supported =
+                        !crate::browser_diagnostics::chromium_webgl_ravu_unstable();
                     self.display_sizing.set_output(&output);
+                    if filter == doslet_config::VideoFilter::Ravu
+                        && !self.display_sizing.ravu_supported
+                    {
+                        log::warn!(
+                            "RAVU disabled on Chromium WebGL; using the configured simple filter"
+                        );
+                        self.notice = Some("RAVU is unavailable on this Chromium WebGL renderer; the configured simple filter is shown instead.".into());
+                    }
                 }
             }
             Some("storage-policy") => {
@@ -1039,6 +1056,8 @@ impl Doslet {
                 self.configurator
                     .set_active(self.configurator.draft.clone());
                 self.display_sizing.gpu = crate::browser_diagnostics::gpu_canvas_active();
+                self.display_sizing.ravu_supported =
+                    !crate::browser_diagnostics::chromium_webgl_ravu_unstable();
                 self.display_sizing
                     .set_output(&self.configurator.active.output);
                 self.configurator.message = Some("Machine applied and restarted.".into());

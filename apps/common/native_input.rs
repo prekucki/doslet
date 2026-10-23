@@ -28,7 +28,9 @@ pub struct LaunchSettings {
     pub adaptive_cpu: bool,
     pub adaptive_idle: bool,
     pub no_dynamic_core: bool,
-    /// Native v86 CPU module; the session retains its Rust devices.
+    /// Select the embedded native v86 CPU; the session retains its Rust devices.
+    pub v86: bool,
+    /// Explicit WASM override (also enables v86 for existing callers).
     pub v86_module: Option<PathBuf>,
     pub v86_host_clock: bool,
     pub dpmi: Option<doslet_runtime::session::dpmi::Mode>,
@@ -65,6 +67,7 @@ impl Default for LaunchSettings {
             adaptive_idle: false,
             no_dynamic_core: false,
             v86_module: None,
+            v86: false,
             v86_host_clock: false,
             dpmi: None,
             core_profile: None,
@@ -176,7 +179,7 @@ pub fn configure_runtime(
     if let Some(mode) = settings.dpmi {
         session.enable_dpmi(mode)?;
     }
-    if settings.v86_module.is_some() {
+    if settings.v86 || settings.v86_module.is_some() {
         // v86 owns execution policy; native profiling/JIT/idle recipes stay off.
         return install_v86(session, settings);
     }
@@ -213,11 +216,20 @@ pub fn configure_runtime(
 }
 
 pub fn install_v86(session: &mut Session, settings: &LaunchSettings) -> Result<(), Box<dyn Error>> {
-    if let Some(path) = &settings.v86_module {
+    if settings.v86 || settings.v86_module.is_some() {
         if settings.wasm_procedures.is_some() || settings.interpret_procedures {
             return Err("v86 cannot be combined with procedure modules".into());
         }
-        let module = fs::read(path).map_err(|error| format!("Cannot read v86 module {}: {error}. Build it with cargo run --manifest-path tools/v86-build/Cargo.toml --release --locked", path.display()))?;
+        let module = if let Some(path) = &settings.v86_module {
+            let bytes = fs::read(path)
+                .map_err(|error| format!("Cannot read v86 module {}: {error}", path.display()))?;
+            if bytes.is_empty() {
+                return Err("v86 module is empty".into());
+            }
+            bytes
+        } else {
+            Vec::new()
+        };
         session.enable_v86(&module)?;
         session.set_v86_host_clock(settings.v86_host_clock)?;
     }

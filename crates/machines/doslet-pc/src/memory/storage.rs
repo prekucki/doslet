@@ -12,7 +12,7 @@ pub(crate) enum Storage {
     },
     #[cfg(feature = "wasm-procedures")]
     Wasm(Box<crate::wasm_procedures::SharedProcedureMemory>),
-    #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+    #[cfg(feature = "v86")]
     V86(Box<crate::v86::Memory>),
 }
 
@@ -31,7 +31,7 @@ impl Storage {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Owned { bytes, .. } => bytes.len(),
-            #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+            #[cfg(feature = "v86")]
             Self::V86(owner) => owner.cpu.physical_ram().len(),
             #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => owner.layout().ram_bytes,
@@ -42,7 +42,7 @@ impl Storage {
     pub(crate) fn bytes(&self) -> &[u8] {
         match self {
             Self::Owned { bytes, .. } => bytes,
-            #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+            #[cfg(feature = "v86")]
             Self::V86(owner) => owner.cpu.physical_ram(),
             #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => owner.ram(),
@@ -53,7 +53,7 @@ impl Storage {
     pub(crate) fn generations(&self) -> &[u64] {
         match self {
             Self::Owned { generations, .. } => generations,
-            #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+            #[cfg(feature = "v86")]
             Self::V86(owner) => &owner.generations,
             #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => owner.generations(),
@@ -65,7 +65,7 @@ impl Storage {
     pub(crate) fn generations_mut(&mut self) -> &mut [u64] {
         match self {
             Self::Owned { generations, .. } => generations,
-            #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+            #[cfg(feature = "v86")]
             Self::V86(owner) => &mut owner.generations,
             #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => owner.generations_mut(),
@@ -77,7 +77,7 @@ impl Storage {
     pub(crate) fn parts_mut(&mut self) -> (&mut [u8], &mut [u64]) {
         match self {
             Self::Owned { bytes, generations } => (bytes, generations),
-            #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+            #[cfg(feature = "v86")]
             Self::V86(owner) => {
                 owner.host_writes = true;
                 (owner.cpu.physical_ram_mut(), &mut owner.generations)
@@ -91,7 +91,7 @@ impl Storage {
     pub(crate) fn parts_with_video_mut(&mut self) -> Option<(&mut [u8], &mut [u64], &mut [u8])> {
         match self {
             Self::Owned { .. } => None,
-            #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+            #[cfg(feature = "v86")]
             Self::V86(_) => None,
             Self::Wasm(owner) => Some(owner.parts_with_video_mut()),
         }
@@ -101,7 +101,7 @@ impl Storage {
     pub(crate) fn video(&self) -> Option<&[u8]> {
         match self {
             Self::Owned { .. } => None,
-            #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+            #[cfg(feature = "v86")]
             Self::V86(_) => None,
             #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => Some(owner.video()),
@@ -112,7 +112,7 @@ impl Storage {
     pub(crate) fn video_mut(&mut self) -> Option<&mut [u8]> {
         match self {
             Self::Owned { .. } => None,
-            #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+            #[cfg(feature = "v86")]
             Self::V86(_) => None,
             #[cfg(feature = "wasm-procedures")]
             Self::Wasm(owner) => Some(owner.video_mut()),
