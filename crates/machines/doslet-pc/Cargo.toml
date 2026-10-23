@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 save-state = ["dep:doslet-state", "dep:prost", "doslet-at-keyboard/save-state", "doslet-config/save-state", "doslet-gameport/save-state", "doslet-i8042/save-state", "doslet-i8237/save-state", "doslet-i8254/save-state", "doslet-i8259/save-state", "doslet-input/save-state", "doslet-mc146818/save-state", "doslet-mpu401/save-state", "doslet-opl3/save-state", "doslet-pcm/save-state", "doslet-sb-dsp/save-state", "doslet-sb-mixer/save-state", "doslet-time/save-state", "doslet-vga/save-state", "doslet-x86/save-state"]
 dynamic-core = ["doslet-x86/dynamic-core"]
+v86 = ["dep:doslet-v86", "dep:doslet-v86-host"]
 profiling = ["doslet-x86/profiling"]
 wasm-procedures = ["dep:doslet-wasm-aot", "dep:doslet-x86-wasm", "doslet-x86/procedure-calls"]
 wasm-procedure-diagnostics = ["wasm-procedures"]
@@ -33,6 +34,8 @@ doslet-i8254.workspace = true
 doslet-i8237.workspace = true
 doslet-vga.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+doslet-v86 = { path = "../../cpu/doslet-v86", optional = true }
+doslet-v86-host = { path = "../../runtime/doslet-v86-host", optional = true }
 doslet-wasm-aot = { path = "../../cpu/doslet-wasm-aot", optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 allocation-counter = "0.8.1"

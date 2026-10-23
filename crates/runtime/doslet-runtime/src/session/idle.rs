@@ -208,6 +208,7 @@ impl Session {
     }
 
     pub fn set_idle_loops(&mut self, enabled: bool) {
+        let enabled = enabled && !self.v86_enabled();
         if !enabled {
             self.cancel_menu_idle();
             self.idle_abandon();
@@ -217,6 +218,10 @@ impl Session {
             self.idle.head_skipped = 0;
         }
         self.idle.enabled = enabled;
+    }
+
+    pub fn idle_loops_enabled(&self) -> bool {
+        self.idle.enabled
     }
 
     /// A foreign engine must leave this boundary to ordinary execution: a proof

@@ -10,6 +10,8 @@ mod recurrence;
 pub use recurrence::RecurrenceMark;
 pub mod resources;
 mod timing;
+#[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+mod v86;
 mod vga_wait;
 #[cfg(feature = "wasm-procedures")]
 pub mod wasm_procedures;
@@ -68,6 +70,7 @@ pub struct ExecutionStats {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachineError {
+    V86(&'static str),
     Hardware(doslet_config::HardwareError),
     Resource(resources::ResourceError),
     Keyboard(doslet_i8042::ControllerError),
@@ -104,6 +107,7 @@ impl From<doslet_sb_dsp::DspError> for MachineError {
 impl fmt::Display for MachineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::V86(message) => write!(f, "v86: {message}"),
             Self::Hardware(error) => write!(f, "hardware configuration: {error:?}"),
             Self::Resource(error) => write!(f, "resource conflict: {error:?}"),
             Self::Keyboard(error) => write!(f, "keyboard: {error:?}"),
@@ -397,6 +401,15 @@ impl PcMachine {
         budget: u32,
         mut observation: Option<&mut StepObservation>,
     ) -> Result<(StepOutcome, u32), MachineError> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        if self.v86_enabled() {
+            if OBSERVE {
+                return Err(MachineError::V86(
+                    "instruction tracing is unavailable with v86",
+                ));
+            }
+            return self.step_v86(budget);
+        }
         #[cfg(feature = "wasm-procedures")]
         self.check_wasm_procedure_failure()?;
         if OBSERVE {

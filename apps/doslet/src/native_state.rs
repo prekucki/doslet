@@ -7,6 +7,9 @@ use std::{
 };
 
 pub fn save(path: &Path, session: &mut Session) -> Result<(), Box<dyn std::error::Error>> {
+    if session.v86_enabled() {
+        return Err("saving v86 CPU state is not implemented".into());
+    }
     session.detach_persistent_store()?;
     let bytes = session.save_state()?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {

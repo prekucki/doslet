@@ -1,5 +1,97 @@
 # Machiavelli the Prince: compatibility target
 
+## v86 startup probe
+
+On 2026-10-23, the local `local_prince_v86_startup_through_app_clock` test ran
+the actual app clock with `games/PRINCE.toml`, `--v86`, direct DPMI and disabled
+host audio for 20 seconds. It remained running with a 640x480 graphics frame.
+This did not reproduce the reported `SS=0127` access failure and does not
+establish interactive gameplay or recovery from that fault.
+
+The separate v86 CPU regression reproduced the exact `IRET: not present` WASM
+panic. That branch now delivers the architectural guest `#NP` exception and
+preserves the return frame; see [v86 diagnostics](v86-core.md). Use the rebuilt
+`target/v86/doslet-v86.wasm` when checking the fix.
+The later `Unimplemented: CS selector is invalid` report exposed another
+upstream panic in the same instruction. Null/out-of-table selectors and invalid
+code rights now deliver guest `#GP`; the first rejected return is retained in
+an `IRET fault:` diagnostic if exception delivery subsequently fails. Neither
+report yet establishes the origin of the game's invalid return frame.
+
+The next report identified the frame mismatch: `000b:1068` is the host's
+`#GP` interrupt gate (`1000h + 13*8`). Its rejected return values were
+EIP=`0`, CS=`35cfh`, flags=`021fh`, consistent with consuming the exception's
+zero error code as EIP, followed by the original EIP and CS. v86 had already
+entered the IDT gate, while the runtime treated that entry as an ordinary
+reflected interrupt. CPU faults now exit before that entry and use the runtime's
+DPMI exception dispatcher. Synthetic tests verify handler recovery and stopping
+without frame corruption when no handler exists. This explains the corrupt
+return in that report; it does not establish the cause of the separately
+reported `SS=0127` access fault or complete interactive-game compatibility.
+
+A follow-up headless run reproduced that `SS=0127` fault after the first menu
+click. DOS/4GW's 16-bit exception handler copied its frame with `REP MOVSD`
+using 16-bit `SI/DI`. The host had placed the locked stack above 1 MiB with a
+flat zero-based `SS`, so the copy accessed the wrong 64 KiB window and its
+`RETF` read a corrupt return address. The host now gives the locked stack a
+16-bit segment based at `0x110000`, with `SP` below `0x10000`; the frame remains
+at the same physical address. The handler returned successfully in the replay.
+The underlying `SS=0127` exception needs separate analysis; this fix repairs
+the handler's return path.
+
+The read-only `v86_prince -- direct --menu` probe then ran for 36 seconds,
+including three scripted pointer clicks, and ended `Running` with no fault
+after 3,082,029,471 CPU steps with the rebuilt ABI 3 module. It drains MIDI/PCM
+without playing either and does not verify the displayed scene, audible output
+or sustained gameplay.
+
+### Live DPMI callback stall
+
+In the reported live `--v86` session, MCP still reported `Running` while the
+introductory letter remained on screen after more than 500 guest seconds. GDB
+found a repeating `#GP(0)` at `00C7:0CBE`, a `CLI` in DOS/4GW's protected DPMI
+callback. The exception frame had CPL 3 and `IOPL=0`; the BIOS tick at `0040:006C`
+remained `028Fh` across 24.9 guest seconds. The callback host had set
+`EFLAGS=0002h` on entry. It now sets `3002h`, matching the client's I/O
+privilege while leaving IF clear. A v86 callback regression executes the same
+kind of `CLI` without a fault. In a 36-second local run with the fix, PRINCE
+advanced from DOS/4GW's 16-bit dispatcher to 32-bit game code at CPL 3 with
+`IOPL=3`; the letter was still visible at that point. The user reported that
+restarting without Doslet's DPMI host avoided the stall; a separate local
+36-second no-host run stayed `Running` in the guest extender's CPL 0 code.
+The follow-up 160-second real-time headless run with direct DPMI, no clicks and
+the rebuilt v86 module reached the actual 640×480 **Start New / Load Old /
+Modem / History** menu at 49,430,311,719 CPU steps. It ended `Running` with no
+fault. Its PNG capture is local under `target/prince-v86-dpmi-160s.png`; audio
+was drained without host playback. This validates the introductory transition,
+not a new game or sustained gameplay.
+
+### DOS return path
+
+The user later reported `unsupported INT 21h service AX=D001` and then
+`AX=D000` when selecting the game's exit-to-DOS action. `AH=D0h` is outside the
+DOS 5.0 services that Doslet provides; an optional NetWare redirector assigns
+a meaning to it, but none is installed here. DOSBox Staging's fallback for
+unknown high DOS functions clears AL and leaves the other registers untouched.
+Doslet now applies
+that behavior to `AH=D0h`, allowing the caller to continue. Native
+interpreter and v86 synthetic exit-path tests cover the return;
+the complete interactive PRINCE exit has not yet been replayed locally.
+
+```sh
+cargo test -p doslet --release --locked --offline local_prince_v86_startup_through_app_clock -- --ignored --nocapture
+cargo run -p doslet-headless --release --features v86-test --locked --offline --example v86_prince -- direct
+cargo run -p doslet-headless --release --features v86-test --locked --offline --example v86_prince -- direct --menu
+cargo run -p doslet-headless --release --features v86-test --locked --offline --example v86_prince -- direct --duration 160 --frame target/prince-v86-dpmi-160s.png
+```
+
+The second command reads the local game without modifying its files, drains
+audio without host playback, and prints final registers and segment caches
+after a bounded 20-second runtime-only probe. `--menu` selects the 36-second
+scripted input probe and `--trace` prints the detailed exception path.
+`reflect` selects reflected DPMI;
+omitting the argument uses the guest extender.
+
 ## Keyboard input
 
 PRINCE requires AT keyboard input (`input.keyboard = "at"` in a version-2

@@ -29,6 +29,7 @@ impl std::fmt::Display for Mixer {
 }
 
 const CAPACITY: usize = 16384;
+const PLAYBACK_RESERVE_MS: usize = 80;
 struct Queue {
     frames: Box<[[f32; 2]]>,
     rates: Box<[u32]>,
@@ -40,6 +41,8 @@ struct Queue {
     underruns: u64,
     callback_frames: usize,
     refilling: bool,
+    host_clock_reserve: bool,
+    priming: bool,
     peak: f32,
     gain: f32,
     spectrum: doslet_pcm::spectrum::Spectrum,
@@ -69,15 +72,44 @@ impl Queue {
             0
         }
     }
+    /// A wall-clock producer cannot run ahead to refill the sink. Delay
+    /// playback instead, retaining a bounded 80 ms reserve across host jitter.
+    fn playback_ready(&mut self) -> bool {
+        if self.host_clock_reserve && self.len == 0 {
+            self.priming = true;
+        }
+        if self.priming {
+            let rate = if self.len == 0 {
+                self.sample_rate
+            } else {
+                self.rates[self.head]
+            };
+            if self.len < (rate as usize * PLAYBACK_RESERVE_MS / 1000).min(CAPACITY - 512) {
+                return false;
+            }
+            self.priming = false;
+        }
+        self.len != 0
+    }
     fn next(&mut self) -> [f32; 2] {
         if !self.active {
             return [0.0; 2];
         }
-        if self.len == 0 {
-            self.underruns += 1;
+        if !self.playback_ready() {
+            // Initial buffering is intentional latency. Count missing frames
+            // after playback starts, including a subsequent refill interval.
+            if !self.host_clock_reserve || self.consumed != 0 {
+                self.underruns += 1;
+            }
             self.spectrum.push([0.0; 2]);
             return [0.0; 2];
         }
+        self.pop()
+    }
+    /// The Pulse server owns its playback reserve and requests data ahead of
+    /// playback. Its transport must consume available frames immediately.
+    fn pop(&mut self) -> [f32; 2] {
+        debug_assert!(self.len != 0);
         let frame = self.frames[self.head].map(|value| value * self.gain);
         self.head = (self.head + 1) % CAPACITY;
         self.len -= 1;
@@ -92,6 +124,8 @@ pub struct Output {
     writer: Writer,
 }
 enum Stream {
+    #[cfg(test)]
+    Mock,
     #[cfg(target_os = "linux")]
     System {
         _outputs: [Box<Output>; 3],
@@ -122,6 +156,13 @@ impl std::ops::Deref for Output {
     }
 }
 impl Output {
+    #[cfg(test)]
+    pub fn mock(rate: u32) -> Self {
+        Self {
+            _stream: Stream::Mock,
+            writer: Writer::mock(rate),
+        }
+    }
     pub fn new(backend: Backend, mixer: Mixer) -> Result<Self, String> {
         if mixer == Mixer::System {
             #[cfg(target_os = "linux")]
@@ -181,6 +222,8 @@ impl Output {
             underruns: 0,
             callback_frames: 0,
             refilling: true,
+            host_clock_reserve: false,
+            priming: false,
             peak: 0.0,
             gain: 1.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
@@ -221,6 +264,10 @@ impl Output {
     pub fn writer(&self) -> Writer {
         self.writer.clone()
     }
+    pub fn writer_with_reserve(&self, host_clock: bool) -> Writer {
+        self.writer.set_host_clock_reserve(host_clock);
+        self.writer()
+    }
     pub fn is_pulse(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -233,6 +280,17 @@ impl Output {
     }
 }
 impl Writer {
+    pub(crate) fn set_host_clock_reserve(&self, enabled: bool) {
+        for source in [&self.fm, &self.secondary].into_iter().flatten() {
+            source.set_host_clock_reserve(enabled);
+        }
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.host_clock_reserve != enabled {
+            q.host_clock_reserve = enabled;
+            q.priming = enabled;
+        }
+    }
+
     pub fn set_volume(&self, percent: u8) {
         self.queue.lock().unwrap_or_else(|e| e.into_inner()).gain =
             f32::from(percent.min(100)) / 100.0;
@@ -270,6 +328,8 @@ impl Writer {
                 underruns: 0,
                 callback_frames: 256,
                 refilling: true,
+                host_clock_reserve: false,
+                priming: false,
                 peak: 0.0,
                 gain: 1.0,
                 spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
@@ -399,6 +459,7 @@ impl Writer {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.active = active;
         if !active {
+            q.priming = q.host_clock_reserve;
             q.spectrum.reset();
         }
         let waker = q.waker.take();
@@ -424,6 +485,7 @@ impl Writer {
         q.consumed = 0;
         q.underruns = 0;
         q.refilling = true;
+        q.priming = q.host_clock_reserve;
         q.peak = 0.0;
         q.spectrum.reset();
         q.generation += 1;
@@ -505,6 +567,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_clock_reserve_absorbs_jitter_without_losing_or_reordering_samples() {
+        let output = Writer::mock(48000);
+        output.set_host_clock_reserve(true);
+        let frames: Vec<_> = (1..=5760).map(|i| [i as f32 / 8192.0; 2]).collect();
+        output.push(&frames[..960]).unwrap();
+        // Keep the first 20 ms until 80 ms are available; output latency
+        // never consumes or replaces guest samples with inserted silence.
+        assert_eq!(output.consume(960), vec![[0.0; 2]; 960]);
+        assert_eq!(output.stats().0, 0);
+        assert_eq!(output.stats().1, 0);
+        output.push(&frames[960..3840]).unwrap();
+        assert_eq!(output.consume(960), frames[..960]);
+        // A delayed producer misses two 20 ms publications.
+        assert_eq!(output.consume(1920), frames[960..2880]);
+        output.push(&frames[3840..]).unwrap();
+        assert_eq!(output.consume(2880), frames[2880..]);
+        assert_eq!(output.stats().1, 0);
+        // An actual empty sink counts underruns and refills before resuming.
+        assert_eq!(output.consume(1), [[0.0; 2]]);
+        output.push(&frames[..960]).unwrap();
+        assert_eq!(output.consume(1), [[0.0; 2]]);
+        assert_eq!(output.stats().1, 2);
+        output.push(&frames[960..3840]).unwrap();
+        assert_eq!(output.consume(960), frames[..960]);
+        output.clear().unwrap();
+        output.push(&frames[..960]).unwrap();
+        assert_eq!(output.consume(1), [[0.0; 2]]);
+        output.set_host_clock_reserve(false);
+        assert_eq!(output.consume(960), frames[..960]);
+    }
+
+    #[test]
     fn volume_changes_buffered_playback_without_changing_queued_audio() {
         let output = Writer::mock(48000);
         output.push(&[[0.8, -0.4]; 4]).unwrap();
@@ -533,6 +627,8 @@ mod tests {
             underruns: 0,
             callback_frames: 256,
             refilling: true,
+            host_clock_reserve: false,
+            priming: false,
             peak: 0.0,
             gain: 1.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(48000),
@@ -569,6 +665,8 @@ mod tests {
             underruns: 0,
             callback_frames: 0,
             refilling: true,
+            host_clock_reserve: false,
+            priming: false,
             peak: 0.0,
             gain: 1.0,
             spectrum: doslet_pcm::spectrum::Spectrum::new(48000),

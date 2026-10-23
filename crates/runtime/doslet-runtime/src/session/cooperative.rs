@@ -413,6 +413,7 @@ impl Session {
     }
     /// General countdown-guard heuristic; mutually exclusive with fixed recipes.
     pub fn set_adaptive_idle(&mut self, enabled: bool) {
+        let enabled = enabled && !self.v86_enabled();
         if enabled && self.analyzer.controller {
             self.set_adaptive_cpu(false);
         }
@@ -424,6 +425,7 @@ impl Session {
         self.menu_idle.adaptive
     }
     pub fn set_menu_idle_site(&mut self, site: Option<MenuIdleSite>) {
+        let site = site.filter(|_| !self.v86_enabled());
         if site.is_some() && self.analyzer.controller {
             self.set_adaptive_cpu(false);
         }
@@ -435,6 +437,7 @@ impl Session {
     }
     /// Add a second known event loop without changing the ordinary CPU path.
     pub fn set_event_idle_site(&mut self, site: Option<EventIdleSite>) {
+        let site = site.filter(|_| !self.v86_enabled());
         if site.is_some() && self.analyzer.controller {
             self.set_adaptive_cpu(false);
         }

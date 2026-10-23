@@ -35,6 +35,8 @@ let port = null, audioPort = null, audioRunning = false, epoch = 0, played = 0;
 let clockMode = 'worklet', nextPoll = 0;
 let ended = false;
 let anchor = null, nextVideo = 0, failed = false;
+// Pictures per second chosen in the Display panel; 0 follows the guest refresh.
+let frameRate = 60;
 let hostSpeed = {at: performance.now(), guest: engine.nanos(), busy: 0, calm: 0};
 function resetHostSpeed() { hostSpeed = {at: performance.now(), guest: engine.nanos(), busy: 0, calm: 0}; }
 let snapshotPending = null;
@@ -103,7 +105,8 @@ function drain() {
 function present(force = false) {
     const now = performance.now();
     if (!force && now < nextVideo) return;
-    nextVideo = now + 16;
+    const millihertz = frameRate ? frameRate * 1000 : engine.video_refresh_millihertz() || 60000;
+    nextVideo = now + 1e6 / Math.min(Math.max(millihertz, 10000), 240000);
     const state = {kind: 'state', epoch, status: engine.status(), steps: engine.steps(), cpuMhz: engine.cpu_mhz(), effectiveCpuMhz: engine.effective_cpu_mhz(), hostCpuLimit: engine.host_cpu_limit(), cpuMode: engine.cpu_mode(), tierRates: Array.from(engine.tier_rates()), tierCounts: Array.from(engine.tier_counts(), Number), keyboardMode: engine.keyboard_mode(),
         nanos: engine.nanos(), idleNanos: engine.idle_nanos(), waitingForIo:engine.waiting_for_io(), dirty:engine.dirty_overlay(), pendingCommit:engine.pending_commit(), cs: engine.cs(), ip: engine.ip(), ax: engine.ax(),
         cx: engine.cx(), di: engine.di(), fault: engine.fault(), midiMode: engine.midi_mode(),
@@ -174,6 +177,7 @@ self.onmessage = ({data}) => {
         if (data.kind === 'mouse-mode') { engine.set_mouse_mode(data.program); present(true); return; }
         if (data.kind === 'keyboard-mode') { engine.set_keyboard_mode(data.program); present(true); return; }
         if (data.kind === 'video-return') { videoPool.push(data.buffer); return; }
+        if (data.kind === 'frame-rate') { frameRate = Number(data.program); return; }
         if (data.kind === 'connect') {
             if (port) port.close();
             if (audioPort) audioPort.close();

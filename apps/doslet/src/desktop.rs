@@ -1,21 +1,19 @@
 //! Desktop presentation owns snapshots; the emulation thread exclusively owns Session.
 use crate::app::Message;
 use crate::native_effects::Effects;
-use crate::presentation::{DisplayFrame, DisplaySizing};
+use crate::presentation::{DisplayFrame, DisplaySizing, FrameRate};
 use doslet_midi_routing::Mode;
 use doslet_runtime::{RuntimeError, SessionStatus};
 use iced::{Element, Subscription, Task, Theme};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU16, Ordering},
     mpsc,
 };
-use std::time::Duration;
 
 use crate::wakeup;
 
 const COMMAND_CAPACITY: usize = 256;
-const REFRESH: Duration = Duration::from_millis(16);
 
 pub struct Registers {
     pub cs: u16,
@@ -32,6 +30,7 @@ pub struct SessionSnapshot {
     pub steps: u64,
     pub registers: Registers,
     pub fault: Option<RuntimeError>,
+    pub v86_error: Option<String>,
     pub pending_commit: bool,
     pub storage_waiting: bool,
     pub dirty: bool,
@@ -49,6 +48,9 @@ impl SessionSnapshot {
     pub fn fault(&self) -> Option<RuntimeError> {
         self.fault
     }
+    pub fn v86_last_error(&self) -> Option<&str> {
+        self.v86_error.as_deref()
+    }
     pub fn pending_commit(&self) -> bool {
         self.pending_commit
     }
@@ -62,6 +64,13 @@ impl SessionSnapshot {
 #[allow(dead_code)]
 pub struct Snapshot {
     pub cpu_settings: crate::cpu_config::Settings,
+    pub v86_host_clock: bool,
+    pub v86_ram_waits: Option<(bool, u64)>,
+    pub v86_vga_polling: Option<(bool, u64)>,
+    pub v86_mpu_polling: Option<(bool, u64)>,
+    pub v86_input_polling: Option<(bool, u64)>,
+    pub idle_loops: bool,
+    pub vga_waits: bool,
     pub cpu_profile: Option<crate::cpu_config::ProfileInfo>,
     pub cpu_learning_available: bool,
     pub disk_reads: (u64, u64),
@@ -114,7 +123,7 @@ pub struct Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn worker(running: bool) -> (Worker, Snapshot) {
         Worker::spawn_with(move || {
@@ -145,6 +154,21 @@ mod tests {
             worker.request.store(true, Ordering::Release);
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn idle_switches_reach_the_worker_and_return_in_snapshots() {
+        let (mut worker, initial) = worker(false);
+        assert!(initial.idle_loops);
+        assert!(initial.vga_waits);
+        worker.send(Message::IdleLoopsToggle(false)).unwrap();
+        worker.send(Message::VgaWaitsToggle(false)).unwrap();
+        let changed = wait_for(&worker, |s| !s.idle_loops && !s.vga_waits);
+        assert_eq!(changed.snapshot.session.status(), SessionStatus::Ready);
+        worker.send(Message::IdleLoopsToggle(true)).unwrap();
+        worker.send(Message::VgaWaitsToggle(true)).unwrap();
+        wait_for(&worker, |s| s.idle_loops && s.vga_waits);
+        drop(worker);
     }
 
     #[test]
@@ -499,6 +523,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             overflow: Arc::new(AtomicBool::new(false)),
             exited: Arc::new(AtomicBool::new(false)),
+            frame_rate: Arc::new(AtomicU16::new(0)),
             signal: wakeup::Signal::default(),
             thread: None,
         };
@@ -530,6 +555,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             overflow: Arc::new(AtomicBool::new(false)),
             exited: Arc::new(AtomicBool::new(false)),
+            frame_rate: Arc::new(AtomicU16::new(0)),
             signal: wakeup::Signal::default(),
             thread: None,
         };
@@ -557,6 +583,18 @@ mod tests {
                 Message::MouseCapture(_, 7, iced::window::MouseCaptureEvent::Motion { dx, dy }),
                 Message::PointerMoved(3, 4),
             ] if *dx == total && *dy == -total / 2.0
+        ));
+        // Leaving drops older positions; re-entering replays after the leave.
+        worker.send(Message::PointerMoved(1, 1)).unwrap();
+        worker.send(Message::PointerLeft).unwrap();
+        let replay: Vec<_> = worker.pointer.lock().unwrap().take_messages().collect();
+        assert!(matches!(replay.as_slice(), [Message::PointerLeft]));
+        worker.send(Message::PointerLeft).unwrap();
+        worker.send(Message::PointerMoved(2, 2)).unwrap();
+        let replay: Vec<_> = worker.pointer.lock().unwrap().take_messages().collect();
+        assert!(matches!(
+            replay.as_slice(),
+            [Message::PointerLeft, Message::PointerMoved(2, 2)]
         ));
         // A new capture drops the motion of the previous one.
         worker.send(motion(5.0, 5.0)).unwrap();
@@ -735,10 +773,12 @@ impl Mailbox {
 struct PendingPointer {
     motion: Option<(iced::window::Id, u64, f64, f64)>,
     position: Option<(u16, u16)>,
+    /// The pointer left the picture; replayed before a later position.
+    left: bool,
 }
 impl PendingPointer {
     fn is_empty(&self) -> bool {
-        self.motion.is_none() && self.position.is_none()
+        self.motion.is_none() && self.position.is_none() && !self.left
     }
     /// Sums captured motion; a different capture replaces stale motion.
     fn add_motion(&mut self, id: iced::window::Id, generation: u64, dx: f64, dy: f64) {
@@ -759,8 +799,9 @@ impl PendingPointer {
                 iced::window::MouseCaptureEvent::Motion { dx, dy },
             )
         });
+        let left = pending.left.then_some(Message::PointerLeft);
         let position = pending.position.map(|(x, y)| Message::PointerMoved(x, y));
-        motion.into_iter().chain(position)
+        motion.into_iter().chain(left).chain(position)
     }
 }
 struct Worker {
@@ -773,6 +814,8 @@ struct Worker {
     stop: Arc<AtomicBool>,
     overflow: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
+    /// `FrameRate::code` of the user's presentation rate.
+    frame_rate: Arc<AtomicU16>,
     signal: wakeup::Signal,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -833,15 +876,17 @@ impl Worker {
         let stop = Arc::new(AtomicBool::new(false));
         let overflow = Arc::new(AtomicBool::new(false));
         let exited = Arc::new(AtomicBool::new(false));
+        let frame_rate = Arc::new(AtomicU16::new(FrameRate::default().code()));
         let signal = wakeup::Signal::default();
         let pointer = Arc::new(Mutex::new(PendingPointer::default()));
         let pending_pointer = pointer.clone();
-        let (output, refresh, stopping, overflowed, wake) = (
+        let (output, refresh, stopping, overflowed, wake, rate) = (
             mailbox.clone(),
             request.clone(),
             stop.clone(),
             overflow.clone(),
             signal.clone(),
+            frame_rate.clone(),
         );
         let on_exit = NotifyOnExit {
             exited: exited.clone(),
@@ -867,8 +912,19 @@ impl Worker {
                 let mut effects = Effects::default();
                 let mut config_dirty = false;
                 let mut sequence = 0;
-                let mut last_publish = std::time::Instant::now();
+                // The ready snapshot covers the first interval.
+                let mut next_publish = std::time::Instant::now()
+                    + FrameRate::from_code(rate.load(Ordering::Relaxed))
+                        .interval(engine.session.video_refresh_millihertz());
+                let mut sample_started = std::time::Instant::now();
+                let mut sample_busy = std::time::Duration::ZERO;
+                let mut sample_steps = engine.session.steps();
+                let mut sample_parks = engine.session.v86_ram_waits().map_or(0, |(_, parks)| parks);
+                let mut sample_vga = engine.session.v86_vga_polling().map_or(0, |(_, reads)| reads);
+                let mut sample_mpu = engine.session.v86_mpu_polling().map_or(0, |(_, reads)| reads);
+                let mut sample_input = engine.session.v86_input_polling().map_or(0, |(_, parks)| parks);
                 while !stopping.load(Ordering::Acquire) {
+                    let turn_started = std::time::Instant::now();
                     let overflow = overflowed.swap(false, Ordering::AcqRel);
                     // Coalesced pointer input comes before the queued buttons.
                     let pointer = pending_pointer
@@ -929,19 +985,29 @@ impl Worker {
                         refresh.store(true, Ordering::Release);
                         config_dirty = true;
                     }
-                    if refresh.load(Ordering::Acquire) && last_publish.elapsed() >= REFRESH {
+                    let now = std::time::Instant::now();
+                    if refresh.load(Ordering::Acquire) && now >= next_publish {
                         refresh.store(false, Ordering::Release);
+                        // Deadlines keep the average rate; a late or idle
+                        // stretch restarts the schedule instead of bursting.
+                        let interval = FrameRate::from_code(rate.load(Ordering::Relaxed))
+                            .interval(engine.session.video_refresh_millihertz());
+                        next_publish = if now - next_publish < interval {
+                            next_publish + interval
+                        } else {
+                            now + interval
+                        };
                         output.publish(Packet {
                             snapshot: engine.snapshot(config_dirty),
                             effects: std::mem::take(&mut effects),
                             sequence,
                         });
                         config_dirty = false;
-                        last_publish = std::time::Instant::now();
                         wake.notify();
                     }
                     // Pace idle/caught-up execution, but let input wake the worker early.
                     let wait = engine.worker_delay(progressed);
+                    sample_busy += turn_started.elapsed();
                     match receiver.recv_timeout(wait) {
                         Ok(Command {
                             message: Message::Tick,
@@ -955,6 +1021,34 @@ impl Worker {
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let elapsed = sample_started.elapsed();
+                    if elapsed >= std::time::Duration::from_secs(2) {
+                        if let Some((enabled, parks)) = engine.session.v86_ram_waits()
+                            && enabled
+                            && engine.session.status() == SessionStatus::Running
+                        {
+                            let seconds = elapsed.as_secs_f64();
+                            eprintln!(
+                                "[INFO doslet] {}: v86 worker active {:.0}%, {:.0} steps/s, {:.0} RAM parks/s, {:.0} VGA parks/s, {:.0} MPU dense reads/s, {:.0} input parks/s, VGA trap={}, PC={:08x}",
+                                engine.name,
+                                100.0 * sample_busy.as_secs_f64() / seconds,
+                                engine.session.steps().saturating_sub(sample_steps) as f64 / seconds,
+                                parks.saturating_sub(sample_parks) as f64 / seconds,
+                                engine.session.v86_vga_polling().map_or(0, |(_, reads)| reads).saturating_sub(sample_vga) as f64 / seconds,
+                                engine.session.v86_mpu_polling().map_or(0, |(_, reads)| reads).saturating_sub(sample_mpu) as f64 / seconds,
+                                engine.session.v86_input_polling().map_or(0, |(_, parks)| parks).saturating_sub(sample_input) as f64 / seconds,
+                                engine.session.v86_vga_polling().is_some_and(|(enabled, _)| enabled),
+                                engine.session.debug_pc(),
+                            );
+                        }
+                        sample_started = std::time::Instant::now();
+                        sample_busy = std::time::Duration::ZERO;
+                        sample_steps = engine.session.steps();
+                        sample_parks = engine.session.v86_ram_waits().map_or(0, |(_, parks)| parks);
+                        sample_vga = engine.session.v86_vga_polling().map_or(0, |(_, reads)| reads);
+                        sample_mpu = engine.session.v86_mpu_polling().map_or(0, |(_, reads)| reads);
+                        sample_input = engine.session.v86_input_polling().map_or(0, |(_, parks)| parks);
                     }
                 }
                 engine.save_core_profile();
@@ -973,6 +1067,7 @@ impl Worker {
                     stop,
                     overflow,
                     exited,
+                    frame_rate,
                     signal,
                     thread: Some(thread),
                 },
@@ -993,6 +1088,13 @@ impl Worker {
             ) => return Ok(self.coalesce(|p| p.add_motion(id, generation, dx, dy))),
             Message::PointerMoved(x, y) => {
                 return Ok(self.coalesce(|p| p.position = Some((x, y))));
+            }
+            // Ordered with the coalesced positions: leaving drops older ones.
+            Message::PointerLeft => {
+                return Ok(self.coalesce(|p| {
+                    p.position = None;
+                    p.left = true;
+                }));
             }
             _ => {}
         }
@@ -1068,6 +1170,9 @@ impl Doslet {
     }
     pub fn update(&mut self, message: Message) -> Task<Message> {
         if let Message::DisplaySizing(message) = message {
+            if let crate::presentation::SizingMessage::FrameRate(rate) = message {
+                self.worker.frame_rate.store(rate.code(), Ordering::Relaxed);
+            }
             let leaving = matches!(
                 message,
                 crate::presentation::SizingMessage::Fullscreen(false)

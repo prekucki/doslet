@@ -15,6 +15,11 @@ run = "cargo test --workspace --locked"
 description = "Format and lint all native targets"
 run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets --locked -- -D warnings"]
 
+[tasks.build]
+description = "Build the optimized iced desktop application"
+env = { RUSTFLAGS='-C target-cpu=native -C llvm-args=-align-all-functions=6', CARGO_PROFILE_RELEASE_LTO = "fat" }
+run = "cargo build -p doslet --release --locked --"
+
 [tasks.run]
 description = "Launch the optimized iced desktop application"
 env = { RUSTFLAGS='-C target-cpu=native -C llvm-args=-align-all-functions=6', CARGO_PROFILE_RELEASE_LTO = "fat" }
@@ -26,6 +31,7 @@ run = "cargo run -p doslet --locked"
 
 [tasks.desktop-install]
 description = "Build Doslet and install its Linux launcher and icon for the current user"
+env = { RUSTFLAGS='-C target-cpu=native -C llvm-args=-align-all-functions=6', CARGO_PROFILE_RELEASE_LTO = "fat" }
 run = ["cargo build -p doslet --release --locked", "python3 tools/install_desktop.py"]
 
 [tasks.macos-app]

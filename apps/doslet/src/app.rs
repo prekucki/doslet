@@ -11,6 +11,61 @@ use std::time::{Duration, Instant};
 mod cpu;
 
 const MAX_STEPS_PER_TICK: u32 = 400_000;
+
+/// Guest relative reads must continue this long before Auto mode locks.
+const RELATIVE_LOCK_NANOS: u64 = 300_000_000;
+/// Auto mode unlocks only after this long without relative reads.
+const RELATIVE_UNLOCK_NANOS: u64 = 3_000_000_000;
+/// A longer gap between reads starts a new streak towards locking.
+const RELATIVE_STREAK_GAP_NANOS: u64 = 1_000_000_000;
+
+/// Hysteresis for the Auto mouse mode, measured in guest time so a pause
+/// changes nothing. A game that polls relative motion unevenly (menus versus
+/// play) no longer flips between a captured and a free pointer.
+#[derive(Default)]
+struct RelativeLatch {
+    relative: bool,
+    /// First and latest read of the current streak while unlocked.
+    streak: Option<(u64, u64)>,
+}
+
+impl RelativeLatch {
+    /// Updates from the latest guest read; returns true when it locks.
+    fn observe(&mut self, last_read: Option<u64>, now: u64) -> bool {
+        let Some(last) = last_read else {
+            *self = Self::default();
+            return false;
+        };
+        let idle = now.saturating_sub(last);
+        if self.relative {
+            if idle >= RELATIVE_UNLOCK_NANOS {
+                *self = Self::default();
+            }
+            return false;
+        }
+        if idle >= RELATIVE_STREAK_GAP_NANOS {
+            self.streak = None;
+            return false;
+        }
+        let start = match self.streak {
+            Some((start, previous))
+                if last.saturating_sub(previous) < RELATIVE_STREAK_GAP_NANOS =>
+            {
+                start
+            }
+            _ => last,
+        };
+        self.streak = Some((start, last));
+        if last.saturating_sub(start) >= RELATIVE_LOCK_NANOS {
+            *self = Self {
+                relative: true,
+                streak: None,
+            };
+            return true;
+        }
+        false
+    }
+}
 const CHUNK: u32 = 10_000;
 const MAX_WORK_PER_TICK: Duration = Duration::from_millis(8);
 struct PreparedOutput {
@@ -112,6 +167,13 @@ pub struct Doslet {
     mouse_capture: Option<iced::window::Id>,
     mouse_capture_pending: bool,
     mouse_capture_generation: u64,
+    relative_latch: RelativeLatch,
+    /// Whether the last update ended with a relative (capturing) mouse mode.
+    was_relative: bool,
+    /// The mode switched to capturing while a dialog covered the picture.
+    capture_on_switch: bool,
+    /// The host pointer is over the game picture (and the window has focus).
+    pointer_inside: bool,
     #[cfg(not(target_arch = "wasm32"))]
     source: Option<std::path::PathBuf>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -148,6 +210,12 @@ pub enum Message {
     HeroesMenuIdleToggle,
     IdleObservationToggle,
     AdaptiveIdleToggle,
+    IdleLoopsToggle(bool),
+    VgaWaitsToggle(bool),
+    V86RamWaitsToggle(bool),
+    V86VgaPollingToggle(bool),
+    V86MpuPollingToggle(bool),
+    V86InputPollingToggle(bool),
     Reset,
     Tick,
     GamepadsReady,
@@ -249,6 +317,10 @@ impl Doslet {
             mouse_capture: None,
             mouse_capture_pending: false,
             mouse_capture_generation: 0,
+            relative_latch: RelativeLatch::default(),
+            was_relative: false,
+            capture_on_switch: false,
+            pointer_inside: false,
             #[cfg(not(target_arch = "wasm32"))]
             source: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -265,11 +337,13 @@ impl Doslet {
     #[cfg(not(target_arch = "wasm32"))]
     #[inline(never)]
     fn init_demo_session(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.session = Session::demo_configured(self.launch.hardware)?.into();
-        self.session.set_dynamic_core(!self.launch.no_dynamic_core);
+        let mut session = Session::demo_configured(self.launch.hardware)?;
+        crate::native_input::install_v86(&mut session, &self.launch)?;
+        session.set_dynamic_core(!self.launch.no_dynamic_core);
         if let Some(path) = &self.launch.core_profile {
-            crate::native_input::load_core_profile(&mut self.session, path);
+            crate::native_input::load_core_profile(&mut session, path);
         }
+        self.session = session.into();
         Ok(())
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -515,6 +589,7 @@ impl Doslet {
             self.session.state_resources()?,
         )?;
         crate::native_input::install_wasm_procedures(&mut session, &self.launch)?;
+        crate::native_input::install_v86(&mut session, &self.launch)?;
         self.launch.persist = false;
         self.launch.hardware = session.hardware_config();
         self.configurator.active.hardware = session.hardware_config();
@@ -632,6 +707,9 @@ impl Doslet {
                     | Message::SpeedTiersToggle
                     | Message::HeroesMenuIdleToggle
                     | Message::AdaptiveIdleToggle
+                    | Message::IdleLoopsToggle(_)
+                    | Message::VgaWaitsToggle(_)
+                    | Message::V86RamWaitsToggle(_)
                     | Message::Step
                     | Message::Reset
                     | Message::Config(
@@ -720,6 +798,37 @@ impl Doslet {
                     );
                 }
             }
+            Message::IdleLoopsToggle(enabled) => {
+                if !self.configurator.pending {
+                    self.session.set_idle_loops(enabled);
+                }
+            }
+            Message::VgaWaitsToggle(enabled) => {
+                if !self.configurator.pending {
+                    self.session.set_vga_wait_acceleration(enabled);
+                }
+            }
+            Message::V86RamWaitsToggle(enabled) => {
+                if !self.configurator.pending {
+                    self.session.set_v86_ram_waits(enabled);
+                    self.anchor = None;
+                }
+            }
+            Message::V86VgaPollingToggle(enabled) => {
+                if !self.configurator.pending {
+                    self.session.set_v86_vga_polling(enabled);
+                }
+            }
+            Message::V86MpuPollingToggle(enabled) => {
+                if !self.configurator.pending {
+                    self.session.set_v86_mpu_polling(enabled);
+                }
+            }
+            Message::V86InputPollingToggle(enabled) => {
+                if !self.configurator.pending {
+                    self.session.set_v86_input_polling(enabled);
+                }
+            }
             Message::CpuMhz(mhz) => {
                 if self.configurator.pending {
                     return Task::none();
@@ -800,7 +909,8 @@ impl Doslet {
                         if let Some(spec) = &mut self.launch.machine_spec {
                             spec.input.mouse_mode = mode;
                         }
-                        return self.release_mouse();
+                        let release = self.release_mouse();
+                        return Task::batch([release, self.follow_mouse_mode()]);
                     }
                     Edit::ApplyAudio => {
                         if self.configurator.audio_only_changes() {
@@ -893,6 +1003,7 @@ impl Doslet {
             }
             Message::ReleaseMouse => return self.release_mouse(),
             Message::PointerMoved(x, y) => {
+                self.pointer_inside = true;
                 if self.mouse_capture.is_none()
                     && !self.mouse_capture_pending
                     && !self.relative_mouse()
@@ -912,11 +1023,7 @@ impl Doslet {
                     && !self.configurator.open
                     && self.workspace.panel.is_none()
                 {
-                    self.mouse_capture_pending = true;
-                    self.mouse_capture_generation = self.mouse_capture_generation.wrapping_add(1);
-                    let generation = self.mouse_capture_generation;
-                    return iced::window::latest()
-                        .and_then(move |id| Task::done(Message::CaptureWindow(id, generation)));
+                    return self.request_capture();
                 }
                 if self.mouse_capture_pending {
                     return Task::none();
@@ -930,6 +1037,7 @@ impl Doslet {
                 }
             }
             Message::PointerLeft => {
+                self.pointer_inside = false;
                 if self.mouse_capture.is_none()
                     && !self.mouse_capture_pending
                     && !(self.debugger.as_ref().is_some_and(|gdb| gdb.connected())
@@ -1231,6 +1339,7 @@ impl Doslet {
                 self.reset();
             }
             Message::FocusLost => {
+                self.pointer_inside = false;
                 let _ = self.session.release_keys();
                 return self.release_mouse();
             }
@@ -1288,6 +1397,15 @@ impl Doslet {
         if !self.worker_owned {
             self.display.refresh(&self.session);
         }
+        // Auto mode follows the guest with hysteresis. A switch to capturing
+        // grabs the pointer at once when it is over the game picture, instead
+        // of waiting for a click; a pointer the player released stays free
+        // until the mode switches again.
+        self.relative_latch.observe(
+            self.session.pointer_relative_last_read(),
+            self.session.emulated_nanos(),
+        );
+        let mouse_task = Task::batch([mouse_task, self.follow_mouse_mode()]);
         #[cfg(not(target_arch = "wasm32"))]
         {
             if self.session.status() != SessionStatus::Running {
@@ -1685,6 +1803,9 @@ impl Doslet {
         if fault != self.logged_fault {
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
             if let Some(error) = fault {
+                if let Some(detail) = self.session.v86_last_error() {
+                    eprintln!("[ERROR doslet] v86: {detail}");
+                }
                 #[cfg(feature = "wasm-procedures")]
                 if let Some(detail) = self.session.wasm_procedure_last_error() {
                     eprintln!("[ERROR doslet] AOT-WASM: {detail}");
@@ -1753,7 +1874,9 @@ impl Doslet {
                     return;
                 }
             } else {
-                self.reset_demo_session();
+                if !self.reset_demo_session() {
+                    return;
+                }
             }
         }
         if let Some(generation) = self.pad_generation {
@@ -1827,19 +1950,17 @@ impl Doslet {
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[inline(never)]
-    fn reset_demo_session(&mut self) {
-        self.session = Session::demo_configured(self.launch.hardware)
-            .expect("validated demo hardware")
-            .into();
-        self.session.set_dynamic_core(!self.launch.no_dynamic_core);
+    fn reset_demo_session(&mut self) -> bool {
+        if let Err(error) = self.init_demo_session() {
+            self.notice = Some(format!("Cannot restart demo: {error}"));
+            return false;
+        }
         self.session
             .set_synchronization_analysis(self.launch.analyze_synchronization);
         if self.launch.adaptive_cpu {
             self.session.set_adaptive_cpu(true);
         }
-        if let Some(path) = &self.launch.core_profile {
-            crate::native_input::load_core_profile(&mut self.session, path);
-        }
+        true
     }
     /// Leaving drops the machine, so it needs Reset's guarantees: committed
     /// saves and no silently discarded temporary changes.
@@ -1930,8 +2051,12 @@ impl Doslet {
         // queued PCM only after the replacement synth has been constructed.
         let config = self.audio_config(&self.midi_choice, self.audio_engine.rate(), false);
         if let Err(error) = config.and_then(|config| {
-            self.audio_engine
-                .configure(config, self.audio.as_ref().map(|a| a.writer()))
+            self.audio_engine.configure(
+                config,
+                self.audio
+                    .as_ref()
+                    .map(|a| a.writer_with_reserve(self.session.v86_host_clock_enabled())),
+            )
         }) {
             self.notice = Some(format!("Audio reset: {error}"));
             self.session.pause();
@@ -2224,7 +2349,12 @@ impl Doslet {
         if self.host_midi.is_some() {
             target = target.saturating_add(crate::native_midi::LOOKAHEAD.as_nanos() as u64);
         }
-        let mut budget = MAX_STEPS_PER_TICK;
+        let host_clock = self.session.v86_host_clock_enabled();
+        let mut budget = if host_clock {
+            4_000_000
+        } else {
+            MAX_STEPS_PER_TICK
+        };
         // Two watermarks maintain a PCM reserve; never run over 80 ms ahead.
         // Only the opt-in experiment changes the existing pacing policy.
         if !M::DEBUG
@@ -2246,10 +2376,16 @@ impl Doslet {
             }
         }
         let previous_memory_wait_steps = self.session.memory_wait_steps();
+        let previous_v86_ram_wait_parks =
+            self.session.v86_ram_waits().map_or(0, |(_, parks)| parks);
+        let previous_v86_vga_throttles =
+            self.session.v86_vga_polling().map_or(0, |(_, reads)| reads);
+        let previous_v86_mpu_throttles =
+            self.session.v86_mpu_polling().map_or(0, |(_, reads)| reads);
         let mut prepared = false;
         while budget != 0
             && self.session.status() == SessionStatus::Running
-            && self.session.emulated_nanos() < target
+            && (host_clock || self.session.emulated_nanos() < target)
             && can_continue()
         {
             let epoch = self.session.epoch();
@@ -2321,6 +2457,30 @@ impl Doslet {
                     "JIT preparation stopped: {error}. Interpreter fallback remains active."
                 ));
             }
+            if host_clock {
+                let host_target = guest
+                    .saturating_add(start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+                if host_target.saturating_sub(self.session.emulated_nanos()) > 1_000_000
+                    && self.session.debug_cpu().accepts_maskable_interrupt()
+                    && !self.session.debug_irq_pending()
+                {
+                    // Catch up idle device time, but first let the CPU service
+                    // a queued IRQ: advancing several more PIT periods would
+                    // merge their edges in the PIC and slow the guest clock.
+                    if let Err(error) = self.session.advance_v86_host_time(host_target) {
+                        self.notice = Some(error.to_string());
+                        self.session.pause();
+                        break;
+                    }
+                    if let Err(error) = self.process_audio() {
+                        self.notice = Some(error);
+                        self.session.pause();
+                        break;
+                    }
+                    budget = budget.saturating_sub(1);
+                    continue;
+                }
+            }
             let completed = match if !M::DEBUG
                 && let Some(tiers) = &mut self.speed_tiers
                 && (tiers.stats.enabled || tiers.has_pending_time())
@@ -2336,7 +2496,10 @@ impl Doslet {
                         .map_err(Into::into)
                 }
             } else {
-                execution.advance(&mut self.session, budget.min(CHUNK))
+                execution.advance(
+                    &mut self.session,
+                    budget.min(if host_clock { 65_536 } else { CHUNK }),
+                )
             } {
                 Ok(completed) => completed,
                 Err(error) => {
@@ -2346,6 +2509,15 @@ impl Doslet {
                 }
             };
             budget = budget.saturating_sub(completed);
+            if host_clock {
+                let host_target = guest
+                    .saturating_add(start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+                if let Err(error) = self.session.advance_v86_host_time(host_target) {
+                    self.notice = Some(error.to_string());
+                    self.session.pause();
+                    break;
+                }
+            }
             if let Err(error) = self.process_audio() {
                 self.notice = Some(error);
                 self.session.pause();
@@ -2360,6 +2532,40 @@ impl Doslet {
                 "[INFO doslet] {}: experimental timer waits active; batched {} logical steps",
                 self.name,
                 self.session.memory_wait_steps()
+            );
+        }
+        if previous_v86_ram_wait_parks == 0
+            && self
+                .session
+                .v86_ram_waits()
+                .is_some_and(|(_, parks)| parks != 0)
+        {
+            eprintln!(
+                "[INFO doslet] {}: v86 RAM wait detected at {:x}; host-clock parking active",
+                self.name,
+                self.session.debug_pc()
+            );
+        }
+        if previous_v86_vga_throttles == 0
+            && self
+                .session
+                .v86_vga_polling()
+                .is_some_and(|(_, reads)| reads != 0)
+        {
+            eprintln!(
+                "[INFO doslet] {}: v86 VGA status polling detected; host-clock pacing active",
+                self.name
+            );
+        }
+        if previous_v86_mpu_throttles == 0
+            && self
+                .session
+                .v86_mpu_polling()
+                .is_some_and(|(_, reads)| reads != 0)
+        {
+            eprintln!(
+                "[INFO doslet] {}: v86 MPU-401 status polling detected; host-clock pacing active",
+                self.name
             );
         }
     }
@@ -2564,7 +2770,10 @@ impl Doslet {
         audio.set_active(false);
         let config = self.audio_config(&self.midi_choice, audio.rate, true)?;
         let mut engine = AudioEngine::new();
-        engine.configure(config, Some(audio.writer()))?;
+        engine.configure(
+            config,
+            Some(audio.writer_with_reserve(self.session.v86_host_clock_enabled())),
+        )?;
         self.audio_engine = engine;
         self.audio = Some(audio);
         self.audio_mixer = mixer;
@@ -2596,7 +2805,10 @@ impl Doslet {
                     audio.set_active(false);
                     let config = self.audio_config(&self.midi_choice, audio.rate, true)?;
                     let mut engine = AudioEngine::new();
-                    engine.configure(config, Some(audio.writer()))?;
+                    engine.configure(
+                        config,
+                        Some(audio.writer_with_reserve(self.session.v86_host_clock_enabled())),
+                    )?;
                     Ok((audio, engine))
                 });
                 match replacement {
@@ -2686,7 +2898,7 @@ impl Doslet {
                 self.audio
                     .as_ref()
                     .or(new_audio.as_ref())
-                    .map(|a| a.writer()),
+                    .map(|a| a.writer_with_reserve(self.session.v86_host_clock_enabled())),
             )?;
             // Dropping the old sender completes its final silence before reuse.
             drop(self.host_midi.take());
@@ -2744,8 +2956,12 @@ impl Doslet {
             if let Some(nanos) = start {
                 config.nanos = nanos;
             }
-            self.audio_engine
-                .configure(config, self.audio.as_ref().map(|a| a.writer()))?;
+            self.audio_engine.configure(
+                config,
+                self.audio
+                    .as_ref()
+                    .map(|a| a.writer_with_reserve(self.session.v86_host_clock_enabled())),
+            )?;
             if let Some(audio) = &self.audio {
                 audio.set_active(self.session.status() == SessionStatus::Running);
             }
@@ -2843,7 +3059,36 @@ impl Doslet {
             .active
             .input
             .mouse_mode
-            .relative(self.session.pointer_relative_in_use())
+            .relative(self.relative_latch.relative)
+    }
+    /// Grabs the pointer when the mouse mode switches to capturing while the
+    /// pointer is over the game picture. A dialog covering the picture defers
+    /// the grab until it closes; a pointer outside the picture is left alone.
+    fn follow_mouse_mode(&mut self) -> Task<Message> {
+        let relative = self.relative_mouse();
+        self.capture_on_switch = relative && (self.capture_on_switch || !self.was_relative);
+        self.was_relative = relative;
+        if !self.capture_on_switch || self.configurator.open || self.workspace.panel.is_some() {
+            return Task::none();
+        }
+        self.capture_on_switch = false;
+        if self.pointer_inside
+            && self.session.status() == SessionStatus::Running
+            && self.mouse_capture.is_none()
+            && !self.mouse_capture_pending
+        {
+            self.request_capture()
+        } else {
+            Task::none()
+        }
+    }
+    /// Starts capturing the host pointer for relative guest motion.
+    fn request_capture(&mut self) -> Task<Message> {
+        self.mouse_capture_pending = true;
+        self.mouse_capture_generation = self.mouse_capture_generation.wrapping_add(1);
+        let generation = self.mouse_capture_generation;
+        iced::window::latest()
+            .and_then(move |id| Task::done(Message::CaptureWindow(id, generation)))
     }
     pub fn has_mouse_capture(&self) -> bool {
         self.mouse_capture.is_some() && !self.mouse_capture_pending
@@ -2919,6 +3164,9 @@ impl Doslet {
     /// learned tiers, relocatable patches and AOT procedures follow it.
     #[cfg(not(target_arch = "wasm32"))]
     fn watch_layout(&mut self, aot: bool) {
+        if self.session.v86_enabled() {
+            return;
+        }
         let Some(path) = &self.source else {
             return;
         };
@@ -3050,6 +3298,52 @@ impl Doslet {
         if self.session.status() != SessionStatus::Running && !self.session.storage_waiting() {
             return Duration::from_millis(16);
         }
+        if self.session.v86_ram_wait_parked() && !self.session.debug_irq_pending() {
+            // A recognized wait has no guest work until an IRQ or memory change.
+            // Input commands wake the channel sooner. If no IRQ deadline is
+            // known, keep servicing autonomous audio and presentation;
+            // otherwise sleep to the device deadline and catch up its clock.
+            return self.session.debug_service_horizon().map_or_else(
+                || Duration::from_millis(16),
+                |until_event| {
+                    Duration::from_nanos(until_event.saturating_sub(self.host_lag_nanos()))
+                },
+            );
+        }
+        if self.session.v86_input_poll_parked() && !self.session.debug_irq_pending() {
+            return self.session.debug_service_horizon().map_or_else(
+                || Duration::from_millis(16),
+                |until_event| {
+                    Duration::from_nanos(until_event.saturating_sub(self.host_lag_nanos()))
+                        .min(Duration::from_millis(16))
+                },
+            );
+        }
+        if let Some(nanos) = self.session.v86_vga_poll_wait_nanos()
+            && !self.session.debug_irq_pending()
+        {
+            // The vertical-retrace pulse is only about 63 us wide in mode 13h.
+            // Sleep toward it, accounting for existing host lag, then poll
+            // without sleeping for the last 250 us so the scheduler cannot
+            // skip the pulse and stall a title animation for another frame.
+            return Duration::from_nanos(
+                nanos
+                    .saturating_sub(self.host_lag_nanos())
+                    .saturating_sub(250_000),
+            );
+        }
+        if let Some(nanos) = self.session.v86_mpu_poll_wait_nanos()
+            && nanos != 0
+            && !self.session.debug_irq_pending()
+        {
+            return Duration::from_nanos(nanos.max(50_000));
+        }
+        if self.session.v86_host_clock_enabled()
+            && progressed
+            && !self.session.debug_cpu().is_halted()
+        {
+            return Duration::ZERO;
+        }
         if !progressed || self.host_lag_nanos() == 0 {
             Duration::from_millis(1)
         } else {
@@ -3093,6 +3387,13 @@ impl Doslet {
         let registers = self.session.registers();
         Snapshot {
             cpu_settings: self.cpu_settings(),
+            v86_host_clock: self.session.v86_host_clock_enabled(),
+            v86_ram_waits: self.session.v86_ram_waits(),
+            v86_vga_polling: self.session.v86_vga_polling(),
+            v86_mpu_polling: self.session.v86_mpu_polling(),
+            v86_input_polling: self.session.v86_input_polling(),
+            idle_loops: self.session.idle_loops_enabled(),
+            vga_waits: self.session.vga_wait_acceleration_enabled(),
             cpu_profile: self.speed_tiers.as_ref().map(|t| t.profile_info()),
             cpu_learning_available: self.session.check_working_state().is_ok(),
             cpu_activity,
@@ -3138,6 +3439,7 @@ impl Doslet {
                     .map(|r| registers.get(r)),
                 },
                 fault: self.session.fault(),
+                v86_error: self.session.v86_last_error().map(str::to_owned),
                 pending_commit: self.session.pending_commit(),
                 storage_waiting: self.session.storage_waiting(),
                 dirty: self.session.dirty_overlay(),
@@ -3196,6 +3498,93 @@ mod quake_tests;
 mod tests {
     include!("../../../tests/fixtures/midi.rs");
     use super::*;
+
+    /// The guest has polled relative motion long enough for Auto to lock.
+    fn lock_relative(app: &mut Doslet) {
+        app.relative_latch = RelativeLatch {
+            relative: true,
+            streak: None,
+        };
+        app.was_relative = true;
+    }
+
+    #[test]
+    fn auto_mouse_mode_locks_after_steady_reads_and_unlocks_after_a_quiet_spell() {
+        const MS: u64 = 1_000_000;
+        let mut latch = RelativeLatch::default();
+        assert!(!latch.observe(None, 0));
+        // A single read, e.g. a menu probing the driver, never locks.
+        for now in [0, 200 * MS, 900 * MS] {
+            assert!(!latch.observe(Some(0), now));
+        }
+        assert!(!latch.relative);
+        // A gap longer than a second starts a new streak.
+        assert!(!latch.observe(Some(2_000 * MS), 2_000 * MS));
+        assert!(!latch.observe(Some(2_250 * MS), 2_250 * MS));
+        assert!(
+            latch.observe(Some(2_300 * MS), 2_300 * MS),
+            "steady reads lock"
+        );
+        assert!(latch.relative);
+        // Pauses in polling shorter than the quiet spell keep it locked.
+        assert!(!latch.observe(Some(2_300 * MS), 4_000 * MS));
+        assert!(!latch.observe(Some(2_300 * MS), 5_299 * MS));
+        assert!(latch.relative);
+        assert!(!latch.observe(Some(2_300 * MS), 5_300 * MS));
+        assert!(!latch.relative, "three quiet seconds unlock");
+    }
+
+    #[test]
+    fn a_dialog_over_the_picture_defers_the_grab_until_it_closes() {
+        use doslet_config::MouseMode;
+        let mut app = Doslet::new();
+        app.launch.machine_spec = Some(doslet_config::MachineSpec::default());
+        app.session = Session::new(&[0xEB, 0xFE]).unwrap().into();
+        app.session.start();
+        let _ = app.update(Message::Config(crate::configurator::Edit::MouseMode(
+            MouseMode::NoCapture,
+        )));
+        let _ = app.update(Message::PointerMoved(10, 10));
+        let _ = app.update(Message::Ui(crate::ui::Action::Open(
+            crate::ui::Panel::Input,
+        )));
+        let _ = app.update(Message::Config(crate::configurator::Edit::MouseMode(
+            MouseMode::Capture,
+        )));
+        assert!(
+            !app.mouse_capture_pending,
+            "the input panel still covers it"
+        );
+        let _ = app.update(Message::Ui(crate::ui::Action::Close));
+        assert!(app.mouse_capture_pending);
+    }
+
+    #[test]
+    fn switching_to_capture_grabs_a_pointer_over_the_picture_but_not_outside() {
+        use doslet_config::MouseMode;
+        for inside in [true, false] {
+            let mut app = Doslet::new();
+            app.launch.machine_spec = Some(doslet_config::MachineSpec::default());
+            app.session = Session::new(&[0xEB, 0xFE]).unwrap().into();
+            app.session.start();
+            let _ = app.update(Message::Config(crate::configurator::Edit::MouseMode(
+                MouseMode::NoCapture,
+            )));
+            let _ = app.update(Message::PointerMoved(10, 10));
+            if !inside {
+                let _ = app.update(Message::PointerLeft);
+            }
+            assert!(!app.mouse_capture_pending);
+            let _ = app.update(Message::Config(crate::configurator::Edit::MouseMode(
+                MouseMode::Capture,
+            )));
+            assert_eq!(app.mouse_capture_pending, inside, "inside={inside}");
+            // Staying in a capturing mode does not grab again after release.
+            let _ = app.update(Message::ReleaseMouse);
+            let _ = app.update(Message::PointerMoved(11, 11));
+            assert!(!app.mouse_capture_pending);
+        }
+    }
     #[test]
     fn blaster_changes_require_restart_and_preserve_active_settings() {
         let mut app = Doslet::new();
@@ -4013,6 +4402,44 @@ audio = false
         assert_eq!(app.session.hardware_config().memory_mib, 4);
         assert!(!app.session.dynamic_core_enabled());
     }
+    #[cfg(feature = "v86")]
+    #[test]
+    #[ignore = "requires tools/v86-build"]
+    fn v86_cli_launch_and_reset_keep_the_selected_core() {
+        use clap::Parser;
+        let mut app = Doslet::from_cli(crate::cli::Cli::parse_from([
+            "doslet",
+            "--v86",
+            "--demo",
+            "--no-audio",
+            "--v86-module",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../target/v86/doslet-v86.wasm"
+            ),
+        ]))
+        .unwrap();
+        assert!(app.session.v86_enabled());
+        assert!(app.session.v86_host_clock_enabled());
+        assert_eq!(app.cpu_settings().core, crate::cpu_config::Core::V86);
+        app.session.start();
+        for _ in 0..1000 {
+            app.session.advance(4096);
+            if app.session.status() != SessionStatus::Running {
+                break;
+            }
+        }
+        assert_eq!(
+            app.session.status(),
+            SessionStatus::Exited(0),
+            "{:?}",
+            app.session.fault()
+        );
+        app.reset();
+        assert!(app.session.v86_enabled());
+        assert!(app.session.v86_host_clock_enabled());
+        assert_eq!(app.cpu_settings().core, crate::cpu_config::Core::V86);
+    }
     include!("../../../tests/fixtures/sb16_pcm.rs");
     include!("../../../tests/fixtures/opl3.rs");
     #[test]
@@ -4159,6 +4586,7 @@ audio = false
                 app.session.start();
                 app.session.advance(100);
                 assert!(app.session.waiting_for_key());
+                lock_relative(&mut app);
                 app.mouse_capture = Some(iced::window::Id::unique());
                 app.mouse_capture_pending = pending;
                 let escape = |modifiers| {
@@ -4297,6 +4725,7 @@ audio = false
         app.session.start();
         app.session.advance(16);
         assert!(app.session.pointer_relative_in_use());
+        lock_relative(&mut app);
         let before = app.session.pointer_position();
         let _ = app.update(Message::PointerMoved(5, 6));
         assert_eq!(app.session.pointer_position(), before);
@@ -4319,11 +4748,18 @@ audio = false
                 pressed: true,
             },
         ));
-        let until = app.session.emulated_nanos() + 1_000_000_000;
-        while app.session.emulated_nanos() < until {
-            let remaining = until - app.session.emulated_nanos();
-            app.session.debug_advance_device_time(remaining).unwrap();
-        }
+        let last_read = app.session.pointer_relative_last_read().unwrap();
+        let advance_to = |app: &mut Doslet, until: u64| {
+            while app.session.emulated_nanos() < until {
+                let remaining = until - app.session.emulated_nanos();
+                app.session.debug_advance_device_time(remaining).unwrap();
+            }
+        };
+        // The old one-second window no longer drops the capture.
+        advance_to(&mut app, last_read + 1_500_000_000);
+        let _ = app.update(Message::PointerMoved(7, 8));
+        assert!(app.has_mouse_capture(), "inertia keeps the capture");
+        advance_to(&mut app, last_read + RELATIVE_UNLOCK_NANOS);
         let _ = app.update(Message::PointerMoved(7, 8));
         assert!(!app.has_mouse_capture());
         assert_eq!(app.session.pointer_buttons(), 0);
@@ -4350,6 +4786,7 @@ audio = false
         app.session.start();
         app.session.advance(16);
         assert!(app.session.pointer_relative_in_use());
+        lock_relative(&mut app);
         let id = iced::window::Id::unique();
         let _ = app.update(Message::PointerButton(0, true));
         let generation = app.mouse_capture_generation;
@@ -4891,6 +5328,54 @@ enabled = false
         assert_eq!(app.audio_engine.stats().notes, 1);
         assert!(app.midi_mode_label().contains("approximation"));
     }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires the local v86 module; no host audio device"]
+    fn v86_midi_phrase_reaches_rust_synthesis_with_both_clocks() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let module = std::fs::read(root.join("target/v86/doslet-v86.wasm")).unwrap();
+        for host_clock in [false, true] {
+            let mut app = Doslet::new();
+            let mut program = vec![0xBA, 0x31, 3, 0xB0, 0x3F, 0xEE];
+            for byte in [0xC0, 0, 0x90, 60, 100] {
+                append_midi_byte(&mut program, byte);
+            }
+            program.extend_from_slice(&[0xEB, 0xFE]);
+            app.session = Session::new(&program).unwrap().into();
+            app.session.enable_v86(&module).unwrap();
+            app.session.set_v86_host_clock(host_clock).unwrap();
+            app.session.start();
+            let began = Instant::now();
+            while app.session.emulated_nanos() < 100_000_000 || app.session.midi_stats().1 < 5 {
+                assert!(began.elapsed() < Duration::from_secs(10));
+                app.tick();
+                assert_eq!(
+                    app.session.status(),
+                    SessionStatus::Running,
+                    "{:?}; {:?}; {:?}",
+                    app.session.fault(),
+                    app.session.v86_last_error(),
+                    app.notice
+                );
+            }
+            assert_eq!(
+                app.session.midi_stats().1,
+                5,
+                "host_clock={host_clock} pc={:x}",
+                app.session.debug_pc()
+            );
+            assert_eq!(app.audio_engine.stats().notes, 1, "host_clock={host_clock}");
+            let nanos = app.session.emulated_nanos() + 10_000_000;
+            let synth = app.audio_engine.inline_mut().midi.as_mut().unwrap();
+            let mut frames = [[0.0; 2]; 512];
+            let count = synth.render_until(nanos, &mut frames).unwrap();
+            assert!(
+                frames[..count].iter().any(|f| *f != [0.0; 2]),
+                "host_clock={host_clock}"
+            );
+        }
+    }
     #[test]
     fn saturated_audio_worker_yields_before_advancing_the_pc_and_reset_recovers() {
         let mut app = Doslet::new();
@@ -4929,6 +5414,70 @@ enabled = false
         );
         assert!(app.audio_engine.ready().unwrap());
     }
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires tools/v86-build; no game or audio device"]
+    fn v86_host_clock_catchup_services_timer_edges_between_elapsed_slices() {
+        use doslet_x86::Gpr16;
+        // PIT channel 0 mode 2, divisor 17045 (~70 Hz); STI; HLT loop.
+        let mut code = vec![
+            0xb0, 0x34, 0xe6, 0x43, 0xb8, 0x95, 0x42, 0xe6, 0x40, 0x88, 0xe0, 0xe6, 0x40, 0xfb,
+            0xf4, 0xeb, 0xfd,
+        ];
+        let handler = 0x100 + code.len() as u16;
+        code.extend_from_slice(&[0x43, 0xb0, 0x20, 0xe6, 0x20, 0xcf]); // INC BX; EOI; IRET.
+        let mut app = Doslet::new();
+        app.session = Session::new(&code).unwrap().into();
+        app.session
+            .enable_v86(
+                &std::fs::read(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../target/v86/doslet-v86.wasm"
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        app.session.set_v86_host_clock(true).unwrap();
+        let vector = [handler as u8, (handler >> 8) as u8, 0, 0x10];
+        assert!(app.session.debug_write_memory(8 * 4, &vector));
+        app.session.start();
+        for _ in 0..30 {
+            app.session.advance(4096);
+            if app.session.debug_cpu().is_halted() {
+                break;
+            }
+        }
+        assert!(app.session.debug_cpu().is_halted());
+        let initial = app.session.emulated_nanos();
+        let now = Instant::now();
+        // A stalled owner must deliver the elapsed timer events, rather than
+        // coalescing all 200 ms into one PIC request before running the CPU.
+        app.anchor = Some((now - Duration::from_millis(200), initial));
+        for _ in 0..1000 {
+            app.tick_at(Instant::now());
+            if app.session.emulated_nanos() >= initial + 200_000_000
+                && !app.session.debug_irq_pending()
+                && app.session.debug_cpu().is_halted()
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            app.session.status(),
+            SessionStatus::Running,
+            "{:?}",
+            app.session.fault()
+        );
+        let elapsed = app.session.emulated_nanos() - initial;
+        let expected = elapsed * 1_193_182 / 1_000_000_000 / 17045;
+        let delivered = u64::from(app.session.debug_cpu().registers.get(Gpr16::Bx));
+        assert!(expected >= 14);
+        assert!(
+            delivered + 1 >= expected && delivered <= expected,
+            "timer edges lost: delivered={delivered}, expected={expected}, elapsed={elapsed}"
+        );
+    }
+
     #[test]
     fn synchronous_learning_finishes_before_execution_and_rebases_host_time() {
         let mut app = Doslet::new();
@@ -5847,6 +6396,810 @@ enabled = false
     #[test]
     #[ignore = "requires local games/civ; never writes back guest files or opens host audio"]
     fn local_civ_midi_startup_diagnostic() {
+        check_local_civ_midi_startup(false, false);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires local CIV, CM-32L ROMs and PULSE_SINK=doslet-audio-probe-output; no physical audio"]
+    fn local_civ_system_mixer_loopback_without_v86() {
+        use clap::Parser;
+        use doslet_pulse::{connect, protocol as p, wait};
+        assert_eq!(
+            std::env::var("PULSE_SINK").unwrap(),
+            "doslet-audio-probe-output"
+        );
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = root.join("games/CIV.toml");
+        let client = connect().unwrap();
+        let sink = wait(client.sink_info_by_name(c"doslet-audio-probe-output".into()))
+            .expect("create the dedicated null sink before recording");
+        assert_eq!(sink.sample_spec.channels, 2);
+        wait(client.source_info_by_name(c"doslet-audio-probe-output.monitor".into()))
+            .expect("the dedicated null sink monitor must exist");
+        let info = wait(client.server_info()).unwrap();
+        eprintln!(
+            "CIV PULSE server={:?} version={:?}; verified dedicated null sink and monitor",
+            info.server_name, info.server_version
+        );
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<[f32; 2]>::with_capacity(
+            48000 * 12,
+        )));
+        let capture = captured.clone();
+        let record = wait(client.create_record_stream(
+            p::RecordStreamParams {
+                sample_spec: p::SampleSpec {
+                    format: p::SampleFormat::Float32Le,
+                    channels: 2,
+                    sample_rate: 48000,
+                },
+                channel_map: p::ChannelMap::stereo(),
+                source_name: Some(c"doslet-audio-probe-output.monitor".into()),
+                buffer_attr: p::stream::BufferAttr {
+                    fragment_size: 480 * 8,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            move |bytes: &[u8]| {
+                let mut frames = capture.lock().unwrap();
+                for frame in bytes.as_chunks::<8>().0 {
+                    if frames.len() < frames.capacity() {
+                        frames.push([
+                            f32::from_le_bytes(frame[..4].try_into().unwrap()),
+                            f32::from_le_bytes(frame[4..].try_into().unwrap()),
+                        ]);
+                    }
+                }
+            },
+        ))
+        .unwrap();
+        let cli = crate::cli::Cli::parse_from([
+            "doslet",
+            "--config",
+            config.to_str().unwrap(),
+            "--drive-mode",
+            "overlay",
+        ])
+        .resolve()
+        .unwrap();
+        let mut app = Doslet::new();
+        app.launch = cli.launch;
+        app.launch.preload_local_media = true;
+        app.configurator
+            .set_active(app.launch.machine_spec.clone().unwrap());
+        app.midi_mode = cli.midi_mode.unwrap().into();
+        app.routing.set_mode(app.midi_mode);
+        app.mt32_rom_dir = cli.mt32_rom_dir;
+        app.audio_mixer = crate::audio::Mixer::System;
+        app.audio_deferred = true;
+        app.audio = Some(
+            crate::audio::Output::new(crate::audio::Backend::Pulse, crate::audio::Mixer::System)
+                .unwrap(),
+        );
+        app.select_midi("CM-32L / MT-32").unwrap();
+        app.init_game_session(cli.game.unwrap()).unwrap();
+        assert!(!app.session.v86_enabled());
+        let started = Instant::now();
+        let inject_stalls = std::env::var_os("DOSLET_AUDIO_PROBE_STALLS").is_some();
+        let mut next_stall = Duration::from_millis(2500);
+        let mut stalls = 0;
+        while app.session.emulated_nanos() < 8_000_000_000
+            && started.elapsed() < Duration::from_secs(20)
+        {
+            if inject_stalls && stalls < 3 && started.elapsed() >= next_stall {
+                // Host/UI scheduling can stop the PC owner while the audio
+                // server keeps consuming. No guest pause or anchor rebase.
+                std::thread::sleep(Duration::from_millis(50));
+                next_stall += Duration::from_secs(1);
+                stalls += 1;
+            }
+            let _ = app.worker_tick();
+            assert_eq!(
+                app.session.status(),
+                SessionStatus::Running,
+                "{:?}; {:?}",
+                app.session.fault(),
+                app.notice
+            );
+            std::thread::yield_now();
+        }
+        assert!(app.session.emulated_nanos() >= 8_000_000_000);
+        assert_eq!(stalls, if inject_stalls { 3 } else { 0 });
+        std::thread::sleep(Duration::from_millis(150));
+        app.audio.as_ref().unwrap().set_active(false);
+        wait(record.cork()).unwrap();
+        let frames = captured.lock().unwrap();
+        let audible = |f: &[f32; 2]| f.iter().any(|v| v.abs() > 0.000001);
+        let first = frames
+            .iter()
+            .position(audible)
+            .expect("no MIDI in system mixer monitor");
+        let last = frames.iter().rposition(audible).unwrap();
+        let mut longest = 0;
+        let mut run = 0;
+        let mut silence = 0;
+        for (index, frame) in frames[first..=last].iter().enumerate() {
+            if audible(frame) {
+                if run >= 480 {
+                    eprintln!(
+                        "CIV PULSE gap at {:.3}s, duration {:.3}ms",
+                        (first + index - run) as f64 / 48000.0,
+                        run as f64 / 48.0
+                    );
+                }
+                run = 0;
+            } else {
+                run += 1;
+                silence += 1;
+                longest = longest.max(run);
+            }
+        }
+        eprintln!(
+            "CIV SYSTEM native stalls={stalls} guest={} wall={:?} frames={} first={first} last={last} zero_frames={silence} longest_zero_run={longest} sink={:?} notes={}",
+            app.session.emulated_nanos(),
+            started.elapsed(),
+            frames.len(),
+            app.audio.as_ref().unwrap().stats(),
+            app.audio_engine.stats().notes
+        );
+        assert!(last - first > 48000);
+        assert!(
+            longest < 480,
+            "system mixer interruption: {longest} frames at 48 kHz"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local CIV, CM-32L ROMs and v86; captures actual app audio without a host device"]
+    fn local_civ_app_audio_matches_between_cpu_backends() {
+        check_local_civ_app_audio(false, 8, None, false, None);
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local CIV, CM-32L ROMs and v86; no host device"]
+    fn local_civ_host_clock_audio_reserve_comparison() {
+        check_local_civ_app_audio(true, 8, None, false, None);
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local CIV, CM-32L ROMs and v86; measures MIDI and BIOS timer cadence"]
+    fn local_civ_tempo_diagnostic() {
+        check_local_civ_app_audio(false, 30, None, false, None);
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local CIV, CM-32L ROMs and v86; records bounded startup frames with one ESC tap"]
+    fn local_civ_escape_animation_diagnostic() {
+        check_local_civ_app_audio(false, 12, None, true, None);
+        check_local_civ_app_audio(false, 12, Some(4_000_000_000), true, None);
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local CIV, CM-32L ROMs and v86; compares title animation without VGA trapping"]
+    fn local_civ_v86_animation_without_vga_trap_diagnostic() {
+        check_local_civ_app_audio(true, 12, Some(4_000_000_000), true, Some(false));
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local CIV, CM-32L ROMs and v86; compares title animation with VGA trapping"]
+    fn local_civ_v86_animation_with_vga_trap_diagnostic() {
+        check_local_civ_app_audio(true, 12, Some(4_000_000_000), true, Some(true));
+    }
+
+    #[cfg(feature = "v86")]
+    fn check_local_civ_app_audio(
+        host_only: bool,
+        seconds: u64,
+        escape_at: Option<u64>,
+        capture: bool,
+        vga_trap: Option<bool>,
+    ) {
+        use clap::Parser;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = root.join("games/CIV.toml");
+        let module = root.join("target/v86/doslet-v86.wasm");
+        let mut reference_cadence = None;
+        for (v86, host_clock, reserve) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            if (host_only && !host_clock) || (seconds > 8 && v86 && (!host_clock || !reserve)) {
+                continue;
+            }
+            let mut args = vec![
+                "doslet",
+                "--config",
+                config.to_str().unwrap(),
+                "--drive-mode",
+                "overlay",
+            ];
+            if v86 {
+                args.extend(["--v86", "--v86-module", module.to_str().unwrap()]);
+            }
+            if v86 && !host_clock {
+                args.push("--v86-instruction-clock");
+            }
+            let cli = crate::cli::Cli::parse_from(args).resolve().unwrap();
+            let mut app = Doslet::new();
+            app.launch = cli.launch;
+            app.launch.preload_local_media = true;
+            app.configurator
+                .set_active(app.launch.machine_spec.clone().unwrap());
+            app.midi_mode = cli.midi_mode.unwrap().into();
+            app.routing.set_mode(app.midi_mode);
+            app.mt32_rom_dir = cli.mt32_rom_dir;
+            app.audio_deferred = true;
+            app.audio = Some(crate::audio::Output::mock(48000));
+            let writer = app.audio.as_ref().unwrap().writer();
+            app.select_midi("CM-32L / MT-32").unwrap();
+            app.init_game_session(cli.game.unwrap()).unwrap();
+            if let Some(enabled) = vga_trap {
+                app.session.set_v86_vga_polling(enabled);
+            }
+            app.session.set_v86_profiling(v86);
+            let began = Instant::now();
+            let mut consumed = 0_u64;
+            let mut nonzero = 0_u64;
+            let mut peak = 0_f32;
+            let mut zero_after_signal = 0_u64;
+            let mut zero_run = 0_u64;
+            let mut longest_zero_run = 0_u64;
+            let mut last_underruns = 0;
+            let mut reported_gaps = 0;
+            let report_period = if capture {
+                1_000_000_000
+            } else {
+                5_000_000_000
+            };
+            let mut next_report = report_period;
+            let mut escape_sent = false;
+            let mut warmup_cadence = None;
+            while app.session.emulated_nanos() < seconds * 1_000_000_000
+                && began.elapsed() < Duration::from_secs(60)
+            {
+                let due = (began.elapsed().as_nanos() * 48000 / 1_000_000_000) as u64;
+                let count = due.saturating_sub(consumed).min(4096) as usize;
+                for frame in writer.consume(count) {
+                    if frame != [0.0; 2] {
+                        nonzero += 1;
+                        zero_run = 0;
+                    } else if nonzero != 0 {
+                        zero_after_signal += 1;
+                        zero_run += 1;
+                        longest_zero_run = longest_zero_run.max(zero_run);
+                    }
+                    peak = peak.max(frame[0].abs()).max(frame[1].abs());
+                }
+                consumed += count as u64;
+                let underruns = writer.stats().1;
+                if underruns > last_underruns && nonzero != 0 && reported_gaps < 8 {
+                    eprintln!(
+                        "CIV GAP reserve={reserve} wall={:?} missing={} pending={}ns queued={} frames",
+                        began.elapsed(),
+                        underruns - last_underruns,
+                        app.audio_engine.pending_nanos(),
+                        16384 - writer.available()
+                    );
+                    reported_gaps += 1;
+                }
+                last_underruns = underruns;
+                let _ = app.worker_tick();
+                if !escape_sent
+                    && app.audio_engine.stats().notes != 0
+                    && escape_at.is_some_and(|at| app.session.emulated_nanos() >= at)
+                {
+                    assert!(app.session.push_key(0x01, 0x1b).unwrap());
+                    escape_sent = true;
+                    eprintln!(
+                        "CIV ESC v86={v86} guest={} notes={}",
+                        app.session.emulated_nanos(),
+                        app.audio_engine.stats().notes
+                    );
+                }
+                if app.session.emulated_nanos() >= next_report {
+                    let mut ticks = [0; 4];
+                    assert!(app.session.debug_read_memory(0x46c, &mut ticks));
+                    eprintln!(
+                        "CIV TEMPO v86={v86} guest={} wall={:?} bios_ticks={} irqs={} notes={} pc={:x}",
+                        app.session.emulated_nanos(),
+                        began.elapsed(),
+                        u32::from_le_bytes(ticks),
+                        app.session.debug_irq_entries(),
+                        app.audio_engine.stats().notes,
+                        app.session.debug_pc()
+                    );
+                    if warmup_cadence.is_none() {
+                        warmup_cadence =
+                            Some((u32::from_le_bytes(ticks), app.session.debug_irq_entries()));
+                    }
+                    if capture {
+                        let pc = app.session.debug_pc();
+                        let mut code = [0; 64];
+                        app.session
+                            .debug_read_memory(pc.saturating_sub(16), &mut code);
+                        eprintln!(
+                            "CIV ANIMATION v86={v86} escape={escape_at:?} second={} regs={:?} code={code:02x?}",
+                            next_report / 1_000_000_000,
+                            app.session.debug_cpu().registers
+                        );
+                        if let Some(frame) = app.session.frame() {
+                            let rgba: Vec<_> = frame
+                                .indices()
+                                .flat_map(|p| frame.palette[usize::from(p)])
+                                .collect();
+                            let path = root.join(format!(
+                                "target/civ-startup-v86-{v86}-esc-{}-vga-{vga_trap:?}-{}.png",
+                                escape_at.is_some(),
+                                next_report / 1_000_000_000
+                            ));
+                            let mut encoder = png::Encoder::new(
+                                std::fs::File::create(path).unwrap(),
+                                frame.width as u32,
+                                frame.height as u32,
+                            );
+                            encoder.set_color(png::ColorType::Rgba);
+                            encoder.set_depth(png::BitDepth::Eight);
+                            encoder
+                                .write_header()
+                                .unwrap()
+                                .write_image_data(&rgba)
+                                .unwrap();
+                        }
+                    }
+                    next_report += report_period;
+                }
+                if host_clock && !reserve {
+                    // Diagnostic reference: disable the reserve even when
+                    // deferred device activation has just configured it.
+                    writer.set_host_clock_reserve(false);
+                }
+                assert_eq!(
+                    app.session.status(),
+                    SessionStatus::Running,
+                    "v86={v86} fault={:?} notice={:?}",
+                    app.session.fault(),
+                    app.notice
+                );
+                std::thread::yield_now();
+            }
+            eprintln!(
+                "CIV APP v86={v86} host_clock={host_clock} reserve={reserve} zero_after_signal={zero_after_signal} longest_zero_run={longest_zero_run} guest={} wall={:?} bytes={:?} synth={:?} nonzero={nonzero} peak={peak} notice={:?} cpu={:?} sink={:?}",
+                app.session.emulated_nanos(),
+                began.elapsed(),
+                app.session.midi_stats(),
+                app.audio_engine.stats(),
+                app.notice,
+                app.session.v86_statistics(),
+                writer.stats()
+            );
+            if seconds > 8 && !capture {
+                let mut ticks = [0; 4];
+                assert!(app.session.debug_read_memory(0x46c, &mut ticks));
+                let (initial_ticks, initial_irqs) = warmup_cadence.unwrap();
+                let cadence = (
+                    u32::from_le_bytes(ticks) - initial_ticks,
+                    app.session.debug_irq_entries() - initial_irqs,
+                );
+                if !v86 {
+                    reference_cadence = Some(cadence);
+                } else if let Some(reference) = reference_cadence {
+                    // Exclude startup/calibration. Missing timer edges cannot
+                    // be hidden by a correctly advancing device-time counter.
+                    assert!(
+                        cadence.0 * 100 >= reference.0 * 95,
+                        "BIOS cadence: {cadence:?} vs {reference:?}"
+                    );
+                    assert!(
+                        cadence.1 * 100 >= reference.1 * 95,
+                        "IRQ cadence: {cadence:?} vs {reference:?}"
+                    );
+                }
+            }
+            assert!(app.session.emulated_nanos() >= seconds * 1_000_000_000);
+            assert!(app.audio_engine.stats().notes > 0, "v86={v86}");
+            assert!(nonzero > 1000 && peak > 0.001, "v86={v86}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local games/civ and the v86 module; no host audio"]
+    fn local_civ_v86_midi_startup_diagnostic() {
+        check_local_civ_midi_startup(true, false);
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local games/civ and the v86 module; no host audio"]
+    fn local_civ_v86_host_clock_midi_startup_diagnostic() {
+        check_local_civ_midi_startup(true, true);
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local games/civ and v86 module; measures the app worker without host audio"]
+    fn local_civ_v86_worker_wait_probe() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| local_civ_v86_worker_wait_probe_inner(false, false, true, false, false, true))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local games/civ and v86 module; samples menu after ESC"]
+    fn local_civ_v86_start_load_idle_probe() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| local_civ_v86_worker_wait_probe_inner(true, false, true, false, false, true))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local games/civ, CM-32L ROMs and v86 module; mock audio output"]
+    fn local_civ_v86_audio_start_load_idle_probe() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| local_civ_v86_worker_wait_probe_inner(true, true, true, false, false, true))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local games/civ and v86 module; comparison without VGA trap"]
+    fn local_civ_v86_start_load_without_vga_trap_probe() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| local_civ_v86_worker_wait_probe_inner(true, false, false, false, false, true))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local games/civ and v86 module; settled Start/Load menu"]
+    fn local_civ_v86_settled_start_load_idle_probe() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| local_civ_v86_worker_wait_probe_inner(true, false, true, true, false, true))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local games/civ and v86 module; settled Start/Load menu with audio"]
+    fn local_civ_v86_audio_settled_start_load_idle_probe() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| local_civ_v86_worker_wait_probe_inner(true, true, true, true, false, true))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local games/civ and v86 module; baseline without DOS input pacing"]
+    fn local_civ_v86_audio_settled_start_load_without_input_polling_probe() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| local_civ_v86_worker_wait_probe_inner(true, true, true, true, false, false))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires local games/civ and v86 module; settled Start/Load menu with audio"]
+    fn local_civ_v86_audio_settled_start_load_with_mpu_pacing_probe() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| local_civ_v86_worker_wait_probe_inner(true, true, true, true, true, true))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "v86")]
+    #[ignore = "requires the local ROTT archive and v86 module; diagnostic only"]
+    fn local_rott_v86_worker_wait_probe() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser;
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+                let cli = crate::cli::Cli::parse_from([
+                    "doslet",
+                    "--config",
+                    root.join("games/ROTT.toml").to_str().unwrap(),
+                    "--v86",
+                    "--v86-module",
+                    root.join("target/v86/doslet-v86.wasm").to_str().unwrap(),
+                    "--no-audio",
+                ])
+                .resolve()
+                .unwrap();
+                let mut app = Doslet::new();
+                app.launch = cli.launch;
+                app.launch.persist = false;
+                app.launch.preload_local_media = true;
+                app.configurator
+                    .set_active(app.launch.machine_spec.clone().unwrap());
+                app.init_game_session(cli.game.unwrap()).unwrap();
+                let began = Instant::now();
+                let mut last = Instant::now();
+                let mut last_steps = app.session.steps();
+                let mut last_irqs = app.session.debug_irq_entries();
+                let mut last_parks = app.session.v86_ram_waits().map_or(0, |(_, p)| p);
+                let mut busy = Duration::ZERO;
+                let mut first_park = None;
+                while began.elapsed() < Duration::from_secs(20)
+                    && first_park.is_none_or(|at: Instant| at.elapsed() < Duration::from_secs(10)) {
+                    let turn = Instant::now();
+                    let guest = app.session.emulated_nanos();
+                    let _ = app.worker_tick();
+                    busy += turn.elapsed();
+                    assert_eq!(app.session.status(), SessionStatus::Running,
+                        "fault={:?} error={:?}", app.session.fault(), app.session.v86_last_error());
+                    if last.elapsed() >= Duration::from_secs(2) {
+                        let parks = app.session.v86_ram_waits().map_or(0, |(_, p)| p);
+                        if parks != 0 && first_park.is_none() {
+                            first_park = Some(Instant::now());
+                        }
+                        let irqs = app.session.debug_irq_entries();
+                        eprintln!("ROTT v86 t={:.1}s guest={:.1}s steps/s={} IRQ/s={} parks/s={} active={:.1}% pc={:x} frame={:?} stats={:?}",
+                            began.elapsed().as_secs_f64(), app.session.emulated_nanos() as f64 / 1e9,
+                            (app.session.steps() - last_steps) as f64 / last.elapsed().as_secs_f64(),
+                            (irqs - last_irqs) as f64 / last.elapsed().as_secs_f64(),
+                            (parks - last_parks) as f64 / last.elapsed().as_secs_f64(),
+                            100.0 * busy.as_secs_f64() / began.elapsed().as_secs_f64(),
+                            app.session.debug_pc(), app.session.frame().map(|f| (f.width, f.height)), app.session.v86_statistics());
+                        last = Instant::now();
+                        last_steps = app.session.steps();
+                        last_irqs = irqs;
+                        last_parks = parks;
+                    }
+                    std::thread::sleep(app.worker_delay(app.session.emulated_nanos() != guest));
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "v86")]
+    fn local_civ_v86_worker_wait_probe_inner(
+        menu: bool,
+        audio: bool,
+        vga_trap: bool,
+        settled: bool,
+        mpu_pacing: bool,
+        input_polling: bool,
+    ) {
+        use clap::Parser;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = root.join("games/CIV.toml");
+        let module = root.join("target/v86/doslet-v86.wasm");
+        let mut arguments = vec![
+            "doslet",
+            "--config",
+            config.to_str().unwrap(),
+            "--v86",
+            "--v86-module",
+            module.to_str().unwrap(),
+        ];
+        if !audio {
+            arguments.push("--no-audio");
+        }
+        let cli = crate::cli::Cli::parse_from(arguments).resolve().unwrap();
+        let mut app = Doslet::new();
+        app.launch = cli.launch;
+        app.launch.preload_local_media = true;
+        app.configurator
+            .set_active(app.launch.machine_spec.clone().unwrap());
+        if audio {
+            app.midi_mode = cli.midi_mode.unwrap().into();
+            app.routing.set_mode(app.midi_mode);
+            app.mt32_rom_dir = cli.mt32_rom_dir;
+            app.audio_deferred = true;
+            app.audio = Some(crate::audio::Output::mock(48000));
+            app.select_midi("CM-32L / MT-32").unwrap();
+        }
+        let writer = app.audio.as_ref().map(|output| output.writer());
+        app.init_game_session(cli.game.unwrap()).unwrap();
+        app.session.set_v86_vga_polling(vga_trap);
+        app.session.set_v86_mpu_polling(mpu_pacing);
+        app.session.set_v86_input_polling(input_polling);
+        app.session.set_v86_profiling(true);
+        let began = Instant::now();
+        let mut busy = Duration::ZERO;
+        let mut pages = std::collections::BTreeMap::<u32, u64>::new();
+        let mut ips = std::collections::BTreeMap::<u32, u64>::new();
+        let mut start_steps = app.session.steps();
+        let mut sampled_at = began;
+        let mut sample_started = !menu;
+        let mut escaped = false;
+        let mut consumed_audio = 0_u64;
+        let mut first_input_park_at = None;
+        let wait_for_input_park = menu && audio && settled && input_polling && !mpu_pacing;
+        let duration = if wait_for_input_park {
+            60
+        } else if settled {
+            30
+        } else if menu {
+            12
+        } else {
+            5
+        };
+        while began.elapsed() < Duration::from_secs(duration) {
+            if wait_for_input_park
+                && sample_started
+                && sampled_at.elapsed() >= Duration::from_secs(4)
+            {
+                break;
+            }
+            if let Some(writer) = &writer {
+                let due = (began.elapsed().as_nanos() * 48000 / 1_000_000_000) as u64;
+                let count = due.saturating_sub(consumed_audio).min(4096) as usize;
+                let _ = writer.consume(count);
+                consumed_audio += count as u64;
+            }
+            if menu && !escaped && began.elapsed() >= Duration::from_secs(4) {
+                assert!(app.session.push_key(0x01, 0x1b).unwrap());
+                escaped = true;
+            }
+            if menu
+                && !sample_started
+                && if wait_for_input_park {
+                    app.session
+                        .v86_input_polling()
+                        .is_some_and(|(_, parks)| parks >= 100)
+                } else {
+                    began.elapsed() >= Duration::from_secs(if settled { 26 } else { 8 })
+                }
+            {
+                sample_started = true;
+                sampled_at = Instant::now();
+                start_steps = app.session.steps();
+            }
+            let turn = Instant::now();
+            let guest = app.session.emulated_nanos();
+            let _ = app.worker_tick();
+            if first_input_park_at.is_none()
+                && app
+                    .session
+                    .v86_input_polling()
+                    .is_some_and(|(_, parks)| parks != 0)
+            {
+                first_input_park_at = Some(began.elapsed());
+            }
+            if sample_started {
+                busy += turn.elapsed();
+                *pages.entry(app.session.debug_pc() & !0xfff).or_default() += 1;
+                *ips.entry(app.session.debug_pc()).or_default() += 1;
+            }
+            assert_eq!(
+                app.session.status(),
+                SessionStatus::Running,
+                "fault={:?} error={:?}",
+                app.session.fault(),
+                app.session.v86_last_error()
+            );
+            std::thread::sleep(app.worker_delay(app.session.emulated_nanos() != guest));
+        }
+        assert!(
+            sample_started,
+            "CIV did not reach a repeatable input-poll wait within {duration}s"
+        );
+        let mut pages: Vec<_> = pages.into_iter().collect();
+        pages.sort_by_key(|(_, hits)| std::cmp::Reverse(*hits));
+        let mut ips: Vec<_> = ips.into_iter().collect();
+        ips.sort_by_key(|(_, hits)| std::cmp::Reverse(*hits));
+        let frame_hash = app.session.frame().map(|frame| {
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+            for pixel in frame.indices() {
+                hash = (hash ^ u64::from(pixel)).wrapping_mul(0x100_0000_01b3);
+            }
+            for rgba in frame.palette {
+                for byte in rgba {
+                    hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            hash
+        });
+        if wait_for_input_park {
+            let frame = app.session.frame().unwrap();
+            let rgba: Vec<_> = frame
+                .indices()
+                .flat_map(|pixel| frame.palette[usize::from(pixel)])
+                .collect();
+            let path = root.join("target/civ-v86-input-poll-menu.png");
+            let mut encoder = png::Encoder::new(
+                std::fs::File::create(path).unwrap(),
+                frame.width as u32,
+                frame.height as u32,
+            );
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&rgba)
+                .unwrap();
+        }
+        eprintln!(
+            "CIV v86 menu={menu} audio={audio} vga_trap={vga_trap} settled={settled} input_polling={input_polling}: worker active {:.1}%, steps={} parks={:?} VGA={:?} MPU={:?} input={:?} first_input_park={first_input_park_at:?} notes={} guest={} frame={frame_hash:?} stats={:?} pages={:?}",
+            100.0 * busy.as_secs_f64() / sampled_at.elapsed().as_secs_f64(),
+            app.session.steps() - start_steps,
+            app.session.v86_ram_waits(),
+            app.session.v86_vga_polling(),
+            app.session.v86_mpu_polling(),
+            app.session.v86_input_polling(),
+            app.audio_engine.stats().notes,
+            app.session.emulated_nanos(),
+            app.session.v86_statistics(),
+            &pages[..pages.len().min(12)]
+        );
+        for &(ip, hits) in ips.iter().take(12) {
+            eprintln!(
+                "CIV v86 IP {ip:08x} hits={hits} code={:02x?}",
+                app.session
+                    .ram_view(ip.saturating_sub(32) as usize..ip as usize + 32)
+            );
+        }
+        if wait_for_input_park {
+            assert!(app.session.push_key(0x1c, 13).unwrap());
+            let pressed = Instant::now();
+            let deadline = pressed + Duration::from_secs(2);
+            let before = frame_hash.unwrap();
+            let mut changed = false;
+            while Instant::now() < deadline {
+                let guest = app.session.emulated_nanos();
+                let _ = app.worker_tick();
+                if let Some(frame) = app.session.frame() {
+                    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+                    for pixel in frame.indices() {
+                        hash = (hash ^ u64::from(pixel)).wrapping_mul(0x100_0000_01b3);
+                    }
+                    for rgba in frame.palette {
+                        for byte in rgba {
+                            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
+                        }
+                    }
+                    if hash != before {
+                        changed = true;
+                        eprintln!("CIV menu Enter changed frame after {:?}", pressed.elapsed());
+                        break;
+                    }
+                }
+                std::thread::sleep(app.worker_delay(app.session.emulated_nanos() != guest));
+            }
+            assert!(changed, "CIV menu ignored Enter after the input poll park");
+        }
+    }
+
+    fn check_local_civ_midi_startup(v86: bool, host_clock: bool) {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut session = crate::native_zip::load_game_with_settings(
             &root.join("games/civ/CIV.EXE"),
@@ -5856,26 +7209,77 @@ enabled = false
             },
         )
         .unwrap();
+        if v86 {
+            session
+                .enable_v86(&std::fs::read(root.join("target/v86/doslet-v86.wasm")).unwrap())
+                .unwrap();
+            session.set_v86_host_clock(host_clock).unwrap();
+        }
+        let started = Instant::now();
         let mut routing = Routing::new(Mode::Mt32);
         let mut bytes = [0; 4096];
         let mut pcm = [doslet_pcm::EMPTY; 4096];
         let mut notes = [0u64; 16];
         let mut wire = doslet_midi_synth::wire::Decoder::new();
+        let mut mt32 = crate::native_roms::detect().map(|directory| {
+            let (control, pcm) = crate::native_roms::read(&directory).unwrap();
+            doslet_mt32::Timeline::new(&control, &pcm, 48000).unwrap()
+        });
+        let mut synth_frames = [[0.0; 2]; 256];
+        let mut synth_nonzero = 0_u64;
+        let mut synth_busy = Duration::ZERO;
         let mut graphics_selected = false;
         let mut sound_selected = false;
         let mut input_selected = false;
         session.start();
-        for second in 0..30 {
+        let seconds = if host_clock { 10 } else { 30 };
+        for second in 0..seconds {
             while session.emulated_nanos() < (second + 1) * 1_000_000_000 {
-                session.advance(10000);
+                assert!(
+                    started.elapsed() < Duration::from_secs(120),
+                    "Civ diagnostic timed out"
+                );
+                if host_clock {
+                    // Match the app: delayed device time is settled separately
+                    // instead of replaying a full CPU grant for each late ms.
+                    let target = started.elapsed().as_nanos() as u64;
+                    if target.saturating_sub(session.emulated_nanos()) <= 1_000_000 {
+                        session.advance(65_536);
+                    }
+                    session
+                        .advance_v86_host_time(started.elapsed().as_nanos() as u64)
+                        .unwrap();
+                } else {
+                    session.advance(10000);
+                }
                 assert_eq!(
                     session.status(),
                     SessionStatus::Running,
-                    "{:?}",
-                    session.fault()
+                    "v86={v86} host_clock={host_clock} fault={:?}; v86={:?}; console={}; PC={:x}",
+                    session.fault(),
+                    session.v86_last_error(),
+                    String::from_utf8_lossy(session.console()),
+                    session.debug_pc()
                 );
                 while session.drain_pcm_timed(&mut pcm) != 0 {}
                 let count = session.drain_midi(&mut bytes);
+                if let Some(synth) = &mut mt32 {
+                    loop {
+                        let render_started = Instant::now();
+                        let n = synth
+                            .render_until(session.emulated_nanos(), &mut synth_frames)
+                            .unwrap();
+                        synth_busy += render_started.elapsed();
+                        if n == 0 {
+                            break;
+                        }
+                        synth_nonzero +=
+                            synth_frames[..n].iter().filter(|f| **f != [0.0; 2]).count() as u64;
+                    }
+                    for &byte in &bytes[..count] {
+                        synth.push_byte(byte).unwrap();
+                    }
+                }
                 for &byte in &bytes[..count] {
                     routing.push(byte, Mode::Mt32, &mut |_| {}).unwrap();
                     if let Some(m) = wire.push(byte).unwrap()
@@ -5906,7 +7310,7 @@ enabled = false
             }
             if second % 5 == 4 {
                 eprintln!(
-                    "CIV guest={}s notes={notes:?} bytes={} SysEx={}",
+                    "CIV guest={}s notes={notes:?} bytes={} SysEx={} synth_nonzero={synth_nonzero}",
                     second + 1,
                     session.midi_stats().1,
                     routing.translator().stats().sysex
@@ -5923,10 +7327,22 @@ enabled = false
                 );
             }
         }
+        eprintln!(
+            "CIV MT-32 render busy {:.1}% of wall time, {} ms over {} ms",
+            100.0 * synth_busy.as_secs_f64() / started.elapsed().as_secs_f64(),
+            synth_busy.as_millis(),
+            started.elapsed().as_millis()
+        );
         assert!(
             notes.iter().sum::<u64>() > 0,
             "Civ must reach actual MIDI playback"
         );
+        if mt32.is_some() {
+            assert!(
+                synth_nonzero > 0,
+                "Civ MIDI must produce a non-silent CM-32L signal"
+            );
+        }
     }
 
     fn check_local_prince_moont_queue(until: u64, restore: bool) {
@@ -6096,6 +7512,54 @@ enabled = false
                 "keyboard must edit the game's name buffer: {mode:?}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires the user's local PRINCE installation; run from repository root"]
+    #[cfg(feature = "v86")]
+    fn local_prince_v86_startup_through_app_clock() {
+        use clap::Parser;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cli = crate::cli::Cli::parse_from([
+            "doslet",
+            "--config",
+            root.join("games/PRINCE.toml").to_str().unwrap(),
+            "--v86",
+            "--v86-module",
+            root.join("target/v86/doslet-v86.wasm").to_str().unwrap(),
+            "--no-audio",
+            "--drive-mode",
+            "overlay",
+        ])
+        .resolve()
+        .unwrap();
+        let mut app = Doslet::new();
+        app.launch = cli.launch;
+        app.launch.preload_local_media = true;
+        app.configurator
+            .set_active(app.launch.machine_spec.clone().unwrap());
+        app.init_game_session(cli.game.unwrap()).unwrap();
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_secs(20) {
+            let _ = app.worker_tick();
+            assert_eq!(
+                app.session.status(),
+                SessionStatus::Running,
+                "fault={:?} error={:?} regs={:?}",
+                app.session.fault(),
+                app.session.v86_last_error(),
+                app.session.registers()
+            );
+            std::thread::yield_now();
+        }
+        eprintln!(
+            "PRINCE app steps={} guest={} mode={:?} frame={:?}",
+            app.session.steps(),
+            app.session.emulated_nanos(),
+            app.launch.dpmi,
+            app.session.frame().map(|f| (f.width, f.height))
+        );
+        assert!(app.session.frame().is_some());
     }
 
     #[test]

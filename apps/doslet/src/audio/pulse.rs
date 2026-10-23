@@ -1,5 +1,5 @@
 //! Rust protocol adapter. The reactor copies PCM; this owner handles control I/O.
-use super::{CAPACITY, Output, Queue, Stream, Writer};
+use super::{CAPACITY, Output, PLAYBACK_RESERVE_MS, Queue, Stream, Writer};
 use doslet_pulse::{Client, PlaybackSource, PlaybackStream, connect_named, playback_params, wait};
 use std::{
     pin::Pin,
@@ -165,7 +165,7 @@ impl PlaybackSource for Source {
         }
         q.callback_frames = q.callback_frames.max(count);
         for bytes in bytes[..count * 8].as_chunks_mut::<8>().0 {
-            let frame = q.next();
+            let frame = q.pop();
             bytes[..4].copy_from_slice(&frame[0].to_le_bytes());
             bytes[4..].copy_from_slice(&frame[1].to_le_bytes());
         }
@@ -204,6 +204,8 @@ pub(super) fn deferred_at_rate(name: &'static std::ffi::CStr, rate: u32) -> Outp
         underruns: 0,
         callback_frames: 480,
         refilling: true,
+        host_clock_reserve: false,
+        priming: false,
         peak: 0.0,
         gain: 1.0,
         spectrum: doslet_pcm::spectrum::Spectrum::new(rate),
@@ -236,6 +238,49 @@ pub(super) fn deferred_at_rate(name: &'static std::ffi::CStr, rate: u32) -> Outp
     }
 }
 
+fn stream_params(
+    rate: u32,
+    name: &'static std::ffi::CStr,
+) -> Result<doslet_pulse::protocol::PlaybackStreamParams, String> {
+    let mut params = playback_params(rate, 2, name)?;
+    #[cfg(test)]
+    if std::env::var_os("DOSLET_PULSE_PROBE_LEGACY_BUFFER").is_some() {
+        return Ok(params); // Explicit A/B reference, absent from normal builds.
+    }
+    // Every PC backend is a real-time producer and can be delayed by host I/O
+    // or scheduling. Buffer at the server; Source must answer requests now.
+    // Automatic prebuffering also stops the read index running ahead forever
+    // after an underrun, unlike the manual-start pre_buffering=0 policy.
+    let bytes = rate * PLAYBACK_RESERVE_MS as u32 / 1000 * 8;
+    params.buffer_attr.target_length = bytes;
+    params.buffer_attr.pre_buffering = bytes;
+    // Keep this reserve in the stream itself. With adjust_latency, the server
+    // subtracts the device latency from target_length, leaving less PCM to
+    // absorb a producer stall (notably with a large PipeWire graph quantum).
+    params.flags.adjust_latency = false;
+    Ok(params)
+}
+
+fn underrun_delta(previous: &mut u64, reported_bytes: u64) -> u64 {
+    // Compatibility servers can encode unknown/negative values in this u64.
+    // Do not turn an unavailable report into 2^61 missed stereo frames.
+    if reported_bytes > i64::MAX as u64 {
+        return 0;
+    }
+    let current = reported_bytes / 8;
+    let delta = current.checked_sub(*previous).unwrap_or(current);
+    *previous = current;
+    delta
+}
+
+fn startup_reserve() -> Duration {
+    #[cfg(test)]
+    if std::env::var_os("DOSLET_PULSE_PROBE_LEGACY_BUFFER").is_some() {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(PLAYBACK_RESERVE_MS as u64)
+}
+
 fn create(
     client: &Client,
     queue: Arc<Mutex<Queue>>,
@@ -253,7 +298,7 @@ fn create(
         q.spectrum = doslet_pcm::spectrum::Spectrum::new(rate);
         rate
     };
-    let mut params = playback_params(rate, 2, name)?;
+    let mut params = stream_params(rate, name)?;
     params.sink_name = std::env::var("PULSE_SINK")
         .ok()
         .map(std::ffi::CString::new)
@@ -267,6 +312,12 @@ fn create(
             .set(doslet_pulse::protocol::Prop::MediaRole, c"doslet-test");
         params.flags.start_muted = Some(false);
         params.flags.no_move = true;
+    }
+    // Compatibility servers can silently fall back to the default output for
+    // an unknown explicit name. Honor the requested routing or fail first.
+    if let Some(sink) = &params.sink_name {
+        wait(client.sink_info_by_name(sink.clone()))
+            .map_err(|error| format!("Requested PulseAudio sink {sink:?}: {error}"))?;
     }
     let expected = params.sample_spec;
     let stream = wait(client.create_playback_stream(
@@ -292,6 +343,10 @@ fn run(
     name: &'static std::ffi::CStr,
 ) -> Result<(), String> {
     let mut playing = false;
+    // Explicitly keep the new stream corked while a wall-clock producer
+    // supplies its reserve. Compatibility servers may begin an uncorked
+    // stream before the requested prebuffer has accumulated.
+    let mut start_after = Instant::now() + startup_reserve();
     let mut next_stats = Instant::now();
     let mut previous_underrun = 0;
     while !control.stop.load(Ordering::Acquire) {
@@ -310,6 +365,7 @@ fn run(
             wait(stream.delete())?;
             stream = create(&client, queue.clone(), current, name)?;
             playing = false;
+            start_after = Instant::now(); // The previous format already drained.
             previous_underrun = 0;
         }
         if current != generation {
@@ -319,10 +375,11 @@ fn run(
             stream = create(&client, queue.clone(), current, name)?;
             generation = current;
             playing = false;
+            start_after = Instant::now() + startup_reserve();
             previous_underrun = 0;
             control.acknowledge(Ok(generation));
         }
-        if active != playing {
+        if active != playing && (!active || Instant::now() >= start_after) {
             if active {
                 wait(stream.uncork())?;
             } else {
@@ -335,14 +392,10 @@ fn run(
             // Timing reports the current underrun interval, not a lifetime
             // counter. Accumulate observed deltas; short gaps between queries
             // remain outside this sampled diagnostic.
-            let current = timing.underrun_for / 8;
-            let delta = if current >= previous_underrun {
-                current - previous_underrun
-            } else {
-                current
-            };
-            queue.lock().unwrap_or_else(|e| e.into_inner()).underruns += delta;
-            previous_underrun = current;
+            let delta = underrun_delta(&mut previous_underrun, timing.underrun_for);
+            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.underruns = q.underruns.saturating_add(delta);
+            drop(q);
             next_stats = Instant::now() + Duration::from_millis(100);
         }
         thread::park_timeout(Duration::from_millis(2));

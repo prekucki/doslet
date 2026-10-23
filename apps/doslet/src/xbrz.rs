@@ -260,7 +260,7 @@ impl shader::Primitive for Frame {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod tests {
     use super::*;
-    use shader::{Pipeline as _, Primitive as _};
+    use shader::Pipeline as _;
 
     pub(crate) fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         struct Wake(std::thread::Thread);

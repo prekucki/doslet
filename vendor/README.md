@@ -29,3 +29,10 @@ bindings in `src/core_saved.rs` and `src/lib_saved.rs`. It exposes complete chip
 state through `doslet_state::State`; no synthesis algorithm was changed.
 Cargo builds use `prost` derives and do not invoke `protoc`. Keep the upstream
 license files with this copy. Verify active FM continuation when updating it.
+
+## v86 CPU/JIT
+
+`v86/` contains the pinned upstream Rust CPU, WASM JIT, instruction generators
+and SoftFloat implementation. It builds separately into WASM through
+`tools/v86-build`, without Node tooling. See its [provenance and local
+changes](v86/README.md) and [build/validation instructions](../docs/compatibility/v86-core.md).

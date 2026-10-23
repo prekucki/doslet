@@ -267,6 +267,7 @@ impl Cli {
         discover: impl FnOnce() -> Option<PathBuf>,
     ) -> Result<Self, Box<dyn Error>> {
         let explicit_drive_mode = self.drive_mode;
+        let explicit_cpu_mhz = self.cpu_mhz.is_some();
         if let Some(config) = &self.config {
             let text = std::fs::read_to_string(config)
                 .map_err(|error| format!("Cannot read {}: {error}", config.display()))?;
@@ -585,6 +586,26 @@ impl Cli {
         self.launch.adaptive_cpu = self.adaptive_cpu;
         // The interpreter is the default; the JIT was slower on ROTT gameplay.
         self.launch.no_dynamic_core = !self.dynamic_core;
+        if self.v86 {
+            self.launch.v86_host_clock = !self.v86_instruction_clock;
+            if self.launch.v86_host_clock && explicit_cpu_mhz {
+                return Err("--cpu-mhz requires --v86-instruction-clock when using v86".into());
+            }
+            if !cfg!(feature = "v86") {
+                return Err("--v86 requires cargo --features v86".into());
+            }
+            self.no_speed_tiers = true;
+            self.no_aot = true;
+            self.autosave_path = None;
+            self.launch.v86_module = Some(self.v86_module.clone().unwrap_or_else(|| {
+                let beside = std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(|parent| parent.join("doslet-v86.wasm")));
+                beside
+                    .filter(|path| path.is_file())
+                    .unwrap_or_else(|| PathBuf::from("target/v86/doslet-v86.wasm"))
+            }));
+        }
         let profile_dpmi = self.launch.machine_spec.as_ref().and_then(|s| s.dpmi);
         self.launch.dpmi = crate::native_input::dpmi_mode(
             self.dpmi
@@ -889,6 +910,17 @@ pub(crate) mod tests {
             let fixture = Fixture::new(&format!(
                 "version={version}\n[game]\nexecutable='../TINY.EXE'\n[machine]\ncpu_mhz=132\n"
             ));
+            if cfg!(feature = "v86") {
+                let host = fixture.cli(&["--no-audio", "--v86"]).resolve().unwrap();
+                assert!(host.launch.v86_host_clock);
+                assert_eq!(host.launch.hardware.cpu_mhz, 132);
+                assert!(
+                    fixture
+                        .cli(&["--v86", "--cpu-mhz", "66"])
+                        .resolve()
+                        .is_err()
+                );
+            }
             for (options, mhz) in [
                 (&["--no-audio"][..], 132),
                 (&["--no-audio", "--cpu-mhz", "66"][..], 66),

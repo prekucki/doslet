@@ -221,7 +221,11 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     let notice = app
         .session
         .fault()
-        .map(|fault| fault.to_string())
+        .map(|fault| {
+            app.session
+                .v86_last_error()
+                .map_or_else(|| fault.to_string(), |detail| format!("{fault}: {detail}"))
+        })
         .or_else(|| app.display_sizing.error().map(str::to_owned))
         .or_else(|| app.notice.clone());
     if let Some(notice) = notice {
@@ -385,7 +389,16 @@ fn backdrop(_: &Theme) -> container::Style {
 }
 
 fn video_indicator(app: &Doslet, compact: bool, icon_only: bool) -> Element<'_, Message> {
-    let label = app.video_mode_label.as_str();
+    let fps = app
+        .display_sizing
+        .fps()
+        .map_or_else(|| "— FPS".into(), |fps| format!("{fps:.0} FPS"));
+    let label = if compact {
+        shorten(&app.video_mode_label, 14).to_string()
+    } else {
+        app.video_mode_label.clone()
+    };
+    let label = format!("{label} · {fps}");
     let icon = svg(svg::Handle::from_memory(Icon::Display.bytes()))
         .width(24)
         .height(24)
@@ -393,25 +406,15 @@ fn video_indicator(app: &Doslet, compact: bool, icon_only: bool) -> Element<'_, 
             color: Some(ACCENT),
         });
     let content: Element<'_, Message> = if icon_only {
-        icon.into()
-    } else if compact {
-        row![
-            icon,
-            text(shorten(label, 14))
-                .size(12)
-                .font(iced::Font::MONOSPACE)
-        ]
-        .spacing(9)
-        .align_y(iced::Center)
-        .into()
+        row![icon, text(fps).size(12).font(iced::Font::MONOSPACE)]
+            .spacing(9)
+            .align_y(iced::Center)
+            .into()
     } else {
-        row![
-            icon,
-            text(label).size(12).font(iced::Font::MONOSPACE).width(140)
-        ]
-        .spacing(9)
-        .align_y(iced::Center)
-        .into()
+        row![icon, text(label).size(12).font(iced::Font::MONOSPACE)]
+            .spacing(9)
+            .align_y(iced::Center)
+            .into()
     };
     tooltip(
         button(content)
@@ -569,7 +572,7 @@ fn fullscreen_style_field(app: &Doslet) -> Element<'_, Message> {
 }
 
 fn display_panel(app: &Doslet) -> Element<'_, Message> {
-    use crate::presentation::{DisplayFilter, ScreenShape, SizingMessage};
+    use crate::presentation::{DisplayFilter, FrameRate, ScreenShape, SizingMessage};
     let perfect = app.display_sizing.pixel_perfect;
     let shape = app.display_sizing.shape;
     let shape_button = |label: &'static str, target: ScreenShape| {
@@ -667,6 +670,26 @@ fn display_panel(app: &Doslet) -> Element<'_, Message> {
             text(
                 "The filter is applied first; the screen shape is then applied to the \
                  filtered picture, so they combine.",
+            )
+            .size(12)
+            .color(MUTED),
+        )
+        .push(field(
+            "Frame rate",
+            pick_list(
+                FrameRate::ALL,
+                Some(app.display_sizing.frame_rate),
+                |rate| Message::DisplaySizing(SizingMessage::FrameRate(rate)),
+            )
+            .padding(8)
+            .text_size(14)
+            .width(Fill)
+            .into(),
+        ))
+        .push(
+            text(
+                "How often a new picture is shown. Hz is the emulated VGA refresh and \
+                 fps the pictures actually shown; the game's own speed does not change.",
             )
             .size(12)
             .color(MUTED),
@@ -796,7 +819,11 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
         );
     }
     if let Some(fault) = app.session.fault() {
-        body = body.push(text(fault.to_string()).size(13).color(DANGER));
+        let message = app
+            .session
+            .v86_last_error()
+            .map_or_else(|| fault.to_string(), |detail| format!("{fault}: {detail}"));
+        body = body.push(text(message).size(13).color(DANGER));
     }
     if let Some(notice) = &app.notice {
         body = body.push(text(notice).size(13).color(MUTED));
@@ -1155,7 +1182,9 @@ fn cpu_indicator(app: &Doslet, compact: bool) -> Element<'_, Message> {
             app.cpu_settings.grey,
         ));
     #[cfg(not(target_arch = "wasm32"))]
-    let speed = if let Some((_, _, grey)) = tier_targets {
+    let speed = if app.v86_host_clock {
+        "v86 · MAX".into()
+    } else if let Some((_, _, grey)) = tier_targets {
         format!("{grey} MHz · Auto")
     } else if app.analysis.controller_enabled {
         format!("{} MHz · Auto", app.analysis.effective_mhz)

@@ -6,6 +6,9 @@ execution-engine details. For everyday use, see [using Doslet](usage.md).
 For the optional profile-guided x86-to-WebAssembly compiler, native differential
 runner and browser CPU acceptance, see [the experimental WASM core](compatibility/wasm-core.md).
 
+For the separately imported v86 CPU/JIT, its Cargo-only table generator and
+native adapter tests, see [the experimental v86 core](compatibility/v86-core.md).
+
 For native desktop/headless remote debugging, RAM patches and mixed 16/32-bit guest
 inspection, see [debugging with GDB](debugging.md).
 
@@ -700,6 +703,7 @@ cargo run -p doslet-pulse --locked --example synchronization -- doslet-audio-pro
 PULSE_SINK=doslet-audio-probe-output RUST_MIN_STACK=8388608 cargo test -p doslet --locked pulse_loopback_pause_and_reset_discard_old_server_audio -- --ignored --nocapture
 PULSE_SINK=doslet-audio-probe-output RUST_MIN_STACK=8388608 cargo test -p doslet --locked system_mixer_loopback -- --ignored --nocapture
 PULSE_SINK=doslet-audio-probe-output RUST_MIN_STACK=8388608 cargo test -p doslet --locked mixer_selection_prepares -- --ignored --nocapture
+PULSE_SINK=doslet-audio-probe-output DOSLET_AUDIO_PROBE_STALLS=1 cargo test -p doslet --release --locked --offline local_civ_system_mixer_loopback_without_v86 -- --ignored --nocapture
 # Replace each placeholder with the ID returned by load-module:
 pactl unload-module FOUR_CHANNEL_MODULE_ID
 pactl unload-module TWO_CHANNEL_MODULE_ID
@@ -748,6 +752,18 @@ samples respectively, and reset interrupted a paused rate transition. The test
 uses the dedicated `doslet-audio-probe-output` null sink and test-only media role
 to isolate saved server mute settings. This is synthetic evidence, not a
 real-game listening test.
+
+The CIV system-mixer probe requires the local game and CM-32L ROMs. It validates
+the dedicated sink and monitor before capturing eight seconds of actual app
+audio, without v86. `DOSLET_AUDIO_PROBE_STALLS=1` inserts three 50-ms delays in
+the emulation owner while the synth and server keep running. On 2026-10-23,
+the old 30-ms/manual-start policy produced a 1850-frame gap (38.5 ms at 48 kHz).
+An 80-ms target alone still produced a 1792-frame gap. Explicit initial corking
+plus the 80-ms stream reserve reduced the longest silence between audible
+frames to one frame in the same isolated PipeWire 1.6.8 probe. This establishes
+bounded stall tolerance in that capture, not physical listening quality or
+long-run stability. `DOSLET_PULSE_PROBE_LEGACY_BUFFER=1` selects the old buffer
+and immediate-start policy in test builds only; omit it for the normal policy.
 
 ### Display validation
 

@@ -954,10 +954,29 @@ impl Library {
             GameEdit::NewActionName(v) => self.new_action_name = v,
             GameEdit::NewActionExe(v) => self.new_action_exe = v,
             GameEdit::AddAction => {
-                let exe = self.new_action_exe.trim().to_owned();
+                let mut exe = self.new_action_exe.trim().to_owned();
                 if exe.is_empty() {
                     self.notice = Some("Enter an executable name (e.g. SETUP.EXE).".into());
                     return;
+                }
+                if let Some(mount) = game
+                    .spec
+                    .mounts
+                    .iter()
+                    .find(|mount| mount.letter == b'C' && mount.kind == SourceKind::BrowserZip)
+                {
+                    let base = game.profile.parent().unwrap_or(Path::new("."));
+                    let path = base.join(game.spec.binding(&mount.source));
+                    let selected = crate::native_zip::read(&path)
+                        .map_err(|error| error.to_string())
+                        .and_then(|archive| crate::native_zip::select(&archive, Some(&exe)));
+                    match selected {
+                        Ok(program) => exe = program,
+                        Err(error) => {
+                            self.notice = Some(error);
+                            return;
+                        }
+                    }
                 }
                 let name = if self.new_action_name.trim().is_empty() {
                     exe.clone()
@@ -974,6 +993,10 @@ impl Library {
                         }
                     })
                     .collect();
+                if game.spec.game.actions.iter().any(|action| action.id == id) {
+                    self.notice = Some("An entrypoint with this label already exists.".into());
+                    return;
+                }
                 game.spec.game.actions.push(GameAction {
                     id,
                     name,
@@ -991,6 +1014,10 @@ impl Library {
                 }
             }
             GameEdit::Save => {
+                if let Err(error) = game.spec.resolve() {
+                    self.notice = Some(format!("Cannot save configuration: {error}"));
+                    return;
+                }
                 let text = machine_profile::export_machine_profile(&game.spec);
                 match std::fs::write(&game.profile, text) {
                     Ok(()) => {
@@ -1175,6 +1202,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    #[ignore = "requires the user's local ROTT archive"]
+    fn rott_entrypoint_editor_checks_archive_programs() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut library = Library::discover();
+        library.games = vec![Game::load(&root.join("games/ROTT.toml")).unwrap()];
+        library.selected = Some(0);
+        library.new_action_name = "Wrong setup".into();
+        library.new_action_exe = "SETSOUND.EXE".into();
+        library.edit_game(GameEdit::AddAction);
+        assert!(library.notice.as_deref().unwrap().contains("SNDSETUP.EXE"));
+        assert_eq!(library.games[0].actions.len(), 1);
+
+        library.new_action_name = "Another setup".into();
+        library.new_action_exe = "sndsetup.exe".into();
+        library.edit_game(GameEdit::AddAction);
+        assert_eq!(library.games[0].actions[1].executable, "SNDSETUP.EXE");
     }
 
     #[test]

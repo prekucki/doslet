@@ -123,6 +123,10 @@ impl PcMachine {
         labels: Option<alloc::vec::Vec<doslet_x86::ExecutionLabel>>,
         rates: [Option<u16>; 3],
     ) -> Result<(), &'static str> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        if labels.is_some() && self.v86_enabled() {
+            return Err("v86 does not support native execution tiers");
+        }
         if rates[1..].iter().any(Option::is_none)
             || rates.iter().flatten().any(|r| !(1..=1000).contains(r))
         {

@@ -123,6 +123,9 @@ impl Snapshot {
     pub fn fault(&self) -> Option<&str> {
         self.fault.as_deref()
     }
+    pub fn v86_last_error(&self) -> Option<&str> {
+        None
+    }
 }
 pub struct Archive {
     pub programs: Vec<String>,
@@ -687,6 +690,9 @@ impl Doslet {
                     ));
                     return Task::none();
                 }
+                if let SizingMessage::FrameRate(rate) = message {
+                    self.command("frame-rate", &rate.code().to_string());
+                }
                 return self
                     .display_sizing
                     .update(message, &self.display)
@@ -1235,7 +1241,12 @@ impl Doslet {
         // Poll bounded presentation snapshots even while paused/importing. The
         // timer neither runs the CPU nor determines audio/device timing.
         Subscription::batch([
-            iced::time::every(web_time::Duration::from_millis(16)).map(|_| Message::Tick),
+            iced::time::every(
+                self.display_sizing
+                    .frame_rate
+                    .interval(self.video_refresh_mhz),
+            )
+            .map(|_| Message::Tick),
             iced::event::listen_with(|event, status, _| {
                 if let iced::Event::Keyboard(event) = event {
                     Some(if status == iced::event::Status::Ignored {

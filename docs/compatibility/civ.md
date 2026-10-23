@@ -96,3 +96,23 @@ INT 33h/0015h reports a 160-byte state buffer; 0016h/0017h save/restore the
 selected driver state. Logitech CyberMan query 53C1h returns unsupported
 (AX=0), per the Logitech SWIFT supplement:
 https://www.bitsavers.org/pdf/logitech/cyberman/CyberMan_3D_SWIFT_Supplement_Ver_1.0_upd_199401.pdf.
+
+## Startup timing with v86
+
+The local `local_civ_escape_animation_diagnostic` compares the native and
+host-clock v86 workers for twelve seconds, with and without one ESC tap at
+four seconds. It writes guest frames and sampled registers/code to `target/`
+without modifying the installation.
+
+The tap skips the opening credits into the title reveal. A sampled native
+execution in the reveal copies a pixel with MOVSB and delays with
+`MOV AX,BX; DEC AX; JNZ` before continuing the outer LOOP. This portion depends
+on CPU throughput rather than waiting on a timer or VGA port on each pixel.
+One second after ESC, the native capture was still revealing the title while
+v86 had reached the menu. Host-clock PIT/IRQ synchronization therefore does
+not by itself stabilize this CPU-dependent visual effect in maximum-throughput
+mode. This evidence does not identify every other animation's timing source.
+
+```sh
+cargo test -p doslet --release --locked --offline local_civ_escape_animation_diagnostic -- --ignored --nocapture
+```

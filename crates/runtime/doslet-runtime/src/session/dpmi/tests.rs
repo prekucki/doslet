@@ -417,6 +417,7 @@ fn callback_maps_real_stack_and_accepts_replacement_return_structure() {
     s.machine.cpu.registers.set32(Gpr32::Esp, 0x200);
     s.machine.cpu.registers.ip = 0x1234;
     s.dpmi_callback(0).unwrap();
+    assert_eq!(s.eflags() & 0x3000, 0x3000);
     assert_eq!(
         s.dpmi_pointer(Seg::Ds, s.registers().get32(Gpr32::Esi), 4, Access::Read)
             .unwrap(),
@@ -432,6 +433,49 @@ fn callback_maps_real_stack_and_accepts_replacement_return_structure() {
     assert_eq!(s.registers().get32(Gpr32::Eax), 0xDEADBEEF);
     assert_eq!(s.registers().ip, 0x4321);
     assert_eq!(s.registers().segment_cache(Seg::Ss).base, 0x60000);
+}
+
+#[test]
+#[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+#[ignore = "requires tools/v86-build"]
+fn v86_dpmi_callback_can_disable_interrupts_at_client_privilege() {
+    extern crate std;
+    let module = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../target/v86/doslet-v86.wasm"
+    ))
+    .unwrap();
+    let mut s = prepared(Mode::Direct);
+    let code = s.registers().cs;
+    s.dpmi.as_mut().unwrap().callbacks[0] = Some(Callback {
+        code,
+        ip: 0x22000,
+        data: DATA,
+        offset: 0x30000,
+        structure: 0x30000,
+    });
+    s.machine.bus.write_u8(0x22000, 0xfa).unwrap(); // CLI
+    s.machine.bus.write_u8(0x22001, 0x90).unwrap(); // NOP
+    s.machine.cpu.set_protected_mode(false);
+    for (seg, value) in [(Seg::Cs, 0x5000), (Seg::Ss, 0x6000)] {
+        s.machine
+            .cpu
+            .load_segment(&mut s.machine.bus, seg, value)
+            .unwrap();
+    }
+    s.machine.cpu.registers.set32(Gpr32::Esp, 0x200);
+    s.dpmi_callback(0).unwrap();
+    s.enable_v86(&module).unwrap();
+    s.advance(1);
+    assert_eq!(
+        s.status(),
+        SessionStatus::Running,
+        "{:?}; {:?}",
+        s.fault(),
+        s.v86_last_error()
+    );
+    assert_eq!(s.registers().ip, 0x22001);
+    assert_eq!(s.eflags() & 0x200, 0); // CLI completed with IF clear.
 }
 
 #[test]
@@ -699,6 +743,120 @@ fn faulting_client(vectors: &[(u8, u32)], client: &[u8]) -> Session {
 
 /// MOV ECX,0; DIV ECX; NOP; JMP $.
 const DIVIDE: [u8; 10] = [0xB9, 0, 0, 0, 0, 0xF7, 0xF1, 0x90, 0xEB, 0xFE];
+
+#[test]
+#[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+#[ignore = "requires tools/v86-build"]
+fn v86_faults_use_dpmi_exception_frames_instead_of_interrupt_reflection() {
+    extern crate std;
+    let module = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../target/v86/doslet-v86.wasm"
+    ))
+    .unwrap();
+    let selector = [0x66, 0xB8, 0x34, 0x12, 0x8E, 0xD8, 0x90, 0x90, 0xEB, 0xFE];
+    // CLI at CPL3/IOPL0 raises #GP(0), matching the extra zero at the front
+    // of the reported PRINCE frame. The handler skips CLI plus one NOP.
+    let privileged = [0xfa, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xeb, 0xfe];
+    for mode in [Mode::Direct, Mode::Reflect] {
+        for (vectors, program, result_address, expected) in [
+            (&[(0, 0x21000)][..], &DIVIDE[..], 0x30000, 1),
+            (&[(13, 0x21100)][..], &privileged[..], 0x30004, 0),
+            (
+                &[(11, 0x21100), (13, 0x21100)][..],
+                &selector[..],
+                0x30004,
+                0x1234,
+            ),
+        ] {
+            let mut s = faulting_client(vectors, program);
+            s.dpmi.as_mut().unwrap().mode = mode;
+            s.machine.bus.write_u32(0x30004, 0xdeadbeef).unwrap();
+            let (cs, ss, esp) = (
+                s.registers().cs,
+                s.registers().ss,
+                s.machine.cpu.stack_pointer(),
+            );
+            s.enable_v86(&module).unwrap();
+            run_until_loop(&mut s);
+            assert_eq!(
+                s.status(),
+                SessionStatus::Running,
+                "{:?}; {:?}",
+                s.fault(),
+                s.v86_last_error()
+            );
+            assert_eq!(s.machine.bus.read_u32(result_address).unwrap(), expected);
+            assert_eq!((s.registers().cs, s.registers().ss), (cs, ss));
+            assert_eq!(s.machine.cpu.stack_pointer(), esp);
+            assert_eq!(s.registers().ip, 0x20008);
+            assert_eq!(s.dpmi.as_ref().unwrap().depth, 0);
+        }
+    }
+    let mut s = faulting_client(&[], &selector);
+    let cs = s.registers().cs;
+    let esp = s.machine.cpu.stack_pointer();
+    s.enable_v86(&module).unwrap();
+    run_until_loop(&mut s);
+    assert_eq!(s.status(), SessionStatus::Faulted);
+    assert_eq!(s.registers().cs, cs); // Never entered the host #GP/IRET gate.
+    assert_eq!(s.machine.cpu.stack_pointer(), esp);
+    assert!(matches!(
+        s.fault(),
+        Some(RuntimeError::Cpu(
+            doslet_x86::CpuError::ArchitecturalFault {
+                vector: 13,
+                error_code: Some(0x1234),
+                ..
+            }
+        ))
+    ));
+}
+
+#[test]
+#[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+#[ignore = "requires tools/v86-build"]
+fn v86_16_bit_exception_handler_copies_its_high_memory_stack() {
+    extern crate std;
+    let module = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../target/v86/doslet-v86.wasm"
+    ))
+    .unwrap();
+    let mut s = faulting_client(
+        &[],
+        &[0xfa, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xeb, 0xfe],
+    );
+    let selector = s.dpmi_alloc_descriptors(1).unwrap();
+    s.dpmi_descriptor_at(LDT + u32::from(selector & !7), 0x22000, 0xffff, 0x9a, 0)
+        .unwrap();
+    s.dpmi.as_mut().unwrap().exceptions[13] = (selector, 0);
+    s.machine.cpu.set_precise_faults(true);
+    // DS=ES=SS; copy the return IP with 16-bit SI/DI to SP-16;
+    // skip the faulting CLI in the 32-bit frame, then RETF32.
+    let handler = [
+        0x8c, 0xd0, 0x8e, 0xd8, 0x8e, 0xc0, 0x89, 0xe6, 0x89, 0xf7, 0x83, 0xef, 0x10, 0xa5, 0x89,
+        0xe5, 0x83, 0x46, 0x0c, 0x02, 0x66, 0xcb,
+    ];
+    for (i, byte) in handler.into_iter().enumerate() {
+        s.machine.bus.write_u8(0x22000 + i as u32, byte).unwrap();
+    }
+    s.enable_v86(&module).unwrap();
+    run_until_loop(&mut s);
+    assert_eq!(
+        s.status(),
+        SessionStatus::Running,
+        "{:?}; {:?}",
+        s.fault(),
+        s.v86_last_error()
+    );
+    assert_eq!(s.registers().ip, 0x20008);
+    assert_eq!(s.dpmi.as_ref().unwrap().depth, 0);
+    assert_eq!(
+        s.machine.bus.read_u16(EXCEPTION_STACK - 32 - 16).unwrap(),
+        EXCEPTION_RETURN as u16
+    );
+}
 
 fn run_until_loop(s: &mut Session) {
     for _ in 0..200 {

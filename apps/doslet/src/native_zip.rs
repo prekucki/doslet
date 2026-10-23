@@ -137,6 +137,35 @@ mod tests {
     const EXIT: &[u8] = &[0xb8, 7, 0x4c, 0xcd, 0x21];
 
     #[test]
+    #[ignore = "requires the user's local ROTT archive"]
+    fn local_rott_sound_setup_launch() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let profile = root.join("games/ROTT.toml");
+        let mut cli = Cli::parse_from([
+            "doslet",
+            "--config",
+            profile.to_str().unwrap(),
+            "--action",
+            "sound-setup",
+            "--v86",
+            "--v86-module",
+            root.join("target/v86/doslet-v86.wasm").to_str().unwrap(),
+            "--no-audio",
+        ])
+        .resolve()
+        .unwrap();
+        assert_eq!(
+            cli.game.as_deref(),
+            Some(std::path::Path::new("SNDSETUP.EXE"))
+        );
+        cli.launch.persist = false;
+        let mut session =
+            load_game_with_settings(cli.game.as_deref().unwrap(), &cli.launch).unwrap();
+        session.start();
+        assert_ne!(session.advance(10_000), 0);
+    }
+
+    #[test]
     fn archived_recording_restores_saved_rates_without_enabling_learning() {
         let fixture = Fixture::new("version=2");
         let path = zip(&fixture, &[("GAME/PLAY.COM", EXIT)]);

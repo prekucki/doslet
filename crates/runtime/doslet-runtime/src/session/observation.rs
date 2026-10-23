@@ -127,6 +127,7 @@ impl Observer {
 impl Session {
     /// Observe sampled recurrence and input queries without changing execution policy.
     pub fn set_idle_observation(&mut self, enabled: bool) {
+        let enabled = enabled && !self.v86_enabled();
         self.synchronization = super::synchronization::Synchronization::default();
         if self.adaptive_idle_enabled() {
             self.cancel_menu_idle();

@@ -4,6 +4,20 @@ Doslet separates architectural CPU behavior, chip behavior, machine wiring and
 application policy. Libraries live in nested domains, with independent manifests
 and tests. No emulation library depends on iced or accesses a host filesystem.
 
+The optional [v86 CPU/JIT adapter](compatibility/v86-core.md) runs a pinned
+upstream CPU in an isolated WASM instance, with a native Wasmtime host and
+`no_std` wire types. Desktop `--v86` uses it in `Session`, retaining Rust PC
+devices through scoped I/O/MMIO callbacks and one v86-owned RAM backing. Upstream
+`std`, unsafe code and SoftFloat C remain inside that WASM build. The host
+owns ports, mapped device memory and interrupt acknowledgement. Execution
+uses bounded CPU grants and returns at port I/O and software-interrupt/service
+boundaries. By default, `--v86` advances Rust devices from monotonic time
+supplied by the native owner, independently of instruction counts. Runtime
+batches bound both guest work and execution iterations, and clock catch-up
+interleaves pending IRQs with CPU execution. `--v86-instruction-clock` restores
+instruction-based timing and hardware-deadline grants for comparisons.
+The browser continues to use the existing CPU path.
+
 The [machine design](design/configurable-machines.md) and its
 [input and overlay extension](design/input-and-write-overlays.md) record the
 design decisions. The initial implementation now includes device registration,

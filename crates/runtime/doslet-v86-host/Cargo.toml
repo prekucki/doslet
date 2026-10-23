@@ -1,0 +1,19 @@
+[package]
+name = "doslet-v86-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+doslet-v86 = { path = "../../cpu/doslet-v86" }
+doslet-bus.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmtime = { version = "=45.0.3", default-features = false, features = ["cranelift", "runtime", "std"] }
+
+[dev-dependencies]
+doslet-x86.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"

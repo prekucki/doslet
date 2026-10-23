@@ -1397,6 +1397,7 @@ dependencies = [
 name = "doslet-headless"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "doslet-aot",
  "doslet-config",
  "doslet-debugger",
@@ -1561,6 +1562,8 @@ dependencies = [
  "doslet-sb-mixer",
  "doslet-state",
  "doslet-time",
+ "doslet-v86",
+ "doslet-v86-host",
  "doslet-vga",
  "doslet-wasm-aot",
  "doslet-x86",
@@ -1670,6 +1673,20 @@ version = "0.1.0"
 dependencies = [
  "doslet-state",
  "prost",
+]
+
+[[package]]
+name = "doslet-v86"
+version = "0.1.0"
+
+[[package]]
+name = "doslet-v86-host"
+version = "0.1.0"
+dependencies = [
+ "doslet-bus",
+ "doslet-v86",
+ "doslet-x86",
+ "wasmtime",
 ]
 
 [[package]]

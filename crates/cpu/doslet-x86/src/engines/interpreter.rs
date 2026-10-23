@@ -34,6 +34,12 @@ pub enum StepOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CpuError {
+    ArchitecturalFault {
+        cs: u16,
+        ip: u32,
+        vector: u8,
+        error_code: Option<u32>,
+    },
     X87Unsupported {
         cs: u16,
         ip: u32,
@@ -138,6 +144,9 @@ impl CpuError {
     pub fn fault(&self) -> Option<Fault> {
         let fault = |vector, error_code| Some(Fault { vector, error_code });
         match *self {
+            Self::ArchitecturalFault {
+                vector, error_code, ..
+            } => fault(vector, error_code),
             Self::DivideError { .. } => fault(0, None),
             Self::SegmentAccess { segment, .. } => fault(
                 if segment == SegmentRegister::Ss {
@@ -166,6 +175,17 @@ impl CpuError {
 impl fmt::Display for CpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ArchitecturalFault {
+                cs,
+                ip,
+                vector,
+                error_code,
+            } => {
+                write!(
+                    f,
+                    "CPU exception {vector:#04x} error={error_code:?} at {cs:04X}:{ip:08X}"
+                )
+            }
             Self::X87Unsupported {
                 cs,
                 ip,
@@ -304,17 +324,17 @@ pub struct CpuSnapshot {
 
 /// Integer execution context for a machine-provided service boundary. Floating
 /// point state and execution caches remain owned by the CPU across the switch.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct CpuContext {
-    general: [u32; 8],
-    ip: u32,
-    caches: [crate::SegmentCache; 6],
-    protected: bool,
-    cpl: u8,
-    flags: u32,
-    control: ControlRegisters,
-    halted: bool,
-    interrupt_shadow: u8,
+    pub general: [u32; 8],
+    pub ip: u32,
+    pub caches: [crate::SegmentCache; 6],
+    pub protected: bool,
+    pub cpl: u8,
+    pub flags: u32,
+    pub control: ControlRegisters,
+    pub halted: bool,
+    pub interrupt_shadow: u8,
 }
 
 impl Cpu {

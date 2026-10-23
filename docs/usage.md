@@ -93,6 +93,8 @@ Use `--program` to choose an EXE or COM path inside the archive, ignoring case.
 With a ZIP profile, `--config` plus `--program` runs another program from the
 same ZIP and save store, for example ROTT's sound setup:
 `--config games/ROTT.toml --program SNDSETUP.EXE`.
+The ROTT profile also exposes this utility as the **Sound Setup** library
+action, available on the command line as `--config games/ROTT.toml --action sound-setup`.
 If the archive contains one program, Doslet selects it automatically; otherwise
 it reports the available programs. The selected program's directory becomes C:,
 including its subdirectories. ZIP data remains unchanged. Writes use a temporary
@@ -128,9 +130,15 @@ Open **Mouse & keyboard** using the icon after Drives on the bottom bar. Choose
 delivery. Changes apply immediately without restarting. Keyboard changes release
 held keys; the selected settings survive Reset. The mouse and keyboard controls
 are also available in **Settings → Input**.
-**Auto** follows relative-motion reads by the game: click the display to capture,
-and the lock releases after one guest second without relative reads. **Capture**
-keeps relative input active after a display click. **No capture** always uses
+**Auto** follows relative-motion reads by the game, with inertia measured in
+guest time: the game must keep reading relative motion for 0.3 s before the
+pointer locks, and the lock releases only after three guest seconds without
+relative reads, so menus and play no longer flip the mode back and forth.
+**Capture** keeps relative input active. When the mode switches to capturing
+while the host pointer is over the game picture, Doslet captures it at once; a
+pointer outside the picture is left alone (click the display to capture), and a
+settings panel over the picture defers the capture until it closes. A pointer
+you released stays free until the mode switches again. **No capture** always uses
 absolute motion. **Ctrl+Esc** releases native capture; plain **Esc** reaches the
 game. In a browser, Pointer Lock requires a display click and Escape releases it.
 Focus loss, pause, settings panels, reset and game termination also release
@@ -307,6 +315,13 @@ offer fixed speed and the interpreter. **Apply** changes execution without resta
 **Revert** discards the draft. Controls are unavailable during machine
 preparation or an attached GDB session.
 
+On the native desktop, **CPU → Idle detection** provides live switches for
+proven native loops, VGA polling, experimental adaptive waits and idle
+observation. A v86 session instead shows its RAM timer-polling switch and park
+counter. Reset restores the launch defaults. See
+[Idle detection and waits](compatibility/idle-detection.md) for the different
+guarantees and the Heroes-specific options.
+
 On native builds, choose **Create profile** in the CPU panel, enter a JSON file
 path, then **Create & use**. This saves a speed-tier profile and activates it
 without restarting. Learning remains off until explicitly enabled.
@@ -410,7 +425,12 @@ of **Display** adds the guest refresh rate and the frame rate, for example
 pixel clock and fixed raster timing (about 70.1 Hz for text and mode 13h,
 59.9 Hz for 640×480); it is not read from the CRTC registers. The frame rate
 counts new guest pictures per second and drops to 0 when the guest is paused
-or draws nothing new. MDA, CGA and
+or draws nothing new.
+**Frame rate** sets how often the UI shows a new picture: 30 to 144 fps
+(60 by default) or **Guest refresh**, which follows the refresh rate above.
+It only limits presentation; guest timing, input and audio stay unchanged, so a
+70 Hz game at 60 fps skips some pictures but runs at the same speed. The
+setting lasts for the session. MDA, CGA and
 EGA modes are not currently implemented.
 **Pixel perfect** selects the largest whole-number zoom that fits the available
 display area, measured in physical pixels, including on HiDPI displays. It does

@@ -16,6 +16,23 @@ Both modes expose allocation telemetry. The host uses fixed metadata and
 identity-mapped guest RAM; guest allocation requests do not allocate host memory.
 Guest executables and DOS4GW.EXE remain ordinary input files.
 
+The v86 adapter returns CPU faults to this host before entering its generic
+interrupt gates. Exception frames include an error code that ordinary interrupt
+frames lack: treating one as an interrupt would reflect the wrong flags and
+make the shim's `IRETD` consume the error code as EIP. The shared exception
+dispatcher now delivers these faults to the client's `0203h` handler on a
+locked stack, or stops at the original instruction when no handler can run.
+Software interrupts and PIC delivery remain distinct from CPU faults.
+
+The opt-in `v86_faults_use_dpmi_exception_frames_instead_of_interrupt_reflection`
+regression exercises divide errors, selector faults and `#GP(0)` from a
+privileged instruction in both Direct and Reflect modes, including handler
+return and preservation of the client stack. A fault without a handler must
+stop at its original CS:EIP instead of falling through a host `IRET` gate.
+The 16-bit handler regression copies from the locked stack with 16-bit
+`SI/DI` and returns through the 32-bit client frame. It guards the dedicated
+stack segment base and offset required by DOS/4GW.
+
 ## Run and compare
 
 Launch a native window with:
@@ -124,7 +141,10 @@ A client handler registered with 0203h receives the client's divide errors
 their error codes, as DPMI 0.9 describes. The host builds the frame on a locked
 16 KiB stack below its frame stacks: return CS:EIP, error code, the faulting
 CS:EIP, EFLAGS and SS:ESP, as dwords for 32-bit clients and words for 16-bit
-ones; only the 32-bit form is tested. The handler runs with interrupts disabled. Its far return resumes the
+ones; the frame contents are tested for 32-bit clients, including a 16-bit
+handler. The locked stack has a dedicated 16-bit segment so handlers using
+16-bit stack-relative string operations reach the same physical frame above
+1 MiB. The handler runs with interrupts disabled. Its far return resumes the
 client at the frame's CS:EIP, EFLAGS and SS:ESP, which it may change, for
 example to skip the instruction; IOPL stays the host's. Portable states keep a
 running handler.
@@ -167,6 +187,11 @@ numeric selector is unchanged. Floating-point state remains owned by the CPU.
 Mouse events received while the client executes protected code are delivered
 through vector 74h and the host's real-mode reflection path. The driver wrapper
 can call a registered DPMI callback and then restore the interrupted client.
+Protected callbacks retain the client's CPL 3 / IOPL 3 privilege while starting
+with IF clear. Previously the host entered callbacks with `EFLAGS=0002h`, so
+DOS/4GW's `CLI` raised `#GP(0)` repeatedly under v86 and prevented timer
+progress. The callback now enters with `EFLAGS=3002h`. A v86 regression executes
+`CLI` in a protected callback and checks that it completes without a fault.
 Regression tests cover direct/reflect delivery, event coordinates, masked-interrupt
 deferral, nested callback return, and preservation of registers, flags and stack.
 The reported PRINCE regression was observed live: driver coordinates changed

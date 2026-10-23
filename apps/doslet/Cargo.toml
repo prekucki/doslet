@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [features]
-default = ["wasm-procedures"]
+default = ["wasm-procedures", "v86"]
+v86 = ["doslet-runtime/v86"]
 dynamic-core = ["doslet-runtime/dynamic-core"]
 wasm-procedures = ["doslet-runtime/wasm-procedures", "doslet-aot/wasm", "dep:doslet-x86-wasm"]
 [dependencies]

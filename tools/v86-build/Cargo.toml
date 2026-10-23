@@ -1,0 +1,11 @@
+[package]
+name = "doslet-v86-build"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-2.0-or-later"
+publish = false
+
+[dependencies]
+boa_engine = "=0.21.1"
+serde_json = "1"

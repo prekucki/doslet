@@ -81,6 +81,11 @@ impl Mpu401 {
             0
         }
     }
+    /// Remaining wire time before the transmit-busy status bit clears.
+    /// A full output queue has no clock-only deadline.
+    pub fn transmit_ready_in_nanos(&self, nanos: u64) -> Option<u64> {
+        (self.output.len < 1024).then(|| self.transmit_ready_nanos.saturating_sub(nanos))
+    }
     pub fn pending_output(&self) -> usize {
         self.output.len
     }
@@ -216,10 +221,12 @@ mod tests {
         assert_eq!(mpu.drain(&mut bytes), 1);
         assert_eq!(bytes[0], 0xB0);
         assert_eq!(mpu.status(1_319_999) & 0x40, 0x40);
+        assert_eq!(mpu.transmit_ready_in_nanos(1_319_999), Some(1));
         assert_eq!(mpu.write_data(11, 1_319_999), Err(MpuError::TransmitBusy));
         assert_eq!(mpu.transmitted_bytes(), 1);
         assert_eq!(mpu.pending_output(), 0);
         assert_eq!(mpu.status(1_320_000) & 0x40, 0);
+        assert_eq!(mpu.transmit_ready_in_nanos(1_320_000), Some(0));
         mpu.write_data(11, 1_320_000).unwrap();
         mpu.write_command(0xFF).unwrap();
         mpu.write_command(0x3F).unwrap();

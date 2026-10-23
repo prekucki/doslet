@@ -508,6 +508,7 @@ impl Session {
 
     /// Diagnostic mode remains independent of the opt-in throughput controller.
     pub fn set_synchronization_analysis(&mut self, enabled: bool) {
+        let enabled = enabled && !self.v86_enabled();
         self.analyzer_recurrence_forget();
         let ceiling = if self.analyzer.ceiling == 0 {
             self.hardware_config().cpu_mhz
@@ -563,6 +564,7 @@ impl Session {
     }
     /// Configured MHz is the ceiling. This controller does not authorize skipping.
     pub fn set_adaptive_cpu(&mut self, enabled: bool) {
+        let enabled = enabled && !self.v86_enabled();
         if enabled {
             self.set_synchronization_analysis(true);
             self.set_adaptive_idle(false);

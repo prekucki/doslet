@@ -40,6 +40,13 @@ Fixed state needs no allocator;
 buffer-owning libraries may use `alloc`. The current crate graph is documented
 in [architecture.md](architecture.md).
 
+The experimental [v86 core](compatibility/v86-core.md) separately compiles
+upstream `std`, unsafe Rust and SoftFloat C into an isolated WASM module.
+Desktop `--v86` replaces CPU execution and RAM ownership while retaining
+Doslet's devices and DOS/BIOS services. Scoped I/O/MMIO callbacks borrow the
+same RAM; no RAM or VRAM image is exchanged during execution. The native host
+and `no_std` wire crate preserve existing emulation-library build boundaries.
+
 ## Native launch profiles
 
 Native `--config FILE.toml` loads a version-1 launch profile. Built-in defaults

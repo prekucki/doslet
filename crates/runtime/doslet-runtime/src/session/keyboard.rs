@@ -97,6 +97,11 @@ impl Session {
                     .cpu
                     .registers
                     .set_byte(0, if pending { 255 } else { 0 });
+                if pending {
+                    self.v86_input_poll.reset();
+                } else {
+                    self.note_v86_empty_input_poll();
+                }
             }
             0x0C => {
                 let tail = self.machine.bus.read_u16(0x41C)?;

@@ -17,6 +17,8 @@ const SAVE_RM: u32 = 0x850;
 const CB_RETURN: u32 = 0x860;
 const TIMER_RETURN: u32 = 0x870;
 const EXCEPTION_RETURN: u32 = 0x880;
+const EXCEPTION_STACK_SELECTOR: u16 = 0x53;
+const EXCEPTION_STACK_BASE: u32 = EXCEPTION_STACK & !0xffff;
 const CB_BASE: u32 = 0x2000;
 const PM_BASE: u32 = 0x1000;
 const GDT: u32 = 0x100000;
@@ -102,6 +104,10 @@ pub(super) struct Host {
 }
 
 impl Host {
+    #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+    pub(super) fn entered(&self) -> bool {
+        self.stats.entered
+    }
     /// A client registered an exception handler, so faults must be precise.
     pub(super) fn handles_exceptions(&self) -> bool {
         self.exceptions.iter().any(|&(selector, _)| selector != 0)
@@ -376,8 +382,11 @@ impl Session {
             .load_segment(&mut self.machine.bus, Seg::Cs, selector)?;
         self.machine
             .cpu
-            .load_segment(&mut self.machine.bus, Seg::Ss, DATA)?;
-        self.machine.cpu.registers.set32(Gpr32::Esp, top);
+            .load_segment(&mut self.machine.bus, Seg::Ss, EXCEPTION_STACK_SELECTOR)?;
+        self.machine
+            .cpu
+            .registers
+            .set32(Gpr32::Esp, top - EXCEPTION_STACK_BASE);
         self.machine.cpu.registers.ip = offset;
         // Interrupts and single-stepping stay off until the handler returns.
         self.machine.cpu.flags &= !0x300;
@@ -550,6 +559,15 @@ impl Session {
         self.dpmi_descriptor_at(GDT + 24, LDT, (DESCRIPTORS * 8 - 1) as u32, 0x82, 0)?;
         // Conventional DPMI BIOS-data selector used by DOS/4GW's DOS services.
         self.dpmi_descriptor_at(GDT + 0x40, 0x400, 0xFFFF, 0x92, 0)?;
+        // The locked exception stack must be addressable by 16-bit string
+        // instructions in a 16-bit handler even for a 32-bit DPMI client.
+        self.dpmi_descriptor_at(
+            GDT + u32::from(EXCEPTION_STACK_SELECTOR & !7),
+            EXCEPTION_STACK_BASE,
+            0xFFFF,
+            0x92,
+            0,
+        )?;
         self.machine.cpu.control.gdtr = DescriptorTable {
             base: GDT,
             limit: 0xFF,
@@ -1548,7 +1566,9 @@ impl Session {
             .registers
             .set32(Gpr32::Edi, callback.offset);
         self.machine.cpu.registers.ip = callback.ip;
-        self.machine.cpu.flags = 2;
+        // Protected callbacks run with the same I/O privilege as the DPMI
+        // client. DOS/4GW uses CLI while copying the real-mode register frame.
+        self.machine.cpu.flags = 0x3002;
         Ok(())
     }
 

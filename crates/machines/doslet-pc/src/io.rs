@@ -86,6 +86,63 @@ impl Default for PcBus {
     }
 }
 impl PcBus {
+    #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+    pub(crate) fn v86_access(
+        &mut self,
+        ram: &mut [u8],
+        request: doslet_v86::DeviceRequest,
+    ) -> Result<u32, BusError> {
+        use doslet_v86::DeviceRequest::*;
+        let width = match request {
+            ReadPort { width, .. }
+            | WritePort { width, .. }
+            | ReadMemory { width, .. }
+            | WriteMemory { width, .. } => width,
+        };
+        assert!(matches!(width, 1 | 2 | 4), "v86 ABI access width");
+        let mut result = 0;
+        for offset in 0..width {
+            let value = match request {
+                ReadPort { port, .. } => self.read_port_u8(port.wrapping_add(u16::from(offset)))?,
+                WritePort { port, value, .. } => {
+                    let port = port.wrapping_add(u16::from(offset));
+                    let byte = (value >> (offset * 8)) as u8;
+                    self.write_port_u8(port, byte)?;
+                    // Legacy CGA compatibility registers also update the BDA.
+                    if matches!(self.routes.write(port), Endpoint::Probe)
+                        && matches!(port, 0x3d8 | 0x3d9)
+                        && let Some(target) = ram.get_mut(0x465 + usize::from(port - 0x3d8))
+                    {
+                        *target = byte;
+                    }
+                    0
+                }
+                ReadMemory { address, .. } => {
+                    let address = self.a20.address(address.wrapping_add(u32::from(offset)));
+                    match self.memory_routes.endpoint(address) {
+                        MemoryEndpoint::Ram => *ram
+                            .get(address as usize)
+                            .ok_or(BusError::UnmappedMemory(address))?,
+                        _ => self.read_u8(address)?,
+                    }
+                }
+                WriteMemory { address, value, .. } => {
+                    let address = self.a20.address(address.wrapping_add(u32::from(offset)));
+                    let byte = (value >> (offset * 8)) as u8;
+                    match self.memory_routes.endpoint(address) {
+                        MemoryEndpoint::Ram => {
+                            *ram.get_mut(address as usize)
+                                .ok_or(BusError::UnmappedMemory(address))? = byte
+                        }
+                        _ => self.write_u8(address, byte)?,
+                    }
+                    0
+                }
+            };
+            result |= u32::from(value) << (offset * 8);
+        }
+        Ok(result)
+    }
     pub(crate) fn interpreter_batch_bus(
         &mut self,
     ) -> Option<crate::memory::batch::BorrowedRamBus<'_>> {

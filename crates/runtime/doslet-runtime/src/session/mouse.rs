@@ -3,6 +3,11 @@ use super::*;
 impl Session {
     /// Relative reads take precedence for one second of guest time, even if
     /// absolute position queries are interleaved. Host motion is not evidence.
+    /// Guest time of the latest relative-motion read, for host-side policy.
+    pub fn pointer_relative_last_read(&self) -> Option<u64> {
+        self.mouse_last_relative_read
+    }
+
     pub fn pointer_relative_in_use(&self) -> bool {
         self.mouse_last_relative_read
             .is_some_and(|last| self.emulated_nanos().saturating_sub(last) < 1_000_000_000)

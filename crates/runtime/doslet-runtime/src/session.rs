@@ -44,8 +44,23 @@ mod storage;
 mod vesa;
 mod video;
 pub use video::VideoModeLabel;
+mod v86_input_poll;
 
 const CONSOLE_CAPACITY: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct V86Statistics {
+    pub compilation_pending: bool,
+    pub run_calls: u64,
+    pub run_nanos: u64,
+    pub context_nanos: u64,
+    pub compilation_nanos: u64,
+    pub compiled_modules: u64,
+    pub jit_entries: u64,
+    pub steps: u64,
+    pub software_interrupts: u64,
+    pub context_imports: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -160,6 +175,7 @@ pub struct Session {
     timeslice_yielded: bool,
     epoch: u64,
     active_service: u8,
+    v86_input_poll: v86_input_poll::InputPoll,
     persistent: Option<storage::Persistent>,
     base_identity: [u8; 32],
     keyboard_prefix: bool,
@@ -176,6 +192,267 @@ pub struct Session {
 }
 
 impl Session {
+    /// Use the isolated v86 CPU/JIT with this session's Rust PC devices.
+    pub fn enable_v86(&mut self, module: &[u8]) -> Result<(), alloc::string::String> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.enable_v86(module)?;
+            self.set_idle_loops(false);
+            self.set_synchronization_analysis(false);
+            self.set_adaptive_idle(false);
+            self.set_idle_observation(false);
+            self.set_adaptive_cpu(false);
+            self.set_menu_idle_site(None);
+            self.set_event_idle_site(None);
+            self.set_v86_input_polling(true);
+            Ok(())
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            let _ = module;
+            Err("v86 requires the native v86 Cargo feature".into())
+        }
+    }
+
+    pub fn v86_enabled(&self) -> bool {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_enabled()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            false
+        }
+    }
+
+    pub fn set_v86_input_polling(&mut self, enabled: bool) {
+        self.v86_input_poll.enabled = enabled && self.v86_enabled();
+        self.v86_input_poll.reset();
+    }
+
+    pub fn v86_input_polling(&self) -> Option<(bool, u64)> {
+        self.v86_enabled()
+            .then_some((self.v86_input_poll.enabled, self.v86_input_poll.parks))
+    }
+
+    pub fn v86_input_poll_parked(&self) -> bool {
+        self.v86_input_poll.parked
+    }
+
+    fn note_v86_empty_input_poll(&mut self) {
+        if !self.v86_input_poll.enabled || !self.v86_host_clock_enabled() {
+            return;
+        }
+        let revision = self
+            .v86_input_poll
+            .sample_revision()
+            .then(|| self.presentation_frame().revision());
+        if self
+            .v86_input_poll
+            .observe_empty(self.emulated_nanos(), revision)
+        {
+            self.timeslice_yielded = true;
+        }
+    }
+
+    /// Host-clock mode never charges device time from instruction counts.
+    pub fn set_v86_host_clock(&mut self, enabled: bool) -> Result<(), &'static str> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.set_v86_host_clock(enabled)
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            let _ = enabled;
+            Err("host-clock execution requires native v86")
+        }
+    }
+
+    pub fn v86_host_clock_enabled(&self) -> bool {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_host_clock_enabled()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            false
+        }
+    }
+
+    /// Toggle exact, idempotent RAM-polling loop parking in host-clock v86.
+    pub fn set_v86_ram_waits(&mut self, enabled: bool) {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        self.machine.set_v86_ram_waits(enabled);
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        let _ = enabled;
+    }
+
+    /// Enabled state and the number of CPU parks at a validated loop head.
+    pub fn v86_ram_waits(&self) -> Option<(bool, u64)> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_ram_waits()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            None
+        }
+    }
+
+    pub fn v86_ram_wait_parked(&self) -> bool {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_ram_wait_parked()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            false
+        }
+    }
+
+    pub fn set_v86_vga_polling(&mut self, enabled: bool) {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        self.machine.set_v86_vga_polling(enabled);
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        let _ = enabled;
+    }
+
+    pub fn v86_vga_polling(&self) -> Option<(bool, u64)> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_vga_polling()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            None
+        }
+    }
+
+    pub fn v86_vga_poll_active(&self) -> bool {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_vga_poll_active()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            false
+        }
+    }
+
+    pub fn v86_vga_poll_wait_nanos(&self) -> Option<u64> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_vga_poll_wait_nanos()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            None
+        }
+    }
+
+    pub fn set_v86_mpu_polling(&mut self, enabled: bool) {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        self.machine.set_v86_mpu_polling(enabled);
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        let _ = enabled;
+    }
+
+    pub fn v86_mpu_polling(&self) -> Option<(bool, u64)> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_mpu_polling()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            None
+        }
+    }
+
+    pub fn v86_mpu_poll_active(&self) -> bool {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_mpu_poll_active()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            false
+        }
+    }
+
+    pub fn v86_mpu_poll_wait_nanos(&self) -> Option<u64> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_mpu_poll_wait_nanos()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            None
+        }
+    }
+
+    /// Advance toward the owner's absolute clock, at most 1 ms per call.
+    /// The owner drains audio between calls and rebases its clock on resume.
+    pub fn advance_v86_host_time(&mut self, target_nanos: u64) -> Result<u64, RuntimeError> {
+        if !self.v86_host_clock_enabled() || self.status != SessionStatus::Running {
+            return Ok(0);
+        }
+        let elapsed = target_nanos.saturating_sub(self.emulated_nanos());
+        Ok(self.machine.debug_advance_device_time(elapsed)?)
+    }
+
+    pub fn v86_statistics(&mut self) -> Option<V86Statistics> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine
+                .v86_stats()
+                .map(
+                    |(stats, steps, software_interrupts, context_imports)| V86Statistics {
+                        compilation_pending: stats.compilation_pending,
+                        run_calls: stats.run_calls,
+                        run_nanos: stats.run_nanos,
+                        context_nanos: stats.context_nanos,
+                        compilation_nanos: stats.compilation_nanos,
+                        compiled_modules: stats.compiled_modules,
+                        jit_entries: stats.jit_entries,
+                        steps,
+                        software_interrupts,
+                        context_imports,
+                    },
+                )
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            None
+        }
+    }
+
+    pub fn v86_last_error(&self) -> Option<&str> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.v86_last_error()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            None
+        }
+    }
+    pub fn set_v86_profiling(&mut self, enabled: bool) {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        self.machine.set_v86_profiling(enabled);
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        let _ = enabled;
+    }
+    /// Wait for native code preparation outside execution and timing windows.
+    pub fn wait_for_v86_compilation(&mut self) -> Result<(), alloc::string::String> {
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        {
+            self.machine.wait_for_v86_compilation()
+        }
+        #[cfg(not(all(feature = "v86", not(target_arch = "wasm32"))))]
+        {
+            Ok(())
+        }
+    }
     /// Configure the PSP and DOS working directory before guest execution.
     pub fn configure_launch(
         &mut self,
@@ -444,6 +721,7 @@ impl Session {
             timeslice_yielded: false,
             epoch,
             active_service: 0,
+            v86_input_poll: v86_input_poll::InputPoll::default(),
             persistent: None,
             base_identity: [0; 32],
             keyboard_prefix: false,
@@ -571,6 +849,9 @@ impl Session {
     pub fn set_vga_wait_acceleration(&mut self, enabled: bool) {
         self.machine.set_vga_wait_acceleration(enabled);
     }
+    pub fn vga_wait_acceleration_enabled(&self) -> bool {
+        self.machine.vga_wait_acceleration_enabled()
+    }
     pub fn set_decode_cache(&mut self, enabled: bool) {
         self.machine.cpu.set_decode_cache(enabled);
     }
@@ -592,6 +873,7 @@ impl Session {
         self.machine.set_borrowed_interpreter_bus(enabled);
     }
     pub fn set_dynamic_core(&mut self, enabled: bool) {
+        let enabled = enabled && !self.v86_enabled();
         self.machine.cpu.set_dynamic_core(enabled);
     }
     pub fn dynamic_core_enabled(&self) -> bool {
@@ -878,8 +1160,14 @@ impl Session {
         #[cfg(feature = "wasm-procedures")]
         let budget = budget.min(u32::MAX - doslet_pc::wasm_procedures::MAX_ATOMIC_PROCEDURE_WORK);
         self.timeslice_yielded = false;
+        self.v86_input_poll.parked = false;
         self.apply_input();
         let mut completed = 0;
+        let host_clock = self.v86_host_clock_enabled();
+        // Also bound work inside one Wasmtime call: REP/MMIO can consume
+        // its whole instruction grant without returning to the owner clock.
+        let budget = if host_clock { budget.min(4096) } else { budget };
+        let mut transitions = 0;
         while completed < budget
             && self.status == SessionStatus::Running
             && !self.storage_wait
@@ -917,6 +1205,16 @@ impl Session {
                 Ok(None) => self.execute_step(budget - completed),
                 Err(error) => Err(error),
             };
+            // REP and MMIO can return after a single guest operation. An
+            // instruction grant alone would then hide tens of thousands of
+            // host/core transitions from the owner clock. Bound those returns
+            // too, so PIC edges can be serviced between small device slices.
+            if host_clock {
+                transitions += 1;
+                if transitions >= 128 {
+                    self.timeslice_yielded = true;
+                }
+            }
             match step {
                 Ok(consumed) => {
                     completed += consumed;
@@ -1232,6 +1530,9 @@ impl Session {
                 }
             }
         }
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        self.machine
+            .set_v86_exception_exits(self.dpmi.as_ref().is_some_and(|host| host.entered()))?;
         let (outcome, consumed) = if OBSERVE {
             let changed = self.machine.ram_writes() != before_service_writes;
             let device_accesses = self.machine.device_accesses() != before_service_devices;
@@ -1250,6 +1551,13 @@ impl Session {
         };
         if outcome == StepOutcome::Halted {
             self.status = SessionStatus::Halted;
+        }
+        if self.v86_host_clock_enabled() && self.machine.cpu.is_halted() {
+            self.timeslice_yielded = true;
+        }
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        if self.machine.v86_host_clock_yielded() {
+            self.timeslice_yielded = true;
         }
         Ok(consumed)
     }
@@ -2213,6 +2521,13 @@ impl Session {
                 }
                 _ => self.dos_error(1)?,
             },
+            (0x21, 0xD0) => {
+                // PRINCE calls D001h and D000h while leaving the game. No
+                // NetWare redirector is installed. Match the DOSBox fallback
+                // for unknown high functions: clear AL and leave the other
+                // registers and carry flag alone.
+                self.machine.cpu.registers.set_byte(0, 0);
+            }
             (0x21, 9) => {
                 let ds = self.machine.cpu.registers.ds;
                 let mut offset = self.machine.cpu.registers.get(Gpr16::Dx);
@@ -2920,6 +3235,28 @@ mod tests {
                 ..
             }))
         ));
+    }
+    #[test]
+    fn prince_high_dos_function_returns_to_exit_path() {
+        // The optional network/redirector calls must not stop DOS termination.
+        let mut session = Session::new(&[
+            0xB8, 0x01, 0xD0, // MOV AX,D001h
+            0xCD, 0x21, // INT 21h
+            0x3C, 0x00, // CMP AL,0
+            0x75, 0x0E, // JNE failure exit
+            0xB8, 0x00, 0xD0, // MOV AX,D000h
+            0xCD, 0x21, // INT 21h
+            0x3C, 0x00, // CMP AL,0
+            0x75, 0x05, // JNE failure exit
+            0xB8, 0x00, 0x4C, // MOV AX,4C00h
+            0xCD, 0x21, // INT 21h
+            0xB8, 0x01, 0x4C, // MOV AX,4C01h
+            0xCD, 0x21, // INT 21h
+        ])
+        .unwrap();
+        session.start();
+        session.advance(100);
+        assert_eq!(session.status(), SessionStatus::Exited(0));
     }
     #[test]
     fn unsupported_com_sizes_are_rejected_before_execution() {

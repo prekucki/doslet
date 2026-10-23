@@ -20,6 +20,7 @@ pub enum Core {
     Jit,
     /// Installed procedure module; the interpreter runs everything else.
     Aot,
+    V86,
 }
 impl std::fmt::Display for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -27,6 +28,7 @@ impl std::fmt::Display for Core {
             Self::Interpreter => "Interpreter",
             Self::Jit => "JIT · Cranelift",
             Self::Aot => "AOT · Wasmtime",
+            Self::V86 => "v86 · CPU/JIT",
         })
     }
 }

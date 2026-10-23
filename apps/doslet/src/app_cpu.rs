@@ -115,7 +115,9 @@ impl Doslet {
             } else {
                 Mode::Fixed
             },
-            core: if self.aot_installed() {
+            core: if self.session.v86_enabled() {
+                Core::V86
+            } else if self.aot_installed() {
                 Core::Aot
             } else if crate::cpu_config::JIT_AVAILABLE && self.session.dynamic_core_enabled() {
                 Core::Jit
@@ -155,6 +157,16 @@ impl Doslet {
         }
     }
     fn apply_cpu(&mut self, settings: Settings) -> Result<(), String> {
+        if self.session.v86_host_clock_enabled() {
+            return Err("v86 uses the host clock at maximum throughput; MHz controls are not available yet.".into());
+        }
+        if self.session.v86_enabled()
+            && (settings.core != Core::V86 || settings.mode != Mode::Fixed)
+        {
+            return Err(
+                "The v86 session uses fixed speed; select another core when launching.".into(),
+            );
+        }
         if !settings.valid() {
             return Err(
                 "CPU speeds must be between 1 and 1000 MHz; select an available core.".into(),

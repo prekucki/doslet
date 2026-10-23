@@ -1123,6 +1123,10 @@ impl PcMachine {
         replace: bool,
     ) -> Result<(), String> {
         let wasm = !matches!(&module, Module::Interpreter(_));
+        #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+        if self.v86_enabled() {
+            return Err("v86 owns this session's CPU and RAM".into());
+        }
         if self.wasm_procedures.is_some() && !replace {
             return Err("WASM procedures already installed".into());
         }
@@ -1403,6 +1407,8 @@ impl PcMachine {
                 })
             }
             Storage::Owned { .. } => None,
+            #[cfg(all(feature = "v86", not(target_arch = "wasm32")))]
+            Storage::V86(_) => None,
         };
         if let Some(storage) = owned {
             self.bus.ram.replace_storage(storage);

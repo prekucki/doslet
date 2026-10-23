@@ -1,0 +1,20 @@
+[package]
+name = "doslet-v86-module"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "BSD-2-Clause"
+
+[lib]
+crate-type = ["cdylib"]
+path = "rust/lib.rs"
+
+[features]
+default = []
+profiler = []
+
+[profile.release]
+lto = true
+opt-level = 3
+panic = "abort"
+overflow-checks = false

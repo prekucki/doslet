@@ -100,6 +100,75 @@ impl Default for FullscreenStyle {
     }
 }
 
+/// How often the UI presents a new guest picture. Only presentation follows
+/// it; guest timing, input and audio do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameRate {
+    /// The guest's vertical refresh, e.g. about 70 Hz in mode 13h.
+    Guest,
+    /// At most this many pictures per second.
+    Limit(u16),
+}
+
+impl Default for FrameRate {
+    fn default() -> Self {
+        Self::Limit(60)
+    }
+}
+
+impl FrameRate {
+    pub const ALL: &[Self] = &[
+        Self::Guest,
+        Self::Limit(30),
+        Self::Limit(50),
+        Self::Limit(60),
+        Self::Limit(75),
+        Self::Limit(100),
+        Self::Limit(120),
+        Self::Limit(144),
+    ];
+
+    /// Time between presented pictures. Without a known guest refresh the
+    /// guest setting falls back to 60 Hz.
+    pub fn interval(self, guest_millihertz: u32) -> std::time::Duration {
+        let millihertz = match self {
+            Self::Guest if guest_millihertz != 0 => guest_millihertz,
+            Self::Guest => 60_000,
+            Self::Limit(fps) => u32::from(fps) * 1000,
+        }
+        .clamp(10_000, 240_000);
+        std::time::Duration::from_nanos(1_000_000_000_000 / u64::from(millihertz))
+    }
+
+    /// Compact form shared with the emulation thread and the browser worker;
+    /// 0 is the guest refresh.
+    pub fn code(self) -> u16 {
+        match self {
+            Self::Guest => 0,
+            Self::Limit(fps) => fps,
+        }
+    }
+
+    // The browser worker reads the code in JavaScript.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn from_code(code: u16) -> Self {
+        if code == 0 {
+            Self::Guest
+        } else {
+            Self::Limit(code)
+        }
+    }
+}
+
+impl std::fmt::Display for FrameRate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Guest => f.write_str("Guest refresh"),
+            Self::Limit(fps) => write!(f, "{fps} fps"),
+        }
+    }
+}
+
 /// Maps a horizontal position on the stretched display (0..1) to the source
 /// image (0..1). The display position is `0.5 + 0.75 d + d^3` for source offset
 /// `d` from the centre, so the centre keeps 4:3 proportions (slope 0.75 of a
@@ -179,6 +248,7 @@ pub struct DisplaySizing {
     /// No frames are presented while a native full screen is about to end.
     frozen: bool,
     pub filter: DisplayFilter,
+    pub frame_rate: FrameRate,
     frames: FrameMeter,
     viewport: Size,
     scale_factor: f32,
@@ -200,6 +270,7 @@ impl Default for DisplaySizing {
             leaving: false,
             frozen: false,
             filter: DisplayFilter::default(),
+            frame_rate: FrameRate::default(),
             frames: FrameMeter::default(),
             viewport: Size::ZERO,
             scale_factor: 1.0,
@@ -229,6 +300,7 @@ pub enum SizingMessage {
     /// The window had time to settle after leaving full screen.
     FullscreenSettled,
     Filter(DisplayFilter),
+    FrameRate(FrameRate),
     Viewport(Size),
     ScaleFactor(f32),
     Uploaded(u64, Result<Allocation, Error>),
@@ -435,6 +507,7 @@ impl DisplaySizing {
                 self.uploads.retry();
                 self.filter = filter;
             }
+            SizingMessage::FrameRate(rate) => self.frame_rate = rate,
             SizingMessage::Viewport(size) => {
                 self.viewport = size;
                 task = query_scale_factor();
@@ -681,6 +754,35 @@ mod tests {
         assert!(!sizing.fullscreen && !sizing.leaving_fullscreen());
         let _ = sizing.update(SizingMessage::FreezeFrames, &frame);
         assert!(!sizing.frames_frozen());
+    }
+
+    #[test]
+    fn frame_rate_intervals_follow_the_guest_or_the_limit() {
+        use std::time::Duration;
+        assert_eq!(
+            FrameRate::default().interval(70_086),
+            Duration::from_nanos(16_666_666)
+        );
+        assert_eq!(
+            FrameRate::Limit(30).interval(0),
+            Duration::from_nanos(33_333_333)
+        );
+        assert_eq!(
+            FrameRate::Guest.interval(70_086),
+            Duration::from_nanos(14_268_184)
+        );
+        // An unknown guest refresh behaves like 60 Hz; extremes are bounded.
+        assert_eq!(
+            FrameRate::Guest.interval(0),
+            FrameRate::Limit(60).interval(0)
+        );
+        assert_eq!(
+            FrameRate::Limit(1000).interval(0),
+            FrameRate::Limit(240).interval(0)
+        );
+        for rate in FrameRate::ALL {
+            assert_eq!(FrameRate::from_code(rate.code()), *rate);
+        }
     }
 
     #[test]

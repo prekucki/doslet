@@ -12,9 +12,11 @@ profiling = ["doslet-runtime/profiling"]
 wasm-procedures = ["doslet-runtime/wasm-procedures", "dep:zip"]
 wasm-procedure-diagnostics = ["wasm-procedures", "doslet-runtime/wasm-procedure-diagnostics"]
 wasm-core-test = ["dep:doslet-x86-wasm", "dep:zip"]
+v86-test = ["doslet-runtime/v86", "dep:zip"]
 wasm-aot-test = ["wasm-core-test", "dep:doslet-wasm-aot", "dep:doslet-wasm-game-probe"]
 wasm-static-test = ["wasm-aot-test", "dep:doslet-aot", "dep:doslet-static-game-probe"]
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 doslet-config.workspace = true
 doslet-pcm.workspace = true
@@ -72,6 +74,14 @@ required-features = ["save-state"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "v86_profile"
+required-features = ["v86-test", "save-state"]
+
+[[example]]
+name = "v86_prince"
+required-features = ["v86-test"]
 
 [[example]]
 name = "check_static_memory"

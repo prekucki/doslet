@@ -295,6 +295,7 @@ impl Session {
                 w.active_service,
                 "RuntimeSession.active_service",
             )?,
+            v86_input_poll: super::v86_input_poll::InputPoll::default(),
             base_identity: doslet_state::narrow(
                 w.base_identity,
                 "RuntimeSession.base_identity length",

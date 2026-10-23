@@ -77,6 +77,9 @@ impl Session {
     /// A persistent-store lease belongs to the live owner, not the replay.
     /// Replays retain private RAM overlays but never publish their writes.
     pub fn check_working_state(&self) -> Result<(), InvalidState> {
+        if self.v86_enabled() {
+            return Err(InvalidState("saving v86 CPU state is not implemented"));
+        }
         if self.fault.is_some() || self.status == SessionStatus::Faulted {
             return Err(InvalidState("cannot save a faulted session"));
         }

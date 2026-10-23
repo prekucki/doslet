@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["apps/common", "vendor/iced_runtime", "vendor/iced_winit", "vendor/nuked-opl3"]
+exclude = ["apps/common", "vendor/iced_runtime", "vendor/iced_winit", "vendor/nuked-opl3", "vendor/v86", "tools/v86-build"]
 members = [
     "crates/foundation/*",
     "crates/cpu/*",

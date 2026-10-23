@@ -1,3 +1,4 @@
+use clap::{Args, Parser, Subcommand};
 use doslet_executable::MzImage;
 use doslet_runtime::{Session, SessionStatus};
 use doslet_x86::{Gpr16, Gpr32};
@@ -16,6 +17,81 @@ use std::{
     path::PathBuf,
     time::Instant,
 };
+
+#[derive(Parser)]
+#[command(
+    about = "Run Doslet without a graphical frontend",
+    arg_required_else_help = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Demo(RunOptions),
+    RunCom {
+        path: PathBuf,
+        #[command(flatten)]
+        options: RunOptions,
+    },
+    RunMz {
+        path: PathBuf,
+        #[command(flatten)]
+        options: RunOptions,
+    },
+    RunStub {
+        path: PathBuf,
+        #[command(flatten)]
+        options: RunOptions,
+    },
+    Inspect {
+        #[arg(default_value = "PRINCE/PRINCE.EXE")]
+        path: PathBuf,
+    },
+    Bench(RunOptions),
+}
+
+#[derive(Args)]
+struct RunOptions {
+    #[arg(long)]
+    steps: Option<u64>,
+    #[arg(long)]
+    frame: Option<PathBuf>,
+    #[arg(long)]
+    midi_log: Option<PathBuf>,
+    #[arg(long)]
+    midi_wave: Option<PathBuf>,
+    #[arg(long)]
+    gdb: Option<std::net::SocketAddr>,
+    #[arg(long)]
+    gdb_after: Option<u64>,
+    #[arg(long)]
+    cdrom: Option<PathBuf>,
+    #[arg(long)]
+    key_at: Vec<String>,
+    #[arg(long)]
+    no_vga_waits: bool,
+    #[arg(long)]
+    no_idle_loops: bool,
+    #[arg(long)]
+    no_decode_cache: bool,
+    #[arg(long)]
+    no_dynamic_core: bool,
+    #[arg(long)]
+    core_profile: Option<PathBuf>,
+    #[arg(long)]
+    profile_cpu: bool,
+    #[arg(long)]
+    trace: Option<u64>,
+    #[arg(long)]
+    trace_tail: bool,
+    #[arg(long)]
+    peek: Vec<String>,
+    #[arg(long)]
+    find_ascii: Vec<String>,
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -134,17 +210,13 @@ impl RunOutput {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let mut args = std::env::args().skip(1);
-    let command = args.next().unwrap_or_else(|| "help".into());
-    if command == "inspect" {
-        let path = args.next().unwrap_or_else(|| "PRINCE/PRINCE.EXE".into());
-        if args.next().is_some() {
-            return Err("inspect accepts one executable path".into());
-        }
-        let bytes = fs::read(&path)?;
+    let cli = Cli::parse();
+    if let Command::Inspect { path } = &cli.command {
+        let bytes = fs::read(path)?;
         let image = MzImage::parse(&bytes)?;
         println!(
-            "Executable: {path}\nFile bytes: {}\nMZ load module: {} bytes\nMZ relocations: {}\nMZ entry: {:04X}:{:04X}",
+            "Executable: {}\nFile bytes: {}\nMZ load module: {} bytes\nMZ relocations: {}\nMZ entry: {:04X}:{:04X}",
+            path.display(),
             bytes.len(),
             image.load_module.len(),
             image.header.relocation_count,
@@ -167,143 +239,91 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         return Ok(());
     }
-    if !matches!(
-        command.as_str(),
-        "demo" | "run-com" | "run-mz" | "run-stub" | "bench"
-    ) {
-        println!(
-            "Doslet headless\n\n  demo [--steps N] [--frame PATH.ppm]\n  run-com PATH [--steps N] [--frame PATH.ppm]\n  run-mz PATH [--steps N] [--frame PATH.ppm]\n  run-stub PATH [--steps N] [--frame PATH.ppm] [--midi-log PATH] [--midi-wave PATH.wav] (experimental game startup)\n  inspect [PATH]  (default: PRINCE/PRINCE.EXE)\n  bench [--steps N]\n\nRunner diagnostics: --trace N, --trace-tail, --peek HEXADDRESS:DECIMALLENGTH (1..128 bytes), --find-ascii PATTERN (1..128 bytes, up to 16 extended-RAM matches), --profile-cpu (requires Cargo feature profiling), --no-vga-waits (disable VGA wait recognition/batching), --no-idle-loops (execute proven idle loops instead of skipping them), --no-decode-cache (use the reference interpreter).\nDemo runs an original COM program. PRINCE intro graphics and guest MIDI are observed; interactive sound is confirmed separately in the UI."
-        );
-        println!(
-            "Debugger: --gdb IP:PORT [--gdb-after STEP] stops for GDB; --cdrom ISO mounts D:; --key-at STEP:SCAN_HEX:ASCII_HEX injects a BIOS key. GDB writes affect guest RAM only."
-        );
-        println!(
-            "Native core: --no-dynamic-core (cached interpreter), --core-profile FILE (load/save observed blocks outside the game directory)."
-        );
-        if command != "help" && command != "--help" && command != "-h" {
-            return Err(format!("unknown command: {command}").into());
-        }
-        return Ok(());
-    }
-    let mut session = match command.as_str() {
-        "run-com" => {
-            let path = args.next().ok_or("run-com requires a file path")?;
+    let (mut session, options, default_budget, bench) = match cli.command {
+        Command::RunCom { path, options } => {
             let bytes = fs::read(path)?;
             if bytes.starts_with(b"MZ") {
                 return Err(
                     "run-com accepts COM only; use run-mz for standalone real-mode MZ, or inspect for LE/LX".into(),
                 );
             }
-            Session::new(&bytes)?
+            (Session::new(&bytes)?, options, 200_000, false)
         }
-        "run-mz" => {
-            let path = args.next().ok_or("run-mz requires a file path")?;
-            Session::from_mz(&fs::read(path)?)?
+        Command::RunMz { path, options } => {
+            (Session::from_mz(&fs::read(path)?)?, options, 200_000, false)
         }
-        "run-stub" => {
-            let path = args.next().ok_or("run-stub requires a file path")?;
-            native_input::load_game(std::path::Path::new(&path))?
+        Command::RunStub { path, options } => {
+            (native_input::load_game(&path)?, options, 200_000, false)
         }
-        "bench" => Session::new(&[0x40, 0xEB, 0xFD])?,
-        _ => Session::demo(),
+        Command::Bench(options) => (Session::new(&[0x40, 0xEB, 0xFD])?, options, 5_000_000, true),
+        Command::Demo(options) => (Session::demo(), options, 200_000, false),
+        Command::Inspect { .. } => unreachable!(),
     };
-    let mut budget: u64 = if command == "bench" {
-        5_000_000
-    } else {
-        200_000
-    };
-    let mut frame_path: Option<PathBuf> = None;
-    let mut core_profile: Option<PathBuf> = None;
-    let mut midi_path: Option<PathBuf> = None;
-    let mut wave_path: Option<PathBuf> = None;
-    let mut gdb_address = None;
-    let mut gdb_after = 0;
+    let budget = options.steps.unwrap_or(default_budget);
+    let frame_path = options.frame;
+    if bench && frame_path.is_some() {
+        return Err("--frame is unavailable for bench".into());
+    }
+    let core_profile = options.core_profile;
+    let midi_path = options.midi_log;
+    let wave_path = options.midi_wave;
+    let mut gdb_address = options.gdb;
+    let gdb_after = options.gdb_after.unwrap_or(0);
     let mut keys = std::collections::VecDeque::new();
-    let mut trace_remaining: u64 = 0;
-    let mut trace_tail = false;
+    let mut trace_remaining = options.trace.unwrap_or(0);
+    let trace_tail = options.trace_tail;
     #[cfg(feature = "profiling")]
-    let mut profile = None;
+    let mut profile = options.profile_cpu.then(profile::Profile::new);
+    #[cfg(not(feature = "profiling"))]
+    if options.profile_cpu {
+        return Err("--profile-cpu requires cargo --features profiling".into());
+    }
     let mut tail: [Option<StepSnapshot>; 64] = [None; 64];
     let mut tail_count = 0usize;
     let mut peeks: Vec<(usize, usize)> = Vec::new();
     let mut finds: Vec<Vec<u8>> = Vec::new();
-    while let Some(option) = args.next() {
-        match option.as_str() {
-            "--gdb" => {
-                gdb_address = Some(
-                    args.next()
-                        .ok_or("missing GDB IP:PORT")?
-                        .parse::<std::net::SocketAddr>()?,
-                )
-            }
-            "--gdb-after" => {
-                gdb_after = args
-                    .next()
-                    .ok_or("missing GDB start step")?
-                    .parse::<u64>()?
-            }
-            "--cdrom" => {
-                session = session
-                    .with_cdrom_image(b'D', fs::read(args.next().ok_or("missing ISO path")?)?)?
-            }
-            "--key-at" => {
-                let value = args.next().ok_or("missing STEP:SCAN_HEX:ASCII_HEX")?;
-                let fields: Vec<_> = value.split(':').collect();
-                if fields.len() != 3 {
-                    return Err("--key-at requires STEP:SCAN_HEX:ASCII_HEX".into());
-                }
-                keys.push_back((
-                    fields[0].parse::<u64>()?,
-                    u8::from_str_radix(fields[1], 16)?,
-                    u8::from_str_radix(fields[2], 16)?,
-                ));
-            }
-            "--no-vga-waits" => session.set_vga_wait_acceleration(false),
-            "--no-idle-loops" => session.set_idle_loops(false),
-            "--no-decode-cache" => session.set_decode_cache(false),
-            "--no-dynamic-core" => session.set_dynamic_core(false),
-            "--core-profile" => {
-                core_profile = Some(args.next().ok_or("missing core profile path")?.into())
-            }
-            "--profile-cpu" => {
-                #[cfg(feature = "profiling")]
-                {
-                    profile = Some(profile::Profile::new());
-                }
-                #[cfg(not(feature = "profiling"))]
-                {
-                    return Err("--profile-cpu requires cargo --features profiling".into());
-                }
-            }
-            "--steps" => budget = args.next().ok_or("missing step budget")?.parse()?,
-            "--trace" => trace_remaining = args.next().ok_or("missing trace limit")?.parse()?,
-            "--trace-tail" => trace_tail = true,
-            "--peek" => {
-                let value = args.next().ok_or("missing ADDRESS:LENGTH for --peek")?;
-                let (address, length) = value
-                    .split_once(':')
-                    .ok_or("--peek requires hexadecimal ADDRESS:decimal LENGTH")?;
-                let address = usize::from_str_radix(address.trim_start_matches("0x"), 16)?;
-                let length: usize = length.parse()?;
-                if !(1..=128).contains(&length) {
-                    return Err("--peek length must be 1..128".into());
-                }
-                peeks.push((address, length));
-            }
-            "--find-ascii" => {
-                let pattern = args.next().ok_or("missing ASCII pattern")?;
-                if pattern.is_empty() || pattern.len() > 128 || !pattern.is_ascii() {
-                    return Err("--find-ascii requires 1..128 ASCII bytes".into());
-                }
-                finds.push(pattern.into_bytes());
-            }
-            "--midi-log" => midi_path = Some(args.next().ok_or("missing MIDI log path")?.into()),
-            "--midi-wave" => wave_path = Some(args.next().ok_or("missing MIDI WAVE path")?.into()),
-            "--frame" if command != "bench" => {
-                frame_path = Some(args.next().ok_or("missing frame path")?.into())
-            }
-            _ => return Err(format!("unknown option: {option}").into()),
+    if let Some(path) = options.cdrom {
+        session = session.with_cdrom_image(b'D', fs::read(path)?)?;
+    }
+    for value in options.key_at {
+        let fields: Vec<_> = value.split(':').collect();
+        if fields.len() != 3 {
+            return Err("--key-at requires STEP:SCAN_HEX:ASCII_HEX".into());
         }
+        keys.push_back((
+            fields[0].parse()?,
+            u8::from_str_radix(fields[1], 16)?,
+            u8::from_str_radix(fields[2], 16)?,
+        ));
+    }
+    if options.no_vga_waits {
+        session.set_vga_wait_acceleration(false);
+    }
+    if options.no_idle_loops {
+        session.set_idle_loops(false);
+    }
+    if options.no_decode_cache {
+        session.set_decode_cache(false);
+    }
+    if options.no_dynamic_core {
+        session.set_dynamic_core(false);
+    }
+    for value in options.peek {
+        let (address, length) = value
+            .split_once(':')
+            .ok_or("--peek requires hexadecimal ADDRESS:decimal LENGTH")?;
+        let address = usize::from_str_radix(address.trim_start_matches("0x"), 16)?;
+        let length: usize = length.parse()?;
+        if !(1..=128).contains(&length) {
+            return Err("--peek length must be 1..128".into());
+        }
+        peeks.push((address, length));
+    }
+    for pattern in options.find_ascii {
+        if pattern.is_empty() || pattern.len() > 128 || !pattern.is_ascii() {
+            return Err("--find-ascii requires 1..128 ASCII bytes".into());
+        }
+        finds.push(pattern.into_bytes());
     }
     if gdb_after != 0 && gdb_address.is_none() {
         return Err("--gdb-after requires --gdb IP:PORT".into());
@@ -476,7 +496,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         session.status(),
         session.steps()
     );
-    if command != "bench" {
+    if !bench {
         println!(
             "Emulated time: {} ns (functional clock)",
             session.emulated_nanos()
@@ -514,7 +534,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if session.loaded_overlays() != 0 {
         println!("Loaded MZ overlays: {}", session.loaded_overlays());
     }
-    if command == "bench" {
+    if bench {
         println!(
             "Elapsed: {:.3}s\nExecution steps/s: {:.0} (host throughput, not emulated MHz)",
             elapsed.as_secs_f64(),
@@ -575,7 +595,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         return Err(error.into());
     }
-    if command != "bench" && session.status() == SessionStatus::Running {
+    if !bench && session.status() == SessionStatus::Running {
         println!(
             "Budget registers: {:?}\nControl registers: {:?}",
             session.registers(),

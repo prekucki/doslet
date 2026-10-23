@@ -1,6 +1,16 @@
 use super::*;
 use doslet_pulse::connect;
 
+fn connect_probe() -> Client {
+    let client = connect().unwrap();
+    let sink = wait(client.sink_info_by_name(c"doslet-audio-probe-output".into()))
+        .expect("create the dedicated null sink before running loopback tests");
+    assert_eq!(sink.sample_spec.channels, 2);
+    wait(client.source_info_by_name(c"doslet-audio-probe-output.monitor".into()))
+        .expect("the dedicated null sink must have its own monitor");
+    client
+}
+
 fn assert_dormant(writer: &Writer) {
     let queue = writer.queue.lock().unwrap();
     assert!(queue.frames.is_empty());
@@ -13,6 +23,67 @@ fn assert_dormant(writer: &Writer) {
         Launch::Pending { .. }
     ));
     assert!(control.thread.get().is_none());
+}
+
+#[test]
+fn host_clock_transport_serves_small_chunks_without_waiting_for_playback_reserve() {
+    let writer = Writer::mock(RATE);
+    writer.set_host_clock_reserve(true);
+    let mut source = Source {
+        queue: writer.queue.clone(),
+        generation: 0,
+        rate: RATE,
+    };
+    let mut context = Context::from_waker(std::task::Waker::noop());
+    let mut bytes = [0; 48 * 8];
+    for _ in 0..3 {
+        writer.push(&[[0.25, -0.5]; 48]).unwrap(); // One ms, below the 80 ms reserve.
+        assert_eq!(
+            Pin::new(&mut source).poll_read(&mut context, &mut bytes),
+            Poll::Ready(bytes.len())
+        );
+        for frame in bytes.as_chunks::<8>().0 {
+            assert_eq!(f32::from_le_bytes(frame[..4].try_into().unwrap()), 0.25);
+            assert_eq!(f32::from_le_bytes(frame[4..].try_into().unwrap()), -0.5);
+        }
+        assert_eq!(
+            Pin::new(&mut source).poll_read(&mut context, &mut bytes),
+            Poll::Pending
+        );
+    }
+    assert_eq!(writer.stats().0, 144);
+    assert_eq!(writer.stats().1, 0);
+}
+
+#[test]
+fn pulse_reserve_is_requested_at_the_server_for_all_cpu_backends() {
+    for rate in [11025, 22050, 48000, 96000] {
+        let params = stream_params(rate, c"test").unwrap();
+        assert_eq!(params.buffer_attr.target_length, rate * 80 / 1000 * 8);
+        assert_eq!(
+            params.buffer_attr.pre_buffering,
+            params.buffer_attr.target_length
+        );
+        assert!(params.buffer_attr.max_length > params.buffer_attr.target_length);
+        assert!(!params.flags.adjust_latency);
+    }
+}
+
+#[test]
+fn unavailable_underrun_reports_preserve_the_last_valid_interval() {
+    let mut previous = 0;
+    for (bytes, delta, last) in [
+        (u64::MAX, 0, 0),
+        (80, 10, 10),
+        (160, 10, 20),
+        (u64::MAX - 8, 0, 20),
+        (240, 10, 30),
+        (0, 0, 0),
+        (80, 10, 10),
+    ] {
+        assert_eq!(underrun_delta(&mut previous, bytes), delta);
+        assert_eq!(previous, last);
+    }
 }
 
 #[test]
@@ -78,7 +149,7 @@ fn native_rate_changes_preserve_segment_duration_and_reset_interrupts_drain() {
         std::env::var("PULSE_SINK").unwrap(),
         "doslet-audio-probe-output"
     );
-    let client = connect().unwrap();
+    let client = connect_probe();
     let captured = Arc::new(Mutex::new(Vec::<f32>::with_capacity(48000 * 4)));
     let capture = captured.clone();
     let record = wait(client.create_record_stream(
@@ -187,7 +258,7 @@ fn system_mixer_loopback_combines_both_sources_and_resets_them() {
         std::env::var("PULSE_SINK").unwrap(),
         "doslet-audio-probe-output"
     );
-    let client = connect().unwrap();
+    let client = connect_probe();
     let captured = Arc::new(Mutex::new(Vec::<[f32; 2]>::with_capacity(48000 * 4)));
     let capture = captured.clone();
     let record = wait(client.create_record_stream(
@@ -350,7 +421,7 @@ fn pulse_loopback_pause_and_reset_discard_old_server_audio() {
     use doslet_pulse::protocol as p;
     let sink = std::env::var("PULSE_SINK").expect("PULSE_SINK must select the test sink");
     assert_eq!(sink, "doslet-audio-probe-output");
-    let client = connect().unwrap();
+    let client = connect_probe();
     let info =
         wait(client.sink_info_by_name(std::ffi::CString::new(sink.clone()).unwrap())).unwrap();
     assert_eq!(info.sample_spec.channels, 2);
