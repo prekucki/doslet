@@ -52,28 +52,30 @@ Browser preparation runs through the emulation Worker and host adapters.
 | Page | Available settings |
 | --- | --- |
 | Machine | Current i386 interpreter, configurable nominal CPU clock (33 MHz by default), 4/8/16/32 MiB RAM, optional x87 subset, VGA/VBE with 512 KiB VRAM |
-| Sound | Optional SB16 at 220h, IRQ 5/7, 8-bit DMA 0/1/3, 16-bit DMA 5/6/7; independent MPU-401 UART at 330h |
+| Sound | Off, AdLib (OPL2), Sound Blaster (8-bit DMA and OPL2), or SB16 (8/16-bit DMA and OPL3); independent MPU-401 UART at 330h |
 | Input | BIOS compatibility or AT keyboard delivery; optional ISA gameport at 201h; mouse capture; controller identity/index, axes, buttons and dead zone |
 | Resources | Resolved I/O ownership and sound resources; invalid assignments identify their configuration field |
 | Output | Host audio, MIDI renderer/port and game/host MIDI dialects, independently of installed guest sound hardware |
 
-The DOS environment supplied to named MZ/extended executable launches includes
-`BLASTER` when SB16 is enabled, for example `A220 I7 D1 H5 T6 P330`.
-IRQ and DMA values follow the machine configuration; `P330` is included only
-when MPU-401 is enabled. Disabling host audio output does not hide guest hardware.
+Choose a game card with `[sound] card = "none"`, `"adlib"`, `"sb"` or `"sb16"`.
+The old `sb16 = true|false` field remains accepted. Named MZ/extended programs
+receive `BLASTER` for Sound Blaster or SB16, for example `A220 I7 D1 H5 T6 P330`
+for SB16. IRQ and DMA follow the machine configuration; `P330` appears for SB16
+only when MPU-401 is enabled. Disabling host audio does not hide guest hardware.
 
 `output.midi_output` accepts `rust`, `apple` (native macOS system GM synth),
 `moont` (requires CM-32L ROMs) or a MIDI port name/index. Apple output uses the
 system sound bank and mixes with Sound Blaster PCM; it always receives GM.
 
-The **Audio → Hardware** page reports whether the guest has accessed SB16/OPL3
-and MPU-401. Changes that affect `BLASTER` require **Apply & restart**: enabling
-or disabling SB16, changing its IRQ/DMA resources while enabled, or toggling
-MPU-401 while SB16 is enabled. A guest may already have read `BLASTER` before
+The **Audio → Hardware** page reports whether the guest has accessed its sound
+card and MPU-401. Changes that affect `BLASTER` require **Apply & restart**:
+changing the Sound Blaster model or its IRQ/DMA resources, or toggling MPU-401
+while SB16 is enabled. A guest may already have read `BLASTER` before
 its first audio port access. Other audio changes can use **Apply** when the
 affected device has never been accessed, preserving execution, RAM, guest time
 and saves. After first access, including a probe, use **Apply & restart**.
-SB16 and OPL3 share their enable switch.
+AdLib has OPL2 without a DSP; Sound Blaster has OPL2 and 8-bit DMA; SB16 has
+OPL3 and 8/16-bit DMA.
 This history survives saved states. Older states lack that history and require
 a restart for hardware changes.
 

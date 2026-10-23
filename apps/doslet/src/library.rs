@@ -1212,6 +1212,31 @@ mod tests {
     }
 
     #[test]
+    fn sound_card_choice_replaces_legacy_sb16_and_survives_reload() {
+        let dir = Directory::new();
+        let mut library = library_with(
+            &dir,
+            "version=2\nname='Game'\n[game]\nexecutable='GAME.EXE'\n[sound]\nsb16=false\n",
+        );
+        config(&mut library, GameEdit::Open);
+        config(&mut library, GameEdit::Set(Setting::SoundCard, "sb".into()));
+        let window = library.config.as_ref().unwrap();
+        assert_eq!(
+            window.effective.hardware.sound(),
+            doslet_config::SoundCard::Sb
+        );
+        assert!(window.get(Setting::Sb16).is_none());
+        config(&mut library, GameEdit::Save);
+        let text = std::fs::read_to_string(dir.0.join("game.toml")).unwrap();
+        assert!(text.contains("card = \"sb\""), "{text}");
+        assert!(!text.contains("sb16="), "{text}");
+        assert_eq!(
+            library.games[0].spec.hardware.sound(),
+            doslet_config::SoundCard::Sb
+        );
+    }
+
+    #[test]
     fn defaults_follow_global_settings_and_presets() {
         let dir = Directory::new();
         let mut library = library_with(

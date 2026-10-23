@@ -39,6 +39,7 @@ pub enum Setting {
     X87,
     Dpmi,
     Sb16,
+    SoundCard,
     SbIrq,
     SbDma8,
     SbDma16,
@@ -63,7 +64,7 @@ pub enum Setting {
     Button2,
 }
 impl Setting {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Preset,
         Self::CpuMhz,
         Self::CpuMode,
@@ -71,6 +72,7 @@ impl Setting {
         Self::X87,
         Self::Dpmi,
         Self::Sb16,
+        Self::SoundCard,
         Self::SbIrq,
         Self::SbDma8,
         Self::SbDma16,
@@ -95,12 +97,13 @@ impl Setting {
         Self::Button2,
     ];
     /// Settings a hardware preset supplies.
-    const PRESET: [Self; 6] = [
+    const PRESET: [Self; 7] = [
         Self::CpuMhz,
         Self::CpuMode,
         Self::Memory,
         Self::X87,
         Self::Sb16,
+        Self::SoundCard,
         Self::Mpu401,
     ];
     /// Table (empty for the top level) and key.
@@ -113,6 +116,7 @@ impl Setting {
             Self::X87 => ("machine", "x87"),
             Self::Dpmi => ("machine", "dpmi"),
             Self::Sb16 => ("sound", "sb16"),
+            Self::SoundCard => ("sound", "card"),
             Self::SbIrq => ("sound", "irq"),
             Self::SbDma8 => ("sound", "dma8"),
             Self::SbDma16 => ("sound", "dma16"),
@@ -142,6 +146,7 @@ impl Setting {
         match self {
             Self::CpuMhz => Some(("machine", "clock_hz")),
             Self::MouseMode => Some(("input", "capture")),
+            Self::SoundCard => Some(("sound", "sb16")),
             _ => None,
         }
     }

@@ -114,7 +114,7 @@ pub struct Snapshot {
     pub notice: Option<String>,
     pub midi_choices: Vec<String>,
     pub midi_choice: String,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub audio_mixer: crate::audio::Mixer,
     pub midi_mode: Mode,
     pub midi_output_mode: Mode,

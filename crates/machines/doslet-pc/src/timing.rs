@@ -196,16 +196,17 @@ impl PcMachine {
             {
                 slice = slice.min(deadline.saturating_sub(self.time().as_nanos()).max(1));
             }
-            if self.hardware_config().sb16 {
-                if self.bus.dsp.playback_format().is_some() {
-                    slice = slice.min(
-                        (1_000_000_000 - self.timing.pcm_fraction)
-                            .div_ceil(u64::from(self.bus.dsp.sample_rate())),
-                    );
-                }
-                if let Some(next) = self.bus.opl.next_sample_nanos() {
-                    slice = slice.min(next);
-                }
+            let sound = self.hardware_config().sound();
+            if sound.has_dsp() && self.bus.dsp.playback_format().is_some() {
+                slice = slice.min(
+                    (1_000_000_000 - self.timing.pcm_fraction)
+                        .div_ceil(u64::from(self.bus.dsp.sample_rate())),
+                );
+            }
+            if sound.has_fm()
+                && let Some(next) = self.bus.opl.next_sample_nanos()
+            {
+                slice = slice.min(next);
             }
             let slice = slice.max(1).min(remaining);
             self.advance_hardware_nanos(slice)?;
@@ -291,7 +292,7 @@ impl PcMachine {
                 "keyboard event",
             );
         }
-        if self.hardware_config().sb16
+        if self.hardware_config().sound().has_dsp()
             && let Some(frames) = self.bus.dsp.frames_until_block_irq()
         {
             include(
@@ -351,12 +352,13 @@ impl Timing {
         {
             nanos = nanos.min(deadline.saturating_sub(self.time.as_nanos()));
         }
-        if bus.hardware_config().sb16 && bus.dsp.playback_format().is_some() {
+        let sound = bus.hardware_config().sound();
+        if sound.has_dsp() && bus.dsp.playback_format().is_some() {
             let deadline =
                 (1_000_000_000 - self.pcm_fraction).div_ceil(u64::from(bus.dsp.sample_rate()));
             nanos = nanos.min(deadline);
         }
-        if bus.hardware_config().sb16
+        if sound.has_fm()
             && let Some(deadline) = bus.opl.next_sample_nanos()
         {
             nanos = nanos.min(deadline);
@@ -469,7 +471,7 @@ impl PcMachine {
         self.advance_fm_audio(nanos)
     }
     fn advance_digital_audio(&mut self, nanos: u64) -> Result<(), MachineError> {
-        if !self.hardware_config().sb16 {
+        if !self.hardware_config().sound().has_dsp() {
             self.timing.pcm_fraction = 0;
             return Ok(());
         }
@@ -551,7 +553,7 @@ impl PcMachine {
         Ok(())
     }
     fn advance_fm_audio(&mut self, nanos: u64) -> Result<(), MachineError> {
-        if !self.hardware_config().sb16 {
+        if !self.hardware_config().sound().has_fm() {
             return Ok(());
         }
         let bus = &mut self.bus;

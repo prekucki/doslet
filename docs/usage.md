@@ -76,8 +76,8 @@ release year and genre:
   - **Machine** — hardware preset (choosing one returns the clock, speed mode,
     memory, x87 and sound cards to the preset), CPU clock and speed mode, x87,
     RAM and the DPMI host.
-  - **Sound & MIDI** — audio output, SB16 with IRQ/DMA, MPU-401, game and
-    device MIDI formats, and the MIDI output.
+  - **Sound & MIDI** — audio output, sound card with IRQ/DMA where applicable,
+    MPU-401, game and device MIDI formats, and the MIDI output.
   - **Mouse & input** — mouse capture (automatic, always, never), hiding the
     system cursor, keyboard delivery, and the gameport with controller, dead
     zone, axes and buttons.
@@ -245,9 +245,10 @@ with `--features dynamic-core` and launch with `--dynamic-core`.
 
 By default, MIDI from the guest is rendered by a basic procedural synthesizer
 and mixed with Sound Blaster PCM and AdLib/OPL3 FM on the default audio device.
-FM is included when **SB16** is enabled in Settings. Select AdLib or Sound Blaster
-music in the game's own setup to use FM; the MIDI output selector does not route
-FM through an external MIDI device. No OPL instrument ROM is required.
+FM is included when **AdLib**, **Sound Blaster** or **SB16** is selected. Select
+AdLib or Sound Blaster music in the game's own setup to use FM; the MIDI output
+selector does not route FM through an external MIDI device. No OPL instrument
+ROM is required.
 The bottom bar shows a 16-band spectrum of the local audio output, from bass
 on the left to treble on the right. It fades during silence and clears on pause
 or mute. Audio produced by an external MIDI synthesizer is not measured.
@@ -289,10 +290,10 @@ over its lifetime. After exhaustion, `auto` pauses the game and attempts CPAL;
 resume after the notice confirms the switch. Explicit `pulse` reports failure
 without switching backends. `cpal` selects the previous path directly.
 
-Choose **Audio → Playback → Mixer** on Linux, or pass `--audio-mixer application|system`.
-**Internal** is the default and combines sources inside Doslet. **System
+Choose **Audio → Playback → Mixer** on Linux or macOS, or pass `--audio-mixer application|system`.
+**Internal** combines sources inside Doslet. **System
 (experimental)** sends three independent stereo float streams to the
-PulseAudio-compatible server: **Sound Blaster PCM** at the guest DSP rate,
+PulseAudio-compatible server on Linux or CoreAudio `DefaultOutput` units on macOS: **Sound Blaster PCM** at the guest DSP rate,
 **AdLib / OPL FM** at 48 kHz, and **MIDI synthesizer** at 48 kHz.
 PCM is decoded and converted to float without application-side resampling.
 The existing FM and MIDI engines retain their internal rate conversion.
@@ -413,12 +414,12 @@ interfaces; disabled interfaces are hidden. MIDI turns green for new notes and
 amber for other traffic. The spectrum measures local output, excluding external
 MIDI sound. Click to open **Audio**:
 
-- **Playback** selects internal or Linux system mixing, local output
+- **Playback** selects internal or system mixing (Linux and macOS), local output
   volume, synthesizer/MIDI port, game format and external receiver format.
   MIDI routing controls appear only when MPU-401 is enabled in the active
   machine. Internal volume applies to local PCM, FM and synthesized MIDI; external MIDI
   devices retain their own volume. CM-32L synthesis follows the selected game
-  format; a GM synth translates MT-32 input to GM. Changing the Linux mixer
+  format; a GM synth translates MT-32 input to GM. Changing the mixer
   pauses the game. Use the toolbar to resume after closing the panel.
 - **Hardware** keeps Revert and Apply in a fixed footer and edits a draft: SB16 with OPL3, MPU-401 MIDI, IRQ and DMA.
   SB16 and OPL3 share their enable switch. Ports are currently fixed (SB16 220h,

@@ -1373,15 +1373,26 @@ fn audio_spectrum(app: &Doslet) -> Element<'_, Message> {
             crate::midi_activity::Lamp::Idle => MUTED,
         }
     };
+    let sound = h.sound();
+    let digital_badge = match sound {
+        doslet_config::SoundCard::Sb16 => "SB16",
+        doslet_config::SoundCard::Sb => "SB",
+        doslet_config::SoundCard::Adlib | doslet_config::SoundCard::None => "",
+    };
+    let fm_badge = match sound {
+        doslet_config::SoundCard::Sb16 => "OPL3",
+        doslet_config::SoundCard::Sb | doslet_config::SoundCard::Adlib => "OPL2",
+        doslet_config::SoundCard::None => "",
+    };
     let badges = row![
-        text(if h.sb16 { "SB16" } else { "" })
+        text(digital_badge)
             .size(10)
             .width(34)
-            .color(if h.sb16 { MUTED } else { EDGE }),
-        text(if h.sb16 { "OPL3" } else { "" })
+            .color(if sound.has_dsp() { MUTED } else { EDGE }),
+        text(fm_badge)
             .size(10)
             .width(34)
-            .color(if h.sb16 { MUTED } else { EDGE }),
+            .color(if sound.has_fm() { MUTED } else { EDGE }),
         text(if h.mpu401 { "MIDI" } else { "" })
             .size(10)
             .width(28)

@@ -37,12 +37,13 @@ native CM-32L engine does, using external Control v1.02 and PCM ROMs.
 
 ## Remaining audio scope
 
-AdLib/Sound Blaster selection writes zero to 0B8Ah before probing OPL at 388h.
-The local `ASOUND.CVL` contains this sequence. 0B8Ah is the Pro Audio Spectrum
-audio-filter register, as documented in the
+AdLib/Sound Blaster selection in `ASOUND.CVL` writes zero to 0B8Ah before
+probing OPL at 388h, then probes the Pro Audio Spectrum interrupt-mask register
+at 0B8Bh when the CT1345 stereo-mixer check at 38Ch/38Dh does not respond.
+0B8Ah and 0B8Bh are Pro Audio Spectrum registers, as documented in the
 [86Box PAS implementation](https://github.com/86Box/86Box/blob/master/src/sound/snd_pas16.c).
-Doslet has no PAS card: this one register reads FFh and ignores writes, without
-aliasing it to OPL or accepting other unknown ports.
+Doslet has no PAS card: these registers read FFh and ignore writes, without
+aliasing them to OPL or accepting other unknown ports.
 
 A 2026-10-16 headless run selected VGA, AdLib/Sound Blaster and keyboard input:
 

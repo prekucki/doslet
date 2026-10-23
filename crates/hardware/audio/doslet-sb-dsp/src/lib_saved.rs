@@ -171,6 +171,10 @@ pub struct SbDspDsp {
     irq8: bool,
     #[prost(bool, tag = "18")]
     irq16: bool,
+    #[prost(uint32, optional, tag = "19")]
+    block_length: Option<u32>,
+    #[prost(bool, optional, tag = "20")]
+    sb2: Option<bool>,
 }
 impl State for Dsp {
     type Wire = SbDspDsp;
@@ -194,14 +198,18 @@ impl State for Dsp {
             left: self.left.as_ref().map(|v| i32::from(*(v))),
             irq8: self.irq8,
             irq16: self.irq16,
+            block_length: (self.block_length != 1).then_some(self.block_length),
+            sb2: (!self.sb16).then_some(true),
         }
     }
     fn load(w: Self::Wire) -> Result<Self, InvalidState> {
+        let block_length = w.block_length.unwrap_or(1);
         let value = Self {
             diagnostics: <Diagnostics as State>::load(doslet_state::required(
                 w.diagnostics,
                 "SbDspDsp.diagnostics",
             )?)?,
+            sb16: !w.sb2.unwrap_or(false),
             reset: w.reset,
             reply: doslet_state::narrow(w.reply, "SbDspDsp.reply length")?,
             reply_len: doslet_state::narrow(w.reply_len, "SbDspDsp.reply_len")?,
@@ -222,6 +230,7 @@ impl State for Dsp {
             speaker: w.speaker,
             sample_rate: w.sample_rate,
             input_rate: doslet_state::narrow(w.input_rate, "SbDspDsp.input_rate")?,
+            block_length,
             dma_parameters: doslet_state::narrow(
                 w.dma_parameters,
                 "SbDspDsp.dma_parameters length",
@@ -248,7 +257,8 @@ impl State for Dsp {
         if !(value.reply_len <= 2
             && value.dma_parameter_len <= 3
             && value.sample_rate != 0
-            && value.sample_rate <= 1_000_000)
+            && value.sample_rate <= 1_000_000
+            && (1..=65536).contains(&value.block_length))
         {
             return Err(InvalidState("SbDspDsp invariants"));
         }

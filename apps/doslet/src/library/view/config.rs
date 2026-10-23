@@ -8,7 +8,7 @@ use super::{
 };
 use crate::library::{ConfigPage, ConfigWindow, Setting};
 use doslet_config::{
-    CpuMode, DpmiHost, HardwarePreset, KeyboardMode, MouseMode, SourceKind, VideoFilter,
+    CpuMode, DpmiHost, HardwarePreset, KeyboardMode, MouseMode, SoundCard, SourceKind, VideoFilter,
     WritePolicy,
 };
 use iced::widget::{
@@ -604,45 +604,45 @@ fn sound<'a>(library: &'a Library, window: &'a ConfigWindow) -> Element<'a, Mess
     let effective = &window.effective;
     let defaults = &window.defaults;
     let mut blaster = column![field(
-        "Sound Blaster 16 · port 220h",
-        switch(window, Setting::Sb16, defaults.hardware.sb16)
+        "Sound card",
+        sound_card_choice(window, defaults.hardware.sound())
     )]
     .spacing(14);
-    if effective.hardware.sb16 {
-        blaster = blaster.push(
-            row![
-                field(
-                    "IRQ",
-                    choice(
-                        window,
-                        Setting::SbIrq,
-                        defaults.hardware.sb_irq.to_string(),
-                        [(5i64, "5"), (7, "7")]
-                    )
+    let sound = effective.hardware.sound();
+    if sound.has_dsp() {
+        let mut io = row![
+            field(
+                "IRQ",
+                choice(
+                    window,
+                    Setting::SbIrq,
+                    defaults.hardware.sb_irq.to_string(),
+                    [(5i64, "5"), (7, "7")]
+                )
+            ),
+            field(
+                "8-bit DMA",
+                choice(
+                    window,
+                    Setting::SbDma8,
+                    defaults.hardware.sb_dma8.to_string(),
+                    [(0i64, "0"), (1, "1"), (3, "3")]
+                )
+            ),
+        ]
+        .spacing(28);
+        if sound.has_dma16() {
+            io = io.push(field(
+                "16-bit DMA",
+                choice(
+                    window,
+                    Setting::SbDma16,
+                    defaults.hardware.sb_dma16.to_string(),
+                    [(5i64, "5"), (6, "6"), (7, "7")],
                 ),
-                field(
-                    "8-bit DMA",
-                    choice(
-                        window,
-                        Setting::SbDma8,
-                        defaults.hardware.sb_dma8.to_string(),
-                        [(0i64, "0"), (1, "1"), (3, "3")]
-                    )
-                ),
-                field(
-                    "16-bit DMA",
-                    choice(
-                        window,
-                        Setting::SbDma16,
-                        defaults.hardware.sb_dma16.to_string(),
-                        [(5i64, "5"), (6, "6"), (7, "7")]
-                    )
-                ),
-            ]
-            .spacing(28)
-            .wrap()
-            .vertical_spacing(12),
-        );
+            ));
+        }
+        blaster = blaster.push(io.wrap().vertical_spacing(12));
     }
     let mut midi = column![field(
         "MPU-401 · port 330h",
@@ -698,10 +698,42 @@ fn sound<'a>(library: &'a Library, window: &'a ConfigWindow) -> Element<'a, Mess
         );
     }
     page.push(rule::horizontal(1))
-        .push(group("Digital audio", blaster))
+        .push(group("Sound card", blaster))
         .push(rule::horizontal(1))
         .push(group("MIDI", midi))
         .into()
+}
+
+fn sound_card_choice(window: &ConfigWindow, default: SoundCard) -> Element<'_, Message> {
+    let explicit = window
+        .get(Setting::SoundCard)
+        .and_then(Value::as_str)
+        .and_then(SoundCard::parse)
+        .or_else(|| {
+            window
+                .get(Setting::Sb16)
+                .and_then(Value::as_bool)
+                .map(|on| if on { SoundCard::Sb16 } else { SoundCard::None })
+        });
+    let mut choices = row![
+        button(text(format!("Default · {default}")).size(12))
+            .padding([6, 12])
+            .style(chip_style(explicit.is_none()))
+            .on_press(edit(GameEdit::Unset(Setting::SoundCard)))
+    ]
+    .spacing(8);
+    for card in SoundCard::ALL {
+        choices = choices.push(
+            button(text(card.to_string()).size(12))
+                .padding([6, 12])
+                .style(chip_style(explicit == Some(card)))
+                .on_press(edit(GameEdit::Set(
+                    Setting::SoundCard,
+                    card.as_str().into(),
+                ))),
+        );
+    }
+    choices.wrap().vertical_spacing(8).into()
 }
 
 pub(super) fn mouse_label(mode: MouseMode) -> &'static str {

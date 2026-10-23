@@ -45,9 +45,15 @@ impl PcMachine {
 
 impl AudioUse {
     pub fn change_blocker(self, old: AudioHardware, new: AudioHardware) -> Option<&'static str> {
-        if old.sb16 != new.sb16 && (self.sb16 || self.opl3) {
+        let old_sound = old.sound();
+        let new_sound = new.sound();
+        if old_sound != new_sound && (self.sb16 || self.opl3) {
             Some("SB16 / OPL3")
-        } else if (old.irq, old.dma8, old.dma16) != (new.irq, new.dma8, new.dma16) && self.sb16 {
+        } else if (old.irq != new.irq
+            || old.dma8 != new.dma8
+            || (old_sound.has_dma16() && old.dma16 != new.dma16))
+            && self.sb16
+        {
             Some("SB16 resources")
         } else if old.mpu401 != new.mpu401 && self.mpu401 {
             Some("MPU-401")

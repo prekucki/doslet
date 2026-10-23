@@ -274,7 +274,7 @@ impl PcBus {
             slave_pic,
             pit,
             mpu: Mpu401::default(),
-            dsp: doslet_sb_dsp::Dsp::default(),
+            dsp: doslet_sb_dsp::Dsp::new(config.sound() == doslet_config::SoundCard::Sb16),
             mixer: doslet_sb_mixer::Mixer::with_routing(
                 config.sb_irq,
                 config.sb_dma8,
@@ -302,8 +302,9 @@ impl PcBus {
         let config = self.config.with_audio(audio);
         config.validate().map_err(crate::MachineError::Hardware)?;
         let routes = Routes::build(config).map_err(crate::MachineError::Resource)?;
-        // Only untouched mixer state may receive new resource defaults.
+        // Only untouched DSP/mixer state may receive new resource defaults.
         if !self.audio_use.sb16 {
+            self.dsp = doslet_sb_dsp::Dsp::new(config.sound() == doslet_config::SoundCard::Sb16);
             self.mixer = doslet_sb_mixer::Mixer::with_routing(audio.irq, audio.dma8, audio.dma16);
         }
         self.config = config;
@@ -680,7 +681,13 @@ impl PortBus for PcBus {
             Endpoint::MixerIndex => Ok(self.mixer.index()),
             Endpoint::Opl => {
                 self.opl_accesses = self.opl_accesses.wrapping_add(1);
-                Ok(self.opl.read(opl_offset(port), self.guest_nanos))
+                let offset = opl_offset(port);
+                let status = self.opl.read(offset, self.guest_nanos);
+                Ok(if !self.config.sound().has_opl3() && offset & 3 == 0 {
+                    status | 0x06
+                } else {
+                    status
+                })
             }
             Endpoint::MixerData => {
                 self.mixer.set_interrupt_status(self.dsp.irq_status());

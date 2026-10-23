@@ -692,17 +692,20 @@ impl PcMachine {
             irq_enabled_sources: self.bus.mixer.enabled_irq_sources(),
             irq: self
                 .hardware_config()
-                .sb16
+                .sound()
+                .has_dsp()
                 .then(|| self.bus.mixer.interrupt_line())
                 .flatten(),
             dma8: self
                 .hardware_config()
-                .sb16
+                .sound()
+                .has_dsp()
                 .then(|| self.bus.mixer.dma_channel(false))
                 .flatten(),
             dma16: self
                 .hardware_config()
-                .sb16
+                .sound()
+                .has_dma16()
                 .then(|| self.bus.mixer.dma_channel(true))
                 .flatten(),
             pcm_frames,

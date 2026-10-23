@@ -141,8 +141,8 @@ impl GlobalSettings {
             if !has("machine", "cpu_mode") {
                 spec.cpu_mode = mode;
             }
-            if !has("sound", "sb16") {
-                spec.hardware.sb16 = hardware.sb16;
+            if !has("sound", "sb16") && !has("sound", "card") {
+                spec.hardware.set_sound_card(hardware.sound());
             }
             if !has("sound", "mpu401") {
                 spec.hardware.mpu401 = hardware.mpu401;
@@ -510,5 +510,16 @@ mod tests {
         assert_eq!(spec.hardware.keyboard, KeyboardMode::Bios);
         // The default preset supplies the machine.
         assert_eq!(spec.hardware.cpu_mhz, 66);
+    }
+
+    #[test]
+    fn explicit_sound_card_is_not_replaced_by_the_default_preset() {
+        let settings = GlobalSettings::default();
+        let profile: DocumentMut = "[sound]\ncard='adlib'\n".parse().unwrap();
+        let mut spec =
+            crate::machine_profile::parse_machine_profile("version=2\n[sound]\ncard='adlib'\n")
+                .unwrap();
+        settings.fill_profile_defaults(&mut spec, &profile);
+        assert_eq!(spec.hardware.sound(), doslet_config::SoundCard::Adlib);
     }
 }

@@ -272,9 +272,23 @@ pub fn parse_machine_profile(text: &str) -> Result<MachineSpec, String> {
         }
     }
     if let Some(s) = section(t, "sound")? {
-        fields(s, &["sb16", "mpu401", "irq", "dma8", "dma16"], "sound.")?;
+        fields(
+            s,
+            &["card", "sb16", "mpu401", "irq", "dma8", "dma16"],
+            "sound.",
+        )?;
         if let Some(v) = boolean(s, "sb16")? {
-            spec.hardware.sb16 = v;
+            spec.hardware.set_sound_card(if v {
+                doslet_config::SoundCard::Sb16
+            } else {
+                doslet_config::SoundCard::None
+            });
+        }
+        if let Some(v) = string(s, "card")? {
+            spec.hardware.set_sound_card(
+                doslet_config::SoundCard::parse(&v)
+                    .ok_or("sound.card must be none, adlib, sb, or sb16")?,
+            );
         }
         if let Some(v) = boolean(s, "mpu401")? {
             spec.hardware.mpu401 = v;
@@ -704,7 +718,14 @@ pub fn export_machine_profile(spec: &MachineSpec) -> String {
     if let Some(dpmi) = spec.dpmi {
         d["machine"]["dpmi"] = value(dpmi.as_str());
     }
-    d["sound"]["sb16"] = value(spec.hardware.sb16);
+    let sound_card = spec.hardware.sound();
+    d["sound"]["sb16"] = value(sound_card != doslet_config::SoundCard::None);
+    if matches!(
+        sound_card,
+        doslet_config::SoundCard::Adlib | doslet_config::SoundCard::Sb
+    ) {
+        d["sound"]["card"] = value(sound_card.as_str());
+    }
     d["sound"]["mpu401"] = value(spec.hardware.mpu401);
     for (k, v) in [
         ("irq", spec.hardware.sb_irq),

@@ -617,17 +617,26 @@ impl Session {
         // DOS games commonly consult BLASTER before probing the DSP. Describe
         // the emulated card, independently of whether host audio is enabled.
         let mut environment = Vec::from(&b"PATH=C:\\\0"[..]);
-        if config.sb16 {
-            environment.extend_from_slice(
-                alloc::format!(
-                    "BLASTER=A220 I{} D{} H{} T6{}\0",
-                    config.sb_irq,
-                    config.sb_dma8,
-                    config.sb_dma16,
-                    if config.mpu401 { " P330" } else { "" },
-                )
-                .as_bytes(),
-            );
+        match config.sound() {
+            doslet_config::SoundCard::None | doslet_config::SoundCard::Adlib => {}
+            doslet_config::SoundCard::Sb => {
+                environment.extend_from_slice(
+                    alloc::format!("BLASTER=A220 I{} D{} T3\0", config.sb_irq, config.sb_dma8,)
+                        .as_bytes(),
+                );
+            }
+            doslet_config::SoundCard::Sb16 => {
+                environment.extend_from_slice(
+                    alloc::format!(
+                        "BLASTER=A220 I{} D{} H{} T6{}\0",
+                        config.sb_irq,
+                        config.sb_dma8,
+                        config.sb_dma16,
+                        if config.mpu401 { " P330" } else { "" },
+                    )
+                    .as_bytes(),
+                );
+            }
         }
         environment.extend_from_slice(b"\0\x01\0");
         for (offset, value) in environment
@@ -807,10 +816,14 @@ impl Session {
         old: doslet_config::AudioHardware,
         new: doslet_config::AudioHardware,
     ) -> bool {
-        old.sb16 != new.sb16
-            || (old.sb16
-                && (old.irq, old.dma8, old.dma16, old.mpu401)
-                    != (new.irq, new.dma8, new.dma16, new.mpu401))
+        let old_card = old.sound();
+        let new_card = new.sound();
+        if !old_card.has_dsp() && !new_card.has_dsp() {
+            return false;
+        }
+        old_card != new_card
+            || (old.irq, old.dma8) != (new.irq, new.dma8)
+            || (old_card.has_dma16() && (old.dma16, old.mpu401) != (new.dma16, new.mpu401))
     }
     pub fn configure_unused_audio(
         &mut self,

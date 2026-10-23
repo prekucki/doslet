@@ -171,12 +171,12 @@ pub(super) fn dialog(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
 
 fn playback(app: &Doslet, narrow: bool) -> Element<'_, Message> {
     let h = app.configurator.active.hardware;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let internal = app.audio_mixer == crate::audio::Mixer::Application;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let internal = true;
     let mut output = column![section_title("Output")].spacing(14);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let switches = row![
             button(text("Internal").size(13))
@@ -195,7 +195,7 @@ fn playback(app: &Doslet, narrow: bool) -> Element<'_, Message> {
         .spacing(4);
         output = output.push(setting("Mixer", switches.into(), narrow));
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         output = output.push(setting("Mixer", text("Internal").size(13).into(), narrow));
     }
@@ -222,7 +222,7 @@ fn playback(app: &Doslet, narrow: bool) -> Element<'_, Message> {
         );
     }
     let mut body = column![card_content(output.into())].spacing(14);
-    if !h.sb16 && !h.mpu401 {
+    if !h.sound().has_fm() && !h.mpu401 {
         body = body.push(
             text("No sound hardware enabled. Add a device in Hardware.")
                 .size(12)
@@ -377,58 +377,120 @@ fn midi(app: &Doslet, narrow: bool) -> Element<'_, Message> {
 fn hardware(app: &Doslet, narrow: bool) -> Element<'_, Message> {
     let config = &app.configurator;
     let h = config.draft.hardware;
+    let sound = h.sound();
     let ready = !config.pending;
-    let mut sb = column![device_header(
-        "Sound Blaster 16",
-        "Digital audio · OPL3 FM",
-        h.sb16,
-        ready.then_some(|v| Message::Config(Edit::Sb16(v))),
-    )]
-    .spacing(16);
-    if h.sb16 {
-        let port = control("I/O port", fixed_value("220h"));
-        let irq = control(
-            "IRQ",
-            pick_list(&[5u8, 7][..], Some(h.sb_irq), |v| {
-                Message::Config(Edit::Irq(v))
-            })
-            .text_size(13)
-            .padding([7, 10])
-            .width(Fill)
-            .into(),
-        );
-        let dma8 = control(
-            "DMA 8-bit",
-            pick_list(&[0u8, 1, 3][..], Some(h.sb_dma8), |v| {
-                Message::Config(Edit::Dma8(v))
-            })
-            .text_size(13)
-            .padding([7, 10])
-            .width(Fill)
-            .into(),
-        );
-        let dma16 = control(
-            "DMA 16-bit",
-            pick_list(&[5u8, 6, 7][..], Some(h.sb_dma16), |v| {
-                Message::Config(Edit::Dma16(v))
-            })
-            .text_size(13)
-            .padding([7, 10])
-            .width(Fill)
-            .into(),
-        );
-        if narrow {
-            sb = sb.push(
-                column![row![port, irq].spacing(12), row![dma8, dma16].spacing(12)].spacing(12),
-            );
-        } else {
-            sb = sb.push(row![port, irq, dma8, dma16].spacing(12));
+    let subtitle = match sound {
+        doslet_config::SoundCard::None => "Disabled",
+        doslet_config::SoundCard::Adlib => "OPL2 FM synthesis · 388h",
+        doslet_config::SoundCard::Sb => "8-bit digital audio · OPL2 FM",
+        doslet_config::SoundCard::Sb16 => "16-bit digital audio · OPL3 FM",
+    };
+    let card_picker: Element<'_, Message> = if ready {
+        pick_list(&doslet_config::SoundCard::ALL[..], Some(sound), |v| {
+            Message::Config(Edit::SoundCard(v))
+        })
+        .text_size(13)
+        .padding([7, 10])
+        .width(if narrow { Fill } else { 180.into() })
+        .into()
+    } else {
+        fixed_value(match sound {
+            doslet_config::SoundCard::None => "Off",
+            doslet_config::SoundCard::Adlib => "AdLib",
+            doslet_config::SoundCard::Sb => "Sound Blaster",
+            doslet_config::SoundCard::Sb16 => "Sound Blaster 16",
+        })
+    };
+    let header: Element<'_, Message> = if narrow {
+        column![
+            column![
+                section_title("Sound card"),
+                text(subtitle).size(12).color(MUTED)
+            ]
+            .spacing(4),
+            card_picker,
+        ]
+        .spacing(10)
+        .into()
+    } else {
+        row![
+            column![
+                section_title("Sound card"),
+                text(subtitle).size(12).color(MUTED)
+            ]
+            .spacing(4),
+            space::horizontal(),
+            card_picker,
+        ]
+        .spacing(12)
+        .align_y(iced::Center)
+        .into()
+    };
+    let mut sb = column![header].spacing(16);
+    match sound {
+        doslet_config::SoundCard::None => {}
+        doslet_config::SoundCard::Adlib => {
+            sb = sb.push(setting("I/O port", fixed_value("388h · fixed"), narrow));
         }
-        sb = sb.push(
-            text("Fixed ports: SB16 220h · OPL3 220h / 388h")
-                .size(11)
-                .color(MUTED),
-        );
+        doslet_config::SoundCard::Sb | doslet_config::SoundCard::Sb16 => {
+            let port = control("I/O port", fixed_value("220h"));
+            let irq = control(
+                "IRQ",
+                pick_list(&[5u8, 7][..], Some(h.sb_irq), |v| {
+                    Message::Config(Edit::Irq(v))
+                })
+                .text_size(13)
+                .padding([7, 10])
+                .width(Fill)
+                .into(),
+            );
+            let dma8 = control(
+                "DMA 8-bit",
+                pick_list(&[0u8, 1, 3][..], Some(h.sb_dma8), |v| {
+                    Message::Config(Edit::Dma8(v))
+                })
+                .text_size(13)
+                .padding([7, 10])
+                .width(Fill)
+                .into(),
+            );
+            if sound.has_dma16() {
+                let dma16 = control(
+                    "DMA 16-bit",
+                    pick_list(&[5u8, 6, 7][..], Some(h.sb_dma16), |v| {
+                        Message::Config(Edit::Dma16(v))
+                    })
+                    .text_size(13)
+                    .padding([7, 10])
+                    .width(Fill)
+                    .into(),
+                );
+                if narrow {
+                    sb = sb.push(
+                        column![row![port, irq].spacing(12), row![dma8, dma16].spacing(12)]
+                            .spacing(12),
+                    );
+                } else {
+                    sb = sb.push(row![port, irq, dma8, dma16].spacing(12));
+                }
+                sb = sb.push(
+                    text("Fixed ports: SB16 220h · OPL3 220h / 388h")
+                        .size(11)
+                        .color(MUTED),
+                );
+            } else {
+                if narrow {
+                    sb = sb.push(column![row![port, irq].spacing(12), dma8].spacing(12));
+                } else {
+                    sb = sb.push(row![port, irq, dma8].spacing(12));
+                }
+                sb = sb.push(
+                    text("Fixed ports: SB 220h · OPL2 220h / 388h")
+                        .size(11)
+                        .color(MUTED),
+                );
+            }
+        }
     }
     let mut mpu = column![device_header(
         "MPU-401",
