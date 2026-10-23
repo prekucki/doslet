@@ -4,6 +4,7 @@ use iced::Size;
 use iced::widget::image::Handle;
 use iced_runtime::image::{self, Allocation, Error};
 
+mod crt;
 mod filter;
 mod upload;
 pub use filter::DisplayFilter;
@@ -252,6 +253,8 @@ pub struct DisplaySizing {
     /// The chosen filter; [`Self::active_filter`] is the one drawn.
     pub filter: DisplayFilter,
     pub frame_rate: FrameRate,
+    /// Alternating scanlines applied before the filter.
+    pub crt: bool,
     /// Simple filter drawn instead of a costly one without a hardware GPU.
     pub fallback: DisplayFilter,
     /// Whether GPU filters and the 16:9 smart warp run on a hardware GPU.
@@ -260,6 +263,7 @@ pub struct DisplaySizing {
     viewport: Size,
     scale_factor: f32,
     filtered: filter::FilterCache,
+    scanlines: crt::CrtCache,
     uploads: upload::UploadQueue,
     #[cfg(target_arch = "wasm32")]
     web_image: Option<PreparedFrame>,
@@ -278,12 +282,14 @@ impl Default for DisplaySizing {
             frozen: false,
             filter: DisplayFilter::default(),
             frame_rate: FrameRate::default(),
+            crt: false,
             fallback: DisplayFilter::default(),
             gpu: true,
             frames: FrameMeter::default(),
             viewport: Size::ZERO,
             scale_factor: 1.0,
             filtered: filter::FilterCache::default(),
+            scanlines: crt::CrtCache::default(),
             uploads: upload::UploadQueue::default(),
             #[cfg(target_arch = "wasm32")]
             web_image: None,
@@ -309,6 +315,7 @@ pub enum SizingMessage {
     /// The window had time to settle after leaving full screen.
     FullscreenSettled,
     Filter(DisplayFilter),
+    Crt(bool),
     FrameRate(FrameRate),
     Viewport(Size),
     ScaleFactor(f32),
@@ -407,21 +414,20 @@ impl DisplaySizing {
             )
         });
         let filter = self.active_filter();
-        self.filtered.refresh(frame.image.as_ref(), filter, target);
+        self.scanlines.refresh(frame.image.as_ref(), self.crt);
+        let source = self.scanlines.image().or(frame.image.as_ref());
+        self.filtered.refresh(source, filter, target);
         #[cfg(target_arch = "wasm32")]
         {
             // WGPU on WASM uploads raster textures when they are first drawn.
             // Waiting for an explicit allocation before drawing deadlocks it.
             self.web_image = frame.dimensions().and_then(|source_size| {
-                self.filtered
-                    .image()
-                    .or(frame.image.as_ref())
-                    .map(|image| PreparedFrame {
-                        image: image.clone(),
-                        generation: frame.generation,
-                        source_size,
-                        filter,
-                    })
+                self.filtered.image().or(source).map(|image| PreparedFrame {
+                    image: image.clone(),
+                    generation: frame.generation,
+                    source_size,
+                    filter,
+                })
             });
             return iced::Task::none();
         }
@@ -429,15 +435,12 @@ impl DisplaySizing {
         {
             self.uploads
                 .offer(frame.dimensions().and_then(|source_size| {
-                    self.filtered
-                        .image()
-                        .or(frame.image.as_ref())
-                        .map(|image| PreparedFrame {
-                            image: image.clone(),
-                            generation: frame.generation,
-                            source_size,
-                            filter,
-                        })
+                    self.filtered.image().or(source).map(|image| PreparedFrame {
+                        image: image.clone(),
+                        generation: frame.generation,
+                        source_size,
+                        filter,
+                    })
                 }));
             self.start_upload()
         }
@@ -549,6 +552,10 @@ impl DisplaySizing {
             SizingMessage::Filter(filter) => {
                 self.uploads.retry();
                 self.filter = filter;
+            }
+            SizingMessage::Crt(enabled) => {
+                self.uploads.retry();
+                self.crt = enabled;
             }
             SizingMessage::FrameRate(rate) => self.frame_rate = rate,
             SizingMessage::Viewport(size) => {

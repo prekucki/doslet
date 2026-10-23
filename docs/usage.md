@@ -530,6 +530,19 @@ browser, including while paused:
   r3 RGB variant) to enlarge to any size. It gives a soft, natural look rather
   than sharp pixel-art edges, and applies only when the picture is enlarged.
 
+**CRT scanlines** in **Display** darkens every other source line before the
+selected filter, on the CPU, including while paused. A paused session also shows
+an overlay over the guest image.
+
+The toolbar holds the game name and the Run/Pause, Restart, Full screen, Info
+and Shut down icons. The status bar below the picture opens CPU, display and
+audio settings. In **Info → Status bar**, choose **Automatic** (default),
+**Compact**, or **CPU + audio meters**. Automatic adds CPU activity and audio
+spectrum meters at widths of at least 760 logical pixels and heights of at least
+360 pixels. Compact keeps a 28-pixel row. Explicit meters use a second row below
+700 pixels wide. The choice lasts for the current session and does not restart
+the game. Info also lists the memory, drive and input indicators.
+
 Scaling and filtering are independent. Filters operate on presentation snapshots
 in the UI; guest execution and mouse coordinates still use the original frame.
 Filtered images are cached until the source frame, filter or intermediate zoom

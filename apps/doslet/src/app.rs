@@ -861,6 +861,7 @@ impl Doslet {
                 }
                 crate::ui::Action::DismissNotice => self.notice = None,
                 crate::ui::Action::AudioPage(page) => self.workspace.audio_page = page,
+                crate::ui::Action::StatusBar(mode) => self.workspace.status_bar = mode,
             },
             Message::Config(edit) => {
                 use crate::configurator::Edit;

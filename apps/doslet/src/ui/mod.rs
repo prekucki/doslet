@@ -21,12 +21,14 @@ const INK: Color = Color::from_rgb8(17, 18, 21);
 pub(crate) const PANEL: Color = Color::from_rgb8(25, 27, 31);
 pub(crate) const EDGE: Color = Color::from_rgb8(48, 51, 57);
 pub(crate) const MUTED: Color = Color::from_rgb8(151, 156, 165);
-pub(crate) const ACCENT: Color = Color::from_rgb8(177, 224, 190);
+pub(crate) const ACCENT: Color = Color::from_rgb8(177, 195, 220);
 pub(crate) const FOREGROUND: Color = Color::from_rgb8(235, 237, 240);
 const HOT: Color = Color::from_rgb8(255, 179, 105);
 const COLD: Color = Color::from_rgb8(125, 194, 255);
 const HOVER: Color = Color::from_rgb8(41, 44, 50);
 const DANGER: Color = Color::from_rgb8(244, 150, 146);
+const STAGE: Color = Color::from_rgb8(20, 21, 24);
+const RUNNING: Color = Color::from_rgb8(133, 183, 151);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
@@ -47,6 +49,7 @@ pub enum Action {
     Close,
     DismissNotice,
     AudioPage(AudioPage),
+    StatusBar(StatusBar),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -56,10 +59,29 @@ pub enum AudioPage {
     Hardware,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StatusBar {
+    #[default]
+    Automatic,
+    Compact,
+    Meters,
+}
+
+impl std::fmt::Display for StatusBar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Automatic => "Automatic",
+            Self::Compact => "Compact",
+            Self::Meters => "CPU + audio meters",
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Workspace {
     pub panel: Option<Panel>,
     pub audio_page: AudioPage,
+    pub status_bar: StatusBar,
     pub cpu: Option<crate::cpu_config::Settings>,
     #[cfg(not(target_arch = "wasm32"))]
     pub cpu_profile_form: Option<crate::cpu_config::ProfileForm>,
@@ -83,9 +105,181 @@ pub fn view(app: &Doslet) -> Element<'_, Message> {
     responsive(move |size| workspace(app, size)).into()
 }
 
+fn chrome(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(PANEL.into()),
+        ..Default::default()
+    }
+}
+
+fn status_button(
+    icon: Icon,
+    label: String,
+    description: &'static str,
+    panel_kind: Panel,
+) -> Element<'static, Message> {
+    let symbol = svg(svg::Handle::from_memory(icon.bytes()))
+        .width(14)
+        .height(14)
+        .style(|_, _| svg::Style { color: Some(MUTED) });
+    let mut content = row![symbol].spacing(6).align_y(iced::Center);
+    if !label.is_empty() {
+        content = content.push(text(label).size(11).color(MUTED));
+    }
+    tooltip(
+        button(content)
+            .padding([3, 6])
+            .height(24)
+            .style(ghost)
+            .on_press(Message::Ui(Action::Open(panel_kind))),
+        container(text(description).size(12))
+            .padding([6, 10])
+            .style(panel),
+        tooltip::Position::Top,
+    )
+    .into()
+}
+
+fn footer(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
+    let width = size.width;
+    let meters = match app.workspace.status_bar {
+        StatusBar::Automatic => width >= 760.0 && size.height >= 360.0,
+        StatusBar::Compact => false,
+        StatusBar::Meters => true,
+    };
+    let inline_meters = meters && width >= 700.0;
+    let status = app.session.status();
+    let color = match status {
+        SessionStatus::Running => RUNNING,
+        SessionStatus::Faulted => DANGER,
+        _ => MUTED,
+    };
+    let progress = if app.configurator.pending {
+        Some("Preparing…")
+    } else if app.session.pending_commit() {
+        Some("Saving…")
+    } else if app.session.storage_waiting() {
+        Some("Loading…")
+    } else if app.session.dirty_overlay() {
+        Some("Unsaved changes")
+    } else {
+        None
+    };
+    let label = progress.unwrap_or(status_label(status));
+    let dot = container(space::horizontal().width(5))
+        .height(5)
+        .style(move |_| container::Style {
+            background: Some(color.into()),
+            border: Border {
+                radius: 3.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    let mut state = row![dot].spacing(7).align_y(iced::Center);
+    if width >= 520.0 || progress.is_some() || meters {
+        state = state.push(text(label).size(11).color(MUTED));
+    }
+    let hint = if app.has_mouse_capture() {
+        format!("{label} · Ctrl+Esc to release mouse")
+    } else {
+        label.to_owned()
+    };
+    let state = tooltip(
+        state,
+        container(text(hint).size(12)).padding([6, 10]).style(panel),
+        tooltip::Position::Top,
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    let speed = if app.v86_host_clock {
+        Some("v86 · MAX".to_owned())
+    } else if let Some(tiers) = app.speed_tiers.filter(|t| t.enabled) {
+        Some(format!("{} MHz · Auto", tiers.grey_mhz))
+    } else if app.analysis.controller_enabled {
+        Some(format!("{} MHz · Auto", app.analysis.effective_mhz))
+    } else {
+        None
+    };
+    #[cfg(target_arch = "wasm32")]
+    let speed = (app.cpu_settings.mode == crate::cpu_config::Mode::Tiers
+        && app.cpu_tiers_available)
+        .then(|| format!("{} MHz · Auto", app.cpu_settings.grey));
+    let speed =
+        speed.unwrap_or_else(|| format!("{} MHz", app.configurator.active.hardware.cpu_mhz));
+    let cpu = if width < 380.0 {
+        String::new()
+    } else if width < 620.0 {
+        speed.split(" · ").next().unwrap_or_default().to_owned()
+    } else {
+        speed
+    };
+    let dimensions = app.display.dimensions().map_or_else(
+        || "—".into(),
+        |size| format!("{}×{}", size.width as u32, size.height as u32),
+    );
+    let audio = if width < 520.0 {
+        ""
+    } else if app.configurator.active.hardware.sb16 {
+        "SB16"
+    } else if app.configurator.active.hardware.mpu401 {
+        "MIDI"
+    } else {
+        "Off"
+    };
+    let cpu_control = if inline_meters {
+        cpu_indicator(app, width < 900.0)
+    } else {
+        status_button(Icon::Cpu, cpu, "CPU settings and activity", Panel::Cpu)
+    };
+    let audio_control = if inline_meters {
+        audio_spectrum(app)
+    } else {
+        status_button(Icon::Audio, audio.into(), "Audio settings", Panel::Audio)
+    };
+    let mut summary = row![state, space::horizontal()]
+        .spacing(6)
+        .align_y(iced::Center);
+    if !meters || inline_meters {
+        summary = summary.push(cpu_control);
+    }
+    summary = summary.push(status_button(
+        Icon::Display,
+        dimensions,
+        "Display and scaling",
+        Panel::Display,
+    ));
+    if !meters || inline_meters {
+        summary = summary.push(audio_control);
+    }
+    let summary = container(summary)
+        .padding([2, 12])
+        .height(if inline_meters { 48 } else { 28 })
+        .width(Fill);
+    let content: Element<'_, Message> = if meters && !inline_meters {
+        column![
+            summary,
+            container(
+                row![
+                    cpu_indicator(app, true),
+                    space::horizontal(),
+                    audio_spectrum(app),
+                ]
+                .spacing(8)
+                .align_y(iced::Center)
+            )
+            .padding([2, 12])
+            .height(44)
+            .width(Fill)
+        ]
+        .into()
+    } else {
+        summary.into()
+    };
+    container(content).width(Fill).style(chrome).into()
+}
+
 fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
     let narrow = size.width < 700.0;
-    let compact_footer = size.width < 1040.0;
     let status = app.session.status();
     let can_run = matches!(
         status,
@@ -97,20 +291,8 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         SessionStatus::Ready => (Icon::Play, "Run"),
         _ => (Icon::Restart, "Restart"),
     };
-    let run = icon_button(
-        icon,
-        label,
-        if can_run {
-            Message::RunPause
-        } else {
-            Message::Reset
-        },
-        true,
-    );
     #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-    let mut identity = row![]
-        .spacing(if narrow { 8 } else { 16 })
-        .align_y(iced::Center);
+    let mut identity = row![].spacing(8).align_y(iced::Center);
     #[cfg(not(target_arch = "wasm32"))]
     if app.from_library {
         identity = identity
@@ -126,95 +308,50 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
             )
             .push(container(rule::vertical(1)).height(18));
     }
-    let identity = identity
-        .push(text("doslet").size(20))
-        .push(container(rule::vertical(1)).height(18))
-        .push(
-            text(shorten(&app.name, if narrow { 12 } else { 38 }))
-                .size(13)
-                .color(MUTED),
-        );
-    let mut actions = row![run].spacing(4).align_y(iced::Center);
+    let title_length = ((size.width - 210.0).max(21.0) / 7.0) as usize;
+    let identity = identity.push(
+        text(shorten(&app.name, title_length.min(64)))
+            .size(13)
+            .color(FOREGROUND),
+    );
+    let mut actions = row![icon_button(
+        icon,
+        label,
+        if can_run {
+            Message::RunPause
+        } else {
+            Message::Reset
+        },
+        false
+    )]
+    .spacing(4)
+    .align_y(iced::Center);
     if can_run {
         actions = actions.push(icon_button(Icon::Restart, "Restart", Message::Reset, false));
     }
-    actions = actions.push(fullscreen_button(app, 36, 18));
+    actions = actions
+        .push(fullscreen_button(app, 32, 18))
+        .push(icon_button(
+            Icon::Menu,
+            "Info and settings",
+            Message::Ui(Action::Open(Panel::Details)),
+            false,
+        ));
     #[cfg(not(target_arch = "wasm32"))]
     {
-        actions = actions.push(quit_button(app, 36, 18));
+        actions = actions.push(quit_button(app, 32, 18));
     }
-    #[cfg(target_arch = "wasm32")]
-    let actions = actions.push(small_button(
-        "Open…",
-        Message::Ui(Action::Open(Panel::Games)),
-    ));
-    let toolbar: Element<'_, Message> = if size.width < 370.0 {
-        column![identity, actions].spacing(10).into()
-    } else {
-        row![identity, space::horizontal(), actions]
-            .align_y(iced::Center)
-            .into()
-    };
-    let toolbar = container(toolbar).padding([10, 16]).width(Fill);
-    let state_color = match status {
-        SessionStatus::Running => ACCENT,
-        SessionStatus::Faulted => DANGER,
-        _ => MUTED,
-    };
-    let progress = if app.configurator.pending {
-        Some("Preparing…")
-    } else if app.session.pending_commit() {
-        Some("Saving…")
-    } else if app.session.storage_waiting() {
-        Some("Loading…")
-    } else if app.session.dirty_overlay() {
-        Some("Unsaved changes")
-    } else {
-        None
-    };
-    let mut bottom = row![
-        container(space::horizontal().width(6))
-            .height(6)
-            .style(move |_| container::Style {
-                background: Some(state_color.into()),
-                border: Border {
-                    radius: 3.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-        text(if compact_footer {
-            progress.unwrap_or(status_label(status))
-        } else {
-            status_label(status)
-        })
-        .size(12)
-        .color(MUTED),
-    ]
-    .spacing(7)
-    .align_y(iced::Center);
-    if !compact_footer {
-        bottom = bottom.push(space::horizontal().width(12)).push(
-            text(if let Some(progress) = progress {
-                progress
-            } else if app.has_mouse_capture() {
-                "Ctrl+Esc to release mouse"
-            } else {
-                ""
-            })
-            .size(12)
-            .color(MUTED),
-        );
-    }
-    if !compact_footer {
-        bottom = bottom.push(space::horizontal());
-    }
+    let toolbar = container(row![identity, space::horizontal(), actions].align_y(iced::Center))
+        .padding([4, 12])
+        .height(40)
+        .width(Fill)
+        .style(chrome);
     // Full screen swaps the toolbar for a thin strip and hides the footer.
     let fullscreen = app.display_sizing.fullscreen;
     let mut shell = if fullscreen {
         column![fullscreen_strip(app, can_run, icon, label), viewport(app)]
     } else {
-        column![toolbar, viewport(app)]
+        column![toolbar, rule::horizontal(1), viewport(app)]
     }
     .height(Fill)
     .width(Fill);
@@ -229,7 +366,7 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         .or_else(|| app.display_sizing.error().map(str::to_owned))
         .or_else(|| app.notice.clone());
     if let Some(notice) = notice {
-        let label = shorten(&notice, if narrow { 48 } else { 112 });
+        let label = shorten(&notice, if narrow { 40 } else { 100 });
         let mut alert = row![
             tooltip(
                 text(label).size(12).color(DANGER),
@@ -247,67 +384,10 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         if app.session.fault().is_none() && app.display_sizing.error().is_none() {
             alert = alert.push(small_button("×", Message::Ui(Action::DismissNotice)));
         }
-        shell = shell.push(container(alert).padding([2, 16]).width(Fill));
+        shell = shell.push(container(alert).padding([2, 12]).width(Fill));
     }
-    let details = || {
-        icon_button(
-            Icon::Info,
-            "Session information",
-            Message::Ui(Action::Open(Panel::Details)),
-            false,
-        )
-    };
-    let bottom: Element<'_, Message> = if size.width >= 370.0 && narrow {
-        column![
-            row![bottom, cpu_indicator(app, true), memory::indicator(app)]
-                .spacing(4)
-                .align_y(iced::Center),
-            row![audio_spectrum(app), video_indicator(app, true, false)].spacing(4),
-            row![drives::indicator(app), input::indicator(), details()].spacing(4),
-        ]
-        .spacing(3)
-        .into()
-    } else if narrow {
-        column![
-            bottom,
-            row![cpu_indicator(app, true), memory::indicator(app)].spacing(4),
-            row![audio_spectrum(app), video_indicator(app, true, true)].spacing(4),
-            row![drives::indicator(app), input::indicator(), details()].spacing(4),
-        ]
-        .spacing(3)
-        .into()
-    } else if compact_footer {
-        column![
-            bottom,
-            row![
-                cpu_indicator(app, false),
-                memory::indicator(app),
-                audio_spectrum(app)
-            ]
-            .spacing(4),
-            row![
-                video_indicator(app, false, false),
-                drives::indicator(app),
-                input::indicator(),
-                details()
-            ]
-            .spacing(4),
-        ]
-        .spacing(3)
-        .into()
-    } else {
-        bottom
-            .push(cpu_indicator(app, false))
-            .push(memory::indicator(app))
-            .push(audio_spectrum(app))
-            .push(video_indicator(app, false, false))
-            .push(drives::indicator(app))
-            .push(input::indicator())
-            .push(details())
-            .into()
-    };
     if !fullscreen {
-        shell = shell.push(container(bottom).padding([5, 16]).width(Fill));
+        shell = shell.push(rule::horizontal(1)).push(footer(app, size));
     }
     let shell: Element<'_, Message> = shell.into();
     if let Some(kind) = app.workspace.panel {
@@ -318,7 +398,7 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
             Panel::Input => return modal(shell, input::dialog(app, size), narrow),
             Panel::Display => ("Display", display_panel(app)),
             Panel::Memory => ("Memory", memory::details(app)),
-            Panel::Details => ("Session", details_panel(app)),
+            Panel::Details => ("Info", details_panel(app)),
             #[cfg(target_arch = "wasm32")]
             Panel::Games => ("Open a game", games_panel(app)),
         };
@@ -341,7 +421,11 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
             column![
                 header,
                 rule::horizontal(1),
-                scrollable(content).height(Fill)
+                scrollable(container(content).padding(iced::Padding {
+                    right: 12.0,
+                    ..Default::default()
+                }))
+                .height(Fill)
             ]
             .spacing(18),
         )
@@ -351,7 +435,7 @@ fn workspace(app: &Doslet, size: iced::Size) -> Element<'_, Message> {
         .height((size.height - 40.0).clamp(
             160.0,
             match kind {
-                Panel::Details => 430.0,
+                Panel::Details => 620.0,
                 Panel::Memory => 520.0,
                 _ => 320.0,
             },
@@ -690,6 +774,21 @@ fn display_panel(app: &Doslet) -> Element<'_, Message> {
             .size(12)
             .color(MUTED),
         )
+        .push(
+            button(
+                text(if app.display_sizing.crt {
+                    "CRT scanlines: on"
+                } else {
+                    "CRT scanlines: off"
+                })
+                .size(13),
+            )
+            .padding([8, 12])
+            .style(move |theme, status| segment(theme, status, app.display_sizing.crt))
+            .on_press(Message::DisplaySizing(SizingMessage::Crt(
+                !app.display_sizing.crt,
+            ))),
+        )
         .push(field(
             "Frame rate",
             pick_list(
@@ -733,11 +832,34 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
     }
     let mut body = column![
         text(&app.name).size(15),
-        row![small_button(
-            "Audio…",
-            Message::Ui(Action::Open(Panel::Audio))
-        ),]
-        .spacing(8),
+        field(
+            "Status bar",
+            pick_list(
+                [StatusBar::Automatic, StatusBar::Compact, StatusBar::Meters],
+                Some(app.workspace.status_bar),
+                |mode| Message::Ui(Action::StatusBar(mode)),
+            )
+            .text_size(13)
+            .padding(8)
+            .width(Fill)
+            .into()
+        ),
+        text("Automatic shows meters in larger windows. Applies to this session.")
+            .size(12)
+            .color(MUTED),
+        column![
+            row![cpu_indicator(app, false), memory::indicator(app)]
+                .spacing(12)
+                .wrap(),
+            row![audio_spectrum(app), video_indicator(app, true, false)]
+                .spacing(12)
+                .wrap(),
+            row![drives::indicator(app), input::indicator()]
+                .spacing(12)
+                .wrap(),
+        ]
+        .spacing(12),
+        rule::horizontal(1),
         text(app.storage_label()).size(13).color(MUTED),
         text(format!("{} instructions", app.session.steps()))
             .size(13)
@@ -760,6 +882,13 @@ fn details_panel(app: &Doslet) -> Element<'_, Message> {
         text(app.midi_mode_label()).size(12).color(MUTED),
     ]
     .spacing(14);
+    #[cfg(target_arch = "wasm32")]
+    {
+        body = body.push(small_button(
+            "Open a game…",
+            Message::Ui(Action::Open(Panel::Games)),
+        ));
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         if let Some(tiers) = app.speed_tiers {
@@ -914,7 +1043,7 @@ enum Icon {
     Disk,
     Input,
     Display,
-    Info,
+    Menu,
     Fullscreen,
     Windowed,
     #[cfg(not(target_arch = "wasm32"))]
@@ -935,7 +1064,7 @@ impl Icon {
             Self::Disk => include_bytes!("icons/disk.svg"),
             Self::Input => include_bytes!("icons/input.svg"),
             Self::Display => include_bytes!("icons/display.svg"),
-            Self::Info => include_bytes!("icons/info.svg"),
+            Self::Menu => include_bytes!("icons/menu.svg"),
             Self::Fullscreen => include_bytes!("icons/fullscreen.svg"),
             Self::Windowed => include_bytes!("icons/windowed.svg"),
             #[cfg(not(target_arch = "wasm32"))]
@@ -952,7 +1081,7 @@ fn icon_button(
     message: Message,
     prominent: bool,
 ) -> Element<'static, Message> {
-    icon_button_sized(icon, label, message, prominent, 36, 18)
+    icon_button_sized(icon, label, message, prominent, 32, 18)
 }
 
 fn icon_button_sized(
@@ -1058,11 +1187,35 @@ fn viewport(app: &Doslet) -> Element<'_, Message> {
                     .on_right_release(Message::PointerButton(1, false))
                     .on_exit(Message::PointerLeft),
             );
+            let screen: Element<'_, Message> = if app.session.status() == SessionStatus::Paused {
+                stack![
+                    content,
+                    container(
+                        row![
+                            svg(svg::Handle::from_memory(Icon::Pause.bytes()))
+                                .width(26)
+                                .height(26),
+                            text("PAUSED").size(28).font(iced::Font::MONOSPACE)
+                        ]
+                        .spacing(12)
+                        .align_y(iced::Center)
+                    )
+                    .center_x(Fill)
+                    .center_y(Fill)
+                    .style(|_| container::Style {
+                        background: Some(Color::from_rgba8(0, 0, 0, 0.55).into()),
+                        ..Default::default()
+                    })
+                ]
+                .into()
+            } else {
+                content.into()
+            };
             if app.display_sizing.pixel_perfect
                 && (width > available.width || height > available.height)
             {
                 scrollable(
-                    content
+                    container(screen)
                         .center_x(available.width.max(width))
                         .center_y(available.height.max(height)),
                 )
@@ -1074,7 +1227,7 @@ fn viewport(app: &Doslet) -> Element<'_, Message> {
                 .height(Fill)
                 .into()
             } else {
-                content.center_x(Fill).center_y(Fill).into()
+                container(screen).center_x(Fill).center_y(Fill).into()
             }
         })
         .into()
@@ -1098,11 +1251,13 @@ fn viewport(app: &Doslet) -> Element<'_, Message> {
         .on_resize(|size| {
             Message::DisplaySizing(crate::presentation::SizingMessage::Viewport(size))
         });
+    let fullscreen = app.display_sizing.fullscreen;
     container(viewport)
+        .padding(if fullscreen { 0 } else { 8 })
         .width(Fill)
         .height(Fill)
-        .style(|_| container::Style {
-            background: Some(Color::BLACK.into()),
+        .style(move |_| container::Style {
+            background: Some(if fullscreen { Color::BLACK } else { STAGE }.into()),
             ..Default::default()
         })
         .into()
@@ -1168,14 +1323,14 @@ fn speed_tier_table(app: &Doslet) -> Element<'_, Message> {
 
 pub(crate) fn panel(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Color::from_rgba8(25, 27, 31, 0.94).into()),
+        background: Some(PANEL.into()),
         border: Border {
-            color: Color::from_rgba8(177, 224, 190, 0.17),
+            color: EDGE,
             width: 1.0,
             radius: 10.0.into(),
         },
         shadow: iced::Shadow {
-            color: Color::from_rgba8(128, 224, 170, 0.09),
+            color: Color::from_rgba8(0, 0, 0, 0.25),
             offset: iced::Vector::new(0.0, 2.0),
             blur_radius: 24.0,
         },
@@ -1341,7 +1496,7 @@ fn audio_spectrum(app: &Doslet) -> Element<'_, Message> {
         let mut bar = iced::widget::Column::new().spacing(1);
         for segment in (0..8).rev() {
             let color = if segment >= lit {
-                Color::from_rgb8(34, 44, 38)
+                EDGE
             } else if segment >= 7 {
                 Color::from_rgb8(226, 125, 113)
             } else if segment >= 5 {
@@ -1447,7 +1602,7 @@ pub(crate) fn primary(_: &Theme, status: button::Status) -> button::Style {
             if disabled {
                 HOVER
             } else if status == button::Status::Hovered {
-                Color::from_rgb8(199, 238, 209)
+                Color::from_rgb8(207, 216, 229)
             } else {
                 ACCENT
             }
@@ -1505,7 +1660,7 @@ pub(crate) fn ghost(_: &Theme, status: button::Status) -> button::Style {
 pub(crate) fn segment(theme: &Theme, status: button::Status, selected: bool) -> button::Style {
     if selected {
         button::Style {
-            background: Some(Color::from_rgba8(177, 224, 190, 0.10).into()),
+            background: Some(Color { a: 0.10, ..ACCENT }.into()),
             text_color: ACCENT,
             border: Border {
                 radius: 6.0.into(),
