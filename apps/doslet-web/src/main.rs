@@ -734,12 +734,13 @@ fn build(args: &Args, bar: &ProgressBar) -> Result<PathBuf> {
         serde_json::to_vec_pretty(&manifest)?,
     )?;
     stage(bar, 4, "Building browser runtime with Trunk");
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()?;
     let dist = if let Some(path) = &args.web_dist {
         path.canonicalize()?
     } else {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .map_err(|_| "building the browser runtime requires the source checkout; use --web-dist with a prebuilt runtime")?;
         let log = fs::File::create(staging.0.join("build.log"))?;
         let mut command = Command::new("trunk");
         command
@@ -976,11 +977,9 @@ fn run(cli: Cli) -> Result<()> {
         Action::Serve { build, port } => (build, Some(port)),
     };
     let temporary = if port.is_some() && args.output.is_none() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
-        fs::create_dir_all(&root)?;
         let temporary = tempfile::Builder::new()
             .prefix("doslet-preview-")
-            .tempdir_in(root)?;
+            .tempdir()?;
         args.output = Some(temporary.path().join("site"));
         Some(temporary)
     } else {
