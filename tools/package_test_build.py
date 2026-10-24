@@ -102,7 +102,9 @@ def main():
                     "package a game with --mode simple, aot or v86.\n"
                 )
                 archive = args.output / f"{name}.zip"
-            (directory / "README.txt").write_text(instructions)
+            # README.txt is reserved by doslet-web for an assembled game bundle.
+            readme = "TEST-BUILD.txt" if kind == "web" else "README.txt"
+            (directory / readme).write_text(instructions)
             (directory / "BUILD.json").write_text(json.dumps({
                 "version": args.version, "commit": commit, "target": kind,
                 "source": source,
