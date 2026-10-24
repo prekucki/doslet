@@ -108,7 +108,10 @@ def main():
                 "source": source,
             }, indent=2) + "\n")
             if kind == "web":
-                with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+                # Registry sources can carry normalized timestamps older than ZIP.
+                with zipfile.ZipFile(
+                    archive, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False
+                ) as output:
                     for path in sorted(directory.rglob("*")):
                         if path.is_file():
                             output.write(path, path.relative_to(stage))
